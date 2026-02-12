@@ -36,7 +36,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
          [x] Execute php.rs CLI on --FILE-- section
          [x] Compare output to --EXPECT--/--EXPECTF--
          [x] Support --SKIPIF--, --INI--, --ENV--, --ARGS--, --CLEAN--
-[ ] 0.6  Verify scaffold: `cargo test` passes with zero tests, `cargo clippy` clean
+[x] 0.6  Verify scaffold: `cargo test` passes with zero tests, `cargo clippy` clean
 
 ################################################################################
 # PHASE 1: TYPE SYSTEM (crates/php-rs-types)
