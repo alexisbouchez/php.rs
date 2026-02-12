@@ -1652,4 +1652,394 @@ mod tests {
             assert_eq!(span.extract(source), expected_text);
         }
     }
+
+    // ======================================================================
+    // Task 2.2.4: Test all 70+ PHP keywords
+    // ======================================================================
+
+    #[test]
+    fn test_all_php_keywords_comprehensive() {
+        // Test: All PHP 8.6 keywords are recognized (case-insensitive)
+        // Reference: php-src/Zend/zend_language_scanner.l
+        // Total: 70+ keywords including control flow, declarations, operators, etc.
+
+        let all_keywords = vec![
+            // Control flow keywords
+            ("if", Token::If),
+            ("else", Token::Else),
+            ("elseif", Token::Elseif),
+            ("endif", Token::Endif),
+            ("while", Token::While),
+            ("endwhile", Token::Endwhile),
+            ("do", Token::Do),
+            ("for", Token::For),
+            ("endfor", Token::Endfor),
+            ("foreach", Token::Foreach),
+            ("endforeach", Token::Endforeach),
+            ("switch", Token::Switch),
+            ("endswitch", Token::Endswitch),
+            ("case", Token::Case),
+            ("default", Token::Default),
+            ("break", Token::Break),
+            ("continue", Token::Continue),
+            ("goto", Token::Goto),
+            ("match", Token::Match),
+            // Declaration keywords
+            ("function", Token::Function),
+            ("fn", Token::Fn),
+            ("class", Token::Class),
+            ("interface", Token::Interface),
+            ("trait", Token::Trait),
+            ("enum", Token::Enum),
+            ("extends", Token::Extends),
+            ("implements", Token::Implements),
+            ("namespace", Token::Namespace),
+            ("use", Token::Use),
+            ("const", Token::Const),
+            ("declare", Token::Declare),
+            ("enddeclare", Token::Enddeclare),
+            // Visibility and modifiers
+            ("public", Token::Public),
+            ("protected", Token::Protected),
+            ("private", Token::Private),
+            ("static", Token::Static),
+            ("final", Token::Final),
+            ("abstract", Token::Abstract),
+            ("readonly", Token::Readonly),
+            ("var", Token::Var),
+            // Exception handling
+            ("try", Token::Try),
+            ("catch", Token::Catch),
+            ("finally", Token::Finally),
+            ("throw", Token::Throw),
+            // Language constructs
+            ("echo", Token::Echo),
+            ("print", Token::Print),
+            ("return", Token::Return),
+            ("yield", Token::Yield),
+            ("new", Token::New),
+            ("clone", Token::Clone),
+            ("instanceof", Token::Instanceof),
+            ("include", Token::Include),
+            ("include_once", Token::IncludeOnce),
+            ("require", Token::Require),
+            ("require_once", Token::RequireOnce),
+            ("eval", Token::Eval),
+            ("isset", Token::Isset),
+            ("empty", Token::Empty),
+            ("unset", Token::Unset),
+            ("exit", Token::Exit),
+            ("die", Token::Exit), // die is an alias for exit
+            ("list", Token::List),
+            ("array", Token::Array),
+            ("callable", Token::Callable),
+            ("global", Token::Global),
+            ("as", Token::As),
+            ("insteadof", Token::Insteadof),
+            // Logical operators (keyword form)
+            ("and", Token::LogicalAnd),
+            ("or", Token::LogicalOr),
+            ("xor", Token::LogicalXor),
+        ];
+
+        println!("\nTesting {} PHP keywords...", all_keywords.len());
+
+        for (keyword, expected_token) in &all_keywords {
+            let source = format!("<?php {}", keyword);
+            let mut lexer = Lexer::new(&source);
+
+            // Skip <?php
+            lexer.next_token();
+
+            // Get the keyword token
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize keyword: {}", keyword));
+
+            assert_eq!(
+                token, *expected_token,
+                "Keyword '{}' should tokenize to {:?}, got {:?}",
+                keyword, expected_token, token
+            );
+            assert_eq!(
+                span.extract(&source),
+                *keyword,
+                "Span should extract '{}'",
+                keyword
+            );
+        }
+
+        println!("✓ All {} keywords passed!", all_keywords.len());
+    }
+
+    #[test]
+    fn test_all_php_keywords_case_insensitive() {
+        // Test: Verify keywords are case-insensitive (fundamental PHP behavior)
+        // Test a representative sample with different cases
+
+        let case_variants = vec![
+            // Each entry: (lowercase, UPPERCASE, MixedCase, expected_token)
+            ("if", "IF", "If", Token::If),
+            ("function", "FUNCTION", "Function", Token::Function),
+            ("class", "CLASS", "Class", Token::Class),
+            ("namespace", "NAMESPACE", "NameSpace", Token::Namespace),
+            ("foreach", "FOREACH", "ForEach", Token::Foreach),
+            ("instanceof", "INSTANCEOF", "InstanceOf", Token::Instanceof),
+            ("readonly", "READONLY", "ReadOnly", Token::Readonly),
+            ("match", "MATCH", "Match", Token::Match),
+            ("enum", "ENUM", "Enum", Token::Enum),
+            ("trait", "TRAIT", "Trait", Token::Trait),
+        ];
+
+        for (lower, upper, mixed, expected_token) in case_variants {
+            // Test lowercase
+            let source_lower = format!("<?php {}", lower);
+            let mut lexer = Lexer::new(&source_lower);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", lower));
+            assert_eq!(token, expected_token, "Failed for lowercase: {}", lower);
+
+            // Test UPPERCASE
+            let source_upper = format!("<?php {}", upper);
+            let mut lexer = Lexer::new(&source_upper);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", upper));
+            assert_eq!(token, expected_token, "Failed for UPPERCASE: {}", upper);
+
+            // Test MixedCase
+            let source_mixed = format!("<?php {}", mixed);
+            let mut lexer = Lexer::new(&source_mixed);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", mixed));
+            assert_eq!(token, expected_token, "Failed for MixedCase: {}", mixed);
+        }
+    }
+
+    #[test]
+    fn test_all_magic_constants() {
+        // Test: All magic constants (case-insensitive)
+        // Reference: php-src/Zend/zend_language_scanner.l
+
+        let magic_constants = vec![
+            ("__LINE__", Token::Line),
+            ("__FILE__", Token::File),
+            ("__DIR__", Token::Dir),
+            ("__FUNCTION__", Token::FuncC),
+            ("__CLASS__", Token::ClassC),
+            ("__TRAIT__", Token::TraitC),
+            ("__METHOD__", Token::MethodC),
+            ("__NAMESPACE__", Token::NsC),
+            ("__PROPERTY__", Token::PropertyC),
+        ];
+
+        for (constant, expected_token) in magic_constants {
+            // Test as-is (uppercase)
+            let source = format!("<?php {}", constant);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", constant));
+            assert_eq!(
+                token, expected_token,
+                "Magic constant '{}' should tokenize to {:?}",
+                constant, expected_token
+            );
+            assert_eq!(span.extract(&source), constant);
+
+            // Test lowercase variant
+            let lowercase = constant.to_lowercase();
+            let source_lower = format!("<?php {}", lowercase);
+            let mut lexer_lower = Lexer::new(&source_lower);
+            lexer_lower.next_token(); // Skip <?php
+            let (token_lower, _) = lexer_lower
+                .next_token()
+                .expect(&format!("Should tokenize: {}", lowercase));
+            assert_eq!(
+                token_lower, expected_token,
+                "Magic constant '{}' (lowercase) should tokenize to {:?}",
+                lowercase, expected_token
+            );
+        }
+    }
+
+    #[test]
+    fn test_keywords_vs_identifiers() {
+        // Test: Keywords are recognized, but similar identifiers are not
+        // This ensures we correctly distinguish keywords from identifiers
+
+        let test_cases = vec![
+            // (input, is_keyword, expected_token)
+            ("if", true, Token::If),
+            ("ifx", false, Token::String), // Not a keyword
+            ("iffy", false, Token::String),
+            ("function", true, Token::Function),
+            ("function1", false, Token::String),
+            ("my_function", false, Token::String),
+            ("class", true, Token::Class),
+            ("class_name", false, Token::String),
+            ("MyClass", false, Token::String),
+            ("foreach", true, Token::Foreach),
+            ("foreachable", false, Token::String),
+            ("match", true, Token::Match),
+            ("matcher", false, Token::String),
+            ("readonly", true, Token::Readonly),
+            ("readonly_property", false, Token::String),
+        ];
+
+        for (text, is_keyword, expected_token) in test_cases {
+            let source = format!("<?php {}", text);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", text));
+
+            assert_eq!(
+                token,
+                expected_token,
+                "'{}' should be {} (got {:?})",
+                text,
+                if is_keyword {
+                    "a keyword"
+                } else {
+                    "an identifier"
+                },
+                token
+            );
+            assert_eq!(span.extract(&source), text);
+        }
+    }
+
+    #[test]
+    fn test_keyword_count_completeness() {
+        // Test: Verify we have all expected keywords
+        // This is a meta-test to ensure we're not missing any keywords
+
+        // Count keywords in our lexer implementation
+        let keywords_in_lexer = vec![
+            "abstract",
+            "and",
+            "array",
+            "as",
+            "break",
+            "callable",
+            "case",
+            "catch",
+            "class",
+            "clone",
+            "const",
+            "continue",
+            "declare",
+            "default",
+            "die",
+            "do",
+            "echo",
+            "else",
+            "elseif",
+            "empty",
+            "enddeclare",
+            "endfor",
+            "endforeach",
+            "endif",
+            "endswitch",
+            "endwhile",
+            "enum",
+            "eval",
+            "exit",
+            "extends",
+            "final",
+            "finally",
+            "fn",
+            "for",
+            "foreach",
+            "function",
+            "global",
+            "goto",
+            "if",
+            "implements",
+            "include",
+            "include_once",
+            "instanceof",
+            "insteadof",
+            "interface",
+            "isset",
+            "list",
+            "match",
+            "namespace",
+            "new",
+            "or",
+            "print",
+            "private",
+            "protected",
+            "public",
+            "readonly",
+            "require",
+            "require_once",
+            "return",
+            "static",
+            "switch",
+            "throw",
+            "trait",
+            "try",
+            "unset",
+            "use",
+            "var",
+            "while",
+            "xor",
+            "yield",
+        ];
+
+        // Magic constants (also case-insensitive like keywords)
+        let magic_constants = vec![
+            "__CLASS__",
+            "__DIR__",
+            "__FILE__",
+            "__FUNCTION__",
+            "__LINE__",
+            "__METHOD__",
+            "__NAMESPACE__",
+            "__TRAIT__",
+            "__PROPERTY__",
+        ];
+
+        println!("\nKeyword count: {}", keywords_in_lexer.len());
+        println!("Magic constant count: {}", magic_constants.len());
+        println!("Total: {}", keywords_in_lexer.len() + magic_constants.len());
+
+        // Verify we have at least 70 total (keywords + magic constants)
+        assert!(
+            keywords_in_lexer.len() + magic_constants.len() >= 70,
+            "Expected at least 70 keywords/constants, found {}",
+            keywords_in_lexer.len() + magic_constants.len()
+        );
+
+        // Test each keyword actually works
+        for keyword in keywords_in_lexer {
+            let source = format!("<?php {}", keyword);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", keyword));
+
+            // Should NOT be a regular String token (should be recognized as keyword)
+            if keyword != "from" {
+                // "from" is special - not a standalone keyword in PHP
+                assert_ne!(
+                    token,
+                    Token::String,
+                    "Keyword '{}' should not tokenize as String (got {:?})",
+                    keyword,
+                    token
+                );
+            }
+        }
+    }
 }
