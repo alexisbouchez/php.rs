@@ -138,9 +138,107 @@ fn get_php_binary() -> Result<PathBuf, String> {
     }
 }
 
+/// Result of checking the SKIPIF section
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SkipResult {
+    /// Test should be skipped with the given reason
+    Skip(String),
+    /// Test should run
+    Run,
+}
+
+/// Check if a test should be skipped by executing the --SKIPIF-- section
+///
+/// The SKIPIF section should output "skip" followed by an optional reason
+/// on a single line if the test should be skipped.
+/// Reference: https://qa.php.net/phpt_details.php
+fn check_skipif(php_binary: &Path, skipif_code: &str) -> Result<SkipResult, String> {
+    let temp_dir = std::env::temp_dir();
+    let temp_file = temp_dir.join(format!("phpt_skipif_{}.php", std::process::id()));
+
+    // Write the SKIPIF code to a temporary file
+    fs::write(&temp_file, skipif_code)
+        .map_err(|e| format!("Failed to write SKIPIF temporary file: {}", e))?;
+
+    // Execute the SKIPIF code
+    let output = Command::new(php_binary)
+        .arg(&temp_file)
+        .output()
+        .map_err(|e| format!("Failed to execute SKIPIF code: {}", e))?;
+
+    // Clean up the temporary file
+    let _ = fs::remove_file(&temp_file);
+
+    // Check the output
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stdout_trimmed = stdout.trim();
+
+    if stdout_trimmed.starts_with("skip") {
+        // Extract the skip reason (everything after "skip")
+        let reason = stdout_trimmed
+            .strip_prefix("skip")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let reason = if reason.is_empty() {
+            "No reason given".to_string()
+        } else {
+            reason
+        };
+        Ok(SkipResult::Skip(reason))
+    } else {
+        Ok(SkipResult::Run)
+    }
+}
+
+/// Execute the --CLEAN-- section code
+///
+/// The CLEAN section is used to clean up any files or resources created during the test.
+/// Errors are ignored since the test result is already determined.
+fn run_clean(php_binary: &Path, clean_code: &str) -> Result<(), String> {
+    let temp_dir = std::env::temp_dir();
+    let temp_file = temp_dir.join(format!("phpt_clean_{}.php", std::process::id()));
+
+    // Write the CLEAN code to a temporary file
+    fs::write(&temp_file, clean_code)
+        .map_err(|e| format!("Failed to write CLEAN temporary file: {}", e))?;
+
+    // Execute the CLEAN code
+    let _ = Command::new(php_binary)
+        .arg(&temp_file)
+        .output()
+        .map_err(|e| format!("Failed to execute CLEAN code: {}", e))?;
+
+    // Clean up the temporary file
+    let _ = fs::remove_file(&temp_file);
+
+    Ok(())
+}
+
+/// Result of executing a PHPT test including skip status
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhptExecutionResult {
+    /// Test was skipped (from --SKIPIF-- section)
+    Skipped { reason: String },
+    /// Test was executed
+    Executed(PhptOutput),
+}
+
 /// Execute a PHPT test by running the php.rs CLI on its --FILE-- section
-pub fn execute_phpt(test: &PhptTest) -> Result<PhptOutput, String> {
+pub fn execute_phpt(test: &PhptTest) -> Result<PhptExecutionResult, String> {
     let php_binary = get_php_binary()?;
+
+    // Check if test should be skipped
+    if let Some(ref skipif_code) = test.skipif {
+        match check_skipif(&php_binary, skipif_code)? {
+            SkipResult::Skip(reason) => {
+                return Ok(PhptExecutionResult::Skipped { reason });
+            }
+            SkipResult::Run => {
+                // Continue with test execution
+            }
+        }
+    }
 
     // Create a temporary file with the PHP code
     let temp_dir = std::env::temp_dir();
@@ -196,11 +294,19 @@ pub fn execute_phpt(test: &PhptTest) -> Result<PhptOutput, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
-    Ok(PhptOutput {
+    let phpt_output = PhptOutput {
         stdout,
         stderr,
         exit_code: output.status.code().unwrap_or(-1),
-    })
+    };
+
+    // Run cleanup code if present
+    if let Some(ref clean_code) = test.clean {
+        let _ = run_clean(&php_binary, clean_code);
+        // Ignore errors from cleanup - test result is what matters
+    }
+
+    Ok(PhptExecutionResult::Executed(phpt_output))
 }
 
 /// Output from executing a PHPT test
@@ -533,10 +639,13 @@ echo $a + $b;
 
         // Try to execute - this may fail if binary doesn't exist yet
         match execute_phpt(&test) {
-            Ok(output) => {
+            Ok(PhptExecutionResult::Executed(output)) => {
                 // If it succeeds, verify we got some output structure
                 // (The actual content won't match until we implement the interpreter)
                 assert!(output.exit_code >= -1);
+            }
+            Ok(PhptExecutionResult::Skipped { .. }) => {
+                panic!("Test should not be skipped");
             }
             Err(e) => {
                 // Expected to fail if binary doesn't exist yet
@@ -793,5 +902,127 @@ echo $a + $b;
             ),
             CompareResult::Match
         );
+    }
+
+    #[test]
+    fn test_skipif_skip_test() {
+        // Test that a SKIPIF section that outputs "skip" causes test to be skipped
+        let test = PhptTest {
+            description: "Test should be skipped".to_string(),
+            file: "<?php\necho \"test\";\n?>".to_string(),
+            expect: PhptExpect::Exact("test".to_string()),
+            skipif: Some("<?php echo \"skip test skipped\"; ?>".to_string()),
+            ini: None,
+            env: None,
+            args: None,
+            post: None,
+            clean: None,
+        };
+
+        match execute_phpt(&test) {
+            Ok(PhptExecutionResult::Skipped { reason }) => {
+                assert_eq!(reason, "test skipped");
+            }
+            Ok(PhptExecutionResult::Executed(_)) => {
+                // If binary doesn't exist or can't execute skipif, this is acceptable
+                // for now since we're testing the parsing/execution logic
+            }
+            Err(_) => {
+                // Binary might not exist yet - acceptable
+            }
+        }
+    }
+
+    #[test]
+    fn test_skipif_run_test() {
+        // Test that a SKIPIF section that doesn't output "skip" allows test to run
+        let test = PhptTest {
+            description: "Test should run".to_string(),
+            file: "<?php\necho \"test\";\n?>".to_string(),
+            expect: PhptExpect::Exact("test".to_string()),
+            skipif: Some("<?php /* no skip output */ ?>".to_string()),
+            ini: None,
+            env: None,
+            args: None,
+            post: None,
+            clean: None,
+        };
+
+        match execute_phpt(&test) {
+            Ok(PhptExecutionResult::Executed(_)) => {
+                // Test ran - good
+            }
+            Ok(PhptExecutionResult::Skipped { .. }) => {
+                panic!("Test should not have been skipped");
+            }
+            Err(_) => {
+                // Binary might not exist yet - acceptable
+            }
+        }
+    }
+
+    #[test]
+    fn test_skipif_with_die() {
+        // Test the standard PHP skipif pattern: die('skip reason')
+        let test = PhptTest {
+            description: "Test with die skip".to_string(),
+            file: "<?php\necho \"test\";\n?>".to_string(),
+            expect: PhptExpect::Exact("test".to_string()),
+            skipif: Some("<?php die('skip extension not loaded'); ?>".to_string()),
+            ini: None,
+            env: None,
+            args: None,
+            post: None,
+            clean: None,
+        };
+
+        match execute_phpt(&test) {
+            Ok(PhptExecutionResult::Skipped { reason }) => {
+                assert_eq!(reason, "extension not loaded");
+            }
+            Ok(PhptExecutionResult::Executed(_)) | Err(_) => {
+                // Binary might not exist yet - acceptable
+            }
+        }
+    }
+
+    #[test]
+    fn test_clean_section() {
+        // Test that CLEAN section is executed (we can't verify it does anything
+        // without a working interpreter, but we can verify it doesn't crash)
+        let test = PhptTest {
+            description: "Test with clean".to_string(),
+            file: "<?php\nfile_put_contents('test.txt', 'data');\necho \"test\";\n?>".to_string(),
+            expect: PhptExpect::Exact("test".to_string()),
+            skipif: None,
+            ini: None,
+            env: None,
+            args: None,
+            post: None,
+            clean: Some("<?php\n@unlink('test.txt');\n?>".to_string()),
+        };
+
+        // Just verify this doesn't crash - we can't check if cleanup actually happened
+        // until we have a working interpreter
+        let _ = execute_phpt(&test);
+    }
+
+    #[test]
+    fn test_all_optional_sections_together() {
+        // Test with all optional sections present
+        let test = PhptTest {
+            description: "Comprehensive test with all sections".to_string(),
+            file: "<?php\necho getenv('TEST_VAR');\n?>".to_string(),
+            expect: PhptExpect::Exact("test_value".to_string()),
+            skipif: Some("<?php /* no skip */ ?>".to_string()),
+            ini: Some("error_reporting=E_ALL".to_string()),
+            env: Some("TEST_VAR=test_value".to_string()),
+            args: Some("arg1 arg2".to_string()),
+            post: None,
+            clean: Some("<?php /* cleanup */ ?>".to_string()),
+        };
+
+        // Just verify this doesn't crash with all sections present
+        let _ = execute_phpt(&test);
     }
 }

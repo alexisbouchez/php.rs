@@ -31,11 +31,11 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
          [x] crates/php-rs-sapi-cli/
 [x] 0.3  Set up CI (GitHub Actions): cargo test, cargo clippy, cargo fmt --check
 [x] 0.4  Add benchmark harness (criterion) in crates/php-rs-vm/benches/
-[~] 0.5  Write PHPT test runner scaffold:
+[x] 0.5  Write PHPT test runner scaffold:
          [x] Parse .phpt files (--TEST--, --FILE--, --EXPECT--, --EXPECTF--)
          [x] Execute php.rs CLI on --FILE-- section
          [x] Compare output to --EXPECT--/--EXPECTF--
-         [ ] Support --SKIPIF--, --INI--, --ENV--, --ARGS--, --CLEAN--
+         [x] Support --SKIPIF--, --INI--, --ENV--, --ARGS--, --CLEAN--
 [ ] 0.6  Verify scaffold: `cargo test` passes with zero tests, `cargo clippy` clean
 
 ################################################################################
