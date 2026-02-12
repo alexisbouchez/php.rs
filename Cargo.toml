@@ -21,3 +21,16 @@ repository = "https://github.com/php/php-rs"
 
 [workspace.dependencies]
 # Shared dependencies across the workspace
+
+[package]
+name = "php-rs"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Integration test dependencies
+
+[dev-dependencies]
