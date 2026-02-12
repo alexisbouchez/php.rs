@@ -102,6 +102,9 @@ impl<'a> Parser<'a> {
             Token::Match => self.parse_match_statement(),
             Token::Try => self.parse_try_statement(),
             Token::Function => self.parse_function_statement(),
+            Token::Class | Token::Abstract | Token::Final | Token::Readonly => {
+                self.parse_class_statement()
+            }
             _ => {
                 // Default case: try to parse as expression statement
                 let start_span = self.current_span;
@@ -786,6 +789,86 @@ impl<'a> Parser<'a> {
             return_type,
             body,
             by_ref,
+            attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
+    }
+
+    /// Parse class declaration statement
+    /// Syntax: [abstract|final|readonly] class Name [extends Parent] [implements Interface1, Interface2] { members }
+    fn parse_class_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+
+        // Parse modifiers (abstract, final, readonly)
+        let mut modifiers = Vec::new();
+        while matches!(
+            self.current_token,
+            Token::Abstract | Token::Final | Token::Readonly
+        ) {
+            let modifier = match self.current_token {
+                Token::Abstract => Modifier::Abstract,
+                Token::Final => Modifier::Final,
+                Token::Readonly => Modifier::Readonly,
+                _ => unreachable!(),
+            };
+            modifiers.push(modifier);
+            self.advance();
+        }
+
+        // Expect 'class' keyword
+        self.expect(Token::Class)?;
+
+        // Parse class name
+        let name = if let Token::String = self.current_token {
+            let n = self.lexer.source_text(&self.current_span).to_string();
+            self.advance();
+            n
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "class name".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            });
+        };
+
+        // Parse optional extends clause
+        let extends = if self.current_token == Token::Extends {
+            self.advance();
+            Some(self.parse_qualified_name()?)
+        } else {
+            None
+        };
+
+        // Parse optional implements clause
+        let implements = if self.current_token == Token::Implements {
+            self.advance();
+            let mut interfaces = Vec::new();
+            loop {
+                interfaces.push(self.parse_qualified_name()?);
+                if self.current_token == Token::Comma {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            interfaces
+        } else {
+            Vec::new()
+        };
+
+        // Parse class body
+        self.expect(Token::LBrace)?;
+        let members = Vec::new();
+        // For now, skip class members parsing - we'll implement that in Task 3.3.7
+        // Just verify we have a closing brace
+        self.expect(Token::RBrace)?;
+
+        Ok(Statement::Class {
+            name,
+            modifiers,
+            extends,
+            implements,
+            members,
             attributes: Vec::new(), // TODO: Parse attributes
             span: start_span,
         })
@@ -3205,6 +3288,156 @@ mod tests {
                 }
             }
             _ => panic!("Expected function declaration"),
+        }
+    }
+
+    // ========================================================================
+    // CLASS DECLARATION TESTS (Task 3.3.6)
+    // ========================================================================
+
+    #[test]
+    fn test_simple_class() {
+        // Test: class Foo { }
+        let source = "<?php class Foo { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class {
+                name,
+                modifiers,
+                extends,
+                implements,
+                members,
+                ..
+            } => {
+                assert_eq!(name, "Foo");
+                assert_eq!(modifiers.len(), 0);
+                assert!(extends.is_none());
+                assert_eq!(implements.len(), 0);
+                assert_eq!(members.len(), 0);
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_class_with_extends() {
+        // Test: class Child extends Parent { }
+        let source = "<?php class Child extends Parent { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class { name, extends, .. } => {
+                assert_eq!(name, "Child");
+                assert!(extends.is_some());
+                let parent = extends.unwrap();
+                assert_eq!(parent.parts.len(), 1);
+                assert_eq!(parent.parts[0], "Parent");
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_class_with_implements() {
+        // Test: class Foo implements Bar, Baz { }
+        let source = "<?php class Foo implements Bar, Baz { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class { implements, .. } => {
+                assert_eq!(implements.len(), 2);
+                assert_eq!(implements[0].parts[0], "Bar");
+                assert_eq!(implements[1].parts[0], "Baz");
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_abstract_class() {
+        // Test: abstract class Foo { }
+        let source = "<?php abstract class Foo { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class { modifiers, .. } => {
+                assert_eq!(modifiers.len(), 1);
+                assert_eq!(modifiers[0], Modifier::Abstract);
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_final_class() {
+        // Test: final class Foo { }
+        let source = "<?php final class Foo { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class { modifiers, .. } => {
+                assert_eq!(modifiers.len(), 1);
+                assert_eq!(modifiers[0], Modifier::Final);
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_readonly_class() {
+        // Test: readonly class Foo { }
+        let source = "<?php readonly class Foo { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class { modifiers, .. } => {
+                assert_eq!(modifiers.len(), 1);
+                assert_eq!(modifiers[0], Modifier::Readonly);
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_class_extends_and_implements() {
+        // Test: class Foo extends Bar implements Baz, Qux { }
+        let source = "<?php class Foo extends Bar implements Baz, Qux { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class {
+                name,
+                extends,
+                implements,
+                ..
+            } => {
+                assert_eq!(name, "Foo");
+                assert!(extends.is_some());
+                assert_eq!(implements.len(), 2);
+            }
+            _ => panic!("Expected class declaration"),
         }
     }
 }
