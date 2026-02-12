@@ -6518,4 +6518,214 @@ mod zresource_tests {
         ref_a.set(ZVal::long(10));
         assert_eq!(ref_a.get().to_long(), 10);
     }
+
+    #[test]
+    fn test_unset_reference_middle_of_chain() {
+        // Test: Unset a reference in the middle of a chain
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $c = &$b;
+        // unset($b);
+        // $c = 99;
+        // echo $a; // outputs 99 - $a and $c still connected
+        // echo $c; // outputs 99
+
+        let ref_a = ZReference::new(ZVal::long(1));
+        let ref_c = {
+            let ref_b = ref_a.clone();
+            let ref_c = ref_b.clone();
+
+            // All three share the same reference
+            assert_eq!(ref_a.refcount(), 3);
+            assert_eq!(ref_b.refcount(), 3);
+            assert_eq!(ref_c.refcount(), 3);
+
+            // ref_b is "unset" when it goes out of scope
+            ref_c
+        };
+
+        // After unsetting $b, $a and $c should still be connected
+        assert_eq!(ref_a.refcount(), 2);
+        assert_eq!(ref_c.refcount(), 2);
+
+        // Modify through $c
+        ref_c.set(ZVal::long(99));
+
+        // Both $a and $c should see the change
+        assert_eq!(ref_a.get().to_long(), 99);
+        assert_eq!(ref_c.get().to_long(), 99);
+    }
+
+    #[test]
+    fn test_unset_original_reference_survives() {
+        // Test: Unset the original variable, reference survives
+        // PHP equivalent:
+        // $a = 10;
+        // $b = &$a;
+        // unset($a);
+        // echo $b; // outputs 10 - $b still has the value
+        // $b = 20;
+        // echo $b; // outputs 20 - $b can still be modified
+
+        let ref_b = {
+            let ref_a = ZReference::new(ZVal::long(10));
+            let ref_b = ref_a.clone();
+
+            assert_eq!(ref_a.refcount(), 2);
+            assert_eq!(ref_b.get().to_long(), 10);
+
+            // ref_a is "unset" when it goes out of scope
+            ref_b
+        };
+
+        // After unsetting $a, $b should still have the value
+        assert_eq!(ref_b.refcount(), 1);
+        assert_eq!(ref_b.get().to_long(), 10);
+
+        // $b can still be modified
+        ref_b.set(ZVal::long(20));
+        assert_eq!(ref_b.get().to_long(), 20);
+    }
+
+    #[test]
+    fn test_reference_to_reference_modification() {
+        // Test: Reference to reference - all point to same value
+        // PHP equivalent:
+        // $p = 100;
+        // $q = &$p;
+        // $r = &$q;
+        // $r = 200;
+        // echo $p; // outputs 200
+        // echo $q; // outputs 200
+        // echo $r; // outputs 200
+
+        let ref_p = ZReference::new(ZVal::long(100));
+        let ref_q = ref_p.clone();
+        let ref_r = ref_q.clone();
+
+        // All three point to the same underlying value
+        assert_eq!(ref_p.refcount(), 3);
+        assert_eq!(ref_q.refcount(), 3);
+        assert_eq!(ref_r.refcount(), 3);
+
+        // Modify through $r
+        ref_r.set(ZVal::long(200));
+
+        // All three should see the change
+        assert_eq!(ref_p.get().to_long(), 200);
+        assert_eq!(ref_q.get().to_long(), 200);
+        assert_eq!(ref_r.get().to_long(), 200);
+    }
+
+    #[test]
+    fn test_unset_multiple_references() {
+        // Test: Unset multiple references in various orders
+        // PHP equivalent:
+        // $a = 5;
+        // $b = &$a;
+        // $c = &$b;
+        // $d = &$c;
+        // unset($b);
+        // unset($d);
+        // $c = 42;
+        // echo $a; // outputs 42
+        // echo $c; // outputs 42
+
+        let ref_a = ZReference::new(ZVal::long(5));
+        let ref_c = {
+            let _ref_b = ref_a.clone();
+            let ref_c = _ref_b.clone();
+            let _ref_d = ref_c.clone();
+
+            // All four share the same reference
+            assert_eq!(ref_a.refcount(), 4);
+
+            // ref_b and ref_d are "unset" when they go out of scope
+            ref_c
+        };
+
+        // After unsetting $b and $d, $a and $c should still be connected
+        assert_eq!(ref_a.refcount(), 2);
+        assert_eq!(ref_c.refcount(), 2);
+
+        // Modify through $c
+        ref_c.set(ZVal::long(42));
+
+        // Both $a and $c should see the change
+        assert_eq!(ref_a.get().to_long(), 42);
+        assert_eq!(ref_c.get().to_long(), 42);
+    }
+
+    #[test]
+    fn test_reference_chain_with_type_changes() {
+        // Test: Reference chain with type changes
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $c = &$b;
+        // $b = "hello";
+        // echo $a; // outputs "hello"
+        // echo $c; // outputs "hello"
+        // unset($b);
+        // $c = 3.14;
+        // echo $a; // outputs 3.14 (float)
+
+        let ref_a = ZReference::new(ZVal::long(1));
+        let ref_c = {
+            let ref_b = ref_a.clone();
+            let ref_c = ref_b.clone();
+
+            // Change type through $b to string
+            ref_b.set(ZVal::string(0x5000));
+
+            // All should see the string
+            assert!(matches!(ref_a.get().type_tag, ZValType::String));
+            assert!(matches!(ref_c.get().type_tag, ZValType::String));
+            assert_eq!(ref_a.get().value, 0x5000);
+
+            // ref_b is "unset" here
+            ref_c
+        };
+
+        // After unsetting $b, change type through $c to double
+        ref_c.set(ZVal::double(3.14));
+
+        // Both $a and $c should see the double
+        assert!(matches!(ref_a.get().type_tag, ZValType::Double));
+        assert!(matches!(ref_c.get().type_tag, ZValType::Double));
+        assert_eq!(ref_a.get().to_double(), 3.14);
+        assert_eq!(ref_c.get().to_double(), 3.14);
+    }
+
+    #[test]
+    fn test_unset_all_but_one_reference() {
+        // Test: Unset all references except one
+        // PHP equivalent:
+        // $a = 100;
+        // $b = &$a;
+        // $c = &$b;
+        // unset($a);
+        // unset($b);
+        // $c = 500;
+        // echo $c; // outputs 500
+
+        let final_ref = {
+            let ref_a = ZReference::new(ZVal::long(100));
+            let ref_b = ref_a.clone();
+            let ref_c = ref_b.clone();
+
+            assert_eq!(ref_a.refcount(), 3);
+
+            // Keep only ref_c, unset ref_a and ref_b
+            ref_c
+        };
+
+        // Only one reference remains
+        assert_eq!(final_ref.refcount(), 1);
+
+        // It can still be modified
+        final_ref.set(ZVal::long(500));
+        assert_eq!(final_ref.get().to_long(), 500);
+    }
 }
