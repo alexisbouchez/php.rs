@@ -4,6 +4,7 @@
 //! matching the reference PHP 8.6 implementation.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// PHP value type discriminant.
 ///
@@ -277,6 +278,150 @@ impl PartialEq for ZVal {
     }
 }
 
+/// PHP string value with reference counting and precomputed hash.
+///
+/// This struct represents PHP's zend_string type. In the reference PHP implementation,
+/// zend_string is a refcounted structure containing:
+/// - gc: zend_refcounted_h (refcount + type_info)
+/// - h: zend_ulong (hash value)
+/// - len: size_t (string length in bytes)
+/// - val: char[] (null-terminated string data)
+///
+/// In Rust, we use Arc for reference counting and store the data in a single allocation.
+/// The hash is precomputed using PHP's DJBX33A hash algorithm.
+///
+/// Reference: php-src/Zend/zend_types.h, zend_string.h
+#[derive(Clone)]
+pub struct ZString {
+    /// Shared reference to the string data
+    inner: Arc<ZStringInner>,
+}
+
+/// Inner data for ZString (stored in Arc for reference counting)
+struct ZStringInner {
+    /// Precomputed hash value (PHP uses DJBX33A hash)
+    hash: u64,
+    /// String data (bytes, not guaranteed to be valid UTF-8)
+    /// PHP strings are binary-safe and can contain null bytes
+    bytes: Box<[u8]>,
+}
+
+impl ZString {
+    /// Create a new ZString from a byte slice
+    pub fn new(bytes: &[u8]) -> Self {
+        let hash = Self::compute_hash(bytes);
+        Self {
+            inner: Arc::new(ZStringInner {
+                hash,
+                bytes: bytes.into(),
+            }),
+        }
+    }
+
+    /// Create a new ZString from a Rust string slice
+    pub fn from_str(s: &str) -> Self {
+        Self::new(s.as_bytes())
+    }
+
+    /// Get the hash value
+    pub fn hash(&self) -> u64 {
+        self.inner.hash
+    }
+
+    /// Get the length in bytes
+    pub fn len(&self) -> usize {
+        self.inner.bytes.len()
+    }
+
+    /// Check if the string is empty
+    pub fn is_empty(&self) -> bool {
+        self.inner.bytes.is_empty()
+    }
+
+    /// Get the bytes as a slice
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.inner.bytes
+    }
+
+    /// Get the string as a &str if it's valid UTF-8
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.inner.bytes).ok()
+    }
+
+    /// Compute the hash using PHP's DJBX33A hash algorithm
+    ///
+    /// Reference: php-src/Zend/zend_string.h
+    /// #define ZEND_STRING_HASH_VAL(s) zend_string_hash_val(s)
+    ///
+    /// The algorithm is:
+    /// hash = 5381
+    /// for each byte c:
+    ///   hash = hash * 33 + c
+    fn compute_hash(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 5381;
+        for &byte in bytes {
+            hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
+        }
+        hash
+    }
+}
+
+impl fmt::Debug for ZString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZString")
+            .field("hash", &self.hash())
+            .field("len", &self.len())
+            .field("bytes", &self.inner.bytes)
+            .finish()
+    }
+}
+
+impl fmt::Display for ZString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(s) = self.as_str() {
+            write!(f, "{}", s)
+        } else {
+            // For binary data, show as hex escape sequences
+            write!(f, "\"")?;
+            for &byte in self.as_bytes() {
+                if (32..=126).contains(&byte) && byte != b'\\' && byte != b'"' {
+                    write!(f, "{}", byte as char)?;
+                } else {
+                    write!(f, "\\x{:02x}", byte)?;
+                }
+            }
+            write!(f, "\"")
+        }
+    }
+}
+
+impl PartialEq for ZString {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast path: if the Arc pointers are the same, they're equal
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return true;
+        }
+
+        // Otherwise, compare the actual bytes
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for ZString {}
+
+impl std::hash::Hash for ZString {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Use the precomputed PHP hash
+        state.write_u64(self.hash());
+    }
+}
+
+impl AsRef<[u8]> for ZString {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,7 +676,7 @@ mod tests {
     #[test]
     fn test_zval_clone_double() {
         // Test: Clone float values including special cases
-        let normal = ZVal::double(3.14159);
+        let normal = ZVal::double(1.23456);
         let inf = ZVal::double(f64::INFINITY);
         let nan = ZVal::double(f64::NAN);
 
@@ -539,7 +684,7 @@ mod tests {
         let inf_clone = inf.clone();
         let nan_clone = nan.clone();
 
-        assert!((normal_clone.as_double().unwrap() - 3.14159).abs() < f64::EPSILON);
+        assert!((normal_clone.as_double().unwrap() - 1.23456).abs() < f64::EPSILON);
         assert!(inf_clone.as_double().unwrap().is_infinite());
         assert!(nan_clone.as_double().unwrap().is_nan());
     }
@@ -669,5 +814,181 @@ mod tests {
         assert_ne!(false_val, int_zero);
         assert_ne!(int_zero, float_zero);
         assert_ne!(int_zero, string_zero);
+    }
+
+    // ========================================================================
+    // ZString tests (Phase 1.2)
+    // ========================================================================
+
+    #[test]
+    fn test_zstring_new_from_bytes() {
+        // Test: Create ZString from byte slice
+        let s = ZString::new(b"hello");
+        assert_eq!(s.len(), 5);
+        assert_eq!(s.as_bytes(), b"hello");
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn test_zstring_from_str() {
+        // Test: Create ZString from Rust &str
+        let s = ZString::from_str("hello world");
+        assert_eq!(s.len(), 11);
+        assert_eq!(s.as_str(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_zstring_empty() {
+        // Test: Empty string
+        let s = ZString::new(b"");
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+        assert_eq!(s.as_bytes(), b"");
+    }
+
+    #[test]
+    fn test_zstring_ascii() {
+        // Test: ASCII string
+        let s = ZString::from_str("Hello, World!");
+        assert_eq!(s.len(), 13);
+        assert_eq!(s.as_str(), Some("Hello, World!"));
+    }
+
+    #[test]
+    fn test_zstring_binary_data() {
+        // Test: Binary data with null bytes
+        // PHP strings are binary-safe and can contain null bytes
+        let binary = b"hello\x00world\xff\xfe";
+        let s = ZString::new(binary);
+        assert_eq!(s.len(), 13);
+        assert_eq!(s.as_bytes(), binary);
+        // as_str() should return None for invalid UTF-8
+        assert_eq!(s.as_str(), None);
+    }
+
+    #[test]
+    fn test_zstring_utf8() {
+        // Test: UTF-8 string (multi-byte characters)
+        let s = ZString::from_str("Hello 世界 🌍");
+        assert!(s.len() > 8); // More bytes than visible characters
+        assert_eq!(s.as_str(), Some("Hello 世界 🌍"));
+    }
+
+    #[test]
+    fn test_zstring_hash_is_precomputed() {
+        // Test: Hash is precomputed and stable
+        let s1 = ZString::from_str("test");
+        let s2 = ZString::from_str("test");
+
+        // Same content = same hash
+        assert_eq!(s1.hash(), s2.hash());
+
+        // Different content = different hash (extremely likely)
+        let s3 = ZString::from_str("different");
+        assert_ne!(s1.hash(), s3.hash());
+    }
+
+    #[test]
+    fn test_zstring_hash_djbx33a() {
+        // Test: Verify DJBX33A hash algorithm implementation
+        // Reference: PHP's DJBX33A hash starts with 5381, then: hash = hash * 33 + c
+        // For empty string: hash should be 5381
+        let empty = ZString::new(b"");
+        assert_eq!(empty.hash(), 5381);
+
+        // For single character 'a' (ASCII 97):
+        // hash = 5381 * 33 + 97 = 177573 + 97 = 177670
+        let a = ZString::new(b"a");
+        assert_eq!(a.hash(), 177670);
+    }
+
+    #[test]
+    fn test_zstring_partial_eq() {
+        // Test: PartialEq compares content
+        let s1 = ZString::from_str("hello");
+        let s2 = ZString::from_str("hello");
+        let s3 = ZString::from_str("world");
+
+        assert_eq!(s1, s2); // Same content
+        assert_ne!(s1, s3); // Different content
+    }
+
+    #[test]
+    fn test_zstring_partial_eq_arc_optimization() {
+        // Test: PartialEq fast path when Arc pointers are the same
+        let s1 = ZString::from_str("test");
+        let s2 = s1.clone(); // Clone shares the same Arc
+
+        assert_eq!(s1, s2); // Should use fast path (ptr_eq)
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+    }
+
+    #[test]
+    fn test_zstring_eq_trait() {
+        // Test: Eq trait is implemented
+        let s1 = ZString::from_str("test");
+        let s2 = ZString::from_str("test");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_zstring_hash_trait() {
+        // Test: Hash trait uses precomputed PHP hash
+        use std::collections::HashMap;
+
+        let s1 = ZString::from_str("key");
+        let s2 = ZString::from_str("key");
+
+        let mut map = HashMap::new();
+        map.insert(s1, 42);
+
+        // Should find the value using s2 (same content)
+        assert_eq!(map.get(&s2), Some(&42));
+    }
+
+    #[test]
+    fn test_zstring_display() {
+        // Test: Display trait for valid UTF-8
+        let s = ZString::from_str("hello");
+        assert_eq!(format!("{}", s), "hello");
+    }
+
+    #[test]
+    fn test_zstring_display_binary() {
+        // Test: Display trait for binary data (hex escapes)
+        let s = ZString::new(b"hello\x00\xff");
+        let display = format!("{}", s);
+        assert!(display.contains("\\x00"));
+        assert!(display.contains("\\xff"));
+    }
+
+    #[test]
+    fn test_zstring_debug() {
+        // Test: Debug trait shows hash, len, and bytes
+        let s = ZString::from_str("test");
+        let debug = format!("{:?}", s);
+        assert!(debug.contains("ZString"));
+        assert!(debug.contains("hash"));
+        assert!(debug.contains("len"));
+        assert!(debug.contains("bytes"));
+    }
+
+    #[test]
+    fn test_zstring_as_ref() {
+        // Test: AsRef<[u8]> implementation
+        let s = ZString::from_str("hello");
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn test_zstring_clone() {
+        // Test: Clone creates a new reference to the same data (Arc clone)
+        let s1 = ZString::from_str("hello");
+        let s2 = s1.clone();
+
+        assert_eq!(s1, s2);
+        assert_eq!(s1.hash(), s2.hash());
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner)); // Same Arc
     }
 }
