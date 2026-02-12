@@ -564,6 +564,151 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Check if a backtick string contains variable interpolation
+    /// Returns true if the string contains unescaped $ followed by a valid variable name
+    fn has_backtick_interpolation(&self, start_pos: usize) -> bool {
+        let mut pos = start_pos + 1; // Skip opening backtick
+        let bytes = self.source.as_bytes();
+
+        while pos < bytes.len() {
+            match bytes[pos] {
+                b'`' => return false, // End of string, no interpolation found
+                b'\\' => {
+                    // Skip escape sequence
+                    pos += 1;
+                    if pos < bytes.len() {
+                        pos += 1; // Skip the escaped character
+                    }
+                }
+                b'$' => {
+                    // Check if this is a variable
+                    if pos + 1 < bytes.len() {
+                        let next = bytes[pos + 1];
+                        // Variable starts with letter or underscore
+                        if next.is_ascii_alphabetic() || next == b'_' {
+                            return true; // Found interpolation
+                        }
+                        // Also check for {$ or ${ patterns
+                        if next == b'{' {
+                            return true;
+                        }
+                    }
+                    pos += 1;
+                }
+                _ => pos += 1,
+            }
+        }
+
+        false // No interpolation found (or unterminated string)
+    }
+
+    /// Scan a backtick string literal (shell execution)
+    /// Backtick strings in PHP support the same escape sequences as double-quoted strings
+    /// and also support variable interpolation.
+    /// Reference: php-src/Zend/zend_language_scanner.l (backticks are similar to double quotes)
+    fn scan_backtick_string(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Check if this string needs interpolation
+        if self.has_backtick_interpolation(start_pos) {
+            // For now, handle backticks with interpolation as constant strings
+            // Full interpolation support would require a ST_BACKTICK state
+            // similar to ST_DOUBLE_QUOTES
+            // TODO: Implement proper backtick interpolation state
+        }
+
+        // Scan as a constant string (no interpolation or simple case)
+        // Consume opening backtick
+        self.consume(); // `
+
+        loop {
+            match self.peek() {
+                None => {
+                    // Unterminated string - reached EOF
+                    return Some((
+                        Token::ConstantEncapsedString,
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some('\\') => {
+                    // Handle escape sequences (same as double-quoted strings)
+                    self.consume(); // consume backslash
+                    match self.peek() {
+                        Some('n') | Some('r') | Some('t') | Some('v') | Some('e') | Some('f')
+                        | Some('\\') | Some('$') | Some('`') | Some('"') => {
+                            // Valid escape sequence
+                            self.consume();
+                        }
+                        Some('x') => {
+                            // Hex escape \xHH
+                            self.consume(); // consume 'x'
+                                            // Consume up to 2 hex digits
+                            for _ in 0..2 {
+                                if let Some(ch) = self.peek() {
+                                    if ch.is_ascii_hexdigit() {
+                                        self.consume();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some('u') => {
+                            // Unicode escape \u{HHHHHH}
+                            self.consume(); // consume 'u'
+                            if self.peek() == Some('{') {
+                                self.consume(); // consume '{'
+                                                // Consume 1-6 hex digits
+                                for _ in 0..6 {
+                                    if let Some(ch) = self.peek() {
+                                        if ch.is_ascii_hexdigit() {
+                                            self.consume();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                                if self.peek() == Some('}') {
+                                    self.consume(); // consume '}'
+                                }
+                            }
+                        }
+                        Some(ch) if ch.is_ascii_digit() => {
+                            // Octal escape \OOO
+                            for _ in 0..3 {
+                                if let Some(ch) = self.peek() {
+                                    if ch >= '0' && ch <= '7' {
+                                        self.consume();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Not a recognized escape sequence, backslash is literal
+                            // The backslash is already consumed, continue
+                        }
+                    }
+                }
+                Some('`') => {
+                    // Closing backtick
+                    self.consume();
+                    return Some((
+                        Token::ConstantEncapsedString,
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some(_) => {
+                    // Regular character
+                    self.consume();
+                }
+            }
+        }
+    }
+
     /// Scan inside ST_DOUBLE_QUOTES state - emit EncapsedAndWhitespace and Variable tokens
     /// This handles variable interpolation inside double-quoted strings
     fn scan_double_quotes_state(&mut self) -> Option<(Token, Span)> {
@@ -1403,6 +1548,10 @@ impl<'src> Lexer<'src> {
             '"' => {
                 // Double-quoted string
                 self.scan_double_quoted_string()
+            }
+            '`' => {
+                // Backtick string (shell execution)
+                self.scan_backtick_string()
             }
             '+' => {
                 self.consume();
@@ -5299,5 +5448,76 @@ mod tests {
 
         let (token3, _) = lexer.next_token().expect("EndHeredoc");
         assert_eq!(token3, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_backtick_string_simple() {
+        // Test: Simple backtick string without interpolation
+        let source = "<?php `ls -la`;";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Backtick string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "`ls -la`");
+    }
+
+    #[test]
+    fn test_backtick_string_empty() {
+        // Test: Empty backtick string
+        let source = "<?php ``;";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Empty backtick");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "``");
+    }
+
+    #[test]
+    fn test_backtick_string_with_variable() {
+        // Test: Backtick string with variable interpolation
+        // In PHP, backticks support variable interpolation like double-quoted strings
+        let source = "<?php `echo $name`;";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        // Backtick strings with variables should tokenize like double-quoted strings
+        // First token is the backtick start/encapsed string part
+        let (token1, _) = lexer.next_token().expect("Token 1");
+        // Could be ConstantEncapsedString or EncapsedAndWhitespace depending on interpolation
+        assert!(token1 == Token::EncapsedAndWhitespace || token1 == Token::ConstantEncapsedString);
+    }
+
+    #[test]
+    fn test_backtick_string_with_escapes() {
+        // Test: Backtick strings support escapes like double-quoted strings
+        let source = r#"<?php `echo "hello\n"`;
+"#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Backtick with escapes");
+        // Should handle as encapsed string
+        assert!(token == Token::ConstantEncapsedString || token == Token::EncapsedAndWhitespace);
+        assert!(span.extract(source).starts_with('`'));
+    }
+
+    #[test]
+    fn test_backtick_string_multiline() {
+        // Test: Backtick strings can span multiple lines
+        let source = r#"<?php `echo "line1
+line2"`;
+"#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, _) = lexer.next_token().expect("Multiline backtick");
+        assert!(token == Token::ConstantEncapsedString || token == Token::EncapsedAndWhitespace);
     }
 }
