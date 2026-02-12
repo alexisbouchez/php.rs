@@ -100,6 +100,7 @@ impl<'a> Parser<'a> {
             Token::Foreach => self.parse_foreach_statement(),
             Token::Switch => self.parse_switch_statement(),
             Token::Match => self.parse_match_statement(),
+            Token::Try => self.parse_try_statement(),
             _ => Err(ParseError::UnexpectedToken {
                 expected: "statement".to_string(),
                 found: self.current_token.clone(),
@@ -568,6 +569,159 @@ impl<'a> Parser<'a> {
             condition,
             arms,
             span: start_span,
+        })
+    }
+
+    /// Parse try/catch/finally statement
+    fn parse_try_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Try)?;
+
+        // Parse try block: try { statements }
+        self.expect(Token::LBrace)?;
+
+        let mut body = Vec::new();
+        while self.current_token != Token::RBrace {
+            body.push(self.parse_statement()?);
+        }
+
+        self.expect(Token::RBrace)?;
+
+        // Parse catch clauses (one or more, or zero if finally present)
+        let mut catches = Vec::new();
+        while self.current_token == Token::Catch {
+            self.advance(); // consume catch
+
+            self.expect(Token::LParen)?;
+
+            // Parse exception types (can be multiple with | separator for multi-catch)
+            let mut types = Vec::new();
+            loop {
+                // Parse a qualified name for exception type
+                let type_name = self.parse_qualified_name()?;
+                types.push(type_name);
+
+                // Check for | (multi-catch separator)
+                if self.current_token == Token::VerticalBar {
+                    self.advance(); // consume |
+                    continue;
+                }
+                break;
+            }
+
+            // Parse optional variable name (PHP 8.0+ allows catch without variable)
+            let var = if self.current_token == Token::Variable {
+                // Extract variable name from token (placeholder for now)
+                self.advance();
+                Some(String::from("e")) // TODO: extract actual name from token
+            } else {
+                None
+            };
+
+            self.expect(Token::RParen)?;
+
+            // Parse catch block
+            self.expect(Token::LBrace)?;
+
+            let mut catch_body = Vec::new();
+            while self.current_token != Token::RBrace {
+                catch_body.push(self.parse_statement()?);
+            }
+
+            self.expect(Token::RBrace)?;
+
+            catches.push(CatchClause {
+                types,
+                var,
+                body: catch_body,
+            });
+        }
+
+        // Parse optional finally block
+        let finally = if self.current_token == Token::Finally {
+            self.advance(); // consume finally
+
+            self.expect(Token::LBrace)?;
+
+            let mut finally_body = Vec::new();
+            while self.current_token != Token::RBrace {
+                finally_body.push(self.parse_statement()?);
+            }
+
+            self.expect(Token::RBrace)?;
+
+            Some(finally_body)
+        } else {
+            None
+        };
+
+        // Validate: must have at least one catch or a finally block
+        if catches.is_empty() && finally.is_none() {
+            return Err(ParseError::UnexpectedToken {
+                expected: "catch or finally clause".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            });
+        }
+
+        Ok(Statement::Try {
+            body,
+            catches,
+            finally,
+            span: start_span,
+        })
+    }
+
+    /// Parse a qualified name (e.g., Exception, \Foo\Bar, namespace\Baz)
+    fn parse_qualified_name(&mut self) -> Result<Name, ParseError> {
+        let mut parts = Vec::new();
+        let fully_qualified = if self.current_token == Token::NsSeparator {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let relative = if self.current_token == Token::Namespace {
+            // Check if next is separator (namespace\...)
+            if matches!(self.peek(), Token::NsSeparator) {
+                self.advance(); // consume namespace
+                self.advance(); // consume \
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Parse name parts separated by \
+        loop {
+            // Expect an identifier (String token)
+            if let Token::String = self.current_token {
+                // TODO: extract actual string value from token
+                parts.push(String::from("Exception")); // placeholder
+                self.advance();
+
+                // Check for namespace separator
+                if self.current_token == Token::NsSeparator {
+                    self.advance();
+                    continue;
+                }
+            } else {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "identifier".to_string(),
+                    found: self.current_token.clone(),
+                    span: self.current_span,
+                });
+            }
+            break;
+        }
+
+        Ok(Name {
+            parts,
+            fully_qualified,
+            relative,
         })
     }
 
@@ -2104,5 +2258,190 @@ mod tests {
         // For now, this might fail since match is typically an expression
         // But we have Statement::Match in the AST for alternative handling
         assert!(stmt.is_ok() || stmt.is_err()); // Just verify it completes
+    }
+
+    // Try-catch-finally statement tests
+
+    #[test]
+    fn test_try_catch_simple() {
+        // Test: try { } catch (Exception $e) { }
+        let source = "<?php try { return 1; } catch (Exception $e) { return 0; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                // Body should have one statement
+                assert_eq!(body.len(), 1);
+                assert!(matches!(body[0], Statement::Return { .. }));
+                // Should have one catch clause
+                assert_eq!(catches.len(), 1);
+                assert_eq!(catches[0].types.len(), 1);
+                assert!(catches[0].var.is_some());
+                assert_eq!(catches[0].body.len(), 1);
+                // No finally
+                assert!(finally.is_none());
+            }
+            _ => panic!("Expected try statement"),
+        }
+    }
+
+    #[test]
+    fn test_try_catch_finally() {
+        // Test: try { } catch (Exception $e) { } finally { }
+        let source =
+            "<?php try { return 1; } catch (Exception $e) { return 0; } finally { return 2; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                // Body should have one statement
+                assert_eq!(body.len(), 1);
+                // Should have one catch clause
+                assert_eq!(catches.len(), 1);
+                // Should have finally
+                assert!(finally.is_some());
+                let finally_body = finally.unwrap();
+                assert_eq!(finally_body.len(), 1);
+                assert!(matches!(finally_body[0], Statement::Return { .. }));
+            }
+            _ => panic!("Expected try statement"),
+        }
+    }
+
+    #[test]
+    fn test_try_finally_without_catch() {
+        // Test: try { } finally { } (no catch)
+        let source = "<?php try { return 1; } finally { return 2; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Try {
+                body,
+                catches,
+                finally,
+                ..
+            } => {
+                // Body should have one statement
+                assert_eq!(body.len(), 1);
+                // No catch clauses
+                assert_eq!(catches.len(), 0);
+                // Should have finally
+                assert!(finally.is_some());
+            }
+            _ => panic!("Expected try statement"),
+        }
+    }
+
+    #[test]
+    fn test_try_multiple_catch() {
+        // Test: try { } catch (Exception1 $e) { } catch (Exception2 $e) { }
+        let source = "<?php try { return 1; } catch (Exception1 $e) { return 0; } catch (Exception2 $e) { return 2; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Try { catches, .. } => {
+                // Should have two catch clauses
+                assert_eq!(catches.len(), 2);
+                assert_eq!(catches[0].types.len(), 1);
+                assert_eq!(catches[1].types.len(), 1);
+            }
+            _ => panic!("Expected try statement"),
+        }
+    }
+
+    #[test]
+    fn test_try_multicatch() {
+        // Test: try { } catch (Exception1 | Exception2 $e) { }
+        // Multi-catch with pipe separator (PHP 7.1+)
+        let source = "<?php try { return 1; } catch (Exception1 | Exception2 $e) { return 0; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Try { catches, .. } => {
+                // Should have one catch clause with two exception types
+                assert_eq!(catches.len(), 1);
+                assert_eq!(catches[0].types.len(), 2);
+                assert!(catches[0].var.is_some());
+            }
+            _ => panic!("Expected try statement"),
+        }
+    }
+
+    #[test]
+    fn test_try_catch_without_variable() {
+        // Test: try { } catch (Exception) { } (PHP 8.0+ - no variable)
+        let source = "<?php try { return 1; } catch (Exception) { return 0; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Try { catches, .. } => {
+                // Should have one catch clause without variable
+                assert_eq!(catches.len(), 1);
+                assert!(catches[0].var.is_none());
+            }
+            _ => panic!("Expected try statement"),
+        }
+    }
+
+    #[test]
+    fn test_try_without_catch_or_finally_fails() {
+        // Test: try { } without catch or finally should fail
+        let source = "<?php try { return 1; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let result = parser.parse_statement();
+
+        // Should fail because no catch or finally
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_try_nested() {
+        // Test: Nested try-catch blocks
+        let source = "<?php try { try { return 1; } catch (Exception $e) { return 2; } } catch (Exception $e) { return 0; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Try { body, catches, .. } => {
+                // Outer try should have one statement (inner try)
+                assert_eq!(body.len(), 1);
+                assert!(matches!(body[0], Statement::Try { .. }));
+                // Outer should have one catch
+                assert_eq!(catches.len(), 1);
+            }
+            _ => panic!("Expected try statement"),
+        }
     }
 }
