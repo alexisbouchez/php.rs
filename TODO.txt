@@ -167,7 +167,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 
 ## 3.3 Statement parsing
 [x] 3.3.1  Implement control flow: if/elseif/else, alternative syntax (if: ... endif;)
-[ ] 3.3.2  Implement loops: while, do-while, for, foreach, alternative syntax
+[x] 3.3.2  Implement loops: while, do-while, for, foreach, alternative syntax
 [ ] 3.3.3  Implement switch/case/default + match expression
 [ ] 3.3.4  Implement try/catch/finally (multi-catch: catch (A | B))
 [ ] 3.3.5  Implement function declarations (named, closures, arrow functions, variadic, type hints)

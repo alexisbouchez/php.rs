@@ -779,7 +779,7 @@ mod tests {
 
         let expressions = vec![
             Expression::IntLiteral { value: 42, span },
-            Expression::FloatLiteral { value: 3.14, span },
+            Expression::FloatLiteral { value: 3.5, span },
             Expression::StringLiteral {
                 value: "hello".to_string(),
                 span,

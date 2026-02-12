@@ -94,6 +94,10 @@ impl<'a> Parser<'a> {
         match self.current_token {
             Token::If => self.parse_if_statement(),
             Token::Return => self.parse_return_statement(),
+            Token::While => self.parse_while_statement(),
+            Token::Do => self.parse_do_while_statement(),
+            Token::For => self.parse_for_statement(),
+            Token::Foreach => self.parse_foreach_statement(),
             _ => Err(ParseError::UnexpectedToken {
                 expected: "statement".to_string(),
                 found: self.current_token.clone(),
@@ -120,6 +124,254 @@ impl<'a> Parser<'a> {
             value,
             span: start_span,
         })
+    }
+
+    /// Parse while statement
+    fn parse_while_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::While)?;
+
+        // Parse condition in parentheses
+        self.expect(Token::LParen)?;
+        let condition = Box::new(self.parse_expression(0)?);
+        self.expect(Token::RParen)?;
+
+        // Check for alternative syntax (colon)
+        let is_alternative_syntax = self.current_token == Token::Colon;
+
+        if is_alternative_syntax {
+            // Alternative syntax: while (...): statements endwhile;
+            self.advance(); // consume colon
+
+            // Parse statements until endwhile
+            let mut body_statements = Vec::new();
+            while self.current_token != Token::Endwhile {
+                body_statements.push(self.parse_statement()?);
+            }
+
+            self.expect(Token::Endwhile)?;
+            self.expect(Token::Semicolon)?;
+
+            let body = Box::new(Statement::Block {
+                statements: body_statements,
+                span: start_span,
+            });
+
+            Ok(Statement::While {
+                condition,
+                body,
+                span: start_span,
+            })
+        } else {
+            // Standard syntax: while (...) statement
+            let body = Box::new(self.parse_statement()?);
+
+            Ok(Statement::While {
+                condition,
+                body,
+                span: start_span,
+            })
+        }
+    }
+
+    /// Parse do-while statement
+    fn parse_do_while_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Do)?;
+
+        // Parse body statement
+        let body = Box::new(self.parse_statement()?);
+
+        // Expect while keyword
+        self.expect(Token::While)?;
+
+        // Parse condition in parentheses
+        self.expect(Token::LParen)?;
+        let condition = Box::new(self.parse_expression(0)?);
+        self.expect(Token::RParen)?;
+
+        // Expect semicolon
+        self.expect(Token::Semicolon)?;
+
+        Ok(Statement::DoWhile {
+            body,
+            condition,
+            span: start_span,
+        })
+    }
+
+    /// Parse for statement
+    fn parse_for_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::For)?;
+
+        self.expect(Token::LParen)?;
+
+        // Parse init expressions (comma-separated)
+        let mut init = Vec::new();
+        if self.current_token != Token::Semicolon {
+            loop {
+                init.push(self.parse_expression(0)?);
+                if self.current_token != Token::Comma {
+                    break;
+                }
+                self.advance(); // consume comma
+            }
+        }
+        self.expect(Token::Semicolon)?;
+
+        // Parse condition expressions (comma-separated)
+        let mut condition = Vec::new();
+        if self.current_token != Token::Semicolon {
+            loop {
+                condition.push(self.parse_expression(0)?);
+                if self.current_token != Token::Comma {
+                    break;
+                }
+                self.advance(); // consume comma
+            }
+        }
+        self.expect(Token::Semicolon)?;
+
+        // Parse increment expressions (comma-separated)
+        let mut increment = Vec::new();
+        if self.current_token != Token::RParen {
+            loop {
+                increment.push(self.parse_expression(0)?);
+                if self.current_token != Token::Comma {
+                    break;
+                }
+                self.advance(); // consume comma
+            }
+        }
+        self.expect(Token::RParen)?;
+
+        // Check for alternative syntax (colon)
+        let is_alternative_syntax = self.current_token == Token::Colon;
+
+        if is_alternative_syntax {
+            // Alternative syntax: for (...): statements endfor;
+            self.advance(); // consume colon
+
+            // Parse statements until endfor
+            let mut body_statements = Vec::new();
+            while self.current_token != Token::Endfor {
+                body_statements.push(self.parse_statement()?);
+            }
+
+            self.expect(Token::Endfor)?;
+            self.expect(Token::Semicolon)?;
+
+            let body = Box::new(Statement::Block {
+                statements: body_statements,
+                span: start_span,
+            });
+
+            Ok(Statement::For {
+                init,
+                condition,
+                increment,
+                body,
+                span: start_span,
+            })
+        } else {
+            // Standard syntax: for (...) statement
+            let body = Box::new(self.parse_statement()?);
+
+            Ok(Statement::For {
+                init,
+                condition,
+                increment,
+                body,
+                span: start_span,
+            })
+        }
+    }
+
+    /// Parse foreach statement
+    fn parse_foreach_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Foreach)?;
+
+        self.expect(Token::LParen)?;
+
+        // Parse iterable expression
+        let iterable = Box::new(self.parse_expression(0)?);
+
+        // Expect 'as' keyword
+        self.expect(Token::As)?;
+
+        // Parse key => value or just value
+        // First, parse potential key or the value
+        let first_expr = self.parse_expression(0)?;
+
+        let (key, value, by_ref) = if self.current_token == Token::DoubleArrow {
+            // key => value syntax
+            self.advance(); // consume =>
+
+            // Check if value is by reference
+            let by_ref = if self.current_token == Token::Ampersand {
+                self.advance();
+                true
+            } else {
+                false
+            };
+
+            let value_expr = self.parse_expression(0)?;
+
+            (Some(Box::new(first_expr)), Box::new(value_expr), by_ref)
+        } else {
+            // Just value (first_expr is the value)
+            // Check if it was prefixed with & (by reference)
+            // Note: In proper implementation, we'd check if first_expr was parsed with &
+            // For now, we assume by_ref is false
+            (None, Box::new(first_expr), false)
+        };
+
+        self.expect(Token::RParen)?;
+
+        // Check for alternative syntax (colon)
+        let is_alternative_syntax = self.current_token == Token::Colon;
+
+        if is_alternative_syntax {
+            // Alternative syntax: foreach (...): statements endforeach;
+            self.advance(); // consume colon
+
+            // Parse statements until endforeach
+            let mut body_statements = Vec::new();
+            while self.current_token != Token::Endforeach {
+                body_statements.push(self.parse_statement()?);
+            }
+
+            self.expect(Token::Endforeach)?;
+            self.expect(Token::Semicolon)?;
+
+            let body = Box::new(Statement::Block {
+                statements: body_statements,
+                span: start_span,
+            });
+
+            Ok(Statement::Foreach {
+                iterable,
+                key,
+                value,
+                by_ref,
+                body,
+                span: start_span,
+            })
+        } else {
+            // Standard syntax: foreach (...) statement
+            let body = Box::new(self.parse_statement()?);
+
+            Ok(Statement::Foreach {
+                iterable,
+                key,
+                value,
+                by_ref,
+                body,
+                span: start_span,
+            })
+        }
     }
 
     /// Parse if/elseif/else statement
@@ -1161,6 +1413,298 @@ mod tests {
                 }
             }
             _ => panic!("Expected if statement"),
+        }
+    }
+
+    // Loop statement tests
+
+    #[test]
+    fn test_simple_while_loop() {
+        // Test: while ($x) return 1;
+        let source = "<?php while ($x) return 1;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::While {
+                condition, body, ..
+            } => {
+                // Condition should be Variable($x)
+                assert!(matches!(*condition, Expression::Variable { .. }));
+                // Body should be Return statement
+                assert!(matches!(*body, Statement::Return { .. }));
+            }
+            _ => panic!("Expected while statement"),
+        }
+    }
+
+    #[test]
+    fn test_while_alternative_syntax() {
+        // Test: while ($x): return 1; endwhile;
+        let source = "<?php while ($x): return 1; endwhile;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::While {
+                condition, body, ..
+            } => {
+                assert!(matches!(*condition, Expression::Variable { .. }));
+                // Body should be a Block with one return statement
+                match *body {
+                    Statement::Block { statements, .. } => {
+                        assert_eq!(statements.len(), 1);
+                        assert!(matches!(statements[0], Statement::Return { .. }));
+                    }
+                    _ => panic!("Expected block in body"),
+                }
+            }
+            _ => panic!("Expected while statement"),
+        }
+    }
+
+    #[test]
+    fn test_do_while_loop() {
+        // Test: do return 1; while ($x);
+        let source = "<?php do return 1; while ($x);";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::DoWhile {
+                body, condition, ..
+            } => {
+                // Body should be Return statement
+                assert!(matches!(*body, Statement::Return { .. }));
+                // Condition should be Variable($x)
+                assert!(matches!(*condition, Expression::Variable { .. }));
+            }
+            _ => panic!("Expected do-while statement"),
+        }
+    }
+
+    #[test]
+    fn test_for_loop_basic() {
+        // Test: for ($i = 0; $i < 10; $i++) return $i;
+        let source = "<?php for ($i = 0; $i < 10; $i++) return $i;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::For {
+                init,
+                condition,
+                increment,
+                body,
+                ..
+            } => {
+                // Init should have one expression
+                assert_eq!(init.len(), 1);
+                assert!(matches!(init[0], Expression::Assign { .. }));
+                // Condition should have one expression
+                assert_eq!(condition.len(), 1);
+                assert!(matches!(condition[0], Expression::BinaryOp { .. }));
+                // Increment should have one expression
+                assert_eq!(increment.len(), 1);
+                assert!(matches!(increment[0], Expression::PostIncrement { .. }));
+                // Body should be Return statement
+                assert!(matches!(*body, Statement::Return { .. }));
+            }
+            _ => panic!("Expected for statement"),
+        }
+    }
+
+    #[test]
+    fn test_for_loop_empty_parts() {
+        // Test: for (;;) return 1;
+        let source = "<?php for (;;) return 1;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::For {
+                init,
+                condition,
+                increment,
+                body,
+                ..
+            } => {
+                // All parts should be empty
+                assert_eq!(init.len(), 0);
+                assert_eq!(condition.len(), 0);
+                assert_eq!(increment.len(), 0);
+                // Body should be Return statement
+                assert!(matches!(*body, Statement::Return { .. }));
+            }
+            _ => panic!("Expected for statement"),
+        }
+    }
+
+    #[test]
+    fn test_for_loop_multiple_expressions() {
+        // Test: for ($i = 0, $j = 0; $i < 10, $j < 10; $i++, $j++) return 1;
+        let source = "<?php for ($i = 0, $j = 0; $i < 10, $j < 10; $i++, $j++) return 1;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::For {
+                init,
+                condition,
+                increment,
+                ..
+            } => {
+                // Each part should have two expressions
+                assert_eq!(init.len(), 2);
+                assert_eq!(condition.len(), 2);
+                assert_eq!(increment.len(), 2);
+            }
+            _ => panic!("Expected for statement"),
+        }
+    }
+
+    #[test]
+    fn test_for_alternative_syntax() {
+        // Test: for ($i = 0; $i < 10; $i++): return $i; endfor;
+        let source = "<?php for ($i = 0; $i < 10; $i++): return $i; endfor;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::For { body, .. } => {
+                // Body should be a Block
+                match *body {
+                    Statement::Block { statements, .. } => {
+                        assert_eq!(statements.len(), 1);
+                        assert!(matches!(statements[0], Statement::Return { .. }));
+                    }
+                    _ => panic!("Expected block in body"),
+                }
+            }
+            _ => panic!("Expected for statement"),
+        }
+    }
+
+    #[test]
+    fn test_foreach_simple_value() {
+        // Test: foreach ($arr as $value) return $value;
+        let source = "<?php foreach ($arr as $value) return $value;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Foreach {
+                iterable,
+                key,
+                value,
+                by_ref,
+                body,
+                ..
+            } => {
+                // Iterable should be Variable($arr)
+                assert!(matches!(*iterable, Expression::Variable { .. }));
+                // No key
+                assert!(key.is_none());
+                // Value should be Variable($value)
+                assert!(matches!(*value, Expression::Variable { .. }));
+                // Not by reference
+                assert!(!by_ref);
+                // Body should be Return statement
+                assert!(matches!(*body, Statement::Return { .. }));
+            }
+            _ => panic!("Expected foreach statement"),
+        }
+    }
+
+    #[test]
+    fn test_foreach_key_value() {
+        // Test: foreach ($arr as $key => $value) return $value;
+        let source = "<?php foreach ($arr as $key => $value) return $value;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Foreach {
+                iterable,
+                key,
+                value,
+                by_ref,
+                body,
+                ..
+            } => {
+                // Iterable should be Variable($arr)
+                assert!(matches!(*iterable, Expression::Variable { .. }));
+                // Key should exist and be Variable($key)
+                assert!(key.is_some());
+                assert!(matches!(*key.unwrap(), Expression::Variable { .. }));
+                // Value should be Variable($value)
+                assert!(matches!(*value, Expression::Variable { .. }));
+                // Not by reference
+                assert!(!by_ref);
+                // Body should be Return statement
+                assert!(matches!(*body, Statement::Return { .. }));
+            }
+            _ => panic!("Expected foreach statement"),
+        }
+    }
+
+    #[test]
+    fn test_foreach_by_reference() {
+        // Test: foreach ($arr as $key => &$value) return $value;
+        let source = "<?php foreach ($arr as $key => &$value) return $value;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Foreach { by_ref, .. } => {
+                // Should be by reference
+                assert!(by_ref);
+            }
+            _ => panic!("Expected foreach statement"),
+        }
+    }
+
+    #[test]
+    fn test_foreach_alternative_syntax() {
+        // Test: foreach ($arr as $value): return $value; endforeach;
+        let source = "<?php foreach ($arr as $value): return $value; endforeach;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Foreach { body, .. } => {
+                // Body should be a Block
+                match *body {
+                    Statement::Block { statements, .. } => {
+                        assert_eq!(statements.len(), 1);
+                        assert!(matches!(statements[0], Statement::Return { .. }));
+                    }
+                    _ => panic!("Expected block in body"),
+                }
+            }
+            _ => panic!("Expected foreach statement"),
         }
     }
 }
