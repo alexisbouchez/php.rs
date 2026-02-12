@@ -202,7 +202,8 @@ impl<'src> Lexer<'src> {
                         // Still return LNumber for now
                     }
                     let span = Span::new(start_pos, self.pos, start_line, start_column);
-                    return Some((Token::LNumber, span));
+                    let token = self.detect_integer_overflow(&self.source[start_pos..self.pos]);
+                    return Some((token, span));
                 }
 
                 // Check for octal (0o or 0O)
@@ -224,7 +225,8 @@ impl<'src> Lexer<'src> {
                         // Still return LNumber
                     }
                     let span = Span::new(start_pos, self.pos, start_line, start_column);
-                    return Some((Token::LNumber, span));
+                    let token = self.detect_integer_overflow(&self.source[start_pos..self.pos]);
+                    return Some((token, span));
                 }
 
                 // Check for binary (0b or 0B)
@@ -246,12 +248,15 @@ impl<'src> Lexer<'src> {
                         // Still return LNumber
                     }
                     let span = Span::new(start_pos, self.pos, start_line, start_column);
-                    return Some((Token::LNumber, span));
+                    let token = self.detect_integer_overflow(&self.source[start_pos..self.pos]);
+                    return Some((token, span));
                 }
 
                 // Traditional octal (leading 0 followed by octal digits)
                 // e.g., 0777, 0123
                 // This is the old-style octal notation
+                // Note: we only consume valid octal digits (0-7)
+                // If we encounter 8 or 9, we stop
                 if ('0'..='7').contains(&next) {
                     while let Some(ch) = self.peek() {
                         if ('0'..='7').contains(&ch) || ch == '_' {
@@ -260,6 +265,14 @@ impl<'src> Lexer<'src> {
                             break;
                         }
                     }
+                    let span = Span::new(start_pos, self.pos, start_line, start_column);
+                    let token = self.detect_integer_overflow(&self.source[start_pos..self.pos]);
+                    return Some((token, span));
+                }
+
+                // Check if next is '8' or '9' - invalid for traditional octal
+                // In this case, just return "0"
+                if next == '8' || next == '9' {
                     let span = Span::new(start_pos, self.pos, start_line, start_column);
                     return Some((Token::LNumber, span));
                 }
@@ -285,7 +298,50 @@ impl<'src> Lexer<'src> {
         }
 
         let span = Span::new(start_pos, self.pos, start_line, start_column);
-        Some((Token::LNumber, span))
+        let token = self.detect_integer_overflow(&self.source[start_pos..self.pos]);
+        Some((token, span))
+    }
+
+    /// Detect if a number literal overflows PHP_INT_MAX and should be DNumber instead of LNumber
+    /// PHP_INT_MAX = 9223372036854775807 (0x7FFFFFFFFFFFFFFF) for 64-bit systems
+    fn detect_integer_overflow(&self, num_str: &str) -> Token {
+        // Strip underscores for parsing
+        let clean_str = num_str.replace('_', "");
+
+        // Try to parse based on prefix
+        let result = if clean_str.starts_with("0x") || clean_str.starts_with("0X") {
+            // Hex
+            let digits = &clean_str[2..];
+            if digits.is_empty() {
+                return Token::LNumber; // Invalid literal like "0x", treat as LNumber for now
+            }
+            i64::from_str_radix(digits, 16)
+        } else if clean_str.starts_with("0b") || clean_str.starts_with("0B") {
+            // Binary
+            let digits = &clean_str[2..];
+            if digits.is_empty() {
+                return Token::LNumber; // Invalid literal like "0b"
+            }
+            i64::from_str_radix(digits, 2)
+        } else if clean_str.starts_with("0o") || clean_str.starts_with("0O") {
+            // Octal with prefix
+            let digits = &clean_str[2..];
+            if digits.is_empty() {
+                return Token::LNumber; // Invalid literal like "0o"
+            }
+            i64::from_str_radix(digits, 8)
+        } else if clean_str.len() > 1 && clean_str.starts_with('0') {
+            // Traditional octal (leading 0)
+            i64::from_str_radix(&clean_str, 8)
+        } else {
+            // Decimal
+            clean_str.parse::<i64>()
+        };
+
+        match result {
+            Ok(_) => Token::LNumber,  // Fits in i64
+            Err(_) => Token::DNumber, // Overflows to float
+        }
     }
 
     /// Scan in ST_IN_SCRIPTING state - inside PHP code
@@ -2351,7 +2407,7 @@ mod tests {
         assert_eq!(span1.extract(source), "42");
 
         // Next should be + (currently BadCharacter, but that's OK for now)
-        let (token2, _) = lexer.next_token().expect("Should get operator");
+        let (_token2, _) = lexer.next_token().expect("Should get operator");
         // We expect BadCharacter for now since single-char operators aren't fully implemented
 
         let (token3, span3) = lexer.next_token().expect("Should get second number");
@@ -2378,5 +2434,183 @@ mod tests {
         let (token2, span2) = lexer.next_token().expect("Should get identifier");
         assert_eq!(token2, Token::String);
         assert_eq!(span2.extract(source), "abc");
+    }
+
+    // ======================================================================
+    // Task 2.2.6: Test integer overflow to float, edge cases
+    // ======================================================================
+
+    #[test]
+    fn test_integer_overflow_to_float() {
+        // Test: Integer literals that exceed PHP_INT_MAX should become DNumber (float)
+        // PHP_INT_MAX for 64-bit: 9223372036854775807
+        // PHP_INT_MAX + 1: 9223372036854775808 → should be DNumber
+
+        let test_cases = vec![
+            // Exact PHP_INT_MAX - should still be LNumber
+            (
+                "<?php 9223372036854775807",
+                Token::LNumber,
+                "9223372036854775807",
+            ),
+            // PHP_INT_MAX + 1 - should overflow to DNumber
+            (
+                "<?php 9223372036854775808",
+                Token::DNumber,
+                "9223372036854775808",
+            ),
+            // Much larger number - definitely DNumber
+            (
+                "<?php 99999999999999999999",
+                Token::DNumber,
+                "99999999999999999999",
+            ),
+            // Negative: PHP_INT_MIN is -9223372036854775808 (exact)
+            // At lexer level, we just scan the positive number; the minus is a separate token
+            // So -9223372036854775808 is: '-' (unary minus) + '9223372036854775808'
+            // The number 9223372036854775808 itself overflows, so it's DNumber
+            // Hex overflow
+            (
+                "<?php 0x7FFFFFFFFFFFFFFF",
+                Token::LNumber,
+                "0x7FFFFFFFFFFFFFFF",
+            ), // PHP_INT_MAX in hex
+            (
+                "<?php 0x8000000000000000",
+                Token::DNumber,
+                "0x8000000000000000",
+            ), // Overflows
+            (
+                "<?php 0xFFFFFFFFFFFFFFFF",
+                Token::DNumber,
+                "0xFFFFFFFFFFFFFFFF",
+            ), // Overflows
+            // Octal overflow
+            (
+                "<?php 0o777777777777777777777",
+                Token::LNumber,
+                "0o777777777777777777777",
+            ), // PHP_INT_MAX in octal
+            (
+                "<?php 0o1000000000000000000000",
+                Token::DNumber,
+                "0o1000000000000000000000",
+            ), // Overflows
+            // Binary overflow
+            (
+                "<?php 0b111111111111111111111111111111111111111111111111111111111111111",
+                Token::LNumber,
+                "0b111111111111111111111111111111111111111111111111111111111111111",
+            ), // 63 ones = PHP_INT_MAX
+            (
+                "<?php 0b1000000000000000000000000000000000000000000000000000000000000000",
+                Token::DNumber,
+                "0b1000000000000000000000000000000000000000000000000000000000000000",
+            ), // 64 bits = overflows
+        ];
+
+        for (source, expected_token, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, expected_token, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
+    }
+
+    #[test]
+    fn test_integer_edge_cases_comprehensive() {
+        // Test: Various edge cases for integer literals
+
+        let test_cases = vec![
+            // Single digit
+            ("<?php 0", Token::LNumber, "0"),
+            ("<?php 1", Token::LNumber, "1"),
+            ("<?php 9", Token::LNumber, "9"),
+            // Multiple underscores (valid in PHP 7.4+)
+            ("<?php 1_000_000", Token::LNumber, "1_000_000"),
+            ("<?php 1_2_3_4_5", Token::LNumber, "1_2_3_4_5"),
+            // Leading underscore in number body (after first digit)
+            ("<?php 1_", Token::LNumber, "1_"), // Trailing underscore - we'll scan it
+            // Hex edge cases
+            ("<?php 0x0", Token::LNumber, "0x0"),
+            ("<?php 0x1", Token::LNumber, "0x1"),
+            ("<?php 0xF", Token::LNumber, "0xF"),
+            ("<?php 0xf", Token::LNumber, "0xf"),
+            ("<?php 0xFF", Token::LNumber, "0xFF"),
+            ("<?php 0X1A", Token::LNumber, "0X1A"), // Capital X
+            ("<?php 0x1_A_F", Token::LNumber, "0x1_A_F"), // Underscore in hex
+            // Octal edge cases
+            ("<?php 0o0", Token::LNumber, "0o0"),
+            ("<?php 0o7", Token::LNumber, "0o7"),
+            ("<?php 0o77", Token::LNumber, "0o77"),
+            ("<?php 0O7", Token::LNumber, "0O7"), // Capital O
+            ("<?php 0o1_7", Token::LNumber, "0o1_7"), // Underscore in octal
+            // Traditional octal (just leading 0)
+            ("<?php 00", Token::LNumber, "00"),
+            ("<?php 01", Token::LNumber, "01"),
+            ("<?php 07", Token::LNumber, "07"),
+            ("<?php 0123", Token::LNumber, "0123"),
+            // Binary edge cases
+            ("<?php 0b0", Token::LNumber, "0b0"),
+            ("<?php 0b1", Token::LNumber, "0b1"),
+            ("<?php 0b10", Token::LNumber, "0b10"),
+            ("<?php 0B1", Token::LNumber, "0B1"), // Capital B
+            ("<?php 0b1_0_1", Token::LNumber, "0b1_0_1"), // Underscore in binary
+        ];
+
+        for (source, expected_token, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, expected_token, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
+    }
+
+    #[test]
+    fn test_invalid_number_literals() {
+        // Test: Invalid number literals that should still tokenize but may have no digits
+        // PHP is lenient and will parse what it can
+
+        let test_cases = vec![
+            // Hex with no digits after 0x - still scans as LNumber "0x"
+            ("<?php 0x", Token::LNumber, "0x"),
+            ("<?php 0X", Token::LNumber, "0X"),
+            // Octal with no digits after 0o
+            ("<?php 0o", Token::LNumber, "0o"),
+            ("<?php 0O", Token::LNumber, "0O"),
+            // Binary with no digits after 0b
+            ("<?php 0b", Token::LNumber, "0b"),
+            ("<?php 0B", Token::LNumber, "0B"),
+            // Hex with invalid digits (8, 9, G) - should stop at invalid char
+            ("<?php 0xG", Token::LNumber, "0x"), // G is not valid hex
+            ("<?php 0x1G", Token::LNumber, "0x1"), // Stops at G
+            // Octal with invalid digits (8, 9) - traditional octal
+            ("<?php 08", Token::LNumber, "0"), // 8 is not valid octal, so stops at 0
+            ("<?php 0789", Token::LNumber, "07"), // Consumes 07, stops at 8 (8 is invalid octal)
+            // Octal with 0o prefix and invalid digit
+            ("<?php 0o8", Token::LNumber, "0o"), // 8 is not valid octal
+            // Binary with invalid digits (2, 3, etc.)
+            ("<?php 0b2", Token::LNumber, "0b"), // 2 is not valid binary
+            ("<?php 0b12", Token::LNumber, "0b1"), // Stops at 2
+        ];
+
+        for (source, expected_token, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, expected_token, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
     }
 }
