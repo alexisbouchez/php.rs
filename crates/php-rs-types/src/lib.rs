@@ -407,6 +407,67 @@ impl ZVal {
         }
     }
 
+    /// Convert this ZVal to a boolean using PHP type juggling rules.
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — convert_to_boolean()
+    ///
+    /// Conversion rules:
+    /// - Null → false
+    /// - False → false
+    /// - True → true
+    /// - Long → false if 0, true otherwise
+    /// - Double → false if 0.0 or NaN, true otherwise
+    /// - String → false if "" or "0", true otherwise
+    /// - Array → false if empty, true otherwise
+    /// - Object → true
+    /// - Resource → true
+    pub fn to_bool(&self) -> bool {
+        match self.type_tag {
+            ZValType::Null => false,
+            ZValType::False => false,
+            ZValType::True => true,
+            ZValType::Long => (self.value as i64) != 0,
+            ZValType::Double => {
+                let d = f64::from_bits(self.value);
+                // In PHP, 0.0 and NaN are both false
+                !d.is_nan() && d != 0.0
+            }
+            ZValType::String => {
+                // SAFETY: We're assuming the pointer is valid for the lifetime of this operation
+                // In a real implementation, this would use proper reference counting
+                let ptr = self.value as usize;
+                if ptr == 0 {
+                    return false;
+                }
+                // SAFETY: For now, this is unsafe. We'll fix this when we properly integrate ZString
+                unsafe {
+                    let zstring = &*(ptr as *const ZString);
+                    let bytes = zstring.as_bytes();
+                    // Empty string or "0" is false
+                    !bytes.is_empty() && bytes != b"0"
+                }
+            }
+            ZValType::Array => {
+                // TODO: Check if array is empty
+                // For now, return true (placeholder)
+                true
+            }
+            ZValType::Object => {
+                // Objects are always true
+                true
+            }
+            ZValType::Resource => {
+                // Resources are always true
+                true
+            }
+            ZValType::Reference => {
+                // TODO: Dereference and convert
+                // For now, return false (placeholder)
+                false
+            }
+        }
+    }
+
     /// Convert this ZVal to a string (ZString) using PHP type juggling rules.
     ///
     /// Reference: php-src/Zend/zend_operators.c — convert_to_string()
@@ -1934,5 +1995,43 @@ mod tests {
         // Reference: php -r 'var_dump((int)false);' outputs "int(0)"
         let val = ZVal::false_val();
         assert_eq!(val.to_long(), 0);
+    }
+
+    // ========================================================================
+    // Null coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_null_to_int() {
+        // Test: null converts to 0
+        // Reference: php -r 'var_dump((int)null);' outputs "int(0)"
+        let val = ZVal::null();
+        assert_eq!(val.to_long(), 0);
+    }
+
+    #[test]
+    fn test_null_to_float() {
+        // Test: null converts to 0.0
+        // Reference: php -r 'var_dump((float)null);' outputs "float(0)"
+        let val = ZVal::null();
+        assert_eq!(val.to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_null_to_string() {
+        // Test: null converts to ""
+        // Reference: php -r 'var_dump((string)null);' outputs 'string(0) ""'
+        let val = ZVal::null();
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some(""));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_null_to_bool() {
+        // Test: null converts to false
+        // Reference: php -r 'var_dump((bool)null);' outputs "bool(false)"
+        let val = ZVal::null();
+        assert!(!val.to_bool());
     }
 }
