@@ -7,5 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+php-rs-lexer = { path = "../php-rs-lexer" }
 
 [dev-dependencies]

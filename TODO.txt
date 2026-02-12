@@ -141,20 +141,20 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 ################################################################################
 
 ## 3.1 AST node definitions
-[ ] 3.1.1  Define AST nodes for:
-           [ ] Statements: expression, echo, return, if/elseif/else, while, do-while,
+[x] 3.1.1  Define AST nodes for:
+           [x] Statements: expression, echo, return, if/elseif/else, while, do-while,
                for, foreach, switch, match, break, continue, declare, namespace, use,
                try/catch/finally, throw, global, static, unset, class, interface, trait,
                enum, function, const, goto/label, block
-           [ ] Expressions: literal, variable, assign, binary op, unary op, ternary,
+           [x] Expressions: literal, variable, assign, binary op, unary op, ternary,
                null coalesce, function call, method call, static call, property access,
                static property, array access, list(), array literal, new, clone,
                instanceof, cast, yield, yield from, arrow fn, closure, match expr,
                throw expr, named argument, spread, isset, empty, eval, include/require
-           [ ] Declarations: function params, return type, class members, property hooks,
+           [x] Declarations: function params, return type, class members, property hooks,
                constants, enum cases, attributes (#[...])
-           [ ] Types: named, nullable, union, intersection, DNF
-[ ] 3.1.2  Test: AST nodes serialize/debug correctly
+           [x] Types: named, nullable, union, intersection, DNF
+[x] 3.1.2  Test: AST nodes serialize/debug correctly
 
 ## 3.2 Expression parsing
 [ ] 3.2.1  Implement Pratt parser for expressions with correct precedence (45+ levels)
