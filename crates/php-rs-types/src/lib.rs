@@ -2075,4 +2075,131 @@ mod tests {
             "Array with multiple elements should convert to true"
         );
     }
+
+    // ========================================================================
+    // String → Bool coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_string_to_bool_empty_string() {
+        // Test: Empty string "" converts to false
+        // Reference: php -r 'var_dump((bool)"");' outputs "bool(false)"
+        let s = ZString::from_str("");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(!val.to_bool(), "Empty string should convert to false");
+    }
+
+    #[test]
+    fn test_string_to_bool_zero_string() {
+        // Test: String "0" converts to false
+        // Reference: php -r 'var_dump((bool)"0");' outputs "bool(false)"
+        let s = ZString::from_str("0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(!val.to_bool(), "String \"0\" should convert to false");
+    }
+
+    #[test]
+    fn test_string_to_bool_whitespace_only() {
+        // Test: Whitespace-only string "   " converts to true (not empty)
+        // Reference: php -r 'var_dump((bool)"   ");' outputs "bool(true)"
+        let s = ZString::from_str("   ");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "Whitespace-only string should convert to true"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_non_zero_number() {
+        // Test: String "1" converts to true
+        // Reference: php -r 'var_dump((bool)"1");' outputs "bool(true)"
+        let s = ZString::from_str("1");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(val.to_bool(), "String \"1\" should convert to true");
+    }
+
+    #[test]
+    fn test_string_to_bool_text() {
+        // Test: Any non-empty text string converts to true
+        // Reference: php -r 'var_dump((bool)"hello");' outputs "bool(true)"
+        let s = ZString::from_str("hello");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "Non-empty text string should convert to true"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_false_string() {
+        // Test: String "false" converts to true (it's not empty and not "0")
+        // Reference: php -r 'var_dump((bool)"false");' outputs "bool(true)"
+        let s = ZString::from_str("false");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \"false\" should convert to true (non-empty string)"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_zero_with_decimal() {
+        // Test: String "0.0" converts to true (not exactly "0")
+        // Reference: php -r 'var_dump((bool)"0.0");' outputs "bool(true)"
+        let s = ZString::from_str("0.0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \"0.0\" should convert to true (not exactly \"0\")"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_negative_zero() {
+        // Test: String "-0" converts to true (not exactly "0")
+        // Reference: php -r 'var_dump((bool)"-0");' outputs "bool(true)"
+        let s = ZString::from_str("-0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \"-0\" should convert to true (not exactly \"0\")"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_zero_with_leading_space() {
+        // Test: String " 0" converts to true (not exactly "0")
+        // Reference: php -r 'var_dump((bool)" 0");' outputs "bool(true)"
+        let s = ZString::from_str(" 0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \" 0\" should convert to true (not exactly \"0\")"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_zero_with_trailing_space() {
+        // Test: String "0 " converts to true (not exactly "0")
+        // Reference: php -r 'var_dump((bool)"0 ");' outputs "bool(true)"
+        let s = ZString::from_str("0 ");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \"0 \" should convert to true (not exactly \"0\")"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_null_byte() {
+        // Test: String with null byte "\0" converts to true (not empty)
+        // Reference: php -r 'var_dump((bool)"\0");' outputs "bool(true)"
+        let s = ZString::new(b"\0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String with null byte should convert to true (not empty)"
+        );
+    }
 }
