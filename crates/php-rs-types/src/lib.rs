@@ -4849,6 +4849,413 @@ mod zarray_tests {
 }
 
 // ============================================================================
+// ClassEntry — Class definition/metadata
+// ============================================================================
+// Reference: php-src/Zend/zend.h — struct _zend_class_entry
+//
+// A ClassEntry represents a class definition in PHP. It contains:
+// - Class name
+// - Parent class (for inheritance)
+// - Implemented interfaces
+// - Methods (function table)
+// - Properties (declared properties with defaults and types)
+// - Constants
+//
+// ClassEntry is shared across all instances of a class.
+// Objects (ZObject) hold a reference to their ClassEntry.
+// ============================================================================
+
+/// Represents a PHP class definition
+///
+/// Reference: php-src/Zend/zend.h — struct _zend_class_entry
+///
+/// A class entry contains all metadata about a class:
+/// - name: The class name (e.g., "MyClass")
+/// - parent: Optional parent class for inheritance
+/// - interfaces: List of implemented interfaces
+/// - methods: Function table (method name → method definition)
+/// - properties: Property table (property name → property info)
+/// - constants: Class constants (constant name → value)
+///
+/// ClassEntry instances are typically wrapped in Arc for shared ownership.
+#[derive(Debug, Clone)]
+pub struct ClassEntry {
+    /// Class name (e.g., "MyClass", "stdClass")
+    name: ZString,
+
+    /// Parent class for inheritance (None for base classes)
+    /// In PHP: class Child extends Parent
+    parent: Option<Arc<ClassEntry>>,
+
+    /// List of implemented interfaces
+    /// In PHP: class MyClass implements Interface1, Interface2
+    interfaces: Vec<Arc<ClassEntry>>,
+
+    /// Method table: method name → method handle/id
+    /// In a full implementation, this would map to zend_function structures
+    /// For now, we use a simple usize handle as a placeholder
+    methods: HashMap<ZString, usize>,
+
+    /// Property table: property name → property handle/id
+    /// In a full implementation, this would map to zend_property_info structures
+    /// For now, we use a simple usize handle as a placeholder
+    properties: HashMap<ZString, usize>,
+
+    /// Class constants: constant name → constant value
+    /// In PHP: class MyClass { const FOO = 42; }
+    /// Constants are evaluated at compile time and stored as ZVal
+    constants: HashMap<ZString, ZVal>,
+}
+
+impl ClassEntry {
+    /// Create a new class entry with just a name
+    ///
+    /// # Arguments
+    /// * `name` - The class name
+    ///
+    /// # Returns
+    /// A new ClassEntry with no parent, interfaces, methods, properties, or constants
+    pub fn new(name: ZString) -> Self {
+        Self {
+            name,
+            parent: None,
+            interfaces: Vec::new(),
+            methods: HashMap::new(),
+            properties: HashMap::new(),
+            constants: HashMap::new(),
+        }
+    }
+
+    /// Get the class name
+    pub fn name(&self) -> &ZString {
+        &self.name
+    }
+
+    /// Set the parent class
+    ///
+    /// # Arguments
+    /// * `parent` - The parent class entry
+    pub fn set_parent(&mut self, parent: Arc<ClassEntry>) {
+        self.parent = Some(parent);
+    }
+
+    /// Get the parent class
+    pub fn parent(&self) -> Option<&Arc<ClassEntry>> {
+        self.parent.as_ref()
+    }
+
+    /// Add an interface
+    ///
+    /// # Arguments
+    /// * `interface` - The interface class entry to add
+    pub fn add_interface(&mut self, interface: Arc<ClassEntry>) {
+        self.interfaces.push(interface);
+    }
+
+    /// Get all implemented interfaces
+    pub fn interfaces(&self) -> &[Arc<ClassEntry>] {
+        &self.interfaces
+    }
+
+    /// Add a method
+    ///
+    /// # Arguments
+    /// * `name` - Method name
+    /// * `method_handle` - Handle/ID for the method definition
+    pub fn add_method(&mut self, name: ZString, method_handle: usize) {
+        self.methods.insert(name, method_handle);
+    }
+
+    /// Get a method handle by name
+    ///
+    /// # Arguments
+    /// * `name` - Method name
+    ///
+    /// # Returns
+    /// Some(handle) if the method exists, None otherwise
+    pub fn get_method(&self, name: &ZString) -> Option<usize> {
+        self.methods.get(name).copied()
+    }
+
+    /// Check if a method exists
+    ///
+    /// # Arguments
+    /// * `name` - Method name
+    ///
+    /// # Returns
+    /// true if the method exists, false otherwise
+    pub fn has_method(&self, name: &ZString) -> bool {
+        self.methods.contains_key(name)
+    }
+
+    /// Add a property
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    /// * `property_handle` - Handle/ID for the property definition
+    pub fn add_property(&mut self, name: ZString, property_handle: usize) {
+        self.properties.insert(name, property_handle);
+    }
+
+    /// Get a property handle by name
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    ///
+    /// # Returns
+    /// Some(handle) if the property exists, None otherwise
+    pub fn get_property(&self, name: &ZString) -> Option<usize> {
+        self.properties.get(name).copied()
+    }
+
+    /// Check if a property exists
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    ///
+    /// # Returns
+    /// true if the property exists, false otherwise
+    pub fn has_property(&self, name: &ZString) -> bool {
+        self.properties.contains_key(name)
+    }
+
+    /// Add a class constant
+    ///
+    /// # Arguments
+    /// * `name` - Constant name
+    /// * `value` - Constant value
+    pub fn add_constant(&mut self, name: ZString, value: ZVal) {
+        self.constants.insert(name, value);
+    }
+
+    /// Get a constant value by name
+    ///
+    /// # Arguments
+    /// * `name` - Constant name
+    ///
+    /// # Returns
+    /// Some(&ZVal) if the constant exists, None otherwise
+    pub fn get_constant(&self, name: &ZString) -> Option<&ZVal> {
+        self.constants.get(name)
+    }
+
+    /// Check if a constant exists
+    ///
+    /// # Arguments
+    /// * `name` - Constant name
+    ///
+    /// # Returns
+    /// true if the constant exists, false otherwise
+    pub fn has_constant(&self, name: &ZString) -> bool {
+        self.constants.contains_key(name)
+    }
+
+    /// Get all method names
+    pub fn method_names(&self) -> Vec<&ZString> {
+        self.methods.keys().collect()
+    }
+
+    /// Get all property names
+    pub fn property_names(&self) -> Vec<&ZString> {
+        self.properties.keys().collect()
+    }
+
+    /// Get all constant names
+    pub fn constant_names(&self) -> Vec<&ZString> {
+        self.constants.keys().collect()
+    }
+}
+
+#[cfg(test)]
+mod classentry_tests {
+    use super::*;
+
+    #[test]
+    fn test_classentry_create() {
+        // Test: Create a basic class
+        // PHP: class MyClass {}
+        let class_name = ZString::new(b"MyClass");
+        let class = ClassEntry::new(class_name.clone());
+
+        assert_eq!(class.name(), &class_name);
+        assert!(class.parent().is_none());
+        assert_eq!(class.interfaces().len(), 0);
+        assert_eq!(class.method_names().len(), 0);
+        assert_eq!(class.property_names().len(), 0);
+        assert_eq!(class.constant_names().len(), 0);
+    }
+
+    #[test]
+    fn test_classentry_with_parent() {
+        // Test: Class with inheritance
+        // PHP: class Parent {} class Child extends Parent {}
+        let parent_class = Arc::new(ClassEntry::new(ZString::new(b"ParentClass")));
+        let mut child_class = ClassEntry::new(ZString::new(b"ChildClass"));
+
+        child_class.set_parent(parent_class.clone());
+
+        assert_eq!(
+            child_class.parent().unwrap().name(),
+            &ZString::new(b"ParentClass")
+        );
+    }
+
+    #[test]
+    fn test_classentry_with_interfaces() {
+        // Test: Class implementing interfaces
+        // PHP: interface I1 {} interface I2 {} class MyClass implements I1, I2 {}
+        let interface1 = Arc::new(ClassEntry::new(ZString::new(b"Interface1")));
+        let interface2 = Arc::new(ClassEntry::new(ZString::new(b"Interface2")));
+        let mut class = ClassEntry::new(ZString::new(b"MyClass"));
+
+        class.add_interface(interface1.clone());
+        class.add_interface(interface2.clone());
+
+        assert_eq!(class.interfaces().len(), 2);
+        assert_eq!(class.interfaces()[0].name(), &ZString::new(b"Interface1"));
+        assert_eq!(class.interfaces()[1].name(), &ZString::new(b"Interface2"));
+    }
+
+    #[test]
+    fn test_classentry_methods() {
+        // Test: Class with methods
+        // PHP: class MyClass { public function foo() {} public function bar() {} }
+        let mut class = ClassEntry::new(ZString::new(b"MyClass"));
+
+        let method_foo = ZString::new(b"foo");
+        let method_bar = ZString::new(b"bar");
+
+        class.add_method(method_foo.clone(), 100); // 100 is a placeholder handle
+        class.add_method(method_bar.clone(), 101); // 101 is a placeholder handle
+
+        assert!(class.has_method(&method_foo));
+        assert!(class.has_method(&method_bar));
+        assert_eq!(class.get_method(&method_foo), Some(100));
+        assert_eq!(class.get_method(&method_bar), Some(101));
+        assert_eq!(class.method_names().len(), 2);
+    }
+
+    #[test]
+    fn test_classentry_properties() {
+        // Test: Class with properties
+        // PHP: class MyClass { public $name; public $age; }
+        let mut class = ClassEntry::new(ZString::new(b"MyClass"));
+
+        let prop_name = ZString::new(b"name");
+        let prop_age = ZString::new(b"age");
+
+        class.add_property(prop_name.clone(), 200); // 200 is a placeholder handle
+        class.add_property(prop_age.clone(), 201); // 201 is a placeholder handle
+
+        assert!(class.has_property(&prop_name));
+        assert!(class.has_property(&prop_age));
+        assert_eq!(class.get_property(&prop_name), Some(200));
+        assert_eq!(class.get_property(&prop_age), Some(201));
+        assert_eq!(class.property_names().len(), 2);
+    }
+
+    #[test]
+    fn test_classentry_constants() {
+        // Test: Class with constants
+        // PHP: class MyClass { const FOO = 42; const BAR = "hello"; }
+        let mut class = ClassEntry::new(ZString::new(b"MyClass"));
+
+        let const_foo = ZString::new(b"FOO");
+        let const_bar = ZString::new(b"BAR");
+
+        class.add_constant(const_foo.clone(), ZVal::long(42));
+        let s = ZString::new(b"hello");
+        class.add_constant(
+            const_bar.clone(),
+            ZVal::string(Box::into_raw(Box::new(s)) as usize),
+        );
+
+        assert!(class.has_constant(&const_foo));
+        assert!(class.has_constant(&const_bar));
+        assert_eq!(
+            class.get_constant(&const_foo).unwrap().as_long().unwrap(),
+            42
+        );
+        assert_eq!(
+            class.get_constant(&const_bar).unwrap().to_string(),
+            ZString::new(b"hello")
+        );
+        assert_eq!(class.constant_names().len(), 2);
+    }
+
+    #[test]
+    fn test_classentry_method_lookup_nonexistent() {
+        // Test: Looking up a non-existent method returns None
+        let class = ClassEntry::new(ZString::new(b"MyClass"));
+        let method_name = ZString::new(b"nonExistent");
+
+        assert!(!class.has_method(&method_name));
+        assert_eq!(class.get_method(&method_name), None);
+    }
+
+    #[test]
+    fn test_classentry_property_lookup_nonexistent() {
+        // Test: Looking up a non-existent property returns None
+        let class = ClassEntry::new(ZString::new(b"MyClass"));
+        let prop_name = ZString::new(b"nonExistent");
+
+        assert!(!class.has_property(&prop_name));
+        assert_eq!(class.get_property(&prop_name), None);
+    }
+
+    #[test]
+    fn test_classentry_constant_lookup_nonexistent() {
+        // Test: Looking up a non-existent constant returns None
+        let class = ClassEntry::new(ZString::new(b"MyClass"));
+        let const_name = ZString::new(b"NONEXISTENT");
+
+        assert!(!class.has_constant(&const_name));
+        assert_eq!(class.get_constant(&const_name), None);
+    }
+
+    #[test]
+    fn test_classentry_complex_hierarchy() {
+        // Test: Complex class hierarchy
+        // PHP: class GrandParent {}
+        //      class Parent extends GrandParent {}
+        //      interface I1 {}
+        //      interface I2 {}
+        //      class Child extends Parent implements I1, I2 {
+        //          const VERSION = 1;
+        //          public $name;
+        //          public function greet() {}
+        //      }
+        let grandparent = Arc::new(ClassEntry::new(ZString::new(b"GrandParent")));
+        let mut parent = ClassEntry::new(ZString::new(b"Parent"));
+        parent.set_parent(grandparent);
+        let parent = Arc::new(parent);
+
+        let interface1 = Arc::new(ClassEntry::new(ZString::new(b"I1")));
+        let interface2 = Arc::new(ClassEntry::new(ZString::new(b"I2")));
+
+        let mut child = ClassEntry::new(ZString::new(b"Child"));
+        child.set_parent(parent.clone());
+        child.add_interface(interface1);
+        child.add_interface(interface2);
+        child.add_constant(ZString::new(b"VERSION"), ZVal::long(1));
+        child.add_property(ZString::new(b"name"), 300);
+        child.add_method(ZString::new(b"greet"), 400);
+
+        // Verify the hierarchy
+        assert_eq!(child.name(), &ZString::new(b"Child"));
+        assert_eq!(child.parent().unwrap().name(), &ZString::new(b"Parent"));
+        assert_eq!(
+            child.parent().unwrap().parent().unwrap().name(),
+            &ZString::new(b"GrandParent")
+        );
+        assert_eq!(child.interfaces().len(), 2);
+        assert_eq!(child.constant_names().len(), 1);
+        assert_eq!(child.property_names().len(), 1);
+        assert_eq!(child.method_names().len(), 1);
+    }
+}
+
+// ============================================================================
 // ZObject — Object representation
 // ============================================================================
 // Reference: php-src/Zend/zend_types.h — struct _zend_object
