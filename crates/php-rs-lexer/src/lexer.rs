@@ -398,6 +398,113 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Scan a double-quoted string literal
+    /// Double-quoted strings in PHP support many escape sequences:
+    /// - \n (newline), \r (carriage return), \t (tab)
+    /// - \v (vertical tab), \e (escape), \f (form feed)
+    /// - \\ (backslash), \$ (dollar sign), \" (double quote)
+    /// - \xHH (hex escape, 2 hex digits)
+    /// - \u{HHHHHH} (unicode escape, 1-6 hex digits)
+    /// - \OOO (octal escape, 1-3 octal digits)
+    /// Variable interpolation is handled separately in task 2.2.8.
+    fn scan_double_quoted_string(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Consume opening double quote
+        self.consume(); // "
+
+        loop {
+            match self.peek() {
+                None => {
+                    // Unterminated string - reached EOF
+                    return Some((
+                        Token::ConstantEncapsedString,
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some('\\') => {
+                    // Check if it's an escape sequence
+                    self.consume(); // consume backslash
+                    match self.peek() {
+                        Some('n') | Some('r') | Some('t') | Some('v') | Some('e') | Some('f')
+                        | Some('\\') | Some('$') | Some('"') => {
+                            // Valid escape sequence
+                            self.consume();
+                        }
+                        Some('x') => {
+                            // Hex escape: \xHH (2 hex digits)
+                            self.consume(); // consume 'x'
+                                            // Consume up to 2 hex digits
+                            for _ in 0..2 {
+                                if let Some(ch) = self.peek() {
+                                    if ch.is_ascii_hexdigit() {
+                                        self.consume();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Some('u') => {
+                            // Unicode escape: \u{HHHHHH} (1-6 hex digits)
+                            self.consume(); // consume 'u'
+                            if let Some('{') = self.peek() {
+                                self.consume(); // consume '{'
+                                                // Consume up to 6 hex digits
+                                for _ in 0..6 {
+                                    if let Some(ch) = self.peek() {
+                                        if ch.is_ascii_hexdigit() {
+                                            self.consume();
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Consume closing '}'
+                                if let Some('}') = self.peek() {
+                                    self.consume();
+                                }
+                            }
+                        }
+                        Some(ch) if ch.is_ascii_digit() => {
+                            // Octal escape: \OOO (1-3 octal digits)
+                            // First digit already peeked, consume it
+                            self.consume();
+                            // Consume up to 2 more octal digits
+                            for _ in 0..2 {
+                                if let Some(ch) = self.peek() {
+                                    if ch >= '0' && ch <= '7' {
+                                        self.consume();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            // Not a recognized escape sequence, backslash is literal
+                            // The backslash is already consumed, continue
+                        }
+                    }
+                }
+                Some('"') => {
+                    // Closing double quote
+                    self.consume();
+                    return Some((
+                        Token::ConstantEncapsedString,
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some(_) => {
+                    // Regular character (including $, which we'll handle in task 2.2.8)
+                    self.consume();
+                }
+            }
+        }
+    }
+
     /// Scan in ST_IN_SCRIPTING state - inside PHP code
     fn scan_scripting(&mut self) -> Option<(Token, Span)> {
         // Skip whitespace
@@ -666,6 +773,10 @@ impl<'src> Lexer<'src> {
             '\'' => {
                 // Single-quoted string
                 self.scan_single_quoted_string()
+            }
+            '"' => {
+                // Double-quoted string
+                self.scan_double_quoted_string()
             }
             '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '&' | '|' | '^' | '~' | '('
             | ')' | '{' | '}' | '[' | ']' | ';' | ',' | '.' | ':' | '?' | '@' | '#' | '\\' => {
@@ -2814,5 +2925,256 @@ mod tests {
             .expect("Should tokenize string with double quotes");
         assert_eq!(token, Token::ConstantEncapsedString);
         assert_eq!(span.extract(source), r#"'hello"world'"#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_simple() {
+        // Test: simple double-quoted string without escape sequences
+        let source = r#"<?php "hello""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize double-quoted string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_empty() {
+        // Test: empty double-quoted string
+        let source = r#"<?php """#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize empty string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_newline() {
+        // Test: double-quoted string with \n escape
+        let source = r#"<?php "hello\nworld""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\n");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\nworld""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_tab() {
+        // Test: double-quoted string with \t escape
+        let source = r#"<?php "hello\tworld""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\t");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\tworld""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_return() {
+        // Test: double-quoted string with \r escape
+        let source = r#"<?php "hello\rworld""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\r");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\rworld""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_vertical_tab() {
+        // Test: double-quoted string with \v escape
+        let source = r#"<?php "hello\vworld""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\v");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\vworld""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_escape() {
+        // Test: double-quoted string with \e escape (ASCII escape character)
+        let source = r#"<?php "hello\eworld""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\e");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\eworld""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_form_feed() {
+        // Test: double-quoted string with \f escape
+        let source = r#"<?php "hello\fworld""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\f");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\fworld""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_backslash() {
+        // Test: double-quoted string with \\ escape
+        let source = r#"<?php "hello\\world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with \\\\");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\\world""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_dollar() {
+        // Test: double-quoted string with \$ escape (literal dollar sign)
+        let source = r#"<?php "hello\$world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\$");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\$world""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_double_quote() {
+        // Test: double-quoted string with \" escape
+        let source = r#"<?php "hello\"world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with \\\"");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\"world""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_hex() {
+        // Test: double-quoted string with \x hex escape
+        let source = r#"<?php "hello\x41world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\x");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\x41world""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_unicode() {
+        // Test: double-quoted string with \u{} unicode escape
+        let source = r#"<?php "hello\u{1F600}world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with \\u{}");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\u{1F600}world""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_escape_octal() {
+        // Test: double-quoted string with \0 octal escape
+        let source = r#"<?php "hello\101world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with \\101");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello\101world""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_multiple_escapes() {
+        // Test: double-quoted string with multiple escape sequences
+        let source = r#"<?php "line1\nline2\ttab\r\nend""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with multiple escapes");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""line1\nline2\ttab\r\nend""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_single_quote_no_escape() {
+        // Test: single quotes don't need escaping in double-quoted strings
+        let source = r#"<?php "hello'world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with single quote");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello'world""#);
+    }
+
+    #[test]
+    fn test_double_quoted_string_multiline() {
+        // Test: double-quoted string spanning multiple lines
+        let source = "<?php \"hello\nworld\"";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize multiline string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "\"hello\nworld\"");
+    }
+
+    #[test]
+    fn test_double_quoted_string_no_variable_interpolation_for_now() {
+        // Test: for now, we'll tokenize $var inside strings as part of the string
+        // Later (task 2.2.8), we'll handle interpolation properly
+        let source = r#"<?php "hello $var world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello $var world""#);
     }
 }

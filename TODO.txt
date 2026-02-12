@@ -117,7 +117,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 2.2.6  Test: integer overflow to float, edge cases
 [~] 2.2.7  Implement string literals:
            [x] Single-quoted: 'hello', escapes: \\, \'
-           [ ] Double-quoted: "hello $var", escapes: \n, \r, \t, \v, \e, \f, \\, \$, \", \x hex, \u{} unicode, \0 octal
+           [x] Double-quoted: "hello $var", escapes: \n, \r, \t, \v, \e, \f, \\, \$, \", \x hex, \u{} unicode, \0 octal
            [ ] Heredoc: <<<EOT ... EOT;
            [ ] Nowdoc: <<<'EOT' ... EOT;
 [ ] 2.2.8  Test: string interpolation: "$var", "{$var}", "${var}", "$obj->prop", "$arr[key]"
