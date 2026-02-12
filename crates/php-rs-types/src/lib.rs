@@ -3449,6 +3449,145 @@ mod zarray_tests {
         assert_eq!(arr.len(), 3);
     }
 
+    /// Test: next free integer key ($a[] = value)
+    /// PHP behavior: $a[] assigns to the next free integer key,
+    /// which is max(integer_keys) + 1, or 0 if no integer keys exist.
+    #[test]
+    fn test_next_free_key_empty_array() {
+        let mut arr = ZArray::new();
+
+        // Empty array: next key should be 0
+        arr.push(ZVal::long(100));
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+
+        // Next should be 1
+        arr.push(ZVal::long(200));
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+    }
+
+    #[test]
+    fn test_next_free_key_with_gaps() {
+        let mut arr = ZArray::new();
+
+        // Insert keys with gaps: 0, 5, 10
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(5, ZVal::long(500));
+        arr.insert_int(10, ZVal::long(1000));
+
+        // Next free key should be 11 (max + 1), not filling gaps
+        arr.push(ZVal::long(1100));
+        assert_eq!(arr.get_int(11).unwrap().to_long(), 1100);
+
+        // Keys 1-4, 6-9 should still be empty
+        assert!(arr.get_int(1).is_none());
+        assert!(arr.get_int(4).is_none());
+        assert!(arr.get_int(6).is_none());
+        assert!(arr.get_int(9).is_none());
+    }
+
+    #[test]
+    fn test_next_free_key_only_string_keys() {
+        let mut arr = ZArray::new();
+
+        // Only string keys, no integer keys
+        arr.insert_string(ZString::new(b"foo"), ZVal::long(1));
+        arr.insert_string(ZString::new(b"bar"), ZVal::long(2));
+
+        // Next free key should be 0 (no integer keys exist)
+        arr.push(ZVal::long(100));
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+
+        // Next should be 1
+        arr.push(ZVal::long(200));
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+    }
+
+    #[test]
+    fn test_next_free_key_with_negative_keys() {
+        let mut arr = ZArray::new();
+
+        // Insert negative and positive keys
+        arr.insert_int(-5, ZVal::long(50));
+        arr.insert_int(-1, ZVal::long(10));
+        arr.insert_int(3, ZVal::long(300));
+
+        // Next free key should be 4 (max + 1), negatives don't count as "max"
+        arr.push(ZVal::long(400));
+        assert_eq!(arr.get_int(4).unwrap().to_long(), 400);
+    }
+
+    #[test]
+    fn test_next_free_key_only_negative_keys() {
+        let mut arr = ZArray::new();
+
+        // Only negative integer keys
+        arr.insert_int(-10, ZVal::long(100));
+        arr.insert_int(-5, ZVal::long(50));
+        arr.insert_int(-1, ZVal::long(10));
+
+        // Max is -1, so next free key should be 0 (-1 + 1)
+        arr.push(ZVal::long(999));
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 999);
+    }
+
+    #[test]
+    fn test_next_free_key_after_deletion() {
+        let mut arr = ZArray::new();
+
+        // Insert 0, 1, 2, 3
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+        arr.insert_int(3, ZVal::long(400));
+
+        // Delete key 2 (creates a gap)
+        arr.remove_int(2);
+
+        // Next free key should still be 4 (max + 1), not filling the gap at 2
+        arr.push(ZVal::long(500));
+        assert_eq!(arr.get_int(4).unwrap().to_long(), 500);
+        assert!(arr.get_int(2).is_none()); // Gap still exists
+    }
+
+    #[test]
+    fn test_next_free_key_mixed_keys_and_push() {
+        let mut arr = ZArray::new();
+
+        // Mix of operations
+        arr.push(ZVal::long(10)); // key 0
+        arr.push(ZVal::long(20)); // key 1
+        arr.insert_string(ZString::new(b"name"), ZVal::long(999)); // string key
+        arr.push(ZVal::long(30)); // key 2
+        arr.insert_int(5, ZVal::long(50)); // explicit key 5
+        arr.push(ZVal::long(60)); // key 6 (max is 5, so next is 6)
+
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 10);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 20);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 30);
+        assert_eq!(arr.get_int(5).unwrap().to_long(), 50);
+        assert_eq!(arr.get_int(6).unwrap().to_long(), 60);
+        assert_eq!(
+            arr.get_string(&ZString::new(b"name")).unwrap().to_long(),
+            999
+        );
+    }
+
+    #[test]
+    fn test_next_free_key_start_from_high_number() {
+        let mut arr = ZArray::new();
+
+        // Start with a high number
+        arr.insert_int(1000, ZVal::long(10000));
+
+        // Next free should be 1001
+        arr.push(ZVal::long(10010));
+        assert_eq!(arr.get_int(1001).unwrap().to_long(), 10010);
+
+        // And 1002
+        arr.push(ZVal::long(10020));
+        assert_eq!(arr.get_int(1002).unwrap().to_long(), 10020);
+    }
+
     #[test]
     fn test_with_capacity() {
         let arr = ZArray::with_capacity(100);

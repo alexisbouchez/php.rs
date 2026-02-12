@@ -76,7 +76,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 1.4.2  Define hash mode (string/non-consecutive int keys, Robin Hood table)
 [x] 1.4.3  Test: insert, get, delete, iteration order preserved
 [x] 1.4.4  Test: packed → hash promotion when string key inserted
-[ ] 1.4.5  Test: next free integer key ($a[] = value)
+[x] 1.4.5  Test: next free integer key ($a[] = value)
 [ ] 1.4.6  Implement copy-on-write (CoW) semantics
 [ ] 1.4.7  Test: CoW — modifying a copy doesn't affect original
 [ ] 1.4.8  Test: nested arrays, recursive references
