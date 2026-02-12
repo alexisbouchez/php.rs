@@ -2202,4 +2202,290 @@ mod tests {
             "String with null byte should convert to true (not empty)"
         );
     }
+
+    // ========================================================================
+    // Direct conversion method tests (Phase 1.3.2)
+    // ========================================================================
+    // Test the to_long(), to_double(), to_string(), to_bool() methods directly
+
+    #[test]
+    fn test_to_long_null() {
+        // Test: ZVal::null().to_long() returns 0
+        // Reference: php -r 'var_dump((int)null);' outputs "int(0)"
+        assert_eq!(ZVal::null().to_long(), 0);
+    }
+
+    #[test]
+    fn test_to_long_false() {
+        // Test: ZVal::false_val().to_long() returns 0
+        // Reference: php -r 'var_dump((int)false);' outputs "int(0)"
+        assert_eq!(ZVal::false_val().to_long(), 0);
+    }
+
+    #[test]
+    fn test_to_long_true() {
+        // Test: ZVal::true_val().to_long() returns 1
+        // Reference: php -r 'var_dump((int)true);' outputs "int(1)"
+        assert_eq!(ZVal::true_val().to_long(), 1);
+    }
+
+    #[test]
+    fn test_to_long_long_identity() {
+        // Test: ZVal::long(42).to_long() returns 42 (identity)
+        assert_eq!(ZVal::long(42).to_long(), 42);
+        assert_eq!(ZVal::long(0).to_long(), 0);
+        assert_eq!(ZVal::long(-999).to_long(), -999);
+        assert_eq!(ZVal::long(i64::MAX).to_long(), i64::MAX);
+        assert_eq!(ZVal::long(i64::MIN).to_long(), i64::MIN);
+    }
+
+    #[test]
+    fn test_to_long_double_truncate() {
+        // Test: ZVal::double(1.9).to_long() returns 1 (truncate towards zero)
+        // Reference: php -r 'var_dump((int)1.9);' outputs "int(1)"
+        assert_eq!(ZVal::double(1.9).to_long(), 1);
+        assert_eq!(ZVal::double(1.1).to_long(), 1);
+        assert_eq!(ZVal::double(-1.9).to_long(), -1);
+        assert_eq!(ZVal::double(0.5).to_long(), 0);
+        assert_eq!(ZVal::double(-0.5).to_long(), 0);
+    }
+
+    #[test]
+    fn test_to_long_double_special_values() {
+        // Test: Special float values convert to long
+        // NAN → 0, INF → i64::MAX, -INF → i64::MIN
+        // Reference: php -r 'var_dump((int)NAN);' outputs "int(0)"
+        //            php -r 'var_dump((int)INF);' outputs "int(9223372036854775807)"
+        assert_eq!(ZVal::double(f64::NAN).to_long(), 0);
+        assert_eq!(ZVal::double(f64::INFINITY).to_long(), i64::MAX);
+        assert_eq!(ZVal::double(f64::NEG_INFINITY).to_long(), i64::MIN);
+    }
+
+    #[test]
+    fn test_to_double_null() {
+        // Test: ZVal::null().to_double() returns 0.0
+        // Reference: php -r 'var_dump((float)null);' outputs "float(0)"
+        assert_eq!(ZVal::null().to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_to_double_false() {
+        // Test: ZVal::false_val().to_double() returns 0.0
+        // Reference: php -r 'var_dump((float)false);' outputs "float(0)"
+        assert_eq!(ZVal::false_val().to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_to_double_true() {
+        // Test: ZVal::true_val().to_double() returns 1.0
+        // Reference: php -r 'var_dump((float)true);' outputs "float(1)"
+        assert_eq!(ZVal::true_val().to_double(), 1.0);
+    }
+
+    #[test]
+    fn test_to_double_long() {
+        // Test: ZVal::long(42).to_double() returns 42.0
+        // Reference: php -r 'var_dump((float)42);' outputs "float(42)"
+        assert_eq!(ZVal::long(42).to_double(), 42.0);
+        assert_eq!(ZVal::long(0).to_double(), 0.0);
+        assert_eq!(ZVal::long(-123).to_double(), -123.0);
+    }
+
+    #[test]
+    fn test_to_double_double_identity() {
+        // Test: ZVal::double(1.5).to_double() returns 1.5 (identity)
+        assert_eq!(ZVal::double(1.5).to_double(), 1.5);
+        assert_eq!(ZVal::double(0.0).to_double(), 0.0);
+        assert_eq!(ZVal::double(-2.5).to_double(), -2.5);
+    }
+
+    #[test]
+    fn test_to_double_special_values_identity() {
+        // Test: Special float values remain unchanged
+        let inf = ZVal::double(f64::INFINITY).to_double();
+        assert!(inf.is_infinite() && inf.is_sign_positive());
+
+        let neg_inf = ZVal::double(f64::NEG_INFINITY).to_double();
+        assert!(neg_inf.is_infinite() && neg_inf.is_sign_negative());
+
+        let nan = ZVal::double(f64::NAN).to_double();
+        assert!(nan.is_nan());
+    }
+
+    #[test]
+    fn test_to_bool_null() {
+        // Test: ZVal::null().to_bool() returns false
+        // Reference: php -r 'var_dump((bool)null);' outputs "bool(false)"
+        assert!(!ZVal::null().to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_false() {
+        // Test: ZVal::false_val().to_bool() returns false
+        assert!(!ZVal::false_val().to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_true() {
+        // Test: ZVal::true_val().to_bool() returns true
+        assert!(ZVal::true_val().to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_long() {
+        // Test: ZVal::long(0).to_bool() returns false, non-zero returns true
+        // Reference: php -r 'var_dump((bool)0);' outputs "bool(false)"
+        //            php -r 'var_dump((bool)1);' outputs "bool(true)"
+        //            php -r 'var_dump((bool)-1);' outputs "bool(true)"
+        assert!(!ZVal::long(0).to_bool());
+        assert!(ZVal::long(1).to_bool());
+        assert!(ZVal::long(-1).to_bool());
+        assert!(ZVal::long(42).to_bool());
+        assert!(ZVal::long(i64::MAX).to_bool());
+        assert!(ZVal::long(i64::MIN).to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_double() {
+        // Test: ZVal::double(0.0).to_bool() returns false, non-zero returns true
+        // Reference: php -r 'var_dump((bool)0.0);' outputs "bool(false)"
+        //            php -r 'var_dump((bool)1.0);' outputs "bool(true)"
+        assert!(!ZVal::double(0.0).to_bool());
+        assert!(ZVal::double(1.0).to_bool());
+        assert!(ZVal::double(-1.0).to_bool());
+        assert!(ZVal::double(0.5).to_bool());
+        assert!(ZVal::double(-0.5).to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_double_special_values() {
+        // Test: NAN is false, INF is true
+        // Reference: php -r 'var_dump((bool)NAN);' outputs "bool(false)"
+        //            php -r 'var_dump((bool)INF);' outputs "bool(true)"
+        assert!(!ZVal::double(f64::NAN).to_bool());
+        assert!(ZVal::double(f64::INFINITY).to_bool());
+        assert!(ZVal::double(f64::NEG_INFINITY).to_bool());
+    }
+
+    #[test]
+    fn test_to_string_null() {
+        // Test: ZVal::null().to_string() returns ""
+        // Reference: php -r 'var_dump((string)null);' outputs 'string(0) ""'
+        let s = ZVal::null().to_string();
+        assert_eq!(s.as_str(), Some(""));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_to_string_false() {
+        // Test: ZVal::false_val().to_string() returns ""
+        // Reference: php -r 'var_dump((string)false);' outputs 'string(0) ""'
+        let s = ZVal::false_val().to_string();
+        assert_eq!(s.as_str(), Some(""));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_to_string_true() {
+        // Test: ZVal::true_val().to_string() returns "1"
+        // Reference: php -r 'var_dump((string)true);' outputs 'string(1) "1"'
+        let s = ZVal::true_val().to_string();
+        assert_eq!(s.as_str(), Some("1"));
+    }
+
+    #[test]
+    fn test_to_string_long() {
+        // Test: ZVal::long(42).to_string() returns "42"
+        // Reference: php -r 'var_dump((string)42);' outputs 'string(2) "42"'
+        assert_eq!(ZVal::long(42).to_string().as_str(), Some("42"));
+        assert_eq!(ZVal::long(0).to_string().as_str(), Some("0"));
+        assert_eq!(ZVal::long(-123).to_string().as_str(), Some("-123"));
+        assert_eq!(
+            ZVal::long(i64::MAX).to_string().as_str(),
+            Some("9223372036854775807")
+        );
+        assert_eq!(
+            ZVal::long(i64::MIN).to_string().as_str(),
+            Some("-9223372036854775808")
+        );
+    }
+
+    #[test]
+    fn test_to_string_double() {
+        // Test: ZVal::double(1.5).to_string() returns "1.5"
+        // Reference: php -r 'var_dump((string)1.5);' outputs 'string(3) "1.5"'
+        assert_eq!(ZVal::double(1.5).to_string().as_str(), Some("1.5"));
+        assert_eq!(ZVal::double(0.0).to_string().as_str(), Some("0"));
+        assert_eq!(ZVal::double(-2.5).to_string().as_str(), Some("-2.5"));
+    }
+
+    #[test]
+    fn test_to_string_double_special_values() {
+        // Test: Special float values convert to strings
+        // Reference: php -r 'var_dump((string)INF);' outputs 'string(3) "INF"'
+        //            php -r 'var_dump((string)(-INF));' outputs 'string(4) "-INF"'
+        //            php -r 'var_dump((string)NAN);' outputs 'string(3) "NAN"'
+        assert_eq!(
+            ZVal::double(f64::INFINITY).to_string().as_str(),
+            Some("INF")
+        );
+        assert_eq!(
+            ZVal::double(f64::NEG_INFINITY).to_string().as_str(),
+            Some("-INF")
+        );
+        assert_eq!(ZVal::double(f64::NAN).to_string().as_str(), Some("NAN"));
+    }
+
+    #[test]
+    fn test_to_string_resource() {
+        // Test: ZVal::resource(5).to_string() returns "Resource id #5"
+        // Reference: php -r '$f = fopen("/dev/null", "r"); echo (string)$f;'
+        //            outputs "Resource id #5" (or similar)
+        let s = ZVal::resource(5).to_string();
+        assert_eq!(s.as_str(), Some("Resource id #5"));
+
+        let s = ZVal::resource(123).to_string();
+        assert_eq!(s.as_str(), Some("Resource id #123"));
+    }
+
+    #[test]
+    fn test_conversion_chaining() {
+        // Test: Chaining conversions works correctly
+        // Example: null → long → double → string
+        let val = ZVal::null();
+        let as_long = val.to_long();
+        assert_eq!(as_long, 0);
+
+        let val2 = ZVal::long(as_long);
+        let as_double = val2.to_double();
+        assert_eq!(as_double, 0.0);
+
+        let val3 = ZVal::double(as_double);
+        let as_string = val3.to_string();
+        assert_eq!(as_string.as_str(), Some("0"));
+    }
+
+    #[test]
+    fn test_conversion_round_trip_long() {
+        // Test: long → string → long should preserve value (for valid numbers)
+        let original = ZVal::long(42);
+        let as_string = original.to_string();
+        let as_val = ZVal::string(Box::into_raw(Box::new(as_string)) as usize);
+        let back_to_long = as_val.to_long();
+        assert_eq!(back_to_long, 42);
+    }
+
+    #[test]
+    fn test_conversion_idempotency() {
+        // Test: Converting twice should give the same result as converting once
+        let val = ZVal::long(42);
+        let s1 = val.to_string();
+        let s2 = val.to_string();
+        assert_eq!(s1, s2);
+
+        let val = ZVal::double(1.5);
+        let l1 = val.to_long();
+        let l2 = val.to_long();
+        assert_eq!(l1, l2);
+    }
 }
