@@ -5826,14 +5826,8 @@ mod zobject_tests {
         //   echo Math::PI;
 
         let mut math_class = ClassEntry::new(ZString::new(b"Math"));
-        math_class.add_constant(
-            ZString::new(b"PI"),
-            ZVal::double(std::f64::consts::PI),
-        );
-        math_class.add_constant(
-            ZString::new(b"E"),
-            ZVal::double(std::f64::consts::E),
-        );
+        math_class.add_constant(ZString::new(b"PI"), ZVal::double(std::f64::consts::PI));
+        math_class.add_constant(ZString::new(b"E"), ZVal::double(std::f64::consts::E));
 
         // Verify constants exist
         assert!(math_class.has_constant(&ZString::new(b"PI")));
@@ -6322,5 +6316,206 @@ mod zresource_tests {
 
         // After dropping ref2, refcount should be 1
         assert_eq!(ref1.refcount(), 1);
+    }
+
+    // ========================================================================
+    // ZReference Tests (1.7.2) - Assign by reference, modify through reference
+    // ========================================================================
+
+    #[test]
+    fn test_assign_by_reference_basic() {
+        // Test: Basic reference assignment
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $b = 2;
+        // echo $a; // outputs 2
+
+        let val_a = ZVal::long(1);
+        let ref_a = ZReference::new(val_a);
+
+        // Assign by reference: $b = &$a
+        let ref_b = ref_a.clone();
+
+        // Verify both point to same value
+        assert_eq!(ref_a.get().to_long(), 1);
+        assert_eq!(ref_b.get().to_long(), 1);
+        assert_eq!(ref_a.refcount(), 2);
+        assert_eq!(ref_b.refcount(), 2);
+
+        // Modify through $b
+        ref_b.set(ZVal::long(2));
+
+        // Both should see the change
+        assert_eq!(ref_a.get().to_long(), 2);
+        assert_eq!(ref_b.get().to_long(), 2);
+    }
+
+    #[test]
+    fn test_assign_by_reference_string() {
+        // Test: Reference assignment with strings (using pointer placeholders)
+        // PHP equivalent:
+        // $a = "hello";
+        // $b = &$a;
+        // $b = "world";
+        // echo $a; // outputs "world"
+
+        let val_a = ZVal::string(0x1000);
+        let ref_a = ZReference::new(val_a);
+
+        // Assign by reference
+        let ref_b = ref_a.clone();
+
+        // Modify through $b
+        ref_b.set(ZVal::string(0x2000));
+
+        // Both should see the new string pointer
+        assert!(matches!(ref_a.get().type_tag, ZValType::String));
+        assert_eq!(ref_a.get().value, 0x2000);
+    }
+
+    #[test]
+    fn test_modify_through_reference_multiple_times() {
+        // Test: Multiple modifications through reference
+        // PHP equivalent:
+        // $a = 10;
+        // $b = &$a;
+        // $b = 20;
+        // $b = 30;
+        // $b = 40;
+        // echo $a; // outputs 40
+
+        let ref_a = ZReference::new(ZVal::long(10));
+        let ref_b = ref_a.clone();
+
+        // Multiple modifications
+        ref_b.set(ZVal::long(20));
+        assert_eq!(ref_a.get().to_long(), 20);
+
+        ref_b.set(ZVal::long(30));
+        assert_eq!(ref_a.get().to_long(), 30);
+
+        ref_b.set(ZVal::long(40));
+        assert_eq!(ref_a.get().to_long(), 40);
+        assert_eq!(ref_b.get().to_long(), 40);
+    }
+
+    #[test]
+    fn test_reference_chain() {
+        // Test: Chain of references
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $c = &$b;
+        // $c = 100;
+        // echo $a; // outputs 100
+        // echo $b; // outputs 100
+
+        let ref_a = ZReference::new(ZVal::long(1));
+        let ref_b = ref_a.clone();
+        let ref_c = ref_b.clone();
+
+        // All three should have same refcount
+        assert_eq!(ref_a.refcount(), 3);
+        assert_eq!(ref_b.refcount(), 3);
+        assert_eq!(ref_c.refcount(), 3);
+
+        // Modify through $c
+        ref_c.set(ZVal::long(100));
+
+        // All should see the change
+        assert_eq!(ref_a.get().to_long(), 100);
+        assert_eq!(ref_b.get().to_long(), 100);
+        assert_eq!(ref_c.get().to_long(), 100);
+    }
+
+    #[test]
+    fn test_reference_with_different_types() {
+        // Test: Reference can hold different types over time
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $b = "string";
+        // $b = 3.14;
+        // echo $a; // outputs 3.14
+
+        let ref_a = ZReference::new(ZVal::long(1));
+        let ref_b = ref_a.clone();
+
+        // Change to string
+        ref_b.set(ZVal::string(0x3000));
+        assert!(matches!(ref_a.get().type_tag, ZValType::String));
+
+        // Change to double
+        ref_b.set(ZVal::double(3.14));
+        assert_eq!(ref_a.get().to_double(), 3.14);
+    }
+
+    #[test]
+    fn test_reference_bidirectional_modification() {
+        // Test: Modifications work in both directions
+        // PHP equivalent:
+        // $a = 10;
+        // $b = &$a;
+        // $a = 20; // modify through $a
+        // echo $b; // outputs 20
+        // $b = 30; // modify through $b
+        // echo $a; // outputs 30
+
+        let ref_a = ZReference::new(ZVal::long(10));
+        let ref_b = ref_a.clone();
+
+        // Modify through ref_a
+        ref_a.set(ZVal::long(20));
+        assert_eq!(ref_b.get().to_long(), 20);
+
+        // Modify through ref_b
+        ref_b.set(ZVal::long(30));
+        assert_eq!(ref_a.get().to_long(), 30);
+    }
+
+    #[test]
+    fn test_reference_with_bool_and_null() {
+        // Test: Reference with bool and null values
+        // PHP equivalent:
+        // $a = true;
+        // $b = &$a;
+        // $b = false;
+        // $b = null;
+
+        let ref_a = ZReference::new(ZVal::true_val());
+        let ref_b = ref_a.clone();
+
+        assert!(matches!(ref_a.get().type_tag, ZValType::True));
+
+        ref_b.set(ZVal::false_val());
+        assert!(matches!(ref_a.get().type_tag, ZValType::False));
+
+        ref_b.set(ZVal::null());
+        assert!(matches!(ref_a.get().type_tag, ZValType::Null));
+    }
+
+    #[test]
+    fn test_reference_independence_after_drop() {
+        // Test: After all but one reference is dropped, the remaining one still works
+        // PHP equivalent:
+        // $a = 5;
+        // $b = &$a;
+        // unset($b);
+        // $a = 10; // $a still works
+        // echo $a; // outputs 10
+
+        let ref_a = ZReference::new(ZVal::long(5));
+        {
+            let ref_b = ref_a.clone();
+            assert_eq!(ref_a.refcount(), 2);
+            assert_eq!(ref_b.get().to_long(), 5);
+            // ref_b drops here
+        }
+
+        // After ref_b is dropped, ref_a should still work
+        assert_eq!(ref_a.refcount(), 1);
+        ref_a.set(ZVal::long(10));
+        assert_eq!(ref_a.get().to_long(), 10);
     }
 }
