@@ -105,6 +105,9 @@ impl<'a> Parser<'a> {
             Token::Class | Token::Abstract | Token::Final | Token::Readonly => {
                 self.parse_class_statement()
             }
+            Token::Interface => self.parse_interface_statement(),
+            Token::Trait => self.parse_trait_statement(),
+            Token::Enum => self.parse_enum_statement(),
             _ => {
                 // Default case: try to parse as expression statement
                 let start_span = self.current_span;
@@ -867,6 +870,159 @@ impl<'a> Parser<'a> {
             name,
             modifiers,
             extends,
+            implements,
+            members,
+            attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
+    }
+
+    /// Parse interface declaration
+    /// Syntax: interface Name [extends Interface1, Interface2, ...] { members }
+    fn parse_interface_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+
+        // Expect 'interface' keyword
+        self.expect(Token::Interface)?;
+
+        // Parse interface name
+        let name = if let Token::String = self.current_token {
+            let n = self.lexer.source_text(&self.current_span).to_string();
+            self.advance();
+            n
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "interface name".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            });
+        };
+
+        // Parse optional extends clause (interfaces can extend multiple interfaces)
+        let extends = if self.current_token == Token::Extends {
+            self.advance();
+            let mut interfaces = Vec::new();
+            loop {
+                interfaces.push(self.parse_qualified_name()?);
+                if self.current_token == Token::Comma {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            interfaces
+        } else {
+            Vec::new()
+        };
+
+        // Parse interface body
+        self.expect(Token::LBrace)?;
+        let members = Vec::new();
+        // For now, skip interface members parsing - we'll implement that later
+        // Just verify we have a closing brace
+        self.expect(Token::RBrace)?;
+
+        Ok(Statement::Interface {
+            name,
+            extends,
+            members,
+            attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
+    }
+
+    /// Parse trait declaration
+    /// Syntax: trait Name { members }
+    fn parse_trait_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+
+        // Expect 'trait' keyword
+        self.expect(Token::Trait)?;
+
+        // Parse trait name
+        let name = if let Token::String = self.current_token {
+            let n = self.lexer.source_text(&self.current_span).to_string();
+            self.advance();
+            n
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "trait name".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            });
+        };
+
+        // Parse trait body
+        self.expect(Token::LBrace)?;
+        let members = Vec::new();
+        // For now, skip trait members parsing - we'll implement that later
+        // Just verify we have a closing brace
+        self.expect(Token::RBrace)?;
+
+        Ok(Statement::Trait {
+            name,
+            members,
+            attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
+    }
+
+    /// Parse enum declaration
+    /// Syntax: enum Name [: Type] [implements Interface1, Interface2, ...] { members }
+    fn parse_enum_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+
+        // Expect 'enum' keyword
+        self.expect(Token::Enum)?;
+
+        // Parse enum name
+        let name = if let Token::String = self.current_token {
+            let n = self.lexer.source_text(&self.current_span).to_string();
+            self.advance();
+            n
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "enum name".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            });
+        };
+
+        // Parse optional backing type (: int or : string)
+        let backing_type = if self.current_token == Token::Colon {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        // Parse optional implements clause
+        let implements = if self.current_token == Token::Implements {
+            self.advance();
+            let mut interfaces = Vec::new();
+            loop {
+                interfaces.push(self.parse_qualified_name()?);
+                if self.current_token == Token::Comma {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            interfaces
+        } else {
+            Vec::new()
+        };
+
+        // Parse enum body
+        self.expect(Token::LBrace)?;
+        let members = Vec::new();
+        // For now, skip enum members parsing - we'll implement that later
+        // Just verify we have a closing brace
+        self.expect(Token::RBrace)?;
+
+        Ok(Statement::Enum {
+            name,
+            backing_type,
             implements,
             members,
             attributes: Vec::new(), // TODO: Parse attributes
@@ -3438,6 +3594,151 @@ mod tests {
                 assert_eq!(implements.len(), 2);
             }
             _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_interface_declaration() {
+        // Test: interface Foo { }
+        let source = "<?php interface Foo { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Interface {
+                name,
+                extends,
+                members,
+                ..
+            } => {
+                assert_eq!(name, "Foo");
+                assert_eq!(extends.len(), 0);
+                assert_eq!(members.len(), 0);
+            }
+            _ => panic!("Expected interface declaration"),
+        }
+    }
+
+    #[test]
+    fn test_interface_extends() {
+        // Test: interface Child extends Parent { }
+        let source = "<?php interface Child extends Parent { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Interface { name, extends, .. } => {
+                assert_eq!(name, "Child");
+                assert_eq!(extends.len(), 1);
+                assert_eq!(extends[0].parts[0], "Parent");
+            }
+            _ => panic!("Expected interface declaration"),
+        }
+    }
+
+    #[test]
+    fn test_interface_extends_multiple() {
+        // Test: interface Foo extends Bar, Baz { }
+        let source = "<?php interface Foo extends Bar, Baz { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Interface { extends, .. } => {
+                assert_eq!(extends.len(), 2);
+                assert_eq!(extends[0].parts[0], "Bar");
+                assert_eq!(extends[1].parts[0], "Baz");
+            }
+            _ => panic!("Expected interface declaration"),
+        }
+    }
+
+    #[test]
+    fn test_trait_declaration() {
+        // Test: trait Foo { }
+        let source = "<?php trait Foo { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Trait { name, members, .. } => {
+                assert_eq!(name, "Foo");
+                assert_eq!(members.len(), 0);
+            }
+            _ => panic!("Expected trait declaration"),
+        }
+    }
+
+    #[test]
+    fn test_enum_declaration() {
+        // Test: enum Foo { }
+        let source = "<?php enum Foo { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Enum {
+                name,
+                backing_type,
+                implements,
+                members,
+                ..
+            } => {
+                assert_eq!(name, "Foo");
+                assert!(backing_type.is_none());
+                assert_eq!(implements.len(), 0);
+                assert_eq!(members.len(), 0);
+            }
+            _ => panic!("Expected enum declaration"),
+        }
+    }
+
+    #[test]
+    fn test_enum_with_backing_type() {
+        // Test: enum Status: int { }
+        let source = "<?php enum Status: int { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Enum {
+                name, backing_type, ..
+            } => {
+                assert_eq!(name, "Status");
+                assert!(backing_type.is_some());
+            }
+            _ => panic!("Expected enum declaration"),
+        }
+    }
+
+    #[test]
+    fn test_enum_with_implements() {
+        // Test: enum Foo implements Bar, Baz { }
+        let source = "<?php enum Foo implements Bar, Baz { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Enum { implements, .. } => {
+                assert_eq!(implements.len(), 2);
+                assert_eq!(implements[0].parts[0], "Bar");
+                assert_eq!(implements[1].parts[0], "Baz");
+            }
+            _ => panic!("Expected enum declaration"),
         }
     }
 }
