@@ -3,6 +3,8 @@
 //! This crate implements the core PHP value types (ZVal, ZString, ZArray, ZObject)
 //! matching the reference PHP 8.6 implementation.
 
+use std::fmt;
+
 /// PHP value type discriminant.
 ///
 /// Represents the type tag for a ZVal. This matches PHP's u1.v.type field.
@@ -207,6 +209,39 @@ impl ZVal {
     }
 }
 
+impl fmt::Display for ZVal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.type_tag {
+            ZValType::Null => write!(f, "NULL"),
+            ZValType::False => write!(f, "bool(false)"),
+            ZValType::True => write!(f, "bool(true)"),
+            ZValType::Long => {
+                let value = self.value as i64;
+                write!(f, "int({})", value)
+            }
+            ZValType::Double => {
+                let value = f64::from_bits(self.value);
+                if value.is_nan() {
+                    write!(f, "float(NAN)")
+                } else if value.is_infinite() {
+                    if value.is_sign_positive() {
+                        write!(f, "float(INF)")
+                    } else {
+                        write!(f, "float(-INF)")
+                    }
+                } else {
+                    write!(f, "float({})", value)
+                }
+            }
+            ZValType::String => write!(f, "string"),
+            ZValType::Array => write!(f, "array"),
+            ZValType::Object => write!(f, "object"),
+            ZValType::Resource => write!(f, "resource"),
+            ZValType::Reference => write!(f, "reference"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +259,101 @@ mod tests {
         let _object = ZVal::object(0);
         let _resource = ZVal::resource(0);
         let _reference = ZVal::reference(0);
+    }
+
+    #[test]
+    fn test_display_null() {
+        // Test: NULL displays as "NULL"
+        // Reference: php -r 'var_dump(null);' outputs "NULL\n"
+        let val = ZVal::null();
+        assert_eq!(format!("{}", val), "NULL");
+    }
+
+    #[test]
+    fn test_display_bool() {
+        // Test: bool(true) and bool(false)
+        // Reference: php -r 'var_dump(true);' outputs "bool(true)\n"
+        //            php -r 'var_dump(false);' outputs "bool(false)\n"
+        let t = ZVal::true_val();
+        let f = ZVal::false_val();
+        assert_eq!(format!("{}", t), "bool(true)");
+        assert_eq!(format!("{}", f), "bool(false)");
+    }
+
+    #[test]
+    fn test_display_long() {
+        // Test: int(42), int(0), int(-123)
+        // Reference: php -r 'var_dump(42);' outputs "int(42)\n"
+        let zero = ZVal::long(0);
+        let positive = ZVal::long(42);
+        let negative = ZVal::long(-123);
+        assert_eq!(format!("{}", zero), "int(0)");
+        assert_eq!(format!("{}", positive), "int(42)");
+        assert_eq!(format!("{}", negative), "int(-123)");
+    }
+
+    #[test]
+    fn test_display_double() {
+        // Test: float(1.5), float(0), float(INF), float(-INF), float(NAN)
+        // Reference: php -r 'var_dump(1.5);' outputs "float(1.5)\n"
+        //            php -r 'var_dump(INF);' outputs "float(INF)\n"
+        //            php -r 'var_dump(-INF);' outputs "float(-INF)\n"
+        //            php -r 'var_dump(NAN);' outputs "float(NAN)\n"
+        let normal = ZVal::double(1.5);
+        let zero = ZVal::double(0.0);
+        let inf = ZVal::double(f64::INFINITY);
+        let neg_inf = ZVal::double(f64::NEG_INFINITY);
+        let nan = ZVal::double(f64::NAN);
+
+        assert_eq!(format!("{}", normal), "float(1.5)");
+        assert_eq!(format!("{}", zero), "float(0)");
+        assert_eq!(format!("{}", inf), "float(INF)");
+        assert_eq!(format!("{}", neg_inf), "float(-INF)");
+        assert_eq!(format!("{}", nan), "float(NAN)");
+    }
+
+    #[test]
+    fn test_display_string_placeholder() {
+        // Test: string (placeholder - just shows type for now)
+        // Note: Actual string content will be implemented in Phase 1.2 (ZString)
+        // For now, we just show the type
+        let s = ZVal::string(0x1234);
+        assert_eq!(format!("{}", s), "string");
+    }
+
+    #[test]
+    fn test_display_array_placeholder() {
+        // Test: array (placeholder)
+        // Note: Actual array display will be implemented in Phase 1.4 (ZArray)
+        let a = ZVal::array(0x5678);
+        assert_eq!(format!("{}", a), "array");
+    }
+
+    #[test]
+    fn test_display_object_placeholder() {
+        // Test: object (placeholder)
+        // Note: Actual object display will be implemented in Phase 1.5 (ZObject)
+        let o = ZVal::object(0xABCD);
+        assert_eq!(format!("{}", o), "object");
+    }
+
+    #[test]
+    fn test_display_resource_placeholder() {
+        // Test: resource (placeholder)
+        // Reference: php -r '$f = fopen("/dev/null", "r"); var_dump($f);'
+        //            outputs "resource(5) of type (stream)"
+        // For now, just show "resource"
+        let r = ZVal::resource(0xDEAD);
+        assert_eq!(format!("{}", r), "resource");
+    }
+
+    #[test]
+    fn test_display_reference_placeholder() {
+        // Test: reference (placeholder)
+        // Note: References are internal; they're not directly displayed.
+        // For now, show "reference"
+        let ref_val = ZVal::reference(0xBEEF);
+        assert_eq!(format!("{}", ref_val), "reference");
     }
 
     #[test]
