@@ -407,6 +407,80 @@ impl ZVal {
         }
     }
 
+    /// Convert this ZVal to a string (ZString) using PHP type juggling rules.
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — convert_to_string()
+    ///
+    /// Conversion rules:
+    /// - Null → ""
+    /// - False → ""
+    /// - True → "1"
+    /// - Long → string representation (e.g., 42 → "42")
+    /// - Double → string representation (e.g., 1.5 → "1.5", INF → "INF", NAN → "NAN")
+    /// - String → identity (but need to extract from pointer)
+    /// - Array → "Array" (with notice)
+    /// - Object → object's __toString() or "Object" (with notice)
+    /// - Resource → "Resource id #N"
+    pub fn to_string(&self) -> ZString {
+        match self.type_tag {
+            ZValType::Null => ZString::from_str(""),
+            ZValType::False => ZString::from_str(""),
+            ZValType::True => ZString::from_str("1"),
+            ZValType::Long => {
+                let value = self.value as i64;
+                ZString::from_str(&value.to_string())
+            }
+            ZValType::Double => {
+                let value = f64::from_bits(self.value);
+                if value.is_nan() {
+                    ZString::from_str("NAN")
+                } else if value.is_infinite() {
+                    if value.is_sign_positive() {
+                        ZString::from_str("INF")
+                    } else {
+                        ZString::from_str("-INF")
+                    }
+                } else {
+                    ZString::from_str(&value.to_string())
+                }
+            }
+            ZValType::String => {
+                // SAFETY: We're assuming the pointer is valid for the lifetime of this operation
+                // In a real implementation, this would use proper reference counting
+                let ptr = self.value as usize;
+                if ptr == 0 {
+                    return ZString::from_str("");
+                }
+                // SAFETY: For now, this is unsafe. We'll fix this when we properly integrate ZString
+                unsafe {
+                    let zstring = &*(ptr as *const ZString);
+                    zstring.clone()
+                }
+            }
+            ZValType::Array => {
+                // TODO: Array conversion (with notice)
+                // For now, return "Array" (placeholder)
+                ZString::from_str("Array")
+            }
+            ZValType::Object => {
+                // TODO: Object conversion (__toString() or notice)
+                // For now, return "Object" (placeholder)
+                ZString::from_str("Object")
+            }
+            ZValType::Resource => {
+                // Resource ID is stored in the value
+                // Format: "Resource id #N"
+                let id = self.value as i64;
+                ZString::from_str(&format!("Resource id #{}", id))
+            }
+            ZValType::Reference => {
+                // TODO: Dereference and convert
+                // For now, return empty string (placeholder)
+                ZString::from_str("")
+            }
+        }
+    }
+
     /// Helper: Convert string bytes to double using PHP's parsing rules
     ///
     /// Reference: php-src/Zend/zend_operators.c — zend_strtod()
@@ -1715,5 +1789,54 @@ mod tests {
         let s = ZString::from_str("1.5E2");
         let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
         assert_eq!(val.to_double(), 150.0);
+    }
+
+    // ========================================================================
+    // Int → String coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_int_to_string_positive() {
+        // Test: int 42 converts to "42"
+        // Reference: php -r 'var_dump((string)42);' outputs 'string(2) "42"'
+        let val = ZVal::long(42);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("42"));
+    }
+
+    #[test]
+    fn test_int_to_string_zero() {
+        // Test: int 0 converts to "0"
+        // Reference: php -r 'var_dump((string)0);' outputs 'string(1) "0"'
+        let val = ZVal::long(0);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("0"));
+    }
+
+    #[test]
+    fn test_int_to_string_negative() {
+        // Test: int -123 converts to "-123"
+        // Reference: php -r 'var_dump((string)-123);' outputs 'string(4) "-123"'
+        let val = ZVal::long(-123);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("-123"));
+    }
+
+    #[test]
+    fn test_int_to_string_max() {
+        // Test: i64::MAX converts to its string representation
+        // Reference: php -r 'var_dump((string)9223372036854775807);' outputs the number as string
+        let val = ZVal::long(i64::MAX);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("9223372036854775807"));
+    }
+
+    #[test]
+    fn test_int_to_string_min() {
+        // Test: i64::MIN converts to its string representation
+        // Reference: php -r 'var_dump((string)(-9223372036854775808));' outputs the number as string
+        let val = ZVal::long(i64::MIN);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("-9223372036854775808"));
     }
 }
