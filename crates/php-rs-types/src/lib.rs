@@ -4327,4 +4327,302 @@ mod zarray_tests {
         // Verify arr2 still has all elements
         assert_eq!(arr2.get_int(1).unwrap().to_long(), 2);
     }
+
+    /// Test nested arrays (multi-dimensional arrays)
+    #[test]
+    fn test_zarray_nested_arrays_basic() {
+        // Test: Create nested arrays like $arr = [[1, 2], [3, 4]]
+        // Reference: PHP allows arbitrary nesting of arrays
+        let mut inner1 = ZArray::new();
+        inner1.push(ZVal::long(1));
+        inner1.push(ZVal::long(2));
+
+        let mut inner2 = ZArray::new();
+        inner2.push(ZVal::long(3));
+        inner2.push(ZVal::long(4));
+
+        let mut outer = ZArray::new();
+        outer.push(ZVal::array(Arc::into_raw(inner1.storage.clone()) as usize));
+        outer.push(ZVal::array(Arc::into_raw(inner2.storage.clone()) as usize));
+
+        // Verify outer array structure
+        assert_eq!(outer.len(), 2);
+
+        // Access nested elements
+        let first_elem = outer.get_int(0).unwrap();
+        assert_eq!(first_elem.type_tag(), ZValType::Array);
+
+        let second_elem = outer.get_int(1).unwrap();
+        assert_eq!(second_elem.type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_nested_arrays_three_levels() {
+        // Test: Three levels of nesting $arr = [[[1, 2]]]
+        let mut level3 = ZArray::new();
+        level3.push(ZVal::long(1));
+        level3.push(ZVal::long(2));
+
+        let mut level2 = ZArray::new();
+        level2.push(ZVal::array(Arc::into_raw(level3.storage.clone()) as usize));
+
+        let mut level1 = ZArray::new();
+        level1.push(ZVal::array(Arc::into_raw(level2.storage.clone()) as usize));
+
+        // Verify structure
+        assert_eq!(level1.len(), 1);
+        assert_eq!(level2.len(), 1);
+        assert_eq!(level3.len(), 2);
+
+        let outer_val = level1.get_int(0).unwrap();
+        assert_eq!(outer_val.type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_nested_mixed_keys() {
+        // Test: Nested array with mixed integer and string keys
+        // $arr = ['outer' => ['inner' => 42]]
+        let mut inner = ZArray::new();
+        inner.insert_string(ZString::new(b"inner"), ZVal::long(42));
+
+        let mut outer = ZArray::new();
+        outer.insert_string(
+            ZString::new(b"outer"),
+            ZVal::array(Arc::into_raw(inner.storage.clone()) as usize),
+        );
+
+        // Verify we can access the nested structure
+        let outer_val = outer.get_string(&ZString::new(b"outer")).unwrap();
+        assert_eq!(outer_val.type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_nested_cow() {
+        // Test: CoW works correctly with nested arrays
+        // When we clone an array containing nested arrays, modifying the inner array
+        // should not affect the cloned outer array's reference to the original inner array
+        let mut inner = ZArray::new();
+        inner.push(ZVal::long(1));
+        inner.push(ZVal::long(2));
+
+        let mut outer = ZArray::new();
+        outer.push(ZVal::array(Arc::into_raw(inner.storage.clone()) as usize));
+
+        // Clone the outer array
+        let outer_clone = outer.clone();
+
+        // Verify both have the same refcount
+        assert_eq!(outer.refcount(), 2);
+        assert_eq!(outer_clone.refcount(), 2);
+
+        // Modify the outer array (should trigger CoW)
+        outer.push(ZVal::long(99));
+
+        // After modification, they should have separate references
+        assert_eq!(outer.refcount(), 1);
+        assert_eq!(outer_clone.refcount(), 1);
+
+        // Lengths should differ
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer_clone.len(), 1);
+    }
+
+    #[test]
+    fn test_zarray_recursive_reference_detection() {
+        // Test: Create a recursive reference $a = []; $a[0] = &$a;
+        // In PHP, this creates a circular reference that requires GC cycle detection
+        // For now, we test that we can represent this structure
+        let mut arr = ZArray::new();
+
+        // In a real implementation, this would be a ZVal::Reference pointing back to arr
+        // For now, we just test that we can create the pointer structure
+        // The actual cycle detection is tested in Phase 6 (GC)
+
+        // Store a reference-like pointer (in practice, this would be managed by GC)
+        arr.push(ZVal::reference(Arc::into_raw(arr.storage.clone()) as usize));
+
+        // Verify the array contains one element
+        assert_eq!(arr.len(), 1);
+
+        let elem = arr.get_int(0).unwrap();
+        assert_eq!(elem.type_tag(), ZValType::Reference);
+    }
+
+    #[test]
+    fn test_zarray_recursive_two_element_cycle() {
+        // Test: $a = []; $b = []; $a[0] = &$b; $b[0] = &$a;
+        // This creates a two-element cycle
+        let mut arr_a = ZArray::new();
+        let mut arr_b = ZArray::new();
+
+        // Create references to each other
+        let ptr_a = Arc::into_raw(arr_a.storage.clone()) as usize;
+        let ptr_b = Arc::into_raw(arr_b.storage.clone()) as usize;
+
+        arr_a.push(ZVal::reference(ptr_b));
+        arr_b.push(ZVal::reference(ptr_a));
+
+        // Verify structure
+        assert_eq!(arr_a.len(), 1);
+        assert_eq!(arr_b.len(), 1);
+
+        let a_elem = arr_a.get_int(0).unwrap();
+        let b_elem = arr_b.get_int(0).unwrap();
+
+        assert_eq!(a_elem.type_tag(), ZValType::Reference);
+        assert_eq!(b_elem.type_tag(), ZValType::Reference);
+    }
+
+    #[test]
+    fn test_zarray_nested_with_scalars() {
+        // Test: Mix of nested arrays and scalar values
+        // $arr = [1, [2, 3], 'hello', [4, [5, 6]]]
+        let mut inner1 = ZArray::new();
+        inner1.push(ZVal::long(2));
+        inner1.push(ZVal::long(3));
+
+        let mut inner2_nested = ZArray::new();
+        inner2_nested.push(ZVal::long(5));
+        inner2_nested.push(ZVal::long(6));
+
+        let mut inner2 = ZArray::new();
+        inner2.push(ZVal::long(4));
+        inner2.push(ZVal::array(
+            Arc::into_raw(inner2_nested.storage.clone()) as usize
+        ));
+
+        let mut outer = ZArray::new();
+        outer.push(ZVal::long(1));
+        outer.push(ZVal::array(Arc::into_raw(inner1.storage.clone()) as usize));
+        outer.push(ZVal::string(0x1234)); // Placeholder for string
+        outer.push(ZVal::array(Arc::into_raw(inner2.storage.clone()) as usize));
+
+        // Verify structure
+        assert_eq!(outer.len(), 4);
+
+        // Check types
+        assert_eq!(outer.get_int(0).unwrap().type_tag(), ZValType::Long);
+        assert_eq!(outer.get_int(1).unwrap().type_tag(), ZValType::Array);
+        assert_eq!(outer.get_int(2).unwrap().type_tag(), ZValType::String);
+        assert_eq!(outer.get_int(3).unwrap().type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_deep_nesting() {
+        // Test: Deep nesting (10 levels) to ensure no stack overflow
+        let mut current = ZArray::new();
+        current.push(ZVal::long(42));
+
+        // Create 10 levels of nesting
+        for _ in 0..10 {
+            let mut parent = ZArray::new();
+            parent.push(ZVal::array(Arc::into_raw(current.storage.clone()) as usize));
+            current = parent;
+        }
+
+        // Verify the outermost array has one element
+        assert_eq!(current.len(), 1);
+        assert_eq!(current.get_int(0).unwrap().type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_recursive_self_reference_multiple_times() {
+        // Test: Array with multiple self-references
+        // $a = []; $a[0] = &$a; $a[1] = &$a; $a[2] = &$a;
+        let mut arr = ZArray::new();
+        let ptr = Arc::into_raw(arr.storage.clone()) as usize;
+
+        arr.push(ZVal::reference(ptr));
+        arr.push(ZVal::reference(ptr));
+        arr.push(ZVal::reference(ptr));
+
+        // Verify structure
+        assert_eq!(arr.len(), 3);
+
+        for i in 0..3 {
+            let elem = arr.get_int(i).unwrap();
+            assert_eq!(elem.type_tag(), ZValType::Reference);
+            assert_eq!(elem.as_ptr().unwrap(), ptr);
+        }
+    }
+
+    #[test]
+    fn test_zarray_nested_empty_arrays() {
+        // Test: Nested empty arrays $arr = [[], [], []]
+        let inner1 = ZArray::new();
+        let inner2 = ZArray::new();
+        let inner3 = ZArray::new();
+
+        let mut outer = ZArray::new();
+        outer.push(ZVal::array(Arc::into_raw(inner1.storage.clone()) as usize));
+        outer.push(ZVal::array(Arc::into_raw(inner2.storage.clone()) as usize));
+        outer.push(ZVal::array(Arc::into_raw(inner3.storage.clone()) as usize));
+
+        // Verify structure
+        assert_eq!(outer.len(), 3);
+
+        for i in 0..3 {
+            assert_eq!(outer.get_int(i).unwrap().type_tag(), ZValType::Array);
+        }
+    }
+
+    #[test]
+    fn test_zarray_nested_hash_mode() {
+        // Test: Nested arrays in hash mode
+        // $arr = ['a' => ['b' => ['c' => 123]]]
+        let mut level3 = ZArray::new();
+        level3.insert_string(ZString::new(b"c"), ZVal::long(123));
+
+        let mut level2 = ZArray::new();
+        level2.insert_string(
+            ZString::new(b"b"),
+            ZVal::array(Arc::into_raw(level3.storage.clone()) as usize),
+        );
+
+        let mut level1 = ZArray::new();
+        level1.insert_string(
+            ZString::new(b"a"),
+            ZVal::array(Arc::into_raw(level2.storage.clone()) as usize),
+        );
+
+        // Verify we can look up the nested keys
+        let val_a = level1.get_string(&ZString::new(b"a")).unwrap();
+        assert_eq!(val_a.type_tag(), ZValType::Array);
+
+        let val_b = level2.get_string(&ZString::new(b"b")).unwrap();
+        assert_eq!(val_b.type_tag(), ZValType::Array);
+
+        let val_c = level3.get_string(&ZString::new(b"c")).unwrap();
+        assert_eq!(val_c.type_tag(), ZValType::Long);
+        assert_eq!(val_c.as_long().unwrap(), 123);
+    }
+
+    #[test]
+    fn test_zarray_recursive_complex_graph() {
+        // Test: Complex graph structure
+        // $a = []; $b = []; $c = [];
+        // $a[0] = &$b; $b[0] = &$c; $c[0] = &$a;
+        // This creates a 3-node cycle
+        let mut arr_a = ZArray::new();
+        let mut arr_b = ZArray::new();
+        let mut arr_c = ZArray::new();
+
+        let ptr_a = Arc::into_raw(arr_a.storage.clone()) as usize;
+        let ptr_b = Arc::into_raw(arr_b.storage.clone()) as usize;
+        let ptr_c = Arc::into_raw(arr_c.storage.clone()) as usize;
+
+        arr_a.push(ZVal::reference(ptr_b));
+        arr_b.push(ZVal::reference(ptr_c));
+        arr_c.push(ZVal::reference(ptr_a));
+
+        // Verify structure
+        assert_eq!(arr_a.len(), 1);
+        assert_eq!(arr_b.len(), 1);
+        assert_eq!(arr_c.len(), 1);
+
+        // Verify all elements are references
+        assert_eq!(arr_a.get_int(0).unwrap().type_tag(), ZValType::Reference);
+        assert_eq!(arr_b.get_int(0).unwrap().type_tag(), ZValType::Reference);
+        assert_eq!(arr_c.get_int(0).unwrap().type_tag(), ZValType::Reference);
+    }
 }

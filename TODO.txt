@@ -79,7 +79,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 1.4.5  Test: next free integer key ($a[] = value)
 [x] 1.4.6  Implement copy-on-write (CoW) semantics
 [x] 1.4.7  Test: CoW — modifying a copy doesn't affect original
-[ ] 1.4.8  Test: nested arrays, recursive references
+[x] 1.4.8  Test: nested arrays, recursive references
 [ ] 1.4.9  Implement count(), key exists, foreach iteration
 
 ## 1.5 ZObject — Object representation
