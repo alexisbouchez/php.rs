@@ -9,3 +9,8 @@ repository.workspace = true
 [dependencies]
 
 [dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "vm_benchmarks"
+harness = false
