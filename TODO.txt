@@ -63,7 +63,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
            [x] string → int: "123" → 123, "12abc" → 12 + notice, "abc" → 0
            [x] string → float: "1.5" → 1.5, "1.5e2" → 150.0
            [x] int → string: 42 → "42"
-           [ ] float → string: 1.5 → "1.5", INF → "INF", NAN → "NAN"
+           [x] float → string: 1.5 → "1.5", INF → "INF", NAN → "NAN"
            [ ] bool → int: true → 1, false → 0
            [ ] null → string: "" , null → int: 0, null → float: 0.0, null → bool: false
            [ ] array → bool: [] → false, [1] → true

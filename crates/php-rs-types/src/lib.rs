@@ -1717,11 +1717,11 @@ mod tests {
 
     #[test]
     fn test_string_to_double_negative() {
-        // Test: Negative float string "-3.14" converts to -3.14
-        // Reference: php -r 'var_dump((float)"-3.14");' outputs "float(-3.14)"
-        let s = ZString::from_str("-3.14");
+        // Test: Negative float string "-2.5" converts to -2.5
+        // Reference: php -r 'var_dump((float)"-2.5");' outputs "float(-2.5)"
+        let s = ZString::from_str("-2.5");
         let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
-        assert_eq!(val.to_double(), -3.14);
+        assert_eq!(val.to_double(), -2.5);
     }
 
     #[test]
@@ -1838,5 +1838,81 @@ mod tests {
         let val = ZVal::long(i64::MIN);
         let s = val.to_string();
         assert_eq!(s.as_str(), Some("-9223372036854775808"));
+    }
+
+    // ========================================================================
+    // Float → String coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_float_to_string_positive() {
+        // Test: float 1.5 converts to "1.5"
+        // Reference: php -r 'var_dump((string)1.5);' outputs 'string(3) "1.5"'
+        let val = ZVal::double(1.5);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("1.5"));
+    }
+
+    #[test]
+    fn test_float_to_string_negative() {
+        // Test: float -2.5 converts to "-2.5"
+        // Reference: php -r 'var_dump((string)(-2.5));' outputs 'string(4) "-2.5"'
+        let val = ZVal::double(-2.5);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("-2.5"));
+    }
+
+    #[test]
+    fn test_float_to_string_zero() {
+        // Test: float 0.0 converts to "0"
+        // Reference: php -r 'var_dump((string)0.0);' outputs 'string(1) "0"'
+        let val = ZVal::double(0.0);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("0"));
+    }
+
+    #[test]
+    fn test_float_to_string_inf() {
+        // Test: INF converts to "INF"
+        // Reference: php -r 'var_dump((string)INF);' outputs 'string(3) "INF"'
+        let val = ZVal::double(f64::INFINITY);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("INF"));
+    }
+
+    #[test]
+    fn test_float_to_string_neg_inf() {
+        // Test: -INF converts to "-INF"
+        // Reference: php -r 'var_dump((string)(-INF));' outputs 'string(4) "-INF"'
+        let val = ZVal::double(f64::NEG_INFINITY);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("-INF"));
+    }
+
+    #[test]
+    fn test_float_to_string_nan() {
+        // Test: NAN converts to "NAN"
+        // Reference: php -r 'var_dump((string)NAN);' outputs 'string(3) "NAN"'
+        let val = ZVal::double(f64::NAN);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("NAN"));
+    }
+
+    #[test]
+    fn test_float_to_string_integer_value() {
+        // Test: float 42.0 converts to "42"
+        // Reference: php -r 'var_dump((string)42.0);' outputs 'string(2) "42"'
+        let val = ZVal::double(42.0);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("42"));
+    }
+
+    #[test]
+    fn test_float_to_string_small_decimal() {
+        // Test: float 0.5 converts to "0.5"
+        // Reference: php -r 'var_dump((string)0.5);' outputs 'string(3) "0.5"'
+        let val = ZVal::double(0.5);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("0.5"));
     }
 }
