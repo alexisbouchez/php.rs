@@ -4318,7 +4318,7 @@ mod zarray_tests {
         for (key, value) in items {
             match key {
                 ZArrayKey::Int(i) => {
-                    assert!(i >= 0 && i < 3);
+                    assert!((0..3).contains(&i));
                     sum += value.to_long();
                 }
                 ZArrayKey::String(_) => panic!("Expected int key"),
@@ -5826,8 +5826,14 @@ mod zobject_tests {
         //   echo Math::PI;
 
         let mut math_class = ClassEntry::new(ZString::new(b"Math"));
-        math_class.add_constant(ZString::new(b"PI"), ZVal::double(3.14159));
-        math_class.add_constant(ZString::new(b"E"), ZVal::double(2.71828));
+        math_class.add_constant(
+            ZString::new(b"PI"),
+            ZVal::double(std::f64::consts::PI),
+        );
+        math_class.add_constant(
+            ZString::new(b"E"),
+            ZVal::double(std::f64::consts::E),
+        );
 
         // Verify constants exist
         assert!(math_class.has_constant(&ZString::new(b"PI")));
@@ -5835,10 +5841,10 @@ mod zobject_tests {
 
         // Verify constant values
         let pi_val = math_class.get_constant(&ZString::new(b"PI")).unwrap();
-        assert_eq!(pi_val.as_double().unwrap(), 3.14159);
+        assert_eq!(pi_val.as_double().unwrap(), std::f64::consts::PI);
 
         let e_val = math_class.get_constant(&ZString::new(b"E")).unwrap();
-        assert_eq!(e_val.as_double().unwrap(), 2.71828);
+        assert_eq!(e_val.as_double().unwrap(), std::f64::consts::E);
 
         // Verify non-existent constant returns None
         assert!(!math_class.has_constant(&ZString::new(b"TAU")));
@@ -5986,6 +5992,138 @@ impl Drop for ZResource {
 // and often represent external state (file handles, connections, etc.)
 // that shouldn't be duplicated
 
+// ============================================================================
+// ZReference — Reference wrapper with refcount
+// ============================================================================
+// Reference: php-src/Zend/zend_types.h — zend_reference
+//
+// In PHP, references are created with the & operator:
+//   $a = 1;
+//   $b = &$a;  // $b is now a reference to $a
+//   $b = 2;    // $a is now 2 as well
+//
+// Under the hood, PHP wraps the value in a zend_reference struct that contains
+// a refcount and the actual zval. Multiple variables can point to the same
+// reference, and modifying through any of them affects all.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// PHP reference wrapper (zend_reference equivalent).
+///
+/// A reference in PHP is a refcounted wrapper around a ZVal that allows
+/// multiple variables to share the same value. When one variable modifies
+/// the value, all references see the change.
+///
+/// Layout:
+/// - refcount: atomic counter tracking how many variables point to this reference
+/// - value: the wrapped ZVal
+///
+/// References are created with the & operator in PHP:
+/// ```php
+/// $a = 1;
+/// $b = &$a;  // Create a reference
+/// $b = 2;    // Now $a is also 2
+/// ```
+#[derive(Debug)]
+pub struct ZReference {
+    /// Reference count (how many variables point to this reference)
+    /// Uses Arc for interior mutability and atomic operations
+    inner: Arc<ZReferenceInner>,
+}
+
+#[derive(Debug)]
+pub struct ZReferenceInner {
+    /// Reference count
+    refcount: AtomicUsize,
+    /// The wrapped value
+    /// We use Mutex to allow modification through shared references
+    value: Mutex<ZVal>,
+}
+
+impl ZReference {
+    /// Create a new reference wrapping a ZVal
+    ///
+    /// # Arguments
+    /// * `value` - The ZVal to wrap
+    ///
+    /// # Returns
+    /// A new ZReference with refcount 1
+    pub fn new(value: ZVal) -> Self {
+        Self {
+            inner: Arc::new(ZReferenceInner {
+                refcount: AtomicUsize::new(1),
+                value: Mutex::new(value),
+            }),
+        }
+    }
+
+    /// Get the current refcount
+    ///
+    /// # Returns
+    /// The number of references pointing to this value
+    pub fn refcount(&self) -> usize {
+        self.inner.refcount.load(Ordering::Relaxed)
+    }
+
+    /// Get a copy of the wrapped value
+    ///
+    /// # Returns
+    /// A clone of the current ZVal
+    pub fn get(&self) -> ZVal {
+        self.inner.value.lock().unwrap().clone()
+    }
+
+    /// Set the wrapped value
+    ///
+    /// # Arguments
+    /// * `value` - The new ZVal to store
+    ///
+    /// This affects all references pointing to this value.
+    pub fn set(&self, value: ZVal) {
+        *self.inner.value.lock().unwrap() = value;
+    }
+
+    /// Get a pointer to the inner data for storage in ZVal
+    pub fn as_ptr(&self) -> *const ZReferenceInner {
+        Arc::as_ptr(&self.inner)
+    }
+
+    /// Reconstruct a ZReference from a raw pointer
+    ///
+    /// # Safety
+    /// The pointer must have been created by `as_ptr()` and not yet freed.
+    /// The caller is responsible for ensuring the pointer is valid.
+    pub unsafe fn from_ptr(ptr: *const ZReferenceInner) -> Self {
+        Self {
+            inner: Arc::from_raw(ptr),
+        }
+    }
+}
+
+impl Clone for ZReference {
+    fn clone(&self) -> Self {
+        // Increment refcount when cloning
+        self.inner.refcount.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for ZReference {
+    fn drop(&mut self) {
+        // Decrement refcount when dropping
+        let prev = self.inner.refcount.fetch_sub(1, Ordering::Relaxed);
+        // When it reaches 0, Arc will automatically free the inner data
+        // (we don't need to do anything extra here because Arc handles it)
+        debug_assert!(prev > 0, "Refcount underflow");
+    }
+}
+
+// Safety: ZReference uses Arc and Mutex internally, which are Send+Sync
+unsafe impl Send for ZReference {}
+unsafe impl Sync for ZReference {}
+
 #[cfg(test)]
 mod zresource_tests {
     use super::*;
@@ -6104,5 +6242,85 @@ mod zresource_tests {
 
         let resource = ZResource::new(1, std::ptr::null_mut(), None);
         drop(resource); // Should not crash
+    }
+
+    // ========================================================================
+    // ZReference Tests (1.7)
+    // ========================================================================
+
+    #[test]
+    fn test_zreference_create() {
+        // Test: Create a reference wrapping a ZVal
+
+        let val = ZVal::long(42);
+        let reference = ZReference::new(val);
+
+        // Reference should wrap the value
+        assert_eq!(reference.get().to_long(), 42);
+    }
+
+    #[test]
+    fn test_zreference_refcount() {
+        // Test: Reference counting starts at 1
+
+        let val = ZVal::long(100);
+        let reference = ZReference::new(val);
+
+        assert_eq!(reference.refcount(), 1);
+    }
+
+    #[test]
+    fn test_zreference_clone_increments_refcount() {
+        // Test: Cloning a reference increments refcount
+
+        let val = ZVal::long(200);
+        let ref1 = ZReference::new(val);
+        let ref2 = ref1.clone();
+
+        // Both references should point to the same underlying value
+        assert_eq!(ref1.refcount(), 2);
+        assert_eq!(ref2.refcount(), 2);
+    }
+
+    #[test]
+    fn test_zreference_modify() {
+        // Test: Modifying through reference affects all refs
+
+        let val = ZVal::long(10);
+        let ref1 = ZReference::new(val);
+        let ref2 = ref1.clone();
+
+        // Modify through ref1
+        ref1.set(ZVal::long(20));
+
+        // Both refs should see the new value
+        assert_eq!(ref1.get().to_long(), 20);
+        assert_eq!(ref2.get().to_long(), 20);
+    }
+
+    #[test]
+    fn test_zreference_with_array() {
+        // Test: References work with arrays
+
+        let arr = ZVal::array(0x1000); // Placeholder pointer
+        let reference = ZReference::new(arr);
+
+        assert!(matches!(reference.get().type_tag, ZValType::Array));
+    }
+
+    #[test]
+    fn test_zreference_drop_decrements_refcount() {
+        // Test: Dropping a reference decrements refcount
+
+        let val = ZVal::long(300);
+        let ref1 = ZReference::new(val);
+        let ref2 = ref1.clone();
+
+        assert_eq!(ref1.refcount(), 2);
+
+        drop(ref2);
+
+        // After dropping ref2, refcount should be 1
+        assert_eq!(ref1.refcount(), 1);
     }
 }

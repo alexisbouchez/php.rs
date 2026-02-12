@@ -92,7 +92,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 1.6.2  Test: create, access, destroy callback
 
 ## 1.7 References
-[ ] 1.7.1  Define ZReference: refcount + wrapped ZVal
+[x] 1.7.1  Define ZReference: refcount + wrapped ZVal
 [ ] 1.7.2  Test: assign by reference, modify through reference
 [ ] 1.7.3  Test: unset reference, reference to reference
 
