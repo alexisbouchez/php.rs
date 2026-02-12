@@ -19,16 +19,16 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 ################################################################################
 
 [x] 0.1  Initialize Cargo workspace at php.rs/ with workspace members
-[ ] 0.2  Create crate stubs:
-         [ ] crates/php-rs-types/
-         [ ] crates/php-rs-lexer/
-         [ ] crates/php-rs-parser/
-         [ ] crates/php-rs-compiler/
-         [ ] crates/php-rs-vm/
-         [ ] crates/php-rs-gc/
-         [ ] crates/php-rs-runtime/
-         [ ] crates/php-rs-ext-standard/
-         [ ] crates/php-rs-sapi-cli/
+[x] 0.2  Create crate stubs:
+         [x] crates/php-rs-types/
+         [x] crates/php-rs-lexer/
+         [x] crates/php-rs-parser/
+         [x] crates/php-rs-compiler/
+         [x] crates/php-rs-vm/
+         [x] crates/php-rs-gc/
+         [x] crates/php-rs-runtime/
+         [x] crates/php-rs-ext-standard/
+         [x] crates/php-rs-sapi-cli/
 [ ] 0.3  Set up CI (GitHub Actions): cargo test, cargo clippy, cargo fmt --check
 [ ] 0.4  Add benchmark harness (criterion) in crates/php-rs-vm/benches/
 [ ] 0.5  Write PHPT test runner scaffold:
