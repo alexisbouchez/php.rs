@@ -13,6 +13,10 @@ enum State {
     InScripting,
     /// ST_DOUBLE_QUOTES - inside double-quoted string with interpolation
     DoubleQuotes,
+    /// ST_HEREDOC - inside heredoc with interpolation
+    Heredoc,
+    /// ST_NOWDOC - inside nowdoc (no interpolation)
+    Nowdoc,
 }
 
 /// PHP Lexer
@@ -29,6 +33,8 @@ pub struct Lexer<'src> {
     state: State,
     /// Whether short open tags are enabled (short_open_tag INI)
     allow_short_tags: bool,
+    /// Heredoc/nowdoc label (used to match closing marker)
+    heredoc_label: Option<String>,
 }
 
 impl<'src> Lexer<'src> {
@@ -41,6 +47,7 @@ impl<'src> Lexer<'src> {
             column: 1,
             state: State::Initial,
             allow_short_tags: false,
+            heredoc_label: None,
         }
     }
 
@@ -53,6 +60,7 @@ impl<'src> Lexer<'src> {
             column: 1,
             state: State::Initial,
             allow_short_tags: true,
+            heredoc_label: None,
         }
     }
 
@@ -118,6 +126,8 @@ impl<'src> Lexer<'src> {
             State::Initial => self.scan_initial(),
             State::InScripting => self.scan_scripting(),
             State::DoubleQuotes => self.scan_double_quotes_state(),
+            State::Heredoc => self.scan_heredoc_state(),
+            State::Nowdoc => self.scan_nowdoc_state(),
         }
     }
 
@@ -650,6 +660,235 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Scan heredoc state - like double quotes, supports variable interpolation
+    /// Reference: php-src/Zend/zend_language_scanner.l (ST_HEREDOC state)
+    fn scan_heredoc_state(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Get the label we're looking for
+        let label = self.heredoc_label.as_ref()?.clone();
+
+        // Check if we're at the start of a line and the label matches
+        // Heredoc closing label must be at the start of a line (possibly with indentation)
+        if self.column == 1 || self.is_at_line_start_with_whitespace() {
+            if let Some(_end_pos) = self.check_heredoc_end(&label) {
+                // We found the closing label
+                // Scan it and emit EndHeredoc token
+                return self.scan_heredoc_end(&label);
+            }
+        }
+
+        // Not at closing label, scan content like in double quotes
+        // Heredoc supports variable interpolation
+        loop {
+            match self.peek() {
+                None => {
+                    // EOF - return what we have
+                    if self.pos > start_pos {
+                        return Some((
+                            Token::EncapsedAndWhitespace,
+                            Span::new(start_pos, self.pos, start_line, start_column),
+                        ));
+                    } else {
+                        return None;
+                    }
+                }
+                Some('$') => {
+                    // Check if this starts a variable
+                    if let Some(next_ch) = self.source[self.pos + 1..].chars().next() {
+                        if next_ch.is_ascii_alphabetic() || next_ch == '_' {
+                            // Emit the string part before the variable (if any)
+                            if self.pos > start_pos {
+                                return Some((
+                                    Token::EncapsedAndWhitespace,
+                                    Span::new(start_pos, self.pos, start_line, start_column),
+                                ));
+                            } else {
+                                // Scan the variable
+                                let var_start = self.pos;
+                                let var_line = self.line;
+                                let var_column = self.column;
+
+                                self.consume(); // $
+
+                                // Consume variable name
+                                while let Some(ch) = self.peek() {
+                                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                                        self.consume();
+                                    } else {
+                                        break;
+                                    }
+                                }
+
+                                return Some((
+                                    Token::Variable,
+                                    Span::new(var_start, self.pos, var_line, var_column),
+                                ));
+                            }
+                        }
+                    }
+                    // Not a variable, just a regular $ character
+                    self.consume();
+                }
+                Some('\n') => {
+                    // Consume newline and check if next line starts with closing label
+                    self.consume();
+
+                    // Check if we're now at the closing label
+                    if let Some(_end_pos) = self.check_heredoc_end(&label) {
+                        // Emit the content up to this point (including the newline)
+                        return Some((
+                            Token::EncapsedAndWhitespace,
+                            Span::new(start_pos, self.pos, start_line, start_column),
+                        ));
+                    }
+                }
+                Some(_) => {
+                    // Regular character
+                    self.consume();
+                }
+            }
+        }
+    }
+
+    /// Scan nowdoc state - like single quotes, NO variable interpolation
+    /// Reference: php-src/Zend/zend_language_scanner.l (ST_NOWDOC state)
+    fn scan_nowdoc_state(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Get the label we're looking for
+        let label = self.heredoc_label.as_ref()?.clone();
+
+        // First, check if we're already at the closing label
+        // (This happens when we're called right after consuming a newline)
+        if self.column == 1 || self.is_at_line_start_with_whitespace() {
+            if let Some(_end_pos) = self.check_heredoc_end(&label) {
+                // We found the closing label immediately
+                // Scan it and emit EndHeredoc token
+                return self.scan_heredoc_end(&label);
+            }
+        }
+
+        // Scan until we find the closing label
+        loop {
+            match self.peek() {
+                None => {
+                    // EOF - return what we have
+                    if self.pos > start_pos {
+                        return Some((
+                            Token::EncapsedAndWhitespace,
+                            Span::new(start_pos, self.pos, start_line, start_column),
+                        ));
+                    } else {
+                        return None;
+                    }
+                }
+                Some('\n') => {
+                    // Consume newline
+                    self.consume();
+
+                    // Check if we're now at the closing label
+                    if let Some(_end_pos) = self.check_heredoc_end(&label) {
+                        // Emit the content up to this point (including the newline)
+                        return Some((
+                            Token::EncapsedAndWhitespace,
+                            Span::new(start_pos, self.pos, start_line, start_column),
+                        ));
+                    }
+                }
+                Some(_) => {
+                    // In nowdoc, everything is literal text (no escape sequences)
+                    self.consume();
+                }
+            }
+        }
+    }
+
+    /// Scan and emit the heredoc/nowdoc end label
+    fn scan_heredoc_end(&mut self, label: &str) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Skip any leading whitespace (flexible heredoc/nowdoc syntax)
+        while let Some(ch) = self.peek() {
+            if ch == ' ' || ch == '\t' {
+                self.consume();
+            } else {
+                break;
+            }
+        }
+
+        // Consume the label
+        for _ in 0..label.len() {
+            self.consume()?;
+        }
+
+        let end_pos = self.pos;
+
+        // Switch back to InScripting state
+        self.state = State::InScripting;
+        self.heredoc_label = None;
+
+        Some((
+            Token::EndHeredoc,
+            Span::new(start_pos, end_pos, start_line, start_column),
+        ))
+    }
+
+    /// Check if we're at a heredoc/nowdoc closing label
+    /// Returns Some(end_pos) if we found the label, None otherwise
+    fn check_heredoc_end(&self, label: &str) -> Option<usize> {
+        let mut pos = self.pos;
+
+        // Skip any leading whitespace (flexible heredoc/nowdoc syntax)
+        while pos < self.source.len() {
+            let ch = self.source[pos..].chars().next()?;
+            if ch == ' ' || ch == '\t' {
+                pos += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+
+        // Check if the label matches
+        if self.source[pos..].starts_with(label) {
+            let label_end = pos + label.len();
+
+            // After the label, we expect ; or newline or EOF
+            if label_end >= self.source.len() {
+                return Some(label_end);
+            }
+
+            let next_ch = self.source[label_end..].chars().next()?;
+            if next_ch == ';' || next_ch == '\n' || next_ch == '\r' {
+                return Some(label_end);
+            }
+        }
+
+        None
+    }
+
+    /// Check if we're at the start of a line (possibly with whitespace)
+    fn is_at_line_start_with_whitespace(&self) -> bool {
+        // Look backwards to see if we're only preceded by whitespace since last newline
+        let mut i = self.pos;
+        while i > 0 {
+            i -= 1;
+            match self.source.as_bytes()[i] {
+                b' ' | b'\t' => continue,
+                b'\n' | b'\r' => return true,
+                _ => return false,
+            }
+        }
+        // We're at the start of the file
+        true
+    }
+
     /// Scan heredoc or nowdoc
     /// Reference: php-src/Zend/zend_language_scanner.l
     /// Heredoc: <<<LABEL or <<<"LABEL" or <<<'LABEL'
@@ -685,7 +924,7 @@ impl<'src> Lexer<'src> {
         };
 
         // Read the label (identifier)
-        let _label_start = self.pos; // Will be used later for extracting label
+        let label_start = self.pos;
         let first_char = self.peek()?;
 
         // Label must start with letter or underscore
@@ -710,8 +949,8 @@ impl<'src> Lexer<'src> {
             }
         }
 
-        let _label_end = self.pos;
-        // let label = &self.source[label_start..label_end];
+        let label_end = self.pos;
+        let label = &self.source[label_start..label_end];
 
         // If quoted, we need the closing quote
         if let Some(quote) = quote_char {
@@ -756,12 +995,19 @@ impl<'src> Lexer<'src> {
         }
 
         // We've successfully scanned a heredoc/nowdoc start
-        // For now, we just return StartHeredoc token
-        // The distinction between heredoc and nowdoc will be handled by checking
-        // if the label was single-quoted (nowdoc) or not (heredoc)
-        //
-        // Note: In full implementation, we would also scan the body and closing marker
-        // But for this task, we're just scanning the opening marker
+        // Store the label and switch to appropriate state
+        // Nowdoc: single-quoted label (no interpolation)
+        // Heredoc: unquoted or double-quoted label (with interpolation)
+
+        self.heredoc_label = Some(label.to_string());
+
+        // Determine if this is heredoc or nowdoc based on quote_char
+        let is_nowdoc = quote_char == Some('\'');
+        if is_nowdoc {
+            self.state = State::Nowdoc;
+        } else {
+            self.state = State::Heredoc;
+        }
 
         let span = Span::new(start_pos, span_end, start_line, start_column);
         Some((Token::StartHeredoc, span))
@@ -4897,5 +5143,161 @@ mod tests {
         let (token3, span3) = lexer.next_token().expect("Token 3");
         assert_eq!(token3, Token::EncapsedAndWhitespace);
         assert_eq!(span3.extract(source), r#"""#);
+    }
+
+    // ======================================================================
+    // Task 2.3.2: Test heredoc/nowdoc body scanning
+    // Reference: php-src/Zend/zend_language_scanner.l (ST_HEREDOC, ST_NOWDOC states)
+    // ======================================================================
+
+    #[test]
+    fn test_heredoc_body_simple() {
+        // Test: Heredoc with simple text body
+        // Expected token sequence:
+        //   StartHeredoc: "<<<EOT"
+        //   EncapsedAndWhitespace: "Hello World"
+        //   EndHeredoc: "EOT"
+        let source = "<?php <<<EOT\nHello World\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, span1) = lexer.next_token().expect("StartHeredoc token");
+        assert_eq!(token1, Token::StartHeredoc);
+        assert_eq!(span1.extract(source), "<<<EOT");
+
+        let (token2, span2) = lexer.next_token().expect("Heredoc body token");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        assert_eq!(span2.extract(source), "Hello World\n");
+
+        let (token3, span3) = lexer.next_token().expect("EndHeredoc token");
+        assert_eq!(token3, Token::EndHeredoc);
+        assert_eq!(span3.extract(source), "EOT");
+    }
+
+    #[test]
+    fn test_heredoc_body_multiline() {
+        // Test: Heredoc with multiline body
+        let source = "<?php <<<EOT\nLine 1\nLine 2\nLine 3\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("Body");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        assert_eq!(span2.extract(source), "Line 1\nLine 2\nLine 3\n");
+
+        let (token3, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token3, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_body_empty() {
+        // Test: Empty heredoc (no body)
+        let source = "<?php <<<EOT\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token2, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_body_with_variable() {
+        // Test: Heredoc with variable interpolation
+        // Expected: Variables should be tokenized like in double-quoted strings
+        let source = "<?php <<<EOT\nHello $name\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("Body before var");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        assert_eq!(span2.extract(source), "Hello ");
+
+        let (token3, span3) = lexer.next_token().expect("Variable");
+        assert_eq!(token3, Token::Variable);
+        assert_eq!(span3.extract(source), "$name");
+
+        let (token4, span4) = lexer.next_token().expect("Body after var");
+        assert_eq!(token4, Token::EncapsedAndWhitespace);
+        assert_eq!(span4.extract(source), "\n");
+
+        let (token5, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token5, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_nowdoc_body_simple() {
+        // Test: Nowdoc with simple text body
+        // Nowdoc uses single quotes, so NO interpolation
+        let source = "<?php <<<'EOT'\nHello $name\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("Nowdoc body");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        // In nowdoc, $name is literal text, not a variable
+        assert_eq!(span2.extract(source), "Hello $name\n");
+
+        let (token3, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token3, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_indented_closing() {
+        // Test: Flexible heredoc (PHP 7.3+) - indented closing marker
+        // The closing marker can be indented
+        let source = "<?php <<<EOT\n    Hello\n    EOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("Body");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        // Body should preserve indentation
+        assert_eq!(span2.extract(source), "    Hello\n");
+
+        let (token3, span3) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token3, Token::EndHeredoc);
+        // Closing marker includes indentation in its span
+        assert!(span3.extract(source).contains("EOT"));
+    }
+
+    #[test]
+    fn test_heredoc_label_not_matching_in_body() {
+        // Test: Label appearing in body but not at start of line doesn't end heredoc
+        let source = "<?php <<<EOT\nThis has EOT in the middle\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("Body");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        // "EOT" in middle of line doesn't end the heredoc
+        assert_eq!(span2.extract(source), "This has EOT in the middle\n");
+
+        let (token3, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token3, Token::EndHeredoc);
     }
 }
