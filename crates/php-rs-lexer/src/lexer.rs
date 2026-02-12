@@ -505,6 +505,123 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Scan heredoc or nowdoc
+    /// Reference: php-src/Zend/zend_language_scanner.l
+    /// Heredoc: <<<LABEL or <<<"LABEL" or <<<'LABEL'
+    /// Nowdoc: <<<'LABEL' (single quotes only)
+    fn scan_heredoc_or_nowdoc(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Consume <<<
+        if self.peek_str(3) != "<<<" {
+            return None;
+        }
+        self.consume_bytes(3);
+
+        // Skip any whitespace after <<<
+        while let Some(ch) = self.peek() {
+            if ch == ' ' || ch == '\t' {
+                self.consume();
+            } else {
+                break;
+            }
+        }
+
+        // Check if we have a quote
+        let is_quoted = matches!(self.peek(), Some('\'') | Some('"'));
+        let quote_char = if is_quoted {
+            let q = self.peek()?;
+            self.consume();
+            Some(q)
+        } else {
+            None
+        };
+
+        // Read the label (identifier)
+        let _label_start = self.pos; // Will be used later for extracting label
+        let first_char = self.peek()?;
+
+        // Label must start with letter or underscore
+        if !first_char.is_alphabetic() && first_char != '_' {
+            // Not a valid heredoc/nowdoc label
+            // This could be <<< used as operator sequence
+            // Backtrack and return None
+            self.pos = start_pos;
+            self.line = start_line;
+            self.column = start_column;
+            return None;
+        }
+
+        self.consume();
+
+        // Continue reading label (alphanumeric and underscore)
+        while let Some(ch) = self.peek() {
+            if ch.is_alphanumeric() || ch == '_' {
+                self.consume();
+            } else {
+                break;
+            }
+        }
+
+        let _label_end = self.pos;
+        // let label = &self.source[label_start..label_end];
+
+        // If quoted, we need the closing quote
+        if let Some(quote) = quote_char {
+            if self.peek() != Some(quote) {
+                // Missing closing quote - invalid
+                self.pos = start_pos;
+                self.line = start_line;
+                self.column = start_column;
+                return None;
+            }
+            self.consume();
+        }
+
+        // After the label (and optional closing quote), we expect newline or whitespace
+        // In PHP, the heredoc label line should end with a newline
+        // Capture the span BEFORE consuming the newline
+        let span_end = self.pos;
+
+        // Consume optional whitespace and newline (but don't include in span)
+        while let Some(ch) = self.peek() {
+            if ch == ' ' || ch == '\t' {
+                self.consume();
+            } else if ch == '\n' || ch == '\r' {
+                // Consume newline
+                if ch == '\r' {
+                    self.consume();
+                    if self.peek() == Some('\n') {
+                        self.consume(); // \r\n
+                    }
+                } else {
+                    self.consume(); // \n
+                }
+                break;
+            } else {
+                // Invalid character after heredoc label
+                // This might not be a heredoc after all
+                self.pos = start_pos;
+                self.line = start_line;
+                self.column = start_column;
+                return None;
+            }
+        }
+
+        // We've successfully scanned a heredoc/nowdoc start
+        // For now, we just return StartHeredoc token
+        // The distinction between heredoc and nowdoc will be handled by checking
+        // if the label was single-quoted (nowdoc) or not (heredoc)
+        //
+        // Note: In full implementation, we would also scan the body and closing marker
+        // But for this task, we're just scanning the opening marker
+
+        let span = Span::new(start_pos, span_end, start_line, start_column);
+        Some((Token::StartHeredoc, span))
+    }
+
     /// Scan in ST_IN_SCRIPTING state - inside PHP code
     fn scan_scripting(&mut self) -> Option<(Token, Span)> {
         // Skip whitespace
@@ -619,6 +736,21 @@ impl<'src> Lexer<'src> {
                 Span::new(start_pos, self.pos, start_line, start_column),
             ));
         }
+        // Check for heredoc/nowdoc before left shift operator
+        // Heredoc: <<<LABEL or <<<"LABEL" or <<<'LABEL'
+        // Nowdoc: <<<'LABEL' (single quotes)
+        if self.peek_str(3) == "<<<" {
+            // Peek ahead to see if this is heredoc/nowdoc or just <<< operator sequence
+            // For heredoc/nowdoc, after <<< we need either:
+            // - An identifier (unquoted label)
+            // - A quoted identifier ('LABEL' or "LABEL")
+            // We'll try to scan it as heredoc/nowdoc
+            if let Some(heredoc_token) = self.scan_heredoc_or_nowdoc() {
+                return Some(heredoc_token);
+            }
+            // If scan_heredoc_or_nowdoc returns None, fall through to regular << handling
+        }
+
         if self.peek_str(2) == "<<" {
             self.consume_bytes(2);
             return Some((
@@ -3176,5 +3308,192 @@ mod tests {
         let (token, span) = lexer.next_token().expect("Should tokenize string");
         assert_eq!(token, Token::ConstantEncapsedString);
         assert_eq!(span.extract(source), r#""hello $var world""#);
+    }
+
+    // ======================================================================
+    // Task 2.2.7: Test heredoc implementation
+    // ======================================================================
+
+    #[test]
+    fn test_heredoc_simple() {
+        // Test: Basic heredoc syntax
+        // Reference: php-src/Zend/tests/heredoc_nowdoc/heredoc_001.phpt
+        let source = "<?php <<<EOT\nHello World\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize heredoc");
+        assert_eq!(token, Token::StartHeredoc);
+        assert_eq!(span.extract(source), "<<<EOT");
+    }
+
+    #[test]
+    fn test_heredoc_with_content() {
+        // Test: Heredoc with multiline content
+        let source = "<?php <<<EOT\nLine 1\nLine 2\nLine 3\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, _) = lexer.next_token().expect("Should tokenize heredoc start");
+        assert_eq!(token, Token::StartHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_empty() {
+        // Test: Empty heredoc
+        let source = "<?php <<<EOT\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, _) = lexer.next_token().expect("Should tokenize empty heredoc");
+        assert_eq!(token, Token::StartHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_different_labels() {
+        // Test: Heredoc with different delimiter labels
+        let labels = vec!["EOT", "EOF", "HTML", "SQL", "END", "MARKER"];
+
+        for label in labels {
+            let source = format!("<?php <<<{}\nContent\n{};\n", label, label);
+            let mut lexer = Lexer::new(&source);
+
+            lexer.next_token(); // Skip <?php
+
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize heredoc with label {}", label));
+            assert_eq!(token, Token::StartHeredoc, "Failed for label: {}", label);
+            assert_eq!(
+                span.extract(&source),
+                format!("<<<{}", label),
+                "Failed for label: {}",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_heredoc_indented_modern() {
+        // Test: Flexible heredoc (PHP 7.3+) - indented closing marker
+        // Reference: php-src/Zend/tests/heredoc_nowdoc/flexible-heredoc-complex-test1.phpt
+        let source = "<?php <<<EOT\n    Line 1\n    Line 2\n    EOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, _) = lexer
+            .next_token()
+            .expect("Should tokenize flexible heredoc");
+        assert_eq!(token, Token::StartHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_no_semicolon() {
+        // Test: Heredoc without trailing semicolon (valid in some contexts)
+        let source = "<?php <<<EOT\nContent\nEOT\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, _) = lexer.next_token().expect("Should tokenize heredoc");
+        assert_eq!(token, Token::StartHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_assignment() {
+        // Test: Heredoc in assignment context
+        let source = "<?php $var = <<<EOT\nHello\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (var_token, _) = lexer.next_token().expect("Should tokenize variable");
+        assert_eq!(var_token, Token::Variable);
+
+        // Skip = operator (BadCharacter for now)
+        lexer.next_token();
+
+        let (heredoc_token, _) = lexer.next_token().expect("Should tokenize heredoc");
+        assert_eq!(heredoc_token, Token::StartHeredoc);
+    }
+
+    #[test]
+    fn test_nowdoc_simple() {
+        // Test: Basic nowdoc syntax (single quotes around label)
+        // Reference: php-src/Zend/tests/heredoc_nowdoc/nowdoc_001.phpt
+        // Note: PHP uses T_START_HEREDOC for both heredoc and nowdoc
+        // The distinction is made by checking if the label is quoted
+        let source = "<?php <<<'EOT'\nHello World\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize nowdoc");
+        assert_eq!(token, Token::StartHeredoc); // Both use StartHeredoc
+        assert_eq!(span.extract(source), "<<<'EOT'");
+    }
+
+    #[test]
+    fn test_nowdoc_double_quotes_syntax() {
+        // Test: Heredoc can also use double quotes (optional)
+        // <<<\"EOT\" is valid heredoc syntax
+        let source = "<?php <<<\"EOT\"\nContent\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize");
+        assert_eq!(token, Token::StartHeredoc);
+        assert_eq!(span.extract(source), "<<<\"EOT\"");
+    }
+
+    #[test]
+    fn test_nowdoc_no_interpolation_marker() {
+        // Test: Nowdoc uses single quotes - this is the marker for no interpolation
+        let source = "<?php <<<'EOT'\n$var {$var}\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize nowdoc");
+        assert_eq!(token, Token::StartHeredoc);
+        assert_eq!(span.extract(source), "<<<'EOT'");
+        // Content tokenization would be tested in subsequent tokens
+        // The lexer/parser will need to remember that this was a nowdoc (quoted label)
+    }
+
+    #[test]
+    fn test_heredoc_vs_nowdoc_label_distinction() {
+        // Test: Ensure heredoc and nowdoc labels are distinguished correctly
+        // PHP uses the same token (T_START_HEREDOC) but the label format differs
+        let test_cases = vec![
+            ("<?php <<<EOT\nEOT;\n", Token::StartHeredoc, "<<<EOT"),
+            ("<?php <<<'EOT'\nEOT;\n", Token::StartHeredoc, "<<<'EOT'"),
+            (
+                "<?php <<<\"EOT\"\nEOT;\n",
+                Token::StartHeredoc,
+                "<<<\"EOT\"",
+            ),
+        ];
+
+        for (source, expected_token, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, expected_token, "Failed for: {}", source);
+            assert_eq!(
+                span.extract(source),
+                expected_text,
+                "Failed for: {}",
+                source
+            );
+        }
     }
 }
