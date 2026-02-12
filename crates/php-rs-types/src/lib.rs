@@ -3037,10 +3037,15 @@ where
 /// - Packed mode: consecutive integer keys 0..n, stored as Vec<ZVal>
 /// - Hash mode: arbitrary keys (strings or non-consecutive integers), stored as RobinHoodTable
 ///
+/// Copy-on-Write (CoW) semantics:
+/// The storage is wrapped in Arc for reference counting. When an array is cloned,
+/// the storage is shared. On the first write operation (insert, remove, push),
+/// if the reference count > 1, the storage is cloned (copy-on-write).
+///
 /// Reference: php-src/Zend/zend_hash.h, zend_hash.c
 #[derive(Debug, Clone)]
 pub struct ZArray {
-    storage: ArrayStorage,
+    storage: Arc<ArrayStorage>,
 }
 
 #[derive(Debug, Clone)]
@@ -3064,30 +3069,49 @@ impl ZArray {
     /// Create a new empty array in packed mode
     pub fn new() -> Self {
         Self {
-            storage: ArrayStorage::Packed(Vec::new()),
+            storage: Arc::new(ArrayStorage::Packed(Vec::new())),
         }
     }
 
     /// Create a new array with a specific capacity in packed mode
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            storage: ArrayStorage::Packed(Vec::with_capacity(capacity)),
+            storage: Arc::new(ArrayStorage::Packed(Vec::with_capacity(capacity))),
+        }
+    }
+
+    /// Get the reference count of the underlying storage
+    ///
+    /// Returns the number of ZArray instances sharing the same storage.
+    /// When this is > 1, a write operation will trigger copy-on-write.
+    pub fn refcount(&self) -> usize {
+        Arc::strong_count(&self.storage)
+    }
+
+    /// Ensure we have unique ownership of the storage (for copy-on-write)
+    ///
+    /// If the storage is shared (refcount > 1), this clones the storage so we have
+    /// exclusive access. This is called before any mutating operation.
+    fn make_mut(&mut self) {
+        if Arc::strong_count(&self.storage) > 1 {
+            // Clone the storage (copy-on-write)
+            self.storage = Arc::new((*self.storage).clone());
         }
     }
 
     /// Check if array is in packed mode
     pub fn is_packed(&self) -> bool {
-        matches!(self.storage, ArrayStorage::Packed(_))
+        matches!(self.storage.as_ref(), ArrayStorage::Packed(_))
     }
 
     /// Check if array is in hash mode
     pub fn is_hash(&self) -> bool {
-        matches!(self.storage, ArrayStorage::Hash(_))
+        matches!(self.storage.as_ref(), ArrayStorage::Hash(_))
     }
 
     /// Get the number of elements in the array
     pub fn len(&self) -> usize {
-        match &self.storage {
+        match self.storage.as_ref() {
             ArrayStorage::Packed(vec) => vec.len(),
             ArrayStorage::Hash(map) => map.len(),
         }
@@ -3102,8 +3126,16 @@ impl ZArray {
     ///
     /// If we're in packed mode and the key is the next sequential index,
     /// we stay in packed mode. Otherwise, we promote to hash mode.
+    ///
+    /// Triggers copy-on-write if storage is shared.
     pub fn insert_int(&mut self, key: i64, value: ZVal) {
-        match &mut self.storage {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
             ArrayStorage::Packed(vec) => {
                 // Check if this key is the next sequential index
                 if key >= 0 && key as usize == vec.len() {
@@ -3111,11 +3143,12 @@ impl ZArray {
                     vec.push(value);
                 } else {
                     // Need to promote to hash mode
-                    self.promote_to_hash();
-                    // Now insert
-                    if let ArrayStorage::Hash(map) = &mut self.storage {
-                        map.insert(ArrayKey::Int(key), value);
+                    let mut table = RobinHoodTable::with_capacity(vec.len() + 1);
+                    for (i, val) in vec.iter().enumerate() {
+                        table.insert(ArrayKey::Int(i as i64), val.clone());
                     }
+                    table.insert(ArrayKey::Int(key), value);
+                    *storage = ArrayStorage::Hash(table);
                 }
             }
             ArrayStorage::Hash(map) => {
@@ -3127,15 +3160,24 @@ impl ZArray {
     /// Insert a value with a string key
     ///
     /// This always promotes to hash mode if we're in packed mode.
+    ///
+    /// Triggers copy-on-write if storage is shared.
     pub fn insert_string(&mut self, key: ZString, value: ZVal) {
-        match &mut self.storage {
-            ArrayStorage::Packed(_) => {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
+            ArrayStorage::Packed(vec) => {
                 // Promote to hash mode
-                self.promote_to_hash();
-                // Now insert
-                if let ArrayStorage::Hash(map) = &mut self.storage {
-                    map.insert(ArrayKey::String(key), value);
+                let mut table = RobinHoodTable::with_capacity(vec.len() + 1);
+                for (i, val) in vec.iter().enumerate() {
+                    table.insert(ArrayKey::Int(i as i64), val.clone());
                 }
+                table.insert(ArrayKey::String(key), value);
+                *storage = ArrayStorage::Hash(table);
             }
             ArrayStorage::Hash(map) => {
                 map.insert(ArrayKey::String(key), value);
@@ -3143,22 +3185,9 @@ impl ZArray {
         }
     }
 
-    /// Promote from packed mode to hash mode
-    ///
-    /// Converts the Vec into a RobinHoodTable with keys 0, 1, 2, ...
-    fn promote_to_hash(&mut self) {
-        if let ArrayStorage::Packed(vec) = &self.storage {
-            let mut table = RobinHoodTable::with_capacity(vec.len());
-            for (i, val) in vec.iter().enumerate() {
-                table.insert(ArrayKey::Int(i as i64), val.clone());
-            }
-            self.storage = ArrayStorage::Hash(table);
-        }
-    }
-
     /// Get a value by integer key
     pub fn get_int(&self, key: i64) -> Option<&ZVal> {
-        match &self.storage {
+        match self.storage.as_ref() {
             ArrayStorage::Packed(vec) => {
                 if key >= 0 && (key as usize) < vec.len() {
                     Some(&vec[key as usize])
@@ -3172,7 +3201,7 @@ impl ZArray {
 
     /// Get a value by string key
     pub fn get_string(&self, key: &ZString) -> Option<&ZVal> {
-        match &self.storage {
+        match self.storage.as_ref() {
             ArrayStorage::Packed(_) => None, // Packed mode has no string keys
             ArrayStorage::Hash(map) => map.get(&ArrayKey::String(key.clone())),
         }
@@ -3181,8 +3210,16 @@ impl ZArray {
     /// Push a value onto the end of the array (like $arr[] = $val in PHP)
     ///
     /// This finds the next free integer key and inserts there.
+    ///
+    /// Triggers copy-on-write if storage is shared.
     pub fn push(&mut self, value: ZVal) {
-        match &mut self.storage {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
             ArrayStorage::Packed(vec) => {
                 vec.push(value);
             }
@@ -3206,18 +3243,28 @@ impl ZArray {
     ///
     /// Returns the removed value if it existed, None otherwise.
     /// Note: In packed mode, this promotes to hash mode (PHP behavior).
+    ///
+    /// Triggers copy-on-write if storage is shared.
     pub fn remove_int(&mut self, key: i64) -> Option<ZVal> {
-        match &mut self.storage {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
             ArrayStorage::Packed(vec) => {
                 // In PHP, unset() on a packed array promotes to hash mode
                 // because we need to maintain gaps
                 if key >= 0 && (key as usize) < vec.len() {
-                    self.promote_to_hash();
-                    if let ArrayStorage::Hash(map) = &mut self.storage {
-                        map.delete(&ArrayKey::Int(key))
-                    } else {
-                        None
+                    // Promote to hash mode
+                    let mut table = RobinHoodTable::with_capacity(vec.len());
+                    for (i, val) in vec.iter().enumerate() {
+                        table.insert(ArrayKey::Int(i as i64), val.clone());
                     }
+                    let result = table.delete(&ArrayKey::Int(key));
+                    *storage = ArrayStorage::Hash(table);
+                    result
                 } else {
                     None
                 }
@@ -3229,8 +3276,16 @@ impl ZArray {
     /// Remove a value by string key
     ///
     /// Returns the removed value if it existed, None otherwise.
+    ///
+    /// Triggers copy-on-write if storage is shared.
     pub fn remove_string(&mut self, key: &ZString) -> Option<ZVal> {
-        match &mut self.storage {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
             ArrayStorage::Packed(_) => None, // Packed mode has no string keys
             ArrayStorage::Hash(map) => map.delete(&ArrayKey::String(key.clone())),
         }
@@ -3242,7 +3297,7 @@ impl ZArray {
     /// For packed mode, keys are integers 0..n.
     /// For hash mode, order is preserved based on insertion order.
     pub fn iter(&self) -> Vec<(ZArrayKey, &ZVal)> {
-        match &self.storage {
+        match self.storage.as_ref() {
             ArrayStorage::Packed(vec) => vec
                 .iter()
                 .enumerate()
@@ -3263,7 +3318,7 @@ impl ZArray {
 
     /// Iterate over keys in insertion order
     pub fn keys(&self) -> Vec<ZArrayKey> {
-        match &self.storage {
+        match self.storage.as_ref() {
             ArrayStorage::Packed(vec) => (0..vec.len() as i64).map(ZArrayKey::Int).collect(),
             ArrayStorage::Hash(map) => map
                 .insertion_order
@@ -3278,7 +3333,7 @@ impl ZArray {
 
     /// Iterate over values in insertion order
     pub fn values(&self) -> Vec<&ZVal> {
-        match &self.storage {
+        match self.storage.as_ref() {
             ArrayStorage::Packed(vec) => vec.iter().collect(),
             ArrayStorage::Hash(map) => map
                 .insertion_order
@@ -4091,5 +4146,185 @@ mod zarray_tests {
         assert_eq!(items[1].1.to_long(), 999); // Updated value
         assert_eq!(items[2].0, ZArrayKey::Int(3));
         assert_eq!(items[2].1.to_long(), 30);
+    }
+
+    /// Test copy-on-write (CoW) semantics for ZArray
+    ///
+    /// Reference: php-src/Zend/zend_hash.c — PHP arrays use refcounting + CoW
+    /// When an array is cloned, the underlying storage is shared until a modification occurs.
+    #[test]
+    fn test_zarray_cow_basic() {
+        // Create original array
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(1));
+        arr1.push(ZVal::long(2));
+        arr1.push(ZVal::long(3));
+
+        // Clone the array (should share storage initially)
+        let arr2 = arr1.clone();
+
+        // Both should have the same values
+        assert_eq!(arr1.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr1.get_int(1).unwrap().to_long(), 2);
+        assert_eq!(arr1.get_int(2).unwrap().to_long(), 3);
+        assert_eq!(arr2.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr2.get_int(1).unwrap().to_long(), 2);
+        assert_eq!(arr2.get_int(2).unwrap().to_long(), 3);
+
+        // Verify storage is shared (reference count should be 2)
+        assert_eq!(arr1.refcount(), 2);
+        assert_eq!(arr2.refcount(), 2);
+
+        // Modify arr1 (should trigger CoW)
+        arr1.insert_int(0, ZVal::long(99));
+
+        // After modification, storage should be separated
+        assert_eq!(arr1.refcount(), 1);
+        assert_eq!(arr2.refcount(), 1);
+
+        // arr1 should have the modified value
+        assert_eq!(arr1.get_int(0).unwrap().to_long(), 99);
+        assert_eq!(arr1.get_int(1).unwrap().to_long(), 2);
+        assert_eq!(arr1.get_int(2).unwrap().to_long(), 3);
+
+        // arr2 should still have the original value
+        assert_eq!(arr2.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr2.get_int(1).unwrap().to_long(), 2);
+        assert_eq!(arr2.get_int(2).unwrap().to_long(), 3);
+    }
+
+    #[test]
+    fn test_zarray_cow_no_copy_on_read() {
+        // Create and clone array
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(10));
+        arr1.push(ZVal::long(20));
+
+        let arr2 = arr1.clone();
+
+        // Reading from either array should NOT trigger CoW
+        assert_eq!(arr1.refcount(), 2);
+        assert_eq!(arr2.refcount(), 2);
+
+        let _ = arr1.get_int(0);
+        let _ = arr2.get_int(1);
+
+        // Still shared
+        assert_eq!(arr1.refcount(), 2);
+        assert_eq!(arr2.refcount(), 2);
+    }
+
+    #[test]
+    fn test_zarray_cow_multiple_clones() {
+        // Create original array
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(1));
+        arr1.push(ZVal::long(2));
+
+        // Create multiple clones
+        let arr2 = arr1.clone();
+        let arr3 = arr1.clone();
+        let arr4 = arr2.clone();
+
+        // All should share storage (refcount = 4)
+        assert_eq!(arr1.refcount(), 4);
+        assert_eq!(arr2.refcount(), 4);
+        assert_eq!(arr3.refcount(), 4);
+        assert_eq!(arr4.refcount(), 4);
+
+        // Modify arr3
+        arr1.insert_int(0, ZVal::long(99));
+
+        // arr1 should now be separate (refcount = 1)
+        assert_eq!(arr1.refcount(), 1);
+
+        // Others should still share (refcount = 3)
+        assert_eq!(arr2.refcount(), 3);
+        assert_eq!(arr3.refcount(), 3);
+        assert_eq!(arr4.refcount(), 3);
+
+        // Verify values
+        assert_eq!(arr1.get_int(0).unwrap().to_long(), 99);
+        assert_eq!(arr2.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr3.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr4.get_int(0).unwrap().to_long(), 1);
+    }
+
+    #[test]
+    fn test_zarray_cow_hash_mode() {
+        // Test CoW with hash mode arrays
+        let mut arr1 = ZArray::new();
+        arr1.insert_string(ZString::new(b"name"), ZVal::long(100));
+        arr1.insert_string(ZString::new(b"age"), ZVal::long(200));
+
+        let arr2 = arr1.clone();
+
+        // Should share storage
+        assert_eq!(arr1.refcount(), 2);
+        assert_eq!(arr2.refcount(), 2);
+
+        // Modify arr1
+        arr1.insert_string(ZString::new(b"name"), ZVal::long(999));
+
+        // Should now be separate
+        assert_eq!(arr1.refcount(), 1);
+        assert_eq!(arr2.refcount(), 1);
+
+        // Verify values
+        assert_eq!(
+            arr1.get_string(&ZString::new(b"name")).unwrap().to_long(),
+            999
+        );
+        assert_eq!(
+            arr2.get_string(&ZString::new(b"name")).unwrap().to_long(),
+            100
+        );
+    }
+
+    #[test]
+    fn test_zarray_cow_push() {
+        // Test that push() triggers CoW
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(1));
+        arr1.push(ZVal::long(2));
+
+        let arr2 = arr1.clone();
+
+        assert_eq!(arr1.refcount(), 2);
+
+        // Push to arr1 should trigger CoW
+        arr1.push(ZVal::long(3));
+
+        assert_eq!(arr1.refcount(), 1);
+        assert_eq!(arr2.refcount(), 1);
+
+        // Verify lengths
+        assert_eq!(arr1.len(), 3);
+        assert_eq!(arr2.len(), 2);
+    }
+
+    #[test]
+    fn test_zarray_cow_remove() {
+        // Test that remove() triggers CoW
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(1));
+        arr1.push(ZVal::long(2));
+        arr1.push(ZVal::long(3));
+
+        let arr2 = arr1.clone();
+
+        assert_eq!(arr1.refcount(), 2);
+
+        // Remove from arr1 should trigger CoW
+        arr1.remove_int(1);
+
+        assert_eq!(arr1.refcount(), 1);
+        assert_eq!(arr2.refcount(), 1);
+
+        // Verify arr1 has element removed
+        assert!(arr1.get_int(1).is_none());
+
+        // Verify arr2 still has all elements
+        assert_eq!(arr2.get_int(1).unwrap().to_long(), 2);
     }
 }
