@@ -106,7 +106,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 ## 2.1 Token definitions
 [x] 2.1.1  Define Token enum matching all PHP tokens (T_VARIABLE, T_LNUMBER, T_STRING, etc.)
 [x] 2.1.2  Define Span type (byte offset start..end, line, column)
-[ ] 2.1.3  Test: Token + Span roundtrip
+[x] 2.1.3  Test: Token + Span roundtrip
 
 ## 2.2 Core scanning
 [ ] 2.2.1  Implement INITIAL state: scan <?php, <?=, <? (short_open_tag)
