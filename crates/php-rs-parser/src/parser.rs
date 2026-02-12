@@ -91,6 +91,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a statement
     pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        // Parse attributes first if present
+        let attributes = if self.current_token == Token::Attribute {
+            self.parse_attributes()?
+        } else {
+            Vec::new()
+        };
+
         match self.current_token {
             Token::If => self.parse_if_statement(),
             Token::Return => self.parse_return_statement(),
@@ -103,13 +110,13 @@ impl<'a> Parser<'a> {
             Token::Try => self.parse_try_statement(),
             Token::Namespace => self.parse_namespace_statement(),
             Token::Use => self.parse_use_statement(),
-            Token::Function => self.parse_function_statement(),
+            Token::Function => self.parse_function_statement_with_attributes(attributes),
             Token::Class | Token::Abstract | Token::Final | Token::Readonly => {
-                self.parse_class_statement()
+                self.parse_class_statement_with_attributes(attributes)
             }
-            Token::Interface => self.parse_interface_statement(),
-            Token::Trait => self.parse_trait_statement(),
-            Token::Enum => self.parse_enum_statement(),
+            Token::Interface => self.parse_interface_statement_with_attributes(attributes),
+            Token::Trait => self.parse_trait_statement_with_attributes(attributes),
+            Token::Enum => self.parse_enum_statement_with_attributes(attributes),
             _ => {
                 // Default case: try to parse as expression statement
                 let start_span = self.current_span;
@@ -687,6 +694,64 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a qualified name (e.g., Exception, \Foo\Bar, namespace\Baz)
+    /// Parse attributes (#[...])
+    /// Syntax: #[Name] or #[Name(args)]
+    /// Can appear multiple times before a declaration
+    fn parse_attributes(&mut self) -> Result<Vec<Attribute>, ParseError> {
+        let mut attributes = Vec::new();
+
+        // Parse all consecutive attributes
+        while self.current_token == Token::Attribute {
+            let start_span = self.current_span;
+            self.expect(Token::Attribute)?; // consume #[
+
+            // Parse attribute name (qualified name)
+            let name = self.parse_qualified_name()?;
+
+            // Parse optional arguments
+            let args = if self.current_token == Token::LParen {
+                self.advance(); // consume (
+                let mut arguments = Vec::new();
+
+                // Parse comma-separated argument list
+                if self.current_token != Token::RParen {
+                    loop {
+                        // For now, parse each argument as a simple expression
+                        // In the future, we'll support named arguments, unpacking, etc.
+                        let value = self.parse_expression(0)?;
+                        arguments.push(Argument {
+                            name: None,
+                            value,
+                            unpack: false,
+                            by_ref: false,
+                        });
+
+                        if self.current_token == Token::Comma {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+
+                self.expect(Token::RParen)?;
+                arguments
+            } else {
+                Vec::new()
+            };
+
+            self.expect(Token::RBracket)?; // consume ]
+
+            attributes.push(Attribute {
+                name,
+                args,
+                span: start_span,
+            });
+        }
+
+        Ok(attributes)
+    }
+
     fn parse_qualified_name(&mut self) -> Result<Name, ParseError> {
         let mut parts = Vec::new();
         let fully_qualified =
@@ -743,9 +808,12 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse function declaration statement
-    /// Syntax: function [&] name(params) [: return_type] { body }
-    fn parse_function_statement(&mut self) -> Result<Statement, ParseError> {
+    /// Parse function declaration statement with attributes
+    /// Syntax: [attributes] function [&] name(params) [: return_type] { body }
+    fn parse_function_statement_with_attributes(
+        &mut self,
+        attributes: Vec<Attribute>,
+    ) -> Result<Statement, ParseError> {
         let start_span = self.current_span;
         self.expect(Token::Function)?;
 
@@ -797,14 +865,17 @@ impl<'a> Parser<'a> {
             return_type,
             body,
             by_ref,
-            attributes: Vec::new(), // TODO: Parse attributes
+            attributes,
             span: start_span,
         })
     }
 
     /// Parse class declaration statement
     /// Syntax: [abstract|final|readonly] class Name [extends Parent] [implements Interface1, Interface2] { members }
-    fn parse_class_statement(&mut self) -> Result<Statement, ParseError> {
+    fn parse_class_statement_with_attributes(
+        &mut self,
+        attributes: Vec<Attribute>,
+    ) -> Result<Statement, ParseError> {
         let start_span = self.current_span;
 
         // Parse modifiers (abstract, final, readonly)
@@ -877,14 +948,17 @@ impl<'a> Parser<'a> {
             extends,
             implements,
             members,
-            attributes: Vec::new(), // TODO: Parse attributes
+            attributes,
             span: start_span,
         })
     }
 
-    /// Parse interface declaration
-    /// Syntax: interface Name [extends Interface1, Interface2, ...] { members }
-    fn parse_interface_statement(&mut self) -> Result<Statement, ParseError> {
+    /// Parse interface declaration with attributes
+    /// Syntax: [attributes] interface Name [extends Interface1, Interface2, ...] { members }
+    fn parse_interface_statement_with_attributes(
+        &mut self,
+        attributes: Vec<Attribute>,
+    ) -> Result<Statement, ParseError> {
         let start_span = self.current_span;
 
         // Expect 'interface' keyword
@@ -931,14 +1005,17 @@ impl<'a> Parser<'a> {
             name,
             extends,
             members,
-            attributes: Vec::new(), // TODO: Parse attributes
+            attributes,
             span: start_span,
         })
     }
 
     /// Parse trait declaration
     /// Syntax: trait Name { members }
-    fn parse_trait_statement(&mut self) -> Result<Statement, ParseError> {
+    fn parse_trait_statement_with_attributes(
+        &mut self,
+        attributes: Vec<Attribute>,
+    ) -> Result<Statement, ParseError> {
         let start_span = self.current_span;
 
         // Expect 'trait' keyword
@@ -967,14 +1044,17 @@ impl<'a> Parser<'a> {
         Ok(Statement::Trait {
             name,
             members,
-            attributes: Vec::new(), // TODO: Parse attributes
+            attributes,
             span: start_span,
         })
     }
 
-    /// Parse enum declaration
-    /// Syntax: enum Name [: Type] [implements Interface1, Interface2, ...] { members }
-    fn parse_enum_statement(&mut self) -> Result<Statement, ParseError> {
+    /// Parse enum declaration with attributes
+    /// Syntax: [attributes] enum Name [: Type] [implements Interface1, Interface2, ...] { members }
+    fn parse_enum_statement_with_attributes(
+        &mut self,
+        attributes: Vec<Attribute>,
+    ) -> Result<Statement, ParseError> {
         let start_span = self.current_span;
 
         // Expect 'enum' keyword
@@ -1030,7 +1110,7 @@ impl<'a> Parser<'a> {
             backing_type,
             implements,
             members,
-            attributes: Vec::new(), // TODO: Parse attributes
+            attributes,
             span: start_span,
         })
     }
@@ -4082,6 +4162,116 @@ mod tests {
                 assert_eq!(uses[0].name.parts[1], "BAR");
             }
             _ => panic!("Expected use const declaration"),
+        }
+    }
+
+    #[test]
+    fn test_attribute_simple_on_class() {
+        // Test: #[A1] class Foo {}
+        let source = "<?php #[A1] class Foo {}";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class {
+                name, attributes, ..
+            } => {
+                assert_eq!(name, "Foo");
+                assert_eq!(attributes.len(), 1);
+                assert_eq!(attributes[0].name.parts.len(), 1);
+                assert_eq!(attributes[0].name.parts[0], "A1");
+                assert_eq!(attributes[0].args.len(), 0);
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_attribute_with_args_on_class() {
+        // Test: #[A1(1, 'test')] class Foo {}
+        let source = "<?php #[A1(1, 'test')] class Foo {}";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class {
+                name, attributes, ..
+            } => {
+                assert_eq!(name, "Foo");
+                assert_eq!(attributes.len(), 1);
+                assert_eq!(attributes[0].name.parts[0], "A1");
+                assert_eq!(attributes[0].args.len(), 2);
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_attribute_multiple_on_class() {
+        // Test: #[A1] #[A2] class Foo {}
+        let source = "<?php #[A1] #[A2] class Foo {}";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class {
+                name, attributes, ..
+            } => {
+                assert_eq!(name, "Foo");
+                assert_eq!(attributes.len(), 2);
+                assert_eq!(attributes[0].name.parts[0], "A1");
+                assert_eq!(attributes[1].name.parts[0], "A2");
+            }
+            _ => panic!("Expected class declaration"),
+        }
+    }
+
+    #[test]
+    fn test_attribute_on_function() {
+        // Test: #[A1(42)] function foo() {}
+        let source = "<?php #[A1(42)] function foo() {}";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function {
+                name, attributes, ..
+            } => {
+                assert_eq!(name, "foo");
+                assert_eq!(attributes.len(), 1);
+                assert_eq!(attributes[0].name.parts[0], "A1");
+                assert_eq!(attributes[0].args.len(), 1);
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_attribute_namespaced() {
+        // Test: #[Foo\Bar\Attr] class Test {}
+        let source = "<?php #[Foo\\Bar\\Attr] class Test {}";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Class { attributes, .. } => {
+                assert_eq!(attributes.len(), 1);
+                assert_eq!(attributes[0].name.parts.len(), 3);
+                assert_eq!(attributes[0].name.parts[0], "Foo");
+                assert_eq!(attributes[0].name.parts[1], "Bar");
+                assert_eq!(attributes[0].name.parts[2], "Attr");
+            }
+            _ => panic!("Expected class declaration"),
         }
     }
 }
