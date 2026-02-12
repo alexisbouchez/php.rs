@@ -2488,4 +2488,308 @@ mod tests {
         let l2 = val.to_long();
         assert_eq!(l1, l2);
     }
+
+    // ================================================================================
+    // PHASE 1.3.3: Edge case tests for type coercion
+    // Reference: php-src/Zend/zend_operators.c
+    // ================================================================================
+
+    #[test]
+    fn test_int_max_to_double() {
+        // Test: PHP_INT_MAX (i64::MAX) can be converted to float
+        // Reference: php -r 'var_dump((float)PHP_INT_MAX);'
+        // Expected: float(9.223372036854776E+18) or similar
+        let val = ZVal::long(i64::MAX);
+        let result = val.to_double();
+
+        // i64::MAX = 9223372036854775807
+        // As f64, this will have some precision loss but should be close
+        assert!(result > 0.0);
+        assert!(result.is_finite());
+        assert_eq!(result, i64::MAX as f64);
+    }
+
+    #[test]
+    fn test_int_min_to_double() {
+        // Test: PHP_INT_MIN (i64::MIN) can be converted to float
+        // Reference: php -r 'var_dump((float)PHP_INT_MIN);'
+        let val = ZVal::long(i64::MIN);
+        let result = val.to_double();
+
+        assert!(result < 0.0);
+        assert!(result.is_finite());
+        assert_eq!(result, i64::MIN as f64);
+    }
+
+    #[test]
+    fn test_very_large_positive_double_to_long() {
+        // Test: Very large positive floats overflow to i64::MAX
+        // Reference: php -r 'var_dump((int)1e100);'
+        // PHP behavior: large positive floats → PHP_INT_MAX
+        let val = ZVal::double(1e100);
+        let result = val.to_long();
+
+        // Since 1e100 > i64::MAX, it should clamp to i64::MAX
+        assert_eq!(result, i64::MAX);
+    }
+
+    #[test]
+    fn test_very_large_negative_double_to_long() {
+        // Test: Very large negative floats overflow to i64::MIN
+        // Reference: php -r 'var_dump((int)-1e100);'
+        // PHP behavior: large negative floats → PHP_INT_MIN
+        let val = ZVal::double(-1e100);
+        let result = val.to_long();
+
+        // Since -1e100 < i64::MIN, it should clamp to i64::MIN
+        assert_eq!(result, i64::MIN);
+    }
+
+    #[test]
+    fn test_double_at_int_max_boundary() {
+        // Test: Float exactly at i64::MAX boundary
+        // This tests the boundary condition
+        let val = ZVal::double(i64::MAX as f64);
+        let result = val.to_long();
+
+        // i64::MAX as f64 loses precision, so we just check it's near max
+        // PHP would convert this to i64::MAX
+        assert!(result == i64::MAX || result == i64::MAX - 1);
+    }
+
+    #[test]
+    fn test_double_at_int_min_boundary() {
+        // Test: Float exactly at i64::MIN boundary
+        let val = ZVal::double(i64::MIN as f64);
+        let result = val.to_long();
+
+        // Similar to max, there may be precision loss
+        assert!(result == i64::MIN || result == i64::MIN + 1);
+    }
+
+    #[test]
+    fn test_double_precision_loss() {
+        // Test: Very large integers lose precision when converted to double
+        // Reference: php -r 'echo (float)9223372036854775807 === (float)9223372036854775806;'
+
+        let max_val = ZVal::long(i64::MAX);
+        let max_minus_1 = ZVal::long(i64::MAX - 1);
+
+        let max_as_double = max_val.to_double();
+        let max_minus_1_as_double = max_minus_1.to_double();
+
+        // Due to f64 precision limits (53 bits mantissa), these may be equal
+        // i64::MAX has 63 bits, so precision loss is expected
+        // We just verify they convert without panicking and are finite
+        assert!(max_as_double.is_finite());
+        assert!(max_minus_1_as_double.is_finite());
+        assert!(max_as_double >= max_minus_1_as_double);
+    }
+
+    #[test]
+    fn test_small_double_precision() {
+        // Test: Small floats with many decimal places
+        // Reference: php -r 'var_dump((string)0.123456789012345);'
+        let val = ZVal::double(0.123456789012345);
+        let as_double = val.to_double();
+
+        // Should preserve precision (within f64 limits)
+        assert!((as_double - 0.123456789012345).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_very_small_double_to_long() {
+        // Test: Very small positive and negative floats truncate to 0
+        // Reference: php -r 'var_dump((int)0.0000001);' → 0
+        let positive_small = ZVal::double(0.0000001);
+        let negative_small = ZVal::double(-0.0000001);
+
+        assert_eq!(positive_small.to_long(), 0);
+        assert_eq!(negative_small.to_long(), 0);
+    }
+
+    #[test]
+    fn test_double_subnormal_values() {
+        // Test: Subnormal (denormalized) floating point values
+        // These are very small floats near zero
+        let subnormal = ZVal::double(f64::MIN_POSITIVE / 2.0);
+
+        // Should convert to 0
+        assert_eq!(subnormal.to_long(), 0);
+
+        // Should preserve the value as double
+        let as_double = subnormal.to_double();
+        assert!(as_double >= 0.0);
+        assert!(as_double < f64::MIN_POSITIVE);
+    }
+
+    #[test]
+    fn test_negative_zero_double() {
+        // Test: Negative zero (-0.0) behavior
+        // Reference: php -r 'var_dump((int)-0.0);' → 0
+        let neg_zero = ZVal::double(-0.0);
+
+        assert_eq!(neg_zero.to_long(), 0);
+        assert_eq!(neg_zero.to_double(), -0.0);
+
+        // -0.0 should convert to false (like 0.0)
+        assert!(!neg_zero.to_bool());
+    }
+
+    #[test]
+    fn test_string_large_integer() {
+        // Test: String containing very large integer
+        // Reference: php -r 'var_dump((int)"9223372036854775807");' → int(9223372036854775807)
+        let s = ZString::from_str("9223372036854775807"); // i64::MAX
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_long();
+        assert_eq!(result, i64::MAX);
+    }
+
+    #[test]
+    fn test_string_overflow_integer() {
+        // Test: String containing integer larger than i64::MAX
+        // Reference: php -r 'var_dump((int)"99999999999999999999");'
+        // PHP behavior: integer overflow during parsing
+        let s = ZString::from_str("99999999999999999999"); // Larger than i64::MAX
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_long();
+        // PHP would parse this and overflow; we should handle gracefully
+        // The exact value depends on overflow behavior, but it should not panic
+        // Most likely wraps around or clamps
+        let _ = result; // Accept any result as long as it doesn't panic
+    }
+
+    #[test]
+    fn test_string_very_large_float() {
+        // Test: String containing very large float
+        // Reference: php -r 'var_dump((float)"1.234567890123456789e+308");'
+        let s = ZString::from_str("1e308");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_double();
+        assert!(result > 0.0);
+        assert!(result.is_finite());
+        assert!(result > 1e100);
+    }
+
+    #[test]
+    fn test_string_float_overflow_to_inf() {
+        // Test: String containing float that overflows to infinity
+        // Reference: php -r 'var_dump((float)"1e309");' → float(INF)
+        let s = ZString::from_str("1e309"); // Larger than f64::MAX
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_double();
+        assert!(result.is_infinite());
+        assert!(result.is_sign_positive());
+    }
+
+    #[test]
+    fn test_string_float_underflow() {
+        // Test: String containing very small float (underflow)
+        // Reference: php -r 'var_dump((float)"1e-400");' → float(0)
+        let s = ZString::from_str("1e-400"); // Smaller than f64::MIN_POSITIVE
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_double();
+        // Should underflow to 0
+        assert_eq!(result, 0.0);
+    }
+
+    #[test]
+    fn test_float_to_string_precision() {
+        // Test: Float to string maintains reasonable precision
+        // Reference: php -r 'echo (string)1.234567890123456;'
+        let val = ZVal::double(1.234567890123456);
+        let s = val.to_string();
+
+        // Should contain the float value as a string
+        let str_val = s.as_str().unwrap();
+
+        // Parse it back to verify precision
+        let parsed: f64 = str_val.parse().unwrap();
+        assert!((parsed - 1.234567890123456).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_float_to_string_no_trailing_zeros() {
+        // Test: Float to string removes trailing zeros
+        // Reference: php -r 'echo (string)1.5;' → "1.5", not "1.50000"
+        // Reference: php -r 'echo (string)2.0;' → "2"
+        let val1 = ZVal::double(1.5);
+        let val2 = ZVal::double(2.0);
+
+        let s1 = val1.to_string();
+        let s2 = val2.to_string();
+
+        // 1.5 should be "1.5"
+        assert_eq!(s1.as_str(), Some("1.5"));
+
+        // 2.0 should be "2" (no decimal point for whole numbers)
+        assert_eq!(s2.as_str(), Some("2"));
+    }
+
+    #[test]
+    fn test_long_max_to_string_and_back() {
+        // Test: i64::MAX → string → parse back
+        // This tests round-trip conversion at the boundary
+        let original = ZVal::long(i64::MAX);
+        let as_string = original.to_string();
+
+        // String should be "9223372036854775807"
+        assert_eq!(as_string.as_str(), Some("9223372036854775807"));
+
+        // Convert back
+        let val = ZVal::string(Box::into_raw(Box::new(as_string)) as usize);
+        let back_to_long = val.to_long();
+        assert_eq!(back_to_long, i64::MAX);
+    }
+
+    #[test]
+    fn test_long_min_to_string_and_back() {
+        // Test: i64::MIN → string → parse back
+        let original = ZVal::long(i64::MIN);
+        let as_string = original.to_string();
+
+        // String should be "-9223372036854775808"
+        assert_eq!(as_string.as_str(), Some("-9223372036854775808"));
+
+        // Convert back
+        let val = ZVal::string(Box::into_raw(Box::new(as_string)) as usize);
+        let back_to_long = val.to_long();
+        assert_eq!(back_to_long, i64::MIN);
+    }
+
+    #[test]
+    fn test_double_max_value() {
+        // Test: f64::MAX handling
+        let val = ZVal::double(f64::MAX);
+
+        // Should convert to i64::MAX when converted to long (overflow)
+        assert_eq!(val.to_long(), i64::MAX);
+
+        // Should preserve as double
+        assert_eq!(val.to_double(), f64::MAX);
+
+        // Should be truthy
+        assert!(val.to_bool());
+    }
+
+    #[test]
+    fn test_double_min_value() {
+        // Test: f64::MIN (most negative) handling
+        let val = ZVal::double(f64::MIN);
+
+        // Should convert to i64::MIN when converted to long (overflow)
+        assert_eq!(val.to_long(), i64::MIN);
+
+        // Should preserve as double
+        assert_eq!(val.to_double(), f64::MIN);
+
+        // Should be truthy (non-zero)
+        assert!(val.to_bool());
+    }
 }
