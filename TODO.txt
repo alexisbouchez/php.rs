@@ -113,7 +113,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 2.2.2  Test: inline HTML passthrough before <?php
 [x] 2.2.3  Implement ST_IN_SCRIPTING: keywords, operators, identifiers
 [x] 2.2.4  Test: all 70+ PHP keywords (abstract, class, function, match, enum, readonly, ...)
-[ ] 2.2.5  Implement number literals: decimal, hex (0x), octal (0o/0), binary (0b), underscores (1_000)
+[x] 2.2.5  Implement number literals: decimal, hex (0x), octal (0o/0), binary (0b), underscores (1_000)
 [ ] 2.2.6  Test: integer overflow to float, edge cases
 [ ] 2.2.7  Implement string literals:
            [ ] Single-quoted: 'hello', escapes: \\, \'

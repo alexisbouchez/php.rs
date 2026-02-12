@@ -169,6 +169,125 @@ impl<'src> Lexer<'src> {
         Some((Token::InlineHtml, span))
     }
 
+    /// Scan a number literal (decimal, hex, octal, binary)
+    /// Reference: php-src/Zend/zend_language_scanner.l
+    fn scan_number(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        let first = self.peek()?;
+
+        if first == '0' {
+            self.consume(); // consume '0'
+
+            // Check for hex (0x or 0X)
+            if let Some(next) = self.peek() {
+                if next == 'x' || next == 'X' {
+                    self.consume(); // consume 'x' or 'X'
+                                    // Consume hex digits (and underscores)
+                    let mut has_digits = false;
+                    while let Some(ch) = self.peek() {
+                        if ch.is_ascii_hexdigit() {
+                            self.consume();
+                            has_digits = true;
+                        } else if ch == '_' {
+                            self.consume(); // Allow underscores as separators
+                        } else {
+                            break;
+                        }
+                    }
+                    // If no hex digits after 0x, this is an error, but we'll let the parser handle it
+                    if !has_digits {
+                        // Still return LNumber for now
+                    }
+                    let span = Span::new(start_pos, self.pos, start_line, start_column);
+                    return Some((Token::LNumber, span));
+                }
+
+                // Check for octal (0o or 0O)
+                if next == 'o' || next == 'O' {
+                    self.consume(); // consume 'o' or 'O'
+                                    // Consume octal digits (0-7 and underscores)
+                    let mut has_digits = false;
+                    while let Some(ch) = self.peek() {
+                        if ('0'..='7').contains(&ch) {
+                            self.consume();
+                            has_digits = true;
+                        } else if ch == '_' {
+                            self.consume();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !has_digits {
+                        // Still return LNumber
+                    }
+                    let span = Span::new(start_pos, self.pos, start_line, start_column);
+                    return Some((Token::LNumber, span));
+                }
+
+                // Check for binary (0b or 0B)
+                if next == 'b' || next == 'B' {
+                    self.consume(); // consume 'b' or 'B'
+                                    // Consume binary digits (0-1 and underscores)
+                    let mut has_digits = false;
+                    while let Some(ch) = self.peek() {
+                        if ch == '0' || ch == '1' {
+                            self.consume();
+                            has_digits = true;
+                        } else if ch == '_' {
+                            self.consume();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !has_digits {
+                        // Still return LNumber
+                    }
+                    let span = Span::new(start_pos, self.pos, start_line, start_column);
+                    return Some((Token::LNumber, span));
+                }
+
+                // Traditional octal (leading 0 followed by octal digits)
+                // e.g., 0777, 0123
+                // This is the old-style octal notation
+                if ('0'..='7').contains(&next) {
+                    while let Some(ch) = self.peek() {
+                        if ('0'..='7').contains(&ch) || ch == '_' {
+                            self.consume();
+                        } else {
+                            break;
+                        }
+                    }
+                    let span = Span::new(start_pos, self.pos, start_line, start_column);
+                    return Some((Token::LNumber, span));
+                }
+
+                // Just "0" followed by something else (not a digit, not a base prefix)
+                // Return just the "0"
+            }
+
+            // Just "0" by itself
+            let span = Span::new(start_pos, self.pos, start_line, start_column);
+            return Some((Token::LNumber, span));
+        }
+
+        // Decimal number (starts with 1-9)
+        while let Some(ch) = self.peek() {
+            if ch.is_ascii_digit() {
+                self.consume();
+            } else if ch == '_' {
+                self.consume(); // Allow underscores as separators
+            } else {
+                break;
+            }
+        }
+
+        let span = Span::new(start_pos, self.pos, start_line, start_column);
+        Some((Token::LNumber, span))
+    }
+
     /// Scan in ST_IN_SCRIPTING state - inside PHP code
     fn scan_scripting(&mut self) -> Option<(Token, Span)> {
         // Skip whitespace
@@ -473,6 +592,10 @@ impl<'src> Lexer<'src> {
                     Token::BadCharacter,
                     Span::new(start_pos, self.pos, start_line, start_column),
                 ))
+            }
+            _ if ch.is_ascii_digit() => {
+                // Number literal: decimal, hex (0x), octal (0o/0), binary (0b)
+                self.scan_number()
             }
             _ if ch.is_alphabetic() || ch == '_' => {
                 // Identifier or keyword
@@ -2041,5 +2164,219 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ======================================================================
+    // Task 2.2.5: Test number literals - decimal, hex, octal, binary, underscores
+    // ======================================================================
+
+    #[test]
+    fn test_number_literal_decimal() {
+        // Test: Decimal integers
+        let test_cases = vec![
+            ("<?php 0", "0"),
+            ("<?php 1", "1"),
+            ("<?php 42", "42"),
+            ("<?php 123", "123"),
+            ("<?php 999", "999"),
+            ("<?php 1234567890", "1234567890"),
+        ];
+
+        for (source, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, Token::LNumber, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
+    }
+
+    #[test]
+    fn test_number_literal_hex() {
+        // Test: Hexadecimal integers (0x prefix)
+        let test_cases = vec![
+            ("<?php 0x0", "0x0"),
+            ("<?php 0x1", "0x1"),
+            ("<?php 0x10", "0x10"),
+            ("<?php 0xFF", "0xFF"),
+            ("<?php 0xff", "0xff"),
+            ("<?php 0xABCD", "0xABCD"),
+            ("<?php 0xabcd", "0xabcd"),
+            ("<?php 0X1F", "0X1F"), // Capital X is also valid
+            ("<?php 0xDEADBEEF", "0xDEADBEEF"),
+        ];
+
+        for (source, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, Token::LNumber, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
+    }
+
+    #[test]
+    fn test_number_literal_octal() {
+        // Test: Octal integers (0o prefix or leading 0)
+        // PHP 8.1+ supports 0o prefix, and traditional leading 0 (but 0o is preferred)
+        let test_cases = vec![
+            ("<?php 0o0", "0o0"),
+            ("<?php 0o7", "0o7"),
+            ("<?php 0o10", "0o10"),
+            ("<?php 0o77", "0o77"),
+            ("<?php 0o777", "0o777"),
+            ("<?php 0O77", "0O77"), // Capital O is also valid
+            // Traditional leading 0 (deprecated style but still valid)
+            ("<?php 00", "00"),
+            ("<?php 07", "07"),
+            ("<?php 010", "010"),
+            ("<?php 0777", "0777"),
+        ];
+
+        for (source, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, Token::LNumber, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
+    }
+
+    #[test]
+    fn test_number_literal_binary() {
+        // Test: Binary integers (0b prefix)
+        let test_cases = vec![
+            ("<?php 0b0", "0b0"),
+            ("<?php 0b1", "0b1"),
+            ("<?php 0b10", "0b10"),
+            ("<?php 0b11", "0b11"),
+            ("<?php 0b1111", "0b1111"),
+            ("<?php 0b10101010", "0b10101010"),
+            ("<?php 0B1010", "0B1010"), // Capital B is also valid
+        ];
+
+        for (source, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, Token::LNumber, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
+    }
+
+    #[test]
+    fn test_number_literal_with_underscores() {
+        // Test: Numeric separators (underscores) - PHP 7.4+
+        // Underscores can appear anywhere in the number except:
+        // - At the start
+        // - At the end
+        // - Adjacent to another underscore
+        // - Adjacent to the base prefix (0x, 0o, 0b)
+
+        let test_cases = vec![
+            // Decimal with underscores
+            ("<?php 1_000", "1_000"),
+            ("<?php 1_000_000", "1_000_000"),
+            ("<?php 100_000", "100_000"),
+            ("<?php 1_2_3_4", "1_2_3_4"),
+            // Hex with underscores
+            ("<?php 0xFF_FF", "0xFF_FF"),
+            ("<?php 0xDEAD_BEEF", "0xDEAD_BEEF"),
+            // Octal with underscores
+            ("<?php 0o7_7_7", "0o7_7_7"),
+            // Binary with underscores
+            ("<?php 0b1010_1010", "0b1010_1010"),
+            ("<?php 0b1111_0000_1111_0000", "0b1111_0000_1111_0000"),
+        ];
+
+        for (source, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, Token::LNumber, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
+    }
+
+    #[test]
+    fn test_number_literal_edge_cases() {
+        // Test: Edge cases for number literals
+        let test_cases = vec![
+            // Just 0
+            ("<?php 0", Token::LNumber, "0"),
+            // Leading zeros with decimal (traditional octal - now deprecated but still works)
+            ("<?php 0123", Token::LNumber, "0123"),
+            // Underscore in various positions (valid)
+            ("<?php 1_0", Token::LNumber, "1_0"),
+            ("<?php 10_0", Token::LNumber, "10_0"),
+            // Maximum safe values
+            (
+                "<?php 9223372036854775807",
+                Token::LNumber,
+                "9223372036854775807",
+            ), // PHP_INT_MAX (64-bit)
+        ];
+
+        for (source, expected_token, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, expected_token, "Failed for: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
+    }
+
+    #[test]
+    fn test_number_literal_in_expression() {
+        // Test: Numbers in expressions (ensure they're properly delimited)
+        let source = "<?php 42+100";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, span1) = lexer.next_token().expect("Should get first number");
+        assert_eq!(token1, Token::LNumber);
+        assert_eq!(span1.extract(source), "42");
+
+        // Next should be + (currently BadCharacter, but that's OK for now)
+        let (token2, _) = lexer.next_token().expect("Should get operator");
+        // We expect BadCharacter for now since single-char operators aren't fully implemented
+
+        let (token3, span3) = lexer.next_token().expect("Should get second number");
+        assert_eq!(token3, Token::LNumber);
+        assert_eq!(span3.extract(source), "100");
+    }
+
+    #[test]
+    fn test_number_literal_followed_by_identifier() {
+        // Test: Number followed by identifier (should be two separate tokens)
+        let source = "<?php 42abc";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        // This should fail during tokenization because "42abc" is invalid
+        // In PHP, this would be a parse error
+        // The lexer should recognize "42" as a number, then "abc" as an identifier
+
+        let (token1, span1) = lexer.next_token().expect("Should get number");
+        assert_eq!(token1, Token::LNumber);
+        assert_eq!(span1.extract(source), "42");
+
+        let (token2, span2) = lexer.next_token().expect("Should get identifier");
+        assert_eq!(token2, Token::String);
+        assert_eq!(span2.extract(source), "abc");
     }
 }
