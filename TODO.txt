@@ -33,7 +33,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 0.4  Add benchmark harness (criterion) in crates/php-rs-vm/benches/
 [~] 0.5  Write PHPT test runner scaffold:
          [x] Parse .phpt files (--TEST--, --FILE--, --EXPECT--, --EXPECTF--)
-         [ ] Execute php.rs CLI on --FILE-- section
+         [x] Execute php.rs CLI on --FILE-- section
          [ ] Compare output to --EXPECT--/--EXPECTF--
          [ ] Support --SKIPIF--, --INI--, --ENV--, --ARGS--, --CLEAN--
 [ ] 0.6  Verify scaffold: `cargo test` passes with zero tests, `cargo clippy` clean
