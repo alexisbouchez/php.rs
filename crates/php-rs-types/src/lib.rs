@@ -35,7 +35,7 @@ pub enum ZValType {
 ///
 /// Total: 16 bytes (matching PHP's zval)
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ZVal {
     /// The actual value, represented as a union (using u64 for now)
     /// Can hold: i64, f64, or a pointer (usize)
@@ -238,6 +238,41 @@ impl fmt::Display for ZVal {
             ZValType::Object => write!(f, "object"),
             ZValType::Resource => write!(f, "resource"),
             ZValType::Reference => write!(f, "reference"),
+        }
+    }
+}
+
+impl PartialEq for ZVal {
+    fn eq(&self, other: &Self) -> bool {
+        // First check if types match
+        if self.type_tag != other.type_tag {
+            return false;
+        }
+
+        // Then compare values based on type
+        match self.type_tag {
+            ZValType::Null | ZValType::False | ZValType::True => {
+                // For these types, equal type tags means equal values
+                true
+            }
+            ZValType::Long => {
+                // Compare as i64
+                (self.value as i64) == (other.value as i64)
+            }
+            ZValType::Double => {
+                // Use f64::eq which respects IEEE 754 (NaN != NaN)
+                let a = f64::from_bits(self.value);
+                let b = f64::from_bits(other.value);
+                a == b
+            }
+            ZValType::String
+            | ZValType::Array
+            | ZValType::Object
+            | ZValType::Resource
+            | ZValType::Reference => {
+                // For pointer types, compare the raw pointer values
+                self.value == other.value
+            }
         }
     }
 }
@@ -459,5 +494,180 @@ mod tests {
             "ZVal must be exactly 16 bytes, got {} bytes",
             size_of::<ZVal>()
         );
+    }
+
+    #[test]
+    fn test_zval_clone() {
+        // Test: ZVal implements Clone
+        // All ZVal variants should be cloneable
+        let original = ZVal::long(42);
+        let cloned = original.clone();
+
+        assert_eq!(cloned.type_tag(), ZValType::Long);
+        assert_eq!(cloned.as_long(), Some(42));
+    }
+
+    #[test]
+    fn test_zval_clone_null() {
+        // Test: Clone null values
+        let original = ZVal::null();
+        let cloned = original.clone();
+        assert_eq!(cloned.type_tag(), ZValType::Null);
+    }
+
+    #[test]
+    fn test_zval_clone_bool() {
+        // Test: Clone boolean values
+        let t = ZVal::true_val();
+        let f = ZVal::false_val();
+
+        let t_clone = t.clone();
+        let f_clone = f.clone();
+
+        assert_eq!(t_clone.type_tag(), ZValType::True);
+        assert_eq!(f_clone.type_tag(), ZValType::False);
+    }
+
+    #[test]
+    fn test_zval_clone_double() {
+        // Test: Clone float values including special cases
+        let normal = ZVal::double(3.14159);
+        let inf = ZVal::double(f64::INFINITY);
+        let nan = ZVal::double(f64::NAN);
+
+        let normal_clone = normal.clone();
+        let inf_clone = inf.clone();
+        let nan_clone = nan.clone();
+
+        assert!((normal_clone.as_double().unwrap() - 3.14159).abs() < f64::EPSILON);
+        assert!(inf_clone.as_double().unwrap().is_infinite());
+        assert!(nan_clone.as_double().unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_zval_clone_pointer_types() {
+        // Test: Clone pointer-based types (string, array, object, etc.)
+        let s = ZVal::string(0x1234);
+        let a = ZVal::array(0x5678);
+        let o = ZVal::object(0xABCD);
+
+        let s_clone = s.clone();
+        let a_clone = a.clone();
+        let o_clone = o.clone();
+
+        assert_eq!(s_clone.as_ptr(), Some(0x1234));
+        assert_eq!(a_clone.as_ptr(), Some(0x5678));
+        assert_eq!(o_clone.as_ptr(), Some(0xABCD));
+    }
+
+    #[test]
+    fn test_zval_partial_eq_null() {
+        // Test: PartialEq for null values
+        let null1 = ZVal::null();
+        let null2 = ZVal::null();
+        let not_null = ZVal::long(0);
+
+        assert_eq!(null1, null2);
+        assert_ne!(null1, not_null);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_bool() {
+        // Test: PartialEq for boolean values
+        let true1 = ZVal::true_val();
+        let true2 = ZVal::true_val();
+        let false1 = ZVal::false_val();
+        let false2 = ZVal::false_val();
+
+        assert_eq!(true1, true2);
+        assert_eq!(false1, false2);
+        assert_ne!(true1, false1);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_long() {
+        // Test: PartialEq for integer values
+        let a = ZVal::long(42);
+        let b = ZVal::long(42);
+        let c = ZVal::long(100);
+        let d = ZVal::long(-42);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_double() {
+        // Test: PartialEq for float values
+        let a = ZVal::double(1.5);
+        let b = ZVal::double(1.5);
+        let c = ZVal::double(2.5);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_double_special() {
+        // Test: PartialEq for special float values (INF, -INF, NAN)
+        // Note: NAN != NAN per IEEE 754
+        let inf1 = ZVal::double(f64::INFINITY);
+        let inf2 = ZVal::double(f64::INFINITY);
+        let neg_inf = ZVal::double(f64::NEG_INFINITY);
+        let nan1 = ZVal::double(f64::NAN);
+        let nan2 = ZVal::double(f64::NAN);
+
+        assert_eq!(inf1, inf2);
+        assert_ne!(inf1, neg_inf);
+        // NAN != NAN is the expected behavior for f64 PartialEq
+        assert_ne!(nan1, nan2);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_different_types() {
+        // Test: Values of different types are not equal
+        // Reference: PHP uses === for strict comparison (type + value)
+        let i = ZVal::long(1);
+        let f = ZVal::double(1.0);
+        let t = ZVal::true_val();
+        let s = ZVal::string(0);
+
+        assert_ne!(i, f); // int(1) !== float(1.0)
+        assert_ne!(i, t); // int(1) !== bool(true)
+        assert_ne!(f, t); // float(1.0) !== bool(true)
+        assert_ne!(i, s); // int(1) !== string
+    }
+
+    #[test]
+    fn test_zval_partial_eq_pointer_types() {
+        // Test: PartialEq for pointer-based types
+        // For now, we compare the raw pointer values
+        let s1 = ZVal::string(0x1234);
+        let s2 = ZVal::string(0x1234);
+        let s3 = ZVal::string(0x5678);
+        let a1 = ZVal::array(0x1234);
+
+        assert_eq!(s1, s2); // Same pointer
+        assert_ne!(s1, s3); // Different pointer
+        assert_ne!(s1, a1); // Different type (string vs array)
+    }
+
+    #[test]
+    fn test_zval_partial_eq_zero_values() {
+        // Test: PartialEq for zero values of different types
+        let null = ZVal::null();
+        let false_val = ZVal::false_val();
+        let int_zero = ZVal::long(0);
+        let float_zero = ZVal::double(0.0);
+        let string_zero = ZVal::string(0);
+
+        // These should all be different with strict comparison (===)
+        assert_ne!(null, false_val);
+        assert_ne!(null, int_zero);
+        assert_ne!(null, float_zero);
+        assert_ne!(false_val, int_zero);
+        assert_ne!(int_zero, float_zero);
+        assert_ne!(int_zero, string_zero);
     }
 }

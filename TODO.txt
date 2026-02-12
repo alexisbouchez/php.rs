@@ -49,7 +49,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 1.1.1  Define ZVal enum: Null, False, True, Long(i64), Double(f64), String, Array, Object, Resource, Reference
 [x] 1.1.2  Test: size_of::<ZVal>() == 16
 [x] 1.1.3  Implement Display for ZVal (PHP-compatible var_dump-style output)
-[ ] 1.1.4  Implement Clone, PartialEq, Debug
+[x] 1.1.4  Implement Clone, PartialEq, Debug
 
 ## 1.2 ZString — Refcounted string with precomputed hash
 [ ] 1.2.1  Define ZString: Arc-based, stores len + hash + bytes
