@@ -370,6 +370,60 @@ pub enum Token {
     /// & not followed by variable or vararg (T_AMPERSAND_NOT_FOLLOWED_BY_VAR_OR_VARARG)
     AmpersandNotFollowedByVarOrVararg,
 
+    // Single-character operators and punctuation
+    /// + operator
+    Plus,
+    /// - operator
+    Minus,
+    /// * operator
+    Star,
+    /// / operator
+    Slash,
+    /// % operator
+    Percent,
+    /// = operator
+    Equals,
+    /// < operator
+    LessThan,
+    /// > operator
+    GreaterThan,
+    /// ! operator
+    Exclamation,
+    /// & operator
+    Ampersand,
+    /// | operator
+    VerticalBar,
+    /// ^ operator
+    Caret,
+    /// ~ operator
+    Tilde,
+    /// ( left parenthesis
+    LParen,
+    /// ) right parenthesis
+    RParen,
+    /// { left brace
+    LBrace,
+    /// } right brace
+    RBrace,
+    /// [ left bracket
+    LBracket,
+    /// ] right bracket
+    RBracket,
+    /// ; semicolon
+    Semicolon,
+    /// , comma
+    Comma,
+    /// . dot operator
+    Dot,
+    /// : colon
+    Colon,
+    /// ? question mark
+    Question,
+    /// @ error suppression operator
+    At,
+    /// \ namespace separator (single backslash)
+    Backslash,
+
     // Error tokens
     /// Invalid character (T_BAD_CHARACTER)
     BadCharacter,

@@ -1013,16 +1013,187 @@ impl<'src> Lexer<'src> {
                 // Double-quoted string
                 self.scan_double_quoted_string()
             }
-            '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '&' | '|' | '^' | '~' | '('
-            | ')' | '{' | '}' | '[' | ']' | ';' | ',' | '.' | ':' | '?' | '@' | '#' | '\\' => {
+            '+' => {
                 self.consume();
-                let span = Span::new(start_pos, self.pos, start_line, start_column);
-                // For now, return these as String tokens (will be refined later)
-                // Actually, we should return BadCharacter for unrecognized single chars
-                // But for basic arithmetic/logic, these are valid
-                // For simplicity in this implementation, we'll just consume them
-                // The parser will handle the semantic meaning
-                Some((Token::BadCharacter, span))
+                Some((
+                    Token::Plus,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '-' => {
+                self.consume();
+                Some((
+                    Token::Minus,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '*' => {
+                self.consume();
+                Some((
+                    Token::Star,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '/' => {
+                self.consume();
+                Some((
+                    Token::Slash,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '%' => {
+                self.consume();
+                Some((
+                    Token::Percent,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '=' => {
+                self.consume();
+                Some((
+                    Token::Equals,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '<' => {
+                self.consume();
+                Some((
+                    Token::LessThan,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '>' => {
+                self.consume();
+                Some((
+                    Token::GreaterThan,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '!' => {
+                self.consume();
+                Some((
+                    Token::Exclamation,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '&' => {
+                self.consume();
+                Some((
+                    Token::Ampersand,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '|' => {
+                self.consume();
+                Some((
+                    Token::VerticalBar,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '^' => {
+                self.consume();
+                Some((
+                    Token::Caret,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '~' => {
+                self.consume();
+                Some((
+                    Token::Tilde,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '(' => {
+                self.consume();
+                Some((
+                    Token::LParen,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            ')' => {
+                self.consume();
+                Some((
+                    Token::RParen,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '{' => {
+                self.consume();
+                Some((
+                    Token::LBrace,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '}' => {
+                self.consume();
+                Some((
+                    Token::RBrace,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '[' => {
+                self.consume();
+                Some((
+                    Token::LBracket,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            ']' => {
+                self.consume();
+                Some((
+                    Token::RBracket,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            ';' => {
+                self.consume();
+                Some((
+                    Token::Semicolon,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            ',' => {
+                self.consume();
+                Some((
+                    Token::Comma,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '.' => {
+                self.consume();
+                Some((
+                    Token::Dot,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            ':' => {
+                self.consume();
+                Some((
+                    Token::Colon,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '?' => {
+                self.consume();
+                Some((
+                    Token::Question,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '@' => {
+                self.consume();
+                Some((
+                    Token::At,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            '\\' => {
+                self.consume();
+                Some((
+                    Token::Backslash,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
             }
             '$' => {
                 // Variable
@@ -2148,7 +2319,7 @@ mod tests {
         //     println!("{}: {:?} = {:?}", i, token, text);
         // }
 
-        // Find key tokens (skip BadCharacter tokens for punctuation)
+        // Now with proper tokens, we can verify all tokens
         let mut idx = 0;
 
         // Token 0: <?php
@@ -2164,33 +2335,47 @@ mod tests {
         assert_eq!(tokens[idx].1, "test");
         idx += 1;
 
-        // Skip BadCharacter for (
-        if tokens[idx].0 == Token::BadCharacter {
-            idx += 1;
-        }
+        // Token 3: (
+        assert_eq!(tokens[idx].0, Token::LParen);
+        idx += 1;
 
-        // Variable $var
+        // Token 4: Variable $var
         assert_eq!(tokens[idx].0, Token::Variable);
         assert_eq!(tokens[idx].1, "$var");
         idx += 1;
 
-        // Skip BadCharacter for )
-        if tokens[idx].0 == Token::BadCharacter {
-            idx += 1;
-        }
+        // Token 5: )
+        assert_eq!(tokens[idx].0, Token::RParen);
+        idx += 1;
 
-        // Skip BadCharacter for {
-        if tokens[idx].0 == Token::BadCharacter {
-            idx += 1;
-        }
+        // Token 6: {
+        assert_eq!(tokens[idx].0, Token::LBrace);
+        idx += 1;
 
-        // return keyword
+        // Token 7: return keyword
         assert_eq!(tokens[idx].0, Token::Return);
         idx += 1;
 
-        // Variable $var
+        // Token 8: Variable $var
         assert_eq!(tokens[idx].0, Token::Variable);
         assert_eq!(tokens[idx].1, "$var");
+        idx += 1;
+
+        // Token 9: +
+        assert_eq!(tokens[idx].0, Token::Plus);
+        idx += 1;
+
+        // Token 10: 1
+        assert_eq!(tokens[idx].0, Token::LNumber);
+        assert_eq!(tokens[idx].1, "1");
+        idx += 1;
+
+        // Token 11: ;
+        assert_eq!(tokens[idx].0, Token::Semicolon);
+        idx += 1;
+
+        // Token 12: }
+        assert_eq!(tokens[idx].0, Token::RBrace);
     }
 
     #[test]
@@ -4042,5 +4227,184 @@ mod tests {
         let (token, span) = lexer.next_token().expect("Should tokenize comment");
         assert_eq!(token, Token::Comment);
         assert_eq!(span.extract(source), "// actual comment");
+    }
+
+    #[test]
+    fn test_all_multi_char_operators() {
+        // Test: All multi-character operators including <=>, ??=, ?->, #[
+        // Reference: php-src/Zend/zend_language_parser.y
+        let test_cases = vec![
+            // Three-character operators
+            ("===", Token::IsIdentical),
+            ("!==", Token::IsNotIdentical),
+            ("<=>", Token::Spaceship),
+            ("<<=", Token::SlEqual),
+            (">>=", Token::SrEqual),
+            ("**=", Token::PowEqual),
+            ("...", Token::Ellipsis),
+            ("??=", Token::CoalesceEqual),
+            ("?->", Token::NullsafeObjectOperator),
+            // Two-character operators
+            ("==", Token::IsEqual),
+            ("!=", Token::IsNotEqual),
+            ("<>", Token::IsNotEqual),
+            ("<=", Token::IsSmallerOrEqual),
+            (">=", Token::IsGreaterOrEqual),
+            ("<<", Token::Sl),
+            (">>", Token::Sr),
+            ("++", Token::Inc),
+            ("--", Token::Dec),
+            ("+=", Token::PlusEqual),
+            ("-=", Token::MinusEqual),
+            ("*=", Token::MulEqual),
+            ("/=", Token::DivEqual),
+            (".=", Token::ConcatEqual),
+            ("%=", Token::ModEqual),
+            ("&=", Token::AndEqual),
+            ("|=", Token::OrEqual),
+            ("^=", Token::XorEqual),
+            ("&&", Token::BooleanAnd),
+            ("||", Token::BooleanOr),
+            ("**", Token::Pow),
+            ("??", Token::Coalesce),
+            ("->", Token::ObjectOperator),
+            ("=>", Token::DoubleArrow),
+            ("::", Token::PaamayimNekudotayim),
+            ("#[", Token::Attribute),
+        ];
+
+        for (op, expected_token) in test_cases {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+
+            lexer.next_token(); // Skip <?php
+
+            let (token, span) = lexer
+                .next_token()
+                .unwrap_or_else(|| panic!("Failed to tokenize operator: {}", op));
+            assert_eq!(
+                token, expected_token,
+                "Operator '{}' should tokenize as {:?}, got {:?}",
+                op, expected_token, token
+            );
+            assert_eq!(
+                span.extract(&source),
+                op,
+                "Operator '{}' span extraction failed",
+                op
+            );
+        }
+    }
+
+    #[test]
+    fn test_all_single_char_operators() {
+        // Test: All single-character operators and punctuation
+        // These should NOT return BadCharacter but proper token types
+        let test_cases = vec![
+            ("+", "+"),
+            ("-", "-"),
+            ("*", "*"),
+            ("/", "/"),
+            ("%", "%"),
+            ("=", "="),
+            ("<", "<"),
+            (">", ">"),
+            ("!", "!"),
+            ("&", "&"),
+            ("|", "|"),
+            ("^", "^"),
+            ("~", "~"),
+            ("(", "("),
+            (")", ")"),
+            ("{", "{"),
+            ("}", "}"),
+            ("[", "["),
+            ("]", "]"),
+            (";", ";"),
+            (",", ","),
+            (".", "."),
+            (":", ":"),
+            ("?", "?"),
+            ("@", "@"),
+        ];
+
+        for (ch, expected_str) in test_cases {
+            let source = format!("<?php {}", ch);
+            let mut lexer = Lexer::new(&source);
+
+            lexer.next_token(); // Skip <?php
+
+            let (token, span) = lexer
+                .next_token()
+                .unwrap_or_else(|| panic!("Failed to tokenize char: {}", ch));
+
+            // We should NOT get BadCharacter for these operators
+            assert_ne!(
+                token,
+                Token::BadCharacter,
+                "Character '{}' should not return BadCharacter",
+                ch
+            );
+
+            assert_eq!(
+                span.extract(&source),
+                expected_str,
+                "Character '{}' span extraction failed",
+                ch
+            );
+        }
+    }
+
+    #[test]
+    fn test_operator_precedence_in_source() {
+        // Test: Operators in a realistic expression
+        let source = "<?php $a = $b + $c * $d ** $e ?? $f ?-> prop <=> $g && $h || $i;";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = vec![];
+        while let Some((token, _)) = lexer.next_token() {
+            tokens.push(token);
+        }
+
+        // Verify we have all expected tokens (at minimum the operators we care about)
+        assert!(tokens.contains(&Token::Variable)); // $a, $b, etc
+        assert!(tokens.contains(&Token::Pow)); // **
+        assert!(tokens.contains(&Token::Coalesce)); // ??
+        assert!(tokens.contains(&Token::NullsafeObjectOperator)); // ?->
+        assert!(tokens.contains(&Token::Spaceship)); // <=>
+        assert!(tokens.contains(&Token::BooleanAnd)); // &&
+        assert!(tokens.contains(&Token::BooleanOr)); // ||
+    }
+
+    #[test]
+    fn test_attribute_syntax() {
+        // Test: #[ attribute syntax (PHP 8.0+)
+        let source = "<?php #[Attribute] class Foo {}";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize #[");
+        assert_eq!(token, Token::Attribute);
+        assert_eq!(span.extract(source), "#[");
+
+        let (token, _) = lexer.next_token().expect("Should tokenize Attribute");
+        assert_eq!(token, Token::String); // 'Attribute' identifier
+    }
+
+    #[test]
+    fn test_hash_comment_vs_attribute() {
+        // Test: # starts a comment, but #[ is an attribute token
+        let source1 = "<?php # this is a comment\necho 'hi';";
+        let mut lexer1 = Lexer::new(source1);
+        lexer1.next_token(); // <?php
+        let (token, _) = lexer1.next_token().expect("Should tokenize #");
+        assert_eq!(token, Token::Comment);
+
+        let source2 = "<?php #[Attr]";
+        let mut lexer2 = Lexer::new(source2);
+        lexer2.next_token(); // <?php
+        let (token, _) = lexer2.next_token().expect("Should tokenize #[");
+        assert_eq!(token, Token::Attribute);
     }
 }

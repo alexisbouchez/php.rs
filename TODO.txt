@@ -122,7 +122,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
            [x] Nowdoc: <<<'EOT' ... EOT;
 [x] 2.2.8  Test: string interpolation: "$var", "{$var}", "${var}", "$obj->prop", "$arr[key]"
 [x] 2.2.9  Implement comments: //, #, /* */, /** */ (docblocks)
-[ ] 2.2.10 Implement operators: all PHP operators including <=>, ??=, ?->, #[
+[x] 2.2.10 Implement operators: all PHP operators including <=>, ??=, ?->, #[
 [ ] 2.2.11 Test: edge cases — unterminated strings, nested comments, __halt_compiler
 
 ## 2.3 Advanced scanning
