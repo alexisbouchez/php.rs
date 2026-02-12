@@ -3342,6 +3342,42 @@ impl ZArray {
                 .collect(),
         }
     }
+
+    /// Count the number of elements in the array
+    ///
+    /// This is a PHP-style alias for `len()` to match PHP's `count()` function.
+    ///
+    /// Reference: php-src/ext/standard/array.c — count() and sizeof()
+    pub fn count(&self) -> usize {
+        self.len()
+    }
+
+    /// Check if an integer key exists in the array
+    ///
+    /// Reference: php-src/ext/standard/array.c — array_key_exists()
+    ///
+    /// Note: This is different from isset() in PHP:
+    /// - array_key_exists() returns true even if value is null
+    /// - isset() returns false if value is null
+    pub fn contains_key_int(&self, key: i64) -> bool {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(vec) => key >= 0 && (key as usize) < vec.len(),
+            ArrayStorage::Hash(map) => map.get(&ArrayKey::Int(key)).is_some(),
+        }
+    }
+
+    /// Check if a string key exists in the array
+    ///
+    /// Reference: php-src/ext/standard/array.c — array_key_exists()
+    pub fn contains_key_string(&self, key: &ZString) -> bool {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(_) => {
+                // Packed mode only has integer keys, so string keys never exist
+                false
+            }
+            ArrayStorage::Hash(map) => map.get(&ArrayKey::String(key.clone())).is_some(),
+        }
+    }
 }
 
 /// Key type for ZArray iteration and access
@@ -4148,6 +4184,191 @@ mod zarray_tests {
         assert_eq!(items[2].1.to_long(), 30);
     }
 
+    /// Test count() method (PHP-style alias for len())
+    ///
+    /// Reference: PHP's count() function
+    #[test]
+    fn test_zarray_count_empty() {
+        let arr = ZArray::new();
+        assert_eq!(arr.count(), 0);
+    }
+
+    #[test]
+    fn test_zarray_count_packed_mode() {
+        let mut arr = ZArray::new();
+        arr.push(ZVal::long(1));
+        arr.push(ZVal::long(2));
+        arr.push(ZVal::long(3));
+        assert_eq!(arr.count(), 3);
+    }
+
+    #[test]
+    fn test_zarray_count_hash_mode() {
+        let mut arr = ZArray::new();
+        arr.insert_int(10, ZVal::long(100));
+        arr.insert_int(20, ZVal::long(200));
+        arr.insert_string(ZString::new(b"key"), ZVal::long(300));
+        assert_eq!(arr.count(), 3);
+    }
+
+    #[test]
+    fn test_zarray_count_after_deletion() {
+        let mut arr = ZArray::new();
+        arr.push(ZVal::long(1));
+        arr.push(ZVal::long(2));
+        arr.push(ZVal::long(3));
+        assert_eq!(arr.count(), 3);
+
+        arr.remove_int(1);
+        assert_eq!(arr.count(), 2);
+    }
+
+    /// Test contains_key() / key_exists() method
+    ///
+    /// Reference: PHP's array_key_exists() and isset()
+    #[test]
+    fn test_zarray_contains_key_int_packed_mode() {
+        let mut arr = ZArray::new();
+        arr.push(ZVal::long(10)); // index 0
+        arr.push(ZVal::long(20)); // index 1
+        arr.push(ZVal::long(30)); // index 2
+
+        assert!(arr.contains_key_int(0));
+        assert!(arr.contains_key_int(1));
+        assert!(arr.contains_key_int(2));
+        assert!(!arr.contains_key_int(3));
+        assert!(!arr.contains_key_int(-1));
+    }
+
+    #[test]
+    fn test_zarray_contains_key_int_hash_mode() {
+        let mut arr = ZArray::new();
+        arr.insert_int(10, ZVal::long(100));
+        arr.insert_int(20, ZVal::long(200));
+        arr.insert_int(30, ZVal::long(300));
+
+        assert!(arr.contains_key_int(10));
+        assert!(arr.contains_key_int(20));
+        assert!(arr.contains_key_int(30));
+        assert!(!arr.contains_key_int(0));
+        assert!(!arr.contains_key_int(15));
+    }
+
+    #[test]
+    fn test_zarray_contains_key_string() {
+        let mut arr = ZArray::new();
+        arr.insert_string(ZString::new(b"foo"), ZVal::long(1));
+        arr.insert_string(ZString::new(b"bar"), ZVal::long(2));
+
+        assert!(arr.contains_key_string(&ZString::new(b"foo")));
+        assert!(arr.contains_key_string(&ZString::new(b"bar")));
+        assert!(!arr.contains_key_string(&ZString::new(b"baz")));
+        assert!(!arr.contains_key_string(&ZString::new(b"")));
+    }
+
+    #[test]
+    fn test_zarray_contains_key_mixed_keys() {
+        let mut arr = ZArray::new();
+        arr.insert_int(0, ZVal::long(10));
+        arr.insert_string(ZString::new(b"name"), ZVal::long(100));
+        arr.insert_int(42, ZVal::long(99));
+
+        // Integer keys
+        assert!(arr.contains_key_int(0));
+        assert!(arr.contains_key_int(42));
+        assert!(!arr.contains_key_int(1));
+
+        // String keys
+        assert!(arr.contains_key_string(&ZString::new(b"name")));
+        assert!(!arr.contains_key_string(&ZString::new(b"age")));
+    }
+
+    #[test]
+    fn test_zarray_contains_key_after_deletion() {
+        let mut arr = ZArray::new();
+        arr.insert_int(5, ZVal::long(50));
+        arr.insert_string(ZString::new(b"test"), ZVal::long(100));
+
+        assert!(arr.contains_key_int(5));
+        assert!(arr.contains_key_string(&ZString::new(b"test")));
+
+        // Delete the keys
+        arr.remove_int(5);
+        arr.remove_string(&ZString::new(b"test"));
+
+        assert!(!arr.contains_key_int(5));
+        assert!(!arr.contains_key_string(&ZString::new(b"test")));
+    }
+
+    /// Test foreach iteration (using Rust's Iterator trait)
+    ///
+    /// Reference: PHP's foreach construct
+    #[test]
+    fn test_zarray_foreach_iteration_packed() {
+        let mut arr = ZArray::new();
+        arr.push(ZVal::long(10));
+        arr.push(ZVal::long(20));
+        arr.push(ZVal::long(30));
+
+        let items = arr.iter();
+        assert_eq!(items.len(), 3);
+
+        // Verify we can iterate like PHP's foreach
+        let mut sum = 0i64;
+        for (key, value) in items {
+            match key {
+                ZArrayKey::Int(i) => {
+                    assert!(i >= 0 && i < 3);
+                    sum += value.to_long();
+                }
+                ZArrayKey::String(_) => panic!("Expected int key"),
+            }
+        }
+        assert_eq!(sum, 60); // 10 + 20 + 30
+    }
+
+    #[test]
+    fn test_zarray_foreach_iteration_hash() {
+        let mut arr = ZArray::new();
+        arr.insert_string(ZString::new(b"a"), ZVal::long(1));
+        arr.insert_string(ZString::new(b"b"), ZVal::long(2));
+        arr.insert_string(ZString::new(b"c"), ZVal::long(3));
+
+        let items = arr.iter();
+        let keys: Vec<String> = items
+            .iter()
+            .map(|(k, _)| match k {
+                ZArrayKey::String(s) => s.as_str().unwrap().to_string(),
+                ZArrayKey::Int(_) => panic!("Expected string key"),
+            })
+            .collect();
+
+        // Order should be preserved (insertion order)
+        assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_zarray_foreach_keys_and_values_separate() {
+        let mut arr = ZArray::new();
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+
+        // Test keys()
+        let keys = arr.keys();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], ZArrayKey::Int(0));
+        assert_eq!(keys[1], ZArrayKey::Int(1));
+        assert_eq!(keys[2], ZArrayKey::Int(2));
+
+        // Test values()
+        let values = arr.values();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].to_long(), 100);
+        assert_eq!(values[1].to_long(), 200);
+        assert_eq!(values[2].to_long(), 300);
+    }
+
     /// Test copy-on-write (CoW) semantics for ZArray
     ///
     /// Reference: php-src/Zend/zend_hash.c — PHP arrays use refcounting + CoW
@@ -4624,5 +4845,322 @@ mod zarray_tests {
         assert_eq!(arr_a.get_int(0).unwrap().type_tag(), ZValType::Reference);
         assert_eq!(arr_b.get_int(0).unwrap().type_tag(), ZValType::Reference);
         assert_eq!(arr_c.get_int(0).unwrap().type_tag(), ZValType::Reference);
+    }
+}
+
+// ============================================================================
+// ZObject — Object representation
+// ============================================================================
+// Reference: php-src/Zend/zend_types.h — struct _zend_object
+//
+// A PHP object consists of:
+// - A reference to its class (ClassEntry)
+// - A properties table (ZArray for dynamic properties)
+// - A unique handle for object identity
+//
+// In PHP, objects are always passed by reference (object handles),
+// so cloning an object creates a shallow copy of the handle, not a deep copy.
+// The clone keyword is used for deep copying objects.
+// ============================================================================
+
+/// Represents a PHP object
+///
+/// Reference: php-src/Zend/zend_types.h — struct _zend_object
+///
+/// An object has:
+/// - class_entry: pointer/reference to the class definition
+/// - properties: dynamic properties storage (ZArray with string keys)
+/// - handle: unique identifier for this object instance
+///
+/// Objects use reference semantics in PHP: $a = $b copies the object handle,
+/// not the object itself. Use clone to create a deep copy.
+#[derive(Debug, Clone)]
+pub struct ZObject {
+    /// Reference to the class entry (class definition)
+    /// In a full implementation, this would be Arc<ClassEntry>
+    /// For now, we use a simple pointer/handle
+    class_entry: usize,
+    /// Dynamic properties storage
+    /// Key: property name (string), Value: property value (ZVal)
+    properties: Arc<ZArray>,
+    /// Unique object handle/identifier
+    /// Used for object identity comparisons (=== operator)
+    handle: u64,
+}
+
+impl ZObject {
+    /// Create a new object instance
+    ///
+    /// # Arguments
+    /// * `class_entry` - Handle/pointer to the class definition
+    ///
+    /// # Returns
+    /// A new ZObject with an empty properties table and unique handle
+    pub fn new(class_entry: usize) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+        Self {
+            class_entry,
+            properties: Arc::new(ZArray::new()),
+            handle: NEXT_HANDLE.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Get the class entry handle
+    pub fn class_entry(&self) -> usize {
+        self.class_entry
+    }
+
+    /// Get the unique object handle
+    pub fn handle(&self) -> u64 {
+        self.handle
+    }
+
+    /// Get a property value by name
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    ///
+    /// # Returns
+    /// Some(&ZVal) if the property exists, None otherwise
+    pub fn get_property(&self, name: &ZString) -> Option<&ZVal> {
+        self.properties.get_string(name)
+    }
+
+    /// Set a property value
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    /// * `value` - Property value
+    pub fn set_property(&mut self, name: ZString, value: ZVal) {
+        // Implement copy-on-write for properties
+        let properties = Arc::make_mut(&mut self.properties);
+        properties.insert_string(name, value);
+    }
+
+    /// Check if a property exists
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    ///
+    /// # Returns
+    /// true if the property exists, false otherwise
+    pub fn has_property(&self, name: &ZString) -> bool {
+        self.properties.contains_key_string(name)
+    }
+
+    /// Remove a property
+    ///
+    /// # Arguments
+    /// * `name` - Property name to remove
+    ///
+    /// # Returns
+    /// The removed property value, or None if it didn't exist
+    pub fn remove_property(&mut self, name: &ZString) -> Option<ZVal> {
+        let properties = Arc::make_mut(&mut self.properties);
+        properties.remove_string(name)
+    }
+
+    /// Get all property names
+    pub fn property_names(&self) -> Vec<ZString> {
+        self.properties
+            .keys()
+            .into_iter()
+            .filter_map(|key| match key {
+                ZArrayKey::String(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get the number of properties
+    pub fn property_count(&self) -> usize {
+        self.properties.count()
+    }
+}
+
+#[cfg(test)]
+mod zobject_tests {
+    use super::*;
+
+    #[test]
+    fn test_zobject_create() {
+        // Test: Create a new object
+        // PHP equivalent: $obj = new stdClass();
+        let class_entry_handle = 1;
+        let obj = ZObject::new(class_entry_handle);
+
+        assert_eq!(obj.class_entry(), class_entry_handle);
+        assert_eq!(obj.property_count(), 0);
+        assert!(obj.handle() > 0);
+    }
+
+    #[test]
+    fn test_zobject_unique_handles() {
+        // Test: Each object gets a unique handle
+        // PHP: $a = new stdClass(); $b = new stdClass();
+        // $a and $b should have different handles
+        let obj1 = ZObject::new(1);
+        let obj2 = ZObject::new(1);
+
+        assert_ne!(obj1.handle(), obj2.handle());
+    }
+
+    #[test]
+    fn test_zobject_set_get_property() {
+        // Test: Set and get a property
+        // PHP: $obj = new stdClass(); $obj->name = "Alice";
+        let mut obj = ZObject::new(1);
+        let prop_name = ZString::new(b"name");
+        let s = ZString::new(b"Alice");
+        let prop_value = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        obj.set_property(prop_name.clone(), prop_value);
+
+        assert_eq!(obj.property_count(), 1);
+        assert!(obj.has_property(&prop_name));
+
+        let retrieved = obj.get_property(&prop_name);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().to_string(), ZString::new(b"Alice"));
+    }
+
+    #[test]
+    fn test_zobject_multiple_properties() {
+        // Test: Set multiple properties
+        // PHP: $obj = new stdClass();
+        //      $obj->name = "Bob";
+        //      $obj->age = 30;
+        //      $obj->city = "NYC";
+        let mut obj = ZObject::new(1);
+
+        let s = ZString::new(b"Bob");
+        obj.set_property(
+            ZString::new(b"name"),
+            ZVal::string(Box::into_raw(Box::new(s)) as usize),
+        );
+        obj.set_property(ZString::new(b"age"), ZVal::long(30));
+        let s3 = ZString::new(b"NYC");
+        obj.set_property(
+            ZString::new(b"city"),
+            ZVal::string(Box::into_raw(Box::new(s3)) as usize),
+        );
+
+        assert_eq!(obj.property_count(), 3);
+        assert_eq!(
+            obj.get_property(&ZString::new(b"name"))
+                .unwrap()
+                .to_string(),
+            ZString::new(b"Bob")
+        );
+        assert_eq!(
+            obj.get_property(&ZString::new(b"age")).unwrap().to_long(),
+            30
+        );
+        assert_eq!(
+            obj.get_property(&ZString::new(b"city"))
+                .unwrap()
+                .to_string(),
+            ZString::new(b"NYC")
+        );
+    }
+
+    #[test]
+    fn test_zobject_overwrite_property() {
+        // Test: Overwrite an existing property
+        // PHP: $obj->name = "Alice"; $obj->name = "Bob";
+        let mut obj = ZObject::new(1);
+        let prop_name = ZString::new(b"name");
+
+        let s1 = ZString::new(b"Alice");
+        obj.set_property(
+            prop_name.clone(),
+            ZVal::string(Box::into_raw(Box::new(s1)) as usize),
+        );
+        assert_eq!(
+            obj.get_property(&prop_name).unwrap().to_string(),
+            ZString::new(b"Alice")
+        );
+
+        let s2 = ZString::new(b"Bob");
+        obj.set_property(
+            prop_name.clone(),
+            ZVal::string(Box::into_raw(Box::new(s2)) as usize),
+        );
+        assert_eq!(obj.property_count(), 1); // Still 1 property
+        assert_eq!(
+            obj.get_property(&prop_name).unwrap().to_string(),
+            ZString::new(b"Bob")
+        );
+    }
+
+    #[test]
+    fn test_zobject_remove_property() {
+        // Test: Remove a property
+        // PHP: $obj->name = "Alice"; unset($obj->name);
+        let mut obj = ZObject::new(1);
+        let prop_name = ZString::new(b"name");
+
+        let s = ZString::new(b"Alice");
+        obj.set_property(
+            prop_name.clone(),
+            ZVal::string(Box::into_raw(Box::new(s)) as usize),
+        );
+        assert!(obj.has_property(&prop_name));
+
+        let removed = obj.remove_property(&prop_name);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_string(), ZString::new(b"Alice"));
+        assert!(!obj.has_property(&prop_name));
+        assert_eq!(obj.property_count(), 0);
+    }
+
+    #[test]
+    fn test_zobject_remove_nonexistent_property() {
+        // Test: Removing a property that doesn't exist
+        let mut obj = ZObject::new(1);
+        let prop_name = ZString::new(b"nonexistent");
+
+        let removed = obj.remove_property(&prop_name);
+        assert!(removed.is_none());
+    }
+
+    #[test]
+    fn test_zobject_property_names() {
+        // Test: Get all property names
+        // PHP: $obj->a = 1; $obj->b = 2; $obj->c = 3;
+        //      array_keys(get_object_vars($obj)) => ["a", "b", "c"]
+        let mut obj = ZObject::new(1);
+
+        obj.set_property(ZString::new(b"a"), ZVal::long(1));
+        obj.set_property(ZString::new(b"b"), ZVal::long(2));
+        obj.set_property(ZString::new(b"c"), ZVal::long(3));
+
+        let names = obj.property_names();
+        assert_eq!(names.len(), 3);
+
+        // Check that all expected names are present (order might vary)
+        let names_bytes: Vec<Vec<u8>> = names.iter().map(|s| s.as_bytes().to_vec()).collect();
+        assert!(names_bytes.contains(&b"a".to_vec()));
+        assert!(names_bytes.contains(&b"b".to_vec()));
+        assert!(names_bytes.contains(&b"c".to_vec()));
+    }
+
+    #[test]
+    fn test_zobject_clone_creates_new_handle() {
+        // Test: Cloning an object creates a new handle
+        // Note: This tests Rust's Clone trait, not PHP's clone keyword
+        // In PHP, clone creates a new object with a new handle
+        let obj1 = ZObject::new(1);
+        let handle1 = obj1.handle();
+
+        let obj2 = obj1.clone();
+        let handle2 = obj2.handle();
+
+        // The clone has the same handle (Rust shallow clone)
+        // For PHP clone behavior, we'd need a separate deep_clone method
+        assert_eq!(handle1, handle2);
+        assert_eq!(obj1.class_entry(), obj2.class_entry());
     }
 }

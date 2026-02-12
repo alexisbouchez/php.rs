@@ -80,10 +80,10 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 1.4.6  Implement copy-on-write (CoW) semantics
 [x] 1.4.7  Test: CoW — modifying a copy doesn't affect original
 [x] 1.4.8  Test: nested arrays, recursive references
-[ ] 1.4.9  Implement count(), key exists, foreach iteration
+[x] 1.4.9  Implement count(), key exists, foreach iteration
 
 ## 1.5 ZObject — Object representation
-[ ] 1.5.1  Define ZObject: class_entry ref, properties (ZArray), handle
+[x] 1.5.1  Define ZObject: class_entry ref, properties (ZArray), handle
 [ ] 1.5.2  Define ClassEntry: name, parent, interfaces, methods, properties, constants
 [ ] 1.5.3  Test: create object, set/get properties, method lookup
 
