@@ -73,7 +73,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 
 ## 1.4 ZArray — Dual-mode hash table
 [x] 1.4.1  Define packed mode (consecutive int keys 0..n, Vec<ZVal> backing)
-[ ] 1.4.2  Define hash mode (string/non-consecutive int keys, Robin Hood table)
+[x] 1.4.2  Define hash mode (string/non-consecutive int keys, Robin Hood table)
 [ ] 1.4.3  Test: insert, get, delete, iteration order preserved
 [ ] 1.4.4  Test: packed → hash promotion when string key inserted
 [ ] 1.4.5  Test: next free integer key ($a[] = value)

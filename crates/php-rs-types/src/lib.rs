@@ -2794,12 +2794,248 @@ mod tests {
     }
 }
 
+/// Robin Hood hash table implementation
+///
+/// Robin Hood hashing is an open addressing collision resolution algorithm
+/// that minimizes variance in probe sequence length. When a collision occurs,
+/// we compare the "probe distance" (how far from the ideal position) of the
+/// inserting element with the existing element. If the inserting element has
+/// probed further (is "poorer"), we swap them and continue inserting the
+/// evicted element.
+///
+/// This matches PHP's internal hash table implementation more closely than
+/// standard HashMap.
+///
+/// Reference: php-src/Zend/zend_hash.c
+#[derive(Debug, Clone)]
+struct RobinHoodTable<K, V> {
+    /// Buckets storing (key, value, probe_distance)
+    /// None represents an empty bucket
+    buckets: Vec<Option<Bucket<K, V>>>,
+    /// Number of elements in the table
+    len: usize,
+    /// Insertion order tracking (for maintaining PHP array semantics)
+    /// Maps key hash to insertion order
+    insertion_order: Vec<(u64, K)>,
+}
+
+#[derive(Debug, Clone)]
+struct Bucket<K, V> {
+    key: K,
+    value: V,
+    /// How far from the ideal position this entry is
+    probe_distance: usize,
+}
+
+impl<K, V> RobinHoodTable<K, V>
+where
+    K: std::hash::Hash + Eq + Clone,
+    V: Clone,
+{
+    /// Initial capacity for new tables
+    const INITIAL_CAPACITY: usize = 8;
+    /// Load factor threshold for resizing (75%)
+    const MAX_LOAD_FACTOR: f64 = 0.75;
+
+    fn new() -> Self {
+        Self::with_capacity(Self::INITIAL_CAPACITY)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.next_power_of_two().max(Self::INITIAL_CAPACITY);
+        Self {
+            buckets: vec![None; capacity],
+            len: 0,
+            insertion_order: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Calculate hash for a key
+    fn hash_key(key: &K) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Get the ideal bucket index for a hash
+    fn ideal_index(&self, hash: u64) -> usize {
+        (hash as usize) & (self.buckets.len() - 1)
+    }
+
+    /// Insert or update a key-value pair
+    fn insert(&mut self, key: K, value: V) {
+        // Check if we need to grow
+        let load_factor = (self.len + 1) as f64 / self.buckets.len() as f64;
+        if load_factor > Self::MAX_LOAD_FACTOR {
+            self.grow();
+        }
+
+        let hash = Self::hash_key(&key);
+        let mut index = self.ideal_index(hash);
+
+        let mut inserting = Bucket {
+            key: key.clone(),
+            value,
+            probe_distance: 0,
+        };
+
+        loop {
+            match &mut self.buckets[index] {
+                None => {
+                    // Empty slot, insert here
+                    self.buckets[index] = Some(inserting);
+                    self.insertion_order.push((hash, key));
+                    self.len += 1;
+                    return;
+                }
+                Some(existing) => {
+                    // Key already exists, update value
+                    if existing.key == inserting.key {
+                        existing.value = inserting.value;
+                        return;
+                    }
+
+                    // Robin Hood: if inserting element is poorer, swap
+                    if inserting.probe_distance > existing.probe_distance {
+                        std::mem::swap(&mut inserting, existing);
+                    }
+
+                    // Continue probing
+                    index = (index + 1) & (self.buckets.len() - 1);
+                    inserting.probe_distance += 1;
+                }
+            }
+        }
+    }
+
+    /// Get a value by key
+    fn get(&self, key: &K) -> Option<&V> {
+        let hash = Self::hash_key(key);
+        let mut index = self.ideal_index(hash);
+        let mut probe_distance = 0;
+
+        loop {
+            match &self.buckets[index] {
+                None => return None,
+                Some(bucket) => {
+                    if bucket.key == *key {
+                        return Some(&bucket.value);
+                    }
+
+                    // If we've probed further than this bucket's distance,
+                    // the key doesn't exist (Robin Hood property)
+                    if probe_distance > bucket.probe_distance {
+                        return None;
+                    }
+
+                    index = (index + 1) & (self.buckets.len() - 1);
+                    probe_distance += 1;
+                }
+            }
+        }
+    }
+
+    /// Delete a key-value pair
+    fn delete(&mut self, key: &K) -> Option<V> {
+        let hash = Self::hash_key(key);
+        let mut index = self.ideal_index(hash);
+        let mut probe_distance = 0;
+
+        // Find the element
+        loop {
+            match &self.buckets[index] {
+                None => return None,
+                Some(bucket) => {
+                    if bucket.key == *key {
+                        break;
+                    }
+
+                    if probe_distance > bucket.probe_distance {
+                        return None;
+                    }
+
+                    index = (index + 1) & (self.buckets.len() - 1);
+                    probe_distance += 1;
+                }
+            }
+        }
+
+        // Remove from buckets
+        let removed_value = self.buckets[index].take().unwrap().value;
+
+        // Backward shift deletion to maintain Robin Hood properties
+        let mut current = index;
+        loop {
+            let next = (current + 1) & (self.buckets.len() - 1);
+
+            match &mut self.buckets[next] {
+                None => break,
+                Some(bucket) if bucket.probe_distance == 0 => break,
+                Some(_) => {
+                    // Shift element backward
+                    let mut bucket = self.buckets[next].take().unwrap();
+                    bucket.probe_distance -= 1;
+                    self.buckets[current] = Some(bucket);
+                    current = next;
+                }
+            }
+        }
+
+        // Remove from insertion order
+        self.insertion_order.retain(|(_, k)| k != key);
+
+        self.len -= 1;
+        Some(removed_value)
+    }
+
+    /// Grow the table to accommodate more elements
+    fn grow(&mut self) {
+        let new_capacity = self.buckets.len() * 2;
+        let old_buckets = std::mem::replace(&mut self.buckets, vec![None; new_capacity]);
+        self.len = 0;
+        let old_insertion_order = std::mem::take(&mut self.insertion_order);
+
+        // Re-insert all elements in insertion order
+        for (_, key) in old_insertion_order {
+            // Find the old value
+            for bucket in old_buckets.iter().flatten() {
+                if bucket.key == key {
+                    self.insert(key.clone(), bucket.value.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Iterate over key-value pairs in insertion order
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.insertion_order
+            .iter()
+            .filter_map(move |(_, key)| self.get(key).map(|value| (key, value)))
+    }
+
+    /// Iterate over keys in insertion order
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        self.insertion_order.iter().map(|(_, key)| key)
+    }
+}
+
 /// ZArray — PHP array implementation with dual-mode storage
 ///
 /// PHP arrays are ordered maps that can have either integer or string keys.
 /// For performance, we use two storage modes:
 /// - Packed mode: consecutive integer keys 0..n, stored as Vec<ZVal>
-/// - Hash mode: arbitrary keys (strings or non-consecutive integers), stored as HashMap
+/// - Hash mode: arbitrary keys (strings or non-consecutive integers), stored as RobinHoodTable
 ///
 /// Reference: php-src/Zend/zend_hash.h, zend_hash.c
 #[derive(Debug, Clone)]
@@ -2813,8 +3049,8 @@ enum ArrayStorage {
     /// Used for: [0 => val0, 1 => val1, 2 => val2, ...]
     Packed(Vec<ZVal>),
     /// Hash mode: arbitrary keys (string or non-consecutive integers)
-    /// TODO: Replace with Robin Hood hash table in future iterations
-    Hash(HashMap<ArrayKey, ZVal>),
+    /// Uses Robin Hood hashing for performance and PHP compatibility
+    Hash(RobinHoodTable<ArrayKey, ZVal>),
 }
 
 /// Array key can be either an integer or a string
@@ -2909,14 +3145,14 @@ impl ZArray {
 
     /// Promote from packed mode to hash mode
     ///
-    /// Converts the Vec into a HashMap with keys 0, 1, 2, ...
+    /// Converts the Vec into a RobinHoodTable with keys 0, 1, 2, ...
     fn promote_to_hash(&mut self) {
         if let ArrayStorage::Packed(vec) = &self.storage {
-            let mut map = HashMap::with_capacity(vec.len());
+            let mut table = RobinHoodTable::with_capacity(vec.len());
             for (i, val) in vec.iter().enumerate() {
-                map.insert(ArrayKey::Int(i as i64), val.clone());
+                table.insert(ArrayKey::Int(i as i64), val.clone());
             }
-            self.storage = ArrayStorage::Hash(map);
+            self.storage = ArrayStorage::Hash(table);
         }
     }
 
@@ -2955,7 +3191,7 @@ impl ZArray {
                 let next_key = map
                     .keys()
                     .filter_map(|k| match k {
-                        ArrayKey::Int(i) => Some(*i),
+                        ArrayKey::Int(i) => Some(i),
                         ArrayKey::String(_) => None,
                     })
                     .max()
@@ -3125,5 +3361,127 @@ mod zarray_tests {
         let arr = ZArray::with_capacity(100);
         assert!(arr.is_packed());
         assert_eq!(arr.len(), 0);
+    }
+
+    // Tests for Robin Hood hash table implementation
+
+    #[test]
+    fn test_robin_hood_basic_insert_get() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        table.insert(ArrayKey::Int(1), ZVal::long(100));
+        table.insert(ArrayKey::Int(2), ZVal::long(200));
+        table.insert(ArrayKey::String(ZString::new(b"key")), ZVal::long(300));
+
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(&ArrayKey::Int(1)).unwrap().to_long(), 100);
+        assert_eq!(table.get(&ArrayKey::Int(2)).unwrap().to_long(), 200);
+        assert_eq!(
+            table
+                .get(&ArrayKey::String(ZString::new(b"key")))
+                .unwrap()
+                .to_long(),
+            300
+        );
+    }
+
+    #[test]
+    fn test_robin_hood_overwrite() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        table.insert(ArrayKey::Int(1), ZVal::long(100));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(&ArrayKey::Int(1)).unwrap().to_long(), 100);
+
+        // Overwrite existing key
+        table.insert(ArrayKey::Int(1), ZVal::long(999));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(&ArrayKey::Int(1)).unwrap().to_long(), 999);
+    }
+
+    #[test]
+    fn test_robin_hood_delete() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        table.insert(ArrayKey::Int(1), ZVal::long(100));
+        table.insert(ArrayKey::Int(2), ZVal::long(200));
+        table.insert(ArrayKey::Int(3), ZVal::long(300));
+
+        assert_eq!(table.len(), 3);
+
+        // Delete middle element
+        assert!(table.delete(&ArrayKey::Int(2)).is_some());
+        assert_eq!(table.len(), 2);
+
+        // Should no longer exist
+        assert!(table.get(&ArrayKey::Int(2)).is_none());
+
+        // Others should still exist
+        assert_eq!(table.get(&ArrayKey::Int(1)).unwrap().to_long(), 100);
+        assert_eq!(table.get(&ArrayKey::Int(3)).unwrap().to_long(), 300);
+    }
+
+    #[test]
+    fn test_robin_hood_grow() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::with_capacity(4);
+
+        // Insert many items to trigger growth
+        for i in 0..20 {
+            table.insert(ArrayKey::Int(i), ZVal::long(i * 10));
+        }
+
+        assert_eq!(table.len(), 20);
+
+        // Verify all items are still accessible
+        for i in 0..20 {
+            assert_eq!(table.get(&ArrayKey::Int(i)).unwrap().to_long(), i * 10);
+        }
+    }
+
+    #[test]
+    fn test_robin_hood_collision_handling() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::with_capacity(4);
+
+        // Insert items that will definitely collide in a small table
+        table.insert(ArrayKey::Int(0), ZVal::long(0));
+        table.insert(ArrayKey::Int(4), ZVal::long(4)); // Will hash to same bucket in size-4 table
+        table.insert(ArrayKey::Int(8), ZVal::long(8)); // Will hash to same bucket in size-4 table
+
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(&ArrayKey::Int(0)).unwrap().to_long(), 0);
+        assert_eq!(table.get(&ArrayKey::Int(4)).unwrap().to_long(), 4);
+        assert_eq!(table.get(&ArrayKey::Int(8)).unwrap().to_long(), 8);
+    }
+
+    #[test]
+    fn test_robin_hood_iteration_order() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        // Insert in specific order
+        table.insert(ArrayKey::Int(3), ZVal::long(3));
+        table.insert(ArrayKey::Int(1), ZVal::long(1));
+        table.insert(ArrayKey::Int(2), ZVal::long(2));
+
+        // Collect insertion order
+        let keys: Vec<i64> = table
+            .iter()
+            .filter_map(|(k, _)| match k {
+                ArrayKey::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+
+        // Should maintain insertion order: 3, 1, 2
+        assert_eq!(keys, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn test_robin_hood_empty_operations() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        assert_eq!(table.len(), 0);
+        assert!(table.is_empty());
+        assert!(table.get(&ArrayKey::Int(1)).is_none());
+        assert!(table.delete(&ArrayKey::Int(1)).is_none());
     }
 }
