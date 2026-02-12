@@ -2793,3 +2793,337 @@ mod tests {
         assert!(val.to_bool());
     }
 }
+
+/// ZArray — PHP array implementation with dual-mode storage
+///
+/// PHP arrays are ordered maps that can have either integer or string keys.
+/// For performance, we use two storage modes:
+/// - Packed mode: consecutive integer keys 0..n, stored as Vec<ZVal>
+/// - Hash mode: arbitrary keys (strings or non-consecutive integers), stored as HashMap
+///
+/// Reference: php-src/Zend/zend_hash.h, zend_hash.c
+#[derive(Debug, Clone)]
+pub struct ZArray {
+    storage: ArrayStorage,
+}
+
+#[derive(Debug, Clone)]
+enum ArrayStorage {
+    /// Packed mode: consecutive integer keys starting from 0
+    /// Used for: [0 => val0, 1 => val1, 2 => val2, ...]
+    Packed(Vec<ZVal>),
+    /// Hash mode: arbitrary keys (string or non-consecutive integers)
+    /// TODO: Replace with Robin Hood hash table in future iterations
+    Hash(HashMap<ArrayKey, ZVal>),
+}
+
+/// Array key can be either an integer or a string
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ArrayKey {
+    Int(i64),
+    String(ZString),
+}
+
+impl ZArray {
+    /// Create a new empty array in packed mode
+    pub fn new() -> Self {
+        Self {
+            storage: ArrayStorage::Packed(Vec::new()),
+        }
+    }
+
+    /// Create a new array with a specific capacity in packed mode
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            storage: ArrayStorage::Packed(Vec::with_capacity(capacity)),
+        }
+    }
+
+    /// Check if array is in packed mode
+    pub fn is_packed(&self) -> bool {
+        matches!(self.storage, ArrayStorage::Packed(_))
+    }
+
+    /// Check if array is in hash mode
+    pub fn is_hash(&self) -> bool {
+        matches!(self.storage, ArrayStorage::Hash(_))
+    }
+
+    /// Get the number of elements in the array
+    pub fn len(&self) -> usize {
+        match &self.storage {
+            ArrayStorage::Packed(vec) => vec.len(),
+            ArrayStorage::Hash(map) => map.len(),
+        }
+    }
+
+    /// Check if the array is empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Insert a value with an integer key
+    ///
+    /// If we're in packed mode and the key is the next sequential index,
+    /// we stay in packed mode. Otherwise, we promote to hash mode.
+    pub fn insert_int(&mut self, key: i64, value: ZVal) {
+        match &mut self.storage {
+            ArrayStorage::Packed(vec) => {
+                // Check if this key is the next sequential index
+                if key >= 0 && key as usize == vec.len() {
+                    // Stay in packed mode
+                    vec.push(value);
+                } else {
+                    // Need to promote to hash mode
+                    self.promote_to_hash();
+                    // Now insert
+                    if let ArrayStorage::Hash(map) = &mut self.storage {
+                        map.insert(ArrayKey::Int(key), value);
+                    }
+                }
+            }
+            ArrayStorage::Hash(map) => {
+                map.insert(ArrayKey::Int(key), value);
+            }
+        }
+    }
+
+    /// Insert a value with a string key
+    ///
+    /// This always promotes to hash mode if we're in packed mode.
+    pub fn insert_string(&mut self, key: ZString, value: ZVal) {
+        match &mut self.storage {
+            ArrayStorage::Packed(_) => {
+                // Promote to hash mode
+                self.promote_to_hash();
+                // Now insert
+                if let ArrayStorage::Hash(map) = &mut self.storage {
+                    map.insert(ArrayKey::String(key), value);
+                }
+            }
+            ArrayStorage::Hash(map) => {
+                map.insert(ArrayKey::String(key), value);
+            }
+        }
+    }
+
+    /// Promote from packed mode to hash mode
+    ///
+    /// Converts the Vec into a HashMap with keys 0, 1, 2, ...
+    fn promote_to_hash(&mut self) {
+        if let ArrayStorage::Packed(vec) = &self.storage {
+            let mut map = HashMap::with_capacity(vec.len());
+            for (i, val) in vec.iter().enumerate() {
+                map.insert(ArrayKey::Int(i as i64), val.clone());
+            }
+            self.storage = ArrayStorage::Hash(map);
+        }
+    }
+
+    /// Get a value by integer key
+    pub fn get_int(&self, key: i64) -> Option<&ZVal> {
+        match &self.storage {
+            ArrayStorage::Packed(vec) => {
+                if key >= 0 && (key as usize) < vec.len() {
+                    Some(&vec[key as usize])
+                } else {
+                    None
+                }
+            }
+            ArrayStorage::Hash(map) => map.get(&ArrayKey::Int(key)),
+        }
+    }
+
+    /// Get a value by string key
+    pub fn get_string(&self, key: &ZString) -> Option<&ZVal> {
+        match &self.storage {
+            ArrayStorage::Packed(_) => None, // Packed mode has no string keys
+            ArrayStorage::Hash(map) => map.get(&ArrayKey::String(key.clone())),
+        }
+    }
+
+    /// Push a value onto the end of the array (like $arr[] = $val in PHP)
+    ///
+    /// This finds the next free integer key and inserts there.
+    pub fn push(&mut self, value: ZVal) {
+        match &mut self.storage {
+            ArrayStorage::Packed(vec) => {
+                vec.push(value);
+            }
+            ArrayStorage::Hash(map) => {
+                // Find the maximum integer key + 1
+                let next_key = map
+                    .keys()
+                    .filter_map(|k| match k {
+                        ArrayKey::Int(i) => Some(*i),
+                        ArrayKey::String(_) => None,
+                    })
+                    .max()
+                    .map(|max| max + 1)
+                    .unwrap_or(0);
+                map.insert(ArrayKey::Int(next_key), value);
+            }
+        }
+    }
+}
+
+impl Default for ZArray {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod zarray_tests {
+    use super::*;
+
+    #[test]
+    fn test_packed_mode_new() {
+        let arr = ZArray::new();
+        assert!(arr.is_packed());
+        assert!(!arr.is_hash());
+        assert_eq!(arr.len(), 0);
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn test_packed_mode_sequential_insert() {
+        let mut arr = ZArray::new();
+
+        // Insert sequential keys 0, 1, 2
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+
+        // Should still be in packed mode
+        assert!(arr.is_packed());
+        assert_eq!(arr.len(), 3);
+
+        // Verify values
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 300);
+    }
+
+    #[test]
+    fn test_packed_mode_push() {
+        let mut arr = ZArray::new();
+
+        // Push values (equivalent to $arr[] = val)
+        arr.push(ZVal::long(10));
+        arr.push(ZVal::long(20));
+        arr.push(ZVal::long(30));
+
+        // Should be in packed mode with keys 0, 1, 2
+        assert!(arr.is_packed());
+        assert_eq!(arr.len(), 3);
+
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 10);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 20);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 30);
+    }
+
+    #[test]
+    fn test_packed_to_hash_promotion_non_sequential() {
+        let mut arr = ZArray::new();
+
+        // Start with sequential keys
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+
+        // Still packed
+        assert!(arr.is_packed());
+
+        // Insert non-sequential key — should promote to hash
+        arr.insert_int(5, ZVal::long(500));
+
+        // Now should be in hash mode
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 3);
+
+        // Verify all values are still accessible
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_int(5).unwrap().to_long(), 500);
+    }
+
+    #[test]
+    fn test_packed_to_hash_promotion_string_key() {
+        let mut arr = ZArray::new();
+
+        // Start with sequential integer keys
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+
+        assert!(arr.is_packed());
+
+        // Insert a string key — should promote to hash
+        let key = ZString::new(b"name");
+        arr.insert_string(key.clone(), ZVal::long(999));
+
+        // Now should be in hash mode
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 3);
+
+        // Verify all values
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_string(&key).unwrap().to_long(), 999);
+    }
+
+    #[test]
+    fn test_get_nonexistent_key() {
+        let arr = ZArray::new();
+
+        // Getting non-existent key should return None
+        assert!(arr.get_int(0).is_none());
+        assert!(arr.get_int(999).is_none());
+
+        let key = ZString::new(b"missing");
+        assert!(arr.get_string(&key).is_none());
+    }
+
+    #[test]
+    fn test_packed_mode_negative_key_promotion() {
+        let mut arr = ZArray::new();
+
+        // Start with key 0
+        arr.insert_int(0, ZVal::long(100));
+        assert!(arr.is_packed());
+
+        // Insert negative key — should promote to hash
+        arr.insert_int(-1, ZVal::long(999));
+
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 2);
+
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(-1).unwrap().to_long(), 999);
+    }
+
+    #[test]
+    fn test_hash_mode_push() {
+        let mut arr = ZArray::new();
+
+        // Force hash mode by inserting a string key
+        arr.insert_string(ZString::new(b"a"), ZVal::long(1));
+
+        assert!(arr.is_hash());
+
+        // Now push some values
+        arr.push(ZVal::long(10));
+        arr.push(ZVal::long(20));
+
+        // Should get integer keys 0 and 1 (next free keys)
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 10);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 20);
+        assert_eq!(arr.len(), 3);
+    }
+
+    #[test]
+    fn test_with_capacity() {
+        let arr = ZArray::with_capacity(100);
+        assert!(arr.is_packed());
+        assert_eq!(arr.len(), 0);
+    }
+}
