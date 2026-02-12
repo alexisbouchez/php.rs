@@ -166,7 +166,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 3.2.7  Test: all cast expressions ((int), (string), (array), (object), (bool), (float), (unset))
 
 ## 3.3 Statement parsing
-[ ] 3.3.1  Implement control flow: if/elseif/else, alternative syntax (if: ... endif;)
+[x] 3.3.1  Implement control flow: if/elseif/else, alternative syntax (if: ... endif;)
 [ ] 3.3.2  Implement loops: while, do-while, for, foreach, alternative syntax
 [ ] 3.3.3  Implement switch/case/default + match expression
 [ ] 3.3.4  Implement try/catch/finally (multi-catch: catch (A | B))

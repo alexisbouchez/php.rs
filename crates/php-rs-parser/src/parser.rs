@@ -89,6 +89,158 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// Parse a statement
+    pub fn parse_statement(&mut self) -> Result<Statement, ParseError> {
+        match self.current_token {
+            Token::If => self.parse_if_statement(),
+            Token::Return => self.parse_return_statement(),
+            _ => Err(ParseError::UnexpectedToken {
+                expected: "statement".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            }),
+        }
+    }
+
+    /// Parse return statement
+    fn parse_return_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Return)?;
+
+        // Check if there's a value to return
+        let value = if self.current_token == Token::Semicolon {
+            None
+        } else {
+            Some(Box::new(self.parse_expression(0)?))
+        };
+
+        self.expect(Token::Semicolon)?;
+
+        Ok(Statement::Return {
+            value,
+            span: start_span,
+        })
+    }
+
+    /// Parse if/elseif/else statement
+    fn parse_if_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::If)?;
+
+        // Parse condition in parentheses
+        self.expect(Token::LParen)?;
+        let condition = Box::new(self.parse_expression(0)?);
+        self.expect(Token::RParen)?;
+
+        // Check for alternative syntax (colon)
+        let is_alternative_syntax = self.current_token == Token::Colon;
+
+        if is_alternative_syntax {
+            // Alternative syntax: if (...): statements endif;
+            self.advance(); // consume colon
+
+            // Parse then statements until elseif/else/endif
+            let mut then_statements = Vec::new();
+            while self.current_token != Token::Elseif
+                && self.current_token != Token::Else
+                && self.current_token != Token::Endif
+            {
+                then_statements.push(self.parse_statement()?);
+            }
+
+            // Parse elseif branches (alternative syntax)
+            let mut elseif_branches = Vec::new();
+            while self.current_token == Token::Elseif {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let elseif_condition = self.parse_expression(0)?;
+                self.expect(Token::RParen)?;
+                self.expect(Token::Colon)?;
+
+                // Parse elseif statements
+                let mut elseif_stmts = Vec::new();
+                while self.current_token != Token::Elseif
+                    && self.current_token != Token::Else
+                    && self.current_token != Token::Endif
+                {
+                    elseif_stmts.push(self.parse_statement()?);
+                }
+
+                let elseif_body = Statement::Block {
+                    statements: elseif_stmts,
+                    span: start_span,
+                };
+                elseif_branches.push((elseif_condition, elseif_body));
+            }
+
+            // Parse else branch (alternative syntax)
+            let else_branch = if self.current_token == Token::Else {
+                self.advance();
+                self.expect(Token::Colon)?;
+
+                // Parse else statements
+                let mut else_stmts = Vec::new();
+                while self.current_token != Token::Endif {
+                    else_stmts.push(self.parse_statement()?);
+                }
+
+                Some(Box::new(Statement::Block {
+                    statements: else_stmts,
+                    span: start_span,
+                }))
+            } else {
+                None
+            };
+
+            // Expect endif;
+            self.expect(Token::Endif)?;
+            self.expect(Token::Semicolon)?;
+
+            let then_branch = Box::new(Statement::Block {
+                statements: then_statements,
+                span: start_span,
+            });
+
+            Ok(Statement::If {
+                condition,
+                then_branch,
+                elseif_branches,
+                else_branch,
+                span: start_span,
+            })
+        } else {
+            // Standard syntax: if (...) statement
+            let then_branch = Box::new(self.parse_statement()?);
+
+            // Parse elseif branches
+            let mut elseif_branches = Vec::new();
+            while self.current_token == Token::Elseif {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let elseif_condition = self.parse_expression(0)?;
+                self.expect(Token::RParen)?;
+                let elseif_body = self.parse_statement()?;
+                elseif_branches.push((elseif_condition, elseif_body));
+            }
+
+            // Parse else branch
+            let else_branch = if self.current_token == Token::Else {
+                self.advance();
+                Some(Box::new(self.parse_statement()?))
+            } else {
+                None
+            };
+
+            Ok(Statement::If {
+                condition,
+                then_branch,
+                elseif_branches,
+                else_branch,
+                span: start_span,
+            })
+        }
+    }
+
     /// Parse a prefix expression (literals, variables, unary operators, parentheses)
     fn parse_prefix(&mut self) -> Result<Expression, ParseError> {
         let token = self.current_token.clone();
@@ -777,6 +929,238 @@ mod tests {
                 }
                 _ => panic!("Expected cast expression for {}", source),
             }
+        }
+    }
+
+    #[test]
+    fn test_simple_if_statement() {
+        // Test: if ($x) return 1;
+        let source = "<?php if ($x) return 1;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::If {
+                condition,
+                then_branch,
+                elseif_branches,
+                else_branch,
+                ..
+            } => {
+                // Condition should be Variable($x)
+                assert!(matches!(*condition, Expression::Variable { .. }));
+                // Then branch should be Return(IntLiteral(1))
+                assert!(matches!(*then_branch, Statement::Return { .. }));
+                // No elseif or else
+                assert!(elseif_branches.is_empty());
+                assert!(else_branch.is_none());
+            }
+            _ => panic!("Expected if statement"),
+        }
+    }
+
+    #[test]
+    fn test_if_else_statement() {
+        // Test: if ($x) return 1; else return 0;
+        let source = "<?php if ($x) return 1; else return 0;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::If {
+                condition,
+                then_branch,
+                elseif_branches,
+                else_branch,
+                ..
+            } => {
+                assert!(matches!(*condition, Expression::Variable { .. }));
+                assert!(matches!(*then_branch, Statement::Return { .. }));
+                assert!(elseif_branches.is_empty());
+                // Else branch should exist
+                assert!(else_branch.is_some());
+                assert!(matches!(*else_branch.unwrap(), Statement::Return { .. }));
+            }
+            _ => panic!("Expected if statement"),
+        }
+    }
+
+    #[test]
+    fn test_if_elseif_else_statement() {
+        // Test: if ($x) return 1; elseif ($y) return 2; else return 0;
+        let source = "<?php if ($x) return 1; elseif ($y) return 2; else return 0;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::If {
+                condition,
+                then_branch,
+                elseif_branches,
+                else_branch,
+                ..
+            } => {
+                assert!(matches!(*condition, Expression::Variable { .. }));
+                assert!(matches!(*then_branch, Statement::Return { .. }));
+                // One elseif branch
+                assert_eq!(elseif_branches.len(), 1);
+                let (elseif_cond, elseif_body) = &elseif_branches[0];
+                assert!(matches!(elseif_cond, Expression::Variable { .. }));
+                assert!(matches!(elseif_body, Statement::Return { .. }));
+                // Else branch should exist
+                assert!(else_branch.is_some());
+            }
+            _ => panic!("Expected if statement"),
+        }
+    }
+
+    #[test]
+    fn test_multiple_elseif() {
+        // Test: if ($x) return 1; elseif ($y) return 2; elseif ($z) return 3;
+        let source = "<?php if ($x) return 1; elseif ($y) return 2; elseif ($z) return 3;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::If {
+                elseif_branches, ..
+            } => {
+                // Two elseif branches
+                assert_eq!(elseif_branches.len(), 2);
+            }
+            _ => panic!("Expected if statement"),
+        }
+    }
+
+    #[test]
+    fn test_alternative_syntax_if() {
+        // Test: if ($x): return 1; endif;
+        let source = "<?php if ($x): return 1; endif;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::If {
+                condition,
+                then_branch,
+                elseif_branches,
+                else_branch,
+                ..
+            } => {
+                assert!(matches!(*condition, Expression::Variable { .. }));
+                // Then branch should be a Block with one return statement
+                match *then_branch {
+                    Statement::Block { statements, .. } => {
+                        assert_eq!(statements.len(), 1);
+                        assert!(matches!(statements[0], Statement::Return { .. }));
+                    }
+                    _ => panic!("Expected block in then branch"),
+                }
+                assert!(elseif_branches.is_empty());
+                assert!(else_branch.is_none());
+            }
+            _ => panic!("Expected if statement"),
+        }
+    }
+
+    #[test]
+    fn test_alternative_syntax_if_else() {
+        // Test: if ($x): return 1; else: return 0; endif;
+        let source = "<?php if ($x): return 1; else: return 0; endif;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::If {
+                condition,
+                then_branch,
+                elseif_branches,
+                else_branch,
+                ..
+            } => {
+                assert!(matches!(*condition, Expression::Variable { .. }));
+                assert!(matches!(*then_branch, Statement::Block { .. }));
+                assert!(elseif_branches.is_empty());
+                // Else branch should be a block
+                assert!(else_branch.is_some());
+                match *else_branch.unwrap() {
+                    Statement::Block { statements, .. } => {
+                        assert_eq!(statements.len(), 1);
+                        assert!(matches!(statements[0], Statement::Return { .. }));
+                    }
+                    _ => panic!("Expected block in else branch"),
+                }
+            }
+            _ => panic!("Expected if statement"),
+        }
+    }
+
+    #[test]
+    fn test_alternative_syntax_if_elseif_else() {
+        // Test: if ($x): return 1; elseif ($y): return 2; else: return 0; endif;
+        let source = "<?php if ($x): return 1; elseif ($y): return 2; else: return 0; endif;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::If {
+                condition,
+                then_branch,
+                elseif_branches,
+                else_branch,
+                ..
+            } => {
+                assert!(matches!(*condition, Expression::Variable { .. }));
+                assert!(matches!(*then_branch, Statement::Block { .. }));
+                // One elseif branch
+                assert_eq!(elseif_branches.len(), 1);
+                let (elseif_cond, elseif_body) = &elseif_branches[0];
+                assert!(matches!(elseif_cond, Expression::Variable { .. }));
+                assert!(matches!(elseif_body, Statement::Block { .. }));
+                // Else branch should exist
+                assert!(else_branch.is_some());
+                assert!(matches!(*else_branch.unwrap(), Statement::Block { .. }));
+            }
+            _ => panic!("Expected if statement"),
+        }
+    }
+
+    #[test]
+    fn test_alternative_syntax_multiple_statements() {
+        // Test: if ($x): return 1; return 2; endif;
+        let source = "<?php if ($x): return 1; return 2; endif;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::If { then_branch, .. } => {
+                // Then branch should be a Block with two return statements
+                match *then_branch {
+                    Statement::Block { statements, .. } => {
+                        assert_eq!(statements.len(), 2);
+                        assert!(matches!(statements[0], Statement::Return { .. }));
+                        assert!(matches!(statements[1], Statement::Return { .. }));
+                    }
+                    _ => panic!("Expected block in then branch"),
+                }
+            }
+            _ => panic!("Expected if statement"),
         }
     }
 }
