@@ -11,6 +11,8 @@ enum State {
     Initial,
     /// ST_IN_SCRIPTING - inside PHP code
     InScripting,
+    /// ST_DOUBLE_QUOTES - inside double-quoted string with interpolation
+    DoubleQuotes,
 }
 
 /// PHP Lexer
@@ -115,6 +117,7 @@ impl<'src> Lexer<'src> {
         match self.state {
             State::Initial => self.scan_initial(),
             State::InScripting => self.scan_scripting(),
+            State::DoubleQuotes => self.scan_double_quotes_state(),
         }
     }
 
@@ -398,6 +401,44 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Check if a double-quoted string contains variable interpolation
+    /// Returns true if the string contains unescaped $ followed by a valid variable name
+    fn has_interpolation(&self, start_pos: usize) -> bool {
+        let mut pos = start_pos + 1; // Skip opening quote
+        let bytes = self.source.as_bytes();
+
+        while pos < bytes.len() {
+            match bytes[pos] {
+                b'"' => return false, // End of string, no interpolation found
+                b'\\' => {
+                    // Skip escape sequence
+                    pos += 1;
+                    if pos < bytes.len() {
+                        pos += 1; // Skip the escaped character
+                    }
+                }
+                b'$' => {
+                    // Check if this is a variable
+                    if pos + 1 < bytes.len() {
+                        let next = bytes[pos + 1];
+                        // Variable starts with letter or underscore
+                        if next.is_ascii_alphabetic() || next == b'_' {
+                            return true; // Found interpolation
+                        }
+                        // Also check for {$ or ${ patterns
+                        if next == b'{' {
+                            return true;
+                        }
+                    }
+                    pos += 1;
+                }
+                _ => pos += 1,
+            }
+        }
+
+        false // No interpolation found (or unterminated string)
+    }
+
     /// Scan a double-quoted string literal
     /// Double-quoted strings in PHP support many escape sequences:
     /// - \n (newline), \r (carriage return), \t (tab)
@@ -406,12 +447,20 @@ impl<'src> Lexer<'src> {
     /// - \xHH (hex escape, 2 hex digits)
     /// - \u{HHHHHH} (unicode escape, 1-6 hex digits)
     /// - \OOO (octal escape, 1-3 octal digits)
-    /// Variable interpolation is handled separately in task 2.2.8.
+    /// Variable interpolation is handled in ST_DOUBLE_QUOTES state.
     fn scan_double_quoted_string(&mut self) -> Option<(Token, Span)> {
         let start_pos = self.pos;
         let start_line = self.line;
         let start_column = self.column;
 
+        // Check if this string needs interpolation
+        if self.has_interpolation(start_pos) {
+            // Switch to ST_DOUBLE_QUOTES state and emit EncapsedAndWhitespace
+            self.state = State::DoubleQuotes;
+            return self.scan_double_quotes_state();
+        }
+
+        // No interpolation - scan as a constant string
         // Consume opening double quote
         self.consume(); // "
 
@@ -475,7 +524,7 @@ impl<'src> Lexer<'src> {
                             // Consume up to 2 more octal digits
                             for _ in 0..2 {
                                 if let Some(ch) = self.peek() {
-                                    if ch >= '0' && ch <= '7' {
+                                    if ('0'..='7').contains(&ch) {
                                         self.consume();
                                     } else {
                                         break;
@@ -498,7 +547,103 @@ impl<'src> Lexer<'src> {
                     ));
                 }
                 Some(_) => {
-                    // Regular character (including $, which we'll handle in task 2.2.8)
+                    // Regular character
+                    self.consume();
+                }
+            }
+        }
+    }
+
+    /// Scan inside ST_DOUBLE_QUOTES state - emit EncapsedAndWhitespace and Variable tokens
+    /// This handles variable interpolation inside double-quoted strings
+    fn scan_double_quotes_state(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // If we're at the start of the string, consume the opening quote
+        if self.peek() == Some('"') {
+            self.consume(); // "
+
+            // If the very next character is a variable, emit empty EncapsedAndWhitespace
+            if self.peek() == Some('$') {
+                if let Some(next_ch) = self.source[self.pos + 1..].chars().next() {
+                    if next_ch.is_ascii_alphabetic() || next_ch == '_' {
+                        // Emit empty string part before variable
+                        return Some((
+                            Token::EncapsedAndWhitespace,
+                            Span::new(start_pos, self.pos, start_line, start_column),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Scan until we hit a variable or closing quote
+        loop {
+            match self.peek() {
+                None => {
+                    // Unterminated string
+                    return Some((
+                        Token::EncapsedAndWhitespace,
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some('"') => {
+                    // Closing quote - emit it and switch back to InScripting
+                    self.consume();
+                    self.state = State::InScripting;
+                    return Some((
+                        Token::EncapsedAndWhitespace,
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some('$') => {
+                    // Check if this starts a variable
+                    if let Some(next_ch) = self.source[self.pos + 1..].chars().next() {
+                        if next_ch.is_ascii_alphabetic() || next_ch == '_' {
+                            // Emit the string part before the variable (if any)
+                            if self.pos > start_pos {
+                                return Some((
+                                    Token::EncapsedAndWhitespace,
+                                    Span::new(start_pos, self.pos, start_line, start_column),
+                                ));
+                            } else {
+                                // Scan the variable
+                                let var_start = self.pos;
+                                let var_line = self.line;
+                                let var_column = self.column;
+
+                                self.consume(); // $
+
+                                // Consume variable name
+                                while let Some(ch) = self.peek() {
+                                    if ch.is_ascii_alphanumeric() || ch == '_' {
+                                        self.consume();
+                                    } else {
+                                        break;
+                                    }
+                                }
+
+                                return Some((
+                                    Token::Variable,
+                                    Span::new(var_start, self.pos, var_line, var_column),
+                                ));
+                            }
+                        }
+                    }
+                    // Not a variable, just a regular $ character
+                    self.consume();
+                }
+                Some('\\') => {
+                    // Handle escape sequences
+                    self.consume();
+                    if self.peek().is_some() {
+                        self.consume(); // Consume the escaped character
+                    }
+                }
+                Some(_) => {
+                    // Regular character
                     self.consume();
                 }
             }
@@ -3587,17 +3732,17 @@ mod tests {
     }
 
     #[test]
-    fn test_double_quoted_string_no_variable_interpolation_for_now() {
-        // Test: for now, we'll tokenize $var inside strings as part of the string
-        // Later (task 2.2.8), we'll handle interpolation properly
+    fn test_double_quoted_string_with_variable_interpolation() {
+        // Test: Variable interpolation is now implemented (task 2.3.1)
         let source = r#"<?php "hello $var world""#;
         let mut lexer = Lexer::new(source);
 
         lexer.next_token(); // Skip <?php
 
+        // Should now emit multiple tokens for interpolation
         let (token, span) = lexer.next_token().expect("Should tokenize string");
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""hello $var world""#);
+        assert_eq!(token, Token::EncapsedAndWhitespace);
+        assert_eq!(span.extract(source), r#""hello "#);
     }
 
     // ======================================================================
@@ -3801,30 +3946,26 @@ mod tests {
         //
         // In PHP's lexer, when scanning double-quoted strings, the lexer switches
         // to ST_DOUBLE_QUOTES state and emits multiple tokens:
-        // 1. Opening quote (implicit in ConstantEncapsedString start)
-        // 2. T_ENCAPSED_AND_WHITESPACE for "hello "
-        // 3. T_VARIABLE for $var
-        // 4. T_ENCAPSED_AND_WHITESPACE for " world"
-        // 5. Closing quote (implicit in ConstantEncapsedString end)
-        //
-        // For now, we test that the lexer can at least recognize this pattern.
-        // Full implementation will be in the scanner state machine.
+        // 1. T_ENCAPSED_AND_WHITESPACE for "hello "
+        // 2. T_VARIABLE for $var
+        // 3. T_ENCAPSED_AND_WHITESPACE for " world"
         let source = r#"<?php "hello $var world""#;
         let mut lexer = Lexer::new(source);
 
         lexer.next_token(); // Skip <?php
 
-        // TODO: When interpolation is implemented, this should return multiple tokens
-        // For now, it should return a single ConstantEncapsedString token
-        let (token, span) = lexer.next_token().expect("Should tokenize string");
+        // Now implemented in task 2.3.1
+        let (token1, span1) = lexer.next_token().expect("Should tokenize string part 1");
+        assert_eq!(token1, Token::EncapsedAndWhitespace);
+        assert_eq!(span1.extract(source), r#""hello "#);
 
-        // This test documents current behavior (no interpolation yet)
-        // When task 2.2.8 implementation is done, update this to expect:
-        // - Token::EncapsedAndWhitespace for "hello "
-        // - Token::Variable for $var
-        // - Token::EncapsedAndWhitespace for " world"
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""hello $var world""#);
+        let (token2, span2) = lexer.next_token().expect("Should tokenize variable");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$var");
+
+        let (token3, span3) = lexer.next_token().expect("Should tokenize string part 2");
+        assert_eq!(token3, Token::EncapsedAndWhitespace);
+        assert_eq!(span3.extract(source), r#" world""#);
     }
 
     #[test]
@@ -3832,22 +3973,18 @@ mod tests {
         // Test: Complex syntax with braces "{$var}"
         // Reference: php-src/Zend/zend_language_scanner.l - T_CURLY_OPEN
         // This syntax is used for complex expressions: "{$obj->prop}", "{$arr['key']}"
+        // NOTE: Full {$ syntax will be in task 2.3.2+ (more complex interpolation)
+        // For now, this is detected as interpolation and emits basic tokens
         let source = r#"<?php "hello {$var} world""#;
         let mut lexer = Lexer::new(source);
 
         lexer.next_token(); // Skip <?php
 
-        // TODO: When interpolation is implemented, this should return:
-        // - T_ENCAPSED_AND_WHITESPACE for "hello "
-        // - T_CURLY_OPEN for {$
-        // - T_STRING_VARNAME or T_VARIABLE for var
-        // - '}' (single char)
-        // - T_ENCAPSED_AND_WHITESPACE for " world"
-        let (token, span) = lexer.next_token().expect("Should tokenize string");
-
-        // Current behavior: returns single string token
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""hello {$var} world""#);
+        // Basic interpolation detection works, though {$} is treated as string content for now
+        // Full {$} support requires more complex state handling (future task)
+        let (token, _span) = lexer.next_token().expect("Should tokenize string");
+        // For now, since {$ is detected as interpolation trigger, it emits encapsed tokens
+        assert_eq!(token, Token::EncapsedAndWhitespace);
     }
 
     #[test]
@@ -3855,69 +3992,58 @@ mod tests {
         // Test: Deprecated syntax "${var}"
         // Reference: php-src/Zend/zend_language_scanner.l - T_DOLLAR_OPEN_CURLY_BRACES
         // This syntax is deprecated in PHP 8.2+ but still needs to be tokenized
+        // NOTE: Full ${ syntax will be in task 2.3.2+ (more complex interpolation)
         let source = r#"<?php "hello ${var} world""#;
         let mut lexer = Lexer::new(source);
 
         lexer.next_token(); // Skip <?php
 
-        // TODO: When interpolation is implemented, this should return:
-        // - T_ENCAPSED_AND_WHITESPACE for "hello "
-        // - T_DOLLAR_OPEN_CURLY_BRACES for ${
-        // - T_STRING_VARNAME for var
-        // - '}' (single char)
-        // - T_ENCAPSED_AND_WHITESPACE for " world"
-        let (token, span) = lexer.next_token().expect("Should tokenize string");
-
-        // Current behavior: returns single string token
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""hello ${var} world""#);
+        // Basic interpolation detection works
+        let (token, _span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::EncapsedAndWhitespace);
     }
 
     #[test]
     fn test_string_interpolation_object_property() {
         // Test: Object property access "$obj->prop"
         // Reference: php-src/Zend/zend_language_scanner.l
-        // The lexer needs to recognize -> inside strings as T_OBJECT_OPERATOR
+        // NOTE: Full object property interpolation ($obj->prop) will be in task 2.3.2+
+        // For now, basic variable interpolation works
         let source = r#"<?php "hello $obj->prop world""#;
         let mut lexer = Lexer::new(source);
 
         lexer.next_token(); // Skip <?php
 
-        // TODO: When interpolation is implemented, this should return:
-        // - T_ENCAPSED_AND_WHITESPACE for "hello "
-        // - T_VARIABLE for $obj
-        // - T_OBJECT_OPERATOR for ->
-        // - T_STRING for prop (property name)
-        // - T_ENCAPSED_AND_WHITESPACE for " world"
+        // Basic variable detection works, though ->prop handling is incomplete
         let (token, span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::EncapsedAndWhitespace);
+        assert_eq!(span.extract(source), r#""hello "#);
 
-        // Current behavior: returns single string token
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""hello $obj->prop world""#);
+        let (token2, span2) = lexer.next_token().expect("Should tokenize variable");
+        assert_eq!(token2, Token::Variable);
+        // Note: Currently only captures $obj, not ->prop (that's for task 2.3.2)
+        assert_eq!(span2.extract(source), "$obj");
     }
 
     #[test]
     fn test_string_interpolation_array_access() {
         // Test: Array access "$arr[key]"
         // Reference: php-src/Zend/zend_language_scanner.l
-        // Array access inside strings has special tokenization rules
+        // NOTE: Full array access interpolation ($arr[key]) will be in task 2.3.2+
         let source = r#"<?php "hello $arr[key] world""#;
         let mut lexer = Lexer::new(source);
 
         lexer.next_token(); // Skip <?php
 
-        // TODO: When interpolation is implemented, this should return:
-        // - T_ENCAPSED_AND_WHITESPACE for "hello "
-        // - T_VARIABLE for $arr
-        // - '[' (single char)
-        // - T_STRING or T_NUM_STRING for key (unquoted key inside string interpolation)
-        // - ']' (single char)
-        // - T_ENCAPSED_AND_WHITESPACE for " world"
+        // Basic variable detection works
         let (token, span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::EncapsedAndWhitespace);
+        assert_eq!(span.extract(source), r#""hello "#);
 
-        // Current behavior: returns single string token
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""hello $arr[key] world""#);
+        let (token2, span2) = lexer.next_token().expect("Should tokenize variable");
+        assert_eq!(token2, Token::Variable);
+        // Note: Currently only captures $arr, not [key] (that's for task 2.3.2)
+        assert_eq!(span2.extract(source), "$arr");
     }
 
     #[test]
@@ -3928,13 +4054,34 @@ mod tests {
 
         lexer.next_token(); // Skip <?php
 
-        // TODO: When interpolation is implemented, this should alternate between
-        // T_ENCAPSED_AND_WHITESPACE and T_VARIABLE tokens
-        let (token, span) = lexer.next_token().expect("Should tokenize string");
+        // Now implemented: alternates between T_ENCAPSED_AND_WHITESPACE and T_VARIABLE tokens
+        let (token1, span1) = lexer.next_token().expect("Token 1");
+        assert_eq!(token1, Token::EncapsedAndWhitespace);
+        assert_eq!(span1.extract(source), r#""x="#);
 
-        // Current behavior: returns single string token
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""x=$x, y=$y, z=$z""#);
+        let (token2, span2) = lexer.next_token().expect("Token 2");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$x");
+
+        let (token3, span3) = lexer.next_token().expect("Token 3");
+        assert_eq!(token3, Token::EncapsedAndWhitespace);
+        assert_eq!(span3.extract(source), ", y=");
+
+        let (token4, span4) = lexer.next_token().expect("Token 4");
+        assert_eq!(token4, Token::Variable);
+        assert_eq!(span4.extract(source), "$y");
+
+        let (token5, span5) = lexer.next_token().expect("Token 5");
+        assert_eq!(token5, Token::EncapsedAndWhitespace);
+        assert_eq!(span5.extract(source), ", z=");
+
+        let (token6, span6) = lexer.next_token().expect("Token 6");
+        assert_eq!(token6, Token::Variable);
+        assert_eq!(span6.extract(source), "$z");
+
+        let (token7, span7) = lexer.next_token().expect("Token 7");
+        assert_eq!(token7, Token::EncapsedAndWhitespace);
+        assert_eq!(span7.extract(source), r#"""#);
     }
 
     #[test]
@@ -3955,39 +4102,34 @@ mod tests {
     #[test]
     fn test_string_interpolation_complex_array_access() {
         // Test: Complex array access with integer key
+        // NOTE: Full array access with [0] will be in task 2.3.2+
         let source = r#"<?php "value is $arr[0]""#;
         let mut lexer = Lexer::new(source);
 
         lexer.next_token(); // Skip <?php
 
-        // TODO: When interpolation is implemented:
-        // - T_ENCAPSED_AND_WHITESPACE for "value is "
-        // - T_VARIABLE for $arr
-        // - '['
-        // - T_NUM_STRING for 0
-        // - ']'
+        // Basic variable detection works
         let (token, span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::EncapsedAndWhitespace);
+        assert_eq!(span.extract(source), r#""value is "#);
 
-        // Current behavior: returns single string token
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""value is $arr[0]""#);
+        let (token2, span2) = lexer.next_token().expect("Should tokenize variable");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$arr");
     }
 
     #[test]
     fn test_string_interpolation_nested_complex() {
         // Test: Complex nested expression with braces
+        // NOTE: Full {$...} complex expressions will be in task 2.3.2+
         let source = r#"<?php "result: {$obj->method()['key']}""#;
         let mut lexer = Lexer::new(source);
 
         lexer.next_token(); // Skip <?php
 
-        // TODO: When interpolation is implemented, the {$ syntax allows
-        // arbitrary expressions inside the braces
-        let (token, span) = lexer.next_token().expect("Should tokenize string");
-
-        // Current behavior: returns single string token
-        assert_eq!(token, Token::ConstantEncapsedString);
-        assert_eq!(span.extract(source), r#""result: {$obj->method()['key']}""#);
+        // Basic interpolation detection works (detects {$ pattern)
+        let (token, _span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::EncapsedAndWhitespace);
     }
 
     #[test]
@@ -4606,5 +4748,154 @@ mod tests {
             result.is_some(),
             "Lexer should handle unterminated heredoc gracefully"
         );
+    }
+
+    // ======================================================================
+    // Task 2.3.1: Implement variable scanning in double-quoted strings
+    // Reference: php-src/Zend/zend_language_scanner.l (ST_DOUBLE_QUOTES state)
+    // ======================================================================
+
+    #[test]
+    fn test_double_quotes_state_simple_variable() {
+        // Test: Simple variable interpolation should emit multiple tokens
+        // In PHP: "hello $name" produces:
+        //   - EncapsedAndWhitespace: "hello "
+        //   - Variable: $name
+        //   - EncapsedAndWhitespace: ""
+        let source = r#"<?php "hello $name""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        // First token should be opening of the encapsed string
+        // PHP emits a '"' token or implicit start marker
+        // We'll emit EncapsedAndWhitespace for the first part
+        let (token1, span1) = lexer.next_token().expect("Should get first token");
+        assert_eq!(token1, Token::EncapsedAndWhitespace);
+        assert_eq!(span1.extract(source), r#""hello "#);
+
+        // Second token should be the variable
+        let (token2, span2) = lexer.next_token().expect("Should get variable token");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$name");
+
+        // Third token should be the closing quote
+        let (token3, span3) = lexer.next_token().expect("Should get closing token");
+        assert_eq!(token3, Token::EncapsedAndWhitespace);
+        assert_eq!(span3.extract(source), r#"""#);
+    }
+
+    #[test]
+    fn test_double_quotes_state_multiple_variables() {
+        // Test: Multiple variables in one string
+        // "x=$x, y=$y" produces:
+        //   - EncapsedAndWhitespace: "x="
+        //   - Variable: $x
+        //   - EncapsedAndWhitespace: ", y="
+        //   - Variable: $y
+        //   - EncapsedAndWhitespace: ""
+        let source = r#"<?php "x=$x, y=$y""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, span1) = lexer.next_token().expect("Token 1");
+        assert_eq!(token1, Token::EncapsedAndWhitespace);
+        assert_eq!(span1.extract(source), r#""x="#);
+
+        let (token2, span2) = lexer.next_token().expect("Token 2");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$x");
+
+        let (token3, span3) = lexer.next_token().expect("Token 3");
+        assert_eq!(token3, Token::EncapsedAndWhitespace);
+        assert_eq!(span3.extract(source), ", y=");
+
+        let (token4, span4) = lexer.next_token().expect("Token 4");
+        assert_eq!(token4, Token::Variable);
+        assert_eq!(span4.extract(source), "$y");
+
+        let (token5, span5) = lexer.next_token().expect("Token 5");
+        assert_eq!(token5, Token::EncapsedAndWhitespace);
+        assert_eq!(span5.extract(source), r#"""#);
+    }
+
+    #[test]
+    fn test_double_quotes_state_no_variables() {
+        // Test: String with no variables should still work
+        // "hello world" produces just one ConstantEncapsedString
+        let source = r#"<?php "hello world""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should get token");
+        // When there's no interpolation, PHP returns ConstantEncapsedString
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""hello world""#);
+    }
+
+    #[test]
+    fn test_double_quotes_state_escaped_dollar() {
+        // Test: Escaped dollar should not trigger interpolation
+        // "price \$100" produces ConstantEncapsedString (no interpolation)
+        let source = r#"<?php "price \$100""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should get token");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""price \$100""#);
+    }
+
+    #[test]
+    fn test_double_quotes_state_variable_at_start() {
+        // Test: Variable at the start of string
+        // "$name is here" produces:
+        //   - EncapsedAndWhitespace: ""
+        //   - Variable: $name
+        //   - EncapsedAndWhitespace: " is here"
+        let source = r#"<?php "$name is here""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, span1) = lexer.next_token().expect("Token 1");
+        assert_eq!(token1, Token::EncapsedAndWhitespace);
+        assert_eq!(span1.extract(source), r#"""#);
+
+        let (token2, span2) = lexer.next_token().expect("Token 2");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$name");
+
+        let (token3, span3) = lexer.next_token().expect("Token 3");
+        assert_eq!(token3, Token::EncapsedAndWhitespace);
+        assert_eq!(span3.extract(source), r#" is here""#);
+    }
+
+    #[test]
+    fn test_double_quotes_state_variable_at_end() {
+        // Test: Variable at the end of string
+        // "hello $name" produces:
+        //   - EncapsedAndWhitespace: "hello "
+        //   - Variable: $name
+        //   - EncapsedAndWhitespace: ""
+        let source = r#"<?php "hello $name""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, span1) = lexer.next_token().expect("Token 1");
+        assert_eq!(token1, Token::EncapsedAndWhitespace);
+        assert_eq!(span1.extract(source), r#""hello "#);
+
+        let (token2, span2) = lexer.next_token().expect("Token 2");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$name");
+
+        let (token3, span3) = lexer.next_token().expect("Token 3");
+        assert_eq!(token3, Token::EncapsedAndWhitespace);
+        assert_eq!(span3.extract(source), r#"""#);
     }
 }
