@@ -3201,6 +3201,99 @@ impl ZArray {
             }
         }
     }
+
+    /// Remove a value by integer key
+    ///
+    /// Returns the removed value if it existed, None otherwise.
+    /// Note: In packed mode, this promotes to hash mode (PHP behavior).
+    pub fn remove_int(&mut self, key: i64) -> Option<ZVal> {
+        match &mut self.storage {
+            ArrayStorage::Packed(vec) => {
+                // In PHP, unset() on a packed array promotes to hash mode
+                // because we need to maintain gaps
+                if key >= 0 && (key as usize) < vec.len() {
+                    self.promote_to_hash();
+                    if let ArrayStorage::Hash(map) = &mut self.storage {
+                        map.delete(&ArrayKey::Int(key))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            ArrayStorage::Hash(map) => map.delete(&ArrayKey::Int(key)),
+        }
+    }
+
+    /// Remove a value by string key
+    ///
+    /// Returns the removed value if it existed, None otherwise.
+    pub fn remove_string(&mut self, key: &ZString) -> Option<ZVal> {
+        match &mut self.storage {
+            ArrayStorage::Packed(_) => None, // Packed mode has no string keys
+            ArrayStorage::Hash(map) => map.delete(&ArrayKey::String(key.clone())),
+        }
+    }
+
+    /// Iterate over (key, value) pairs in insertion order
+    ///
+    /// Returns a vector of (key, value) pairs.
+    /// For packed mode, keys are integers 0..n.
+    /// For hash mode, order is preserved based on insertion order.
+    pub fn iter(&self) -> Vec<(ZArrayKey, &ZVal)> {
+        match &self.storage {
+            ArrayStorage::Packed(vec) => vec
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (ZArrayKey::Int(i as i64), v))
+                .collect(),
+            ArrayStorage::Hash(map) => map
+                .insertion_order
+                .iter()
+                .filter_map(|(_, key)| {
+                    map.get(key).map(|value| match key {
+                        ArrayKey::Int(i) => (ZArrayKey::Int(*i), value),
+                        ArrayKey::String(s) => (ZArrayKey::String(s.clone()), value),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// Iterate over keys in insertion order
+    pub fn keys(&self) -> Vec<ZArrayKey> {
+        match &self.storage {
+            ArrayStorage::Packed(vec) => (0..vec.len() as i64).map(ZArrayKey::Int).collect(),
+            ArrayStorage::Hash(map) => map
+                .insertion_order
+                .iter()
+                .map(|(_, key)| match key {
+                    ArrayKey::Int(i) => ZArrayKey::Int(*i),
+                    ArrayKey::String(s) => ZArrayKey::String(s.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Iterate over values in insertion order
+    pub fn values(&self) -> Vec<&ZVal> {
+        match &self.storage {
+            ArrayStorage::Packed(vec) => vec.iter().collect(),
+            ArrayStorage::Hash(map) => map
+                .insertion_order
+                .iter()
+                .filter_map(|(_, key)| map.get(key))
+                .collect(),
+        }
+    }
+}
+
+/// Key type for ZArray iteration and access
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ZArrayKey {
+    Int(i64),
+    String(ZString),
 }
 
 impl Default for ZArray {
@@ -3483,5 +3576,381 @@ mod zarray_tests {
         assert!(table.is_empty());
         assert!(table.get(&ArrayKey::Int(1)).is_none());
         assert!(table.delete(&ArrayKey::Int(1)).is_none());
+    }
+
+    // =========================================================================
+    // Task 1.4.3: ZArray insert, get, delete, iteration order tests
+    // =========================================================================
+
+    #[test]
+    fn test_zarray_insert_get_int_keys() {
+        let mut arr = ZArray::new();
+
+        // Insert values with integer keys
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+
+        // Test get
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 300);
+
+        // Test non-existent key
+        assert!(arr.get_int(3).is_none());
+        assert!(arr.get_int(-1).is_none());
+    }
+
+    #[test]
+    fn test_zarray_insert_get_string_keys() {
+        let mut arr = ZArray::new();
+
+        let key1 = ZString::new(b"name");
+        let key2 = ZString::new(b"age");
+        let key3 = ZString::new(b"city");
+
+        // Insert values with string keys
+        arr.insert_string(key1.clone(), ZVal::long(100));
+        arr.insert_string(key2.clone(), ZVal::long(200));
+        arr.insert_string(key3.clone(), ZVal::long(300));
+
+        // Test get
+        assert_eq!(arr.get_string(&key1).unwrap().to_long(), 100);
+        assert_eq!(arr.get_string(&key2).unwrap().to_long(), 200);
+        assert_eq!(arr.get_string(&key3).unwrap().to_long(), 300);
+
+        // Test non-existent key
+        let missing = ZString::new(b"missing");
+        assert!(arr.get_string(&missing).is_none());
+    }
+
+    #[test]
+    fn test_zarray_insert_get_mixed_keys() {
+        let mut arr = ZArray::new();
+
+        // Start with packed mode
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+
+        // Add string key (promotes to hash mode)
+        let key = ZString::new(b"name");
+        arr.insert_string(key.clone(), ZVal::long(300));
+
+        // Add more integer keys
+        arr.insert_int(2, ZVal::long(400));
+        arr.insert_int(10, ZVal::long(500));
+
+        // Test all gets
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_string(&key).unwrap().to_long(), 300);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 400);
+        assert_eq!(arr.get_int(10).unwrap().to_long(), 500);
+
+        assert!(arr.is_hash());
+    }
+
+    #[test]
+    fn test_zarray_delete_packed_mode() {
+        let mut arr = ZArray::new();
+
+        // Insert in packed mode
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+
+        assert!(arr.is_packed());
+        assert_eq!(arr.len(), 3);
+
+        // Delete from packed mode (should promote to hash)
+        let removed = arr.remove_int(1);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_long(), 200);
+
+        // Should now be in hash mode (PHP behavior)
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 2);
+
+        // Verify remaining elements
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert!(arr.get_int(1).is_none()); // Deleted
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 300);
+    }
+
+    #[test]
+    fn test_zarray_delete_hash_mode_int_keys() {
+        let mut arr = ZArray::new();
+
+        // Force hash mode
+        arr.insert_int(5, ZVal::long(500));
+        arr.insert_int(1, ZVal::long(100));
+        arr.insert_int(3, ZVal::long(300));
+        arr.insert_int(2, ZVal::long(200));
+
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 4);
+
+        // Delete middle element
+        let removed = arr.remove_int(3);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_long(), 300);
+        assert_eq!(arr.len(), 3);
+
+        // Verify deletion
+        assert!(arr.get_int(3).is_none());
+
+        // Verify remaining elements
+        assert_eq!(arr.get_int(5).unwrap().to_long(), 500);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 200);
+
+        // Delete another
+        let removed = arr.remove_int(1);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_long(), 100);
+        assert_eq!(arr.len(), 2);
+
+        assert!(arr.get_int(1).is_none());
+        assert_eq!(arr.get_int(5).unwrap().to_long(), 500);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 200);
+    }
+
+    #[test]
+    fn test_zarray_delete_hash_mode_string_keys() {
+        let mut arr = ZArray::new();
+
+        let key1 = ZString::new(b"name");
+        let key2 = ZString::new(b"age");
+        let key3 = ZString::new(b"city");
+
+        arr.insert_string(key1.clone(), ZVal::long(100));
+        arr.insert_string(key2.clone(), ZVal::long(200));
+        arr.insert_string(key3.clone(), ZVal::long(300));
+
+        assert_eq!(arr.len(), 3);
+
+        // Delete middle element
+        let removed = arr.remove_string(&key2);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_long(), 200);
+        assert_eq!(arr.len(), 2);
+
+        // Verify deletion
+        assert!(arr.get_string(&key2).is_none());
+
+        // Verify remaining elements
+        assert_eq!(arr.get_string(&key1).unwrap().to_long(), 100);
+        assert_eq!(arr.get_string(&key3).unwrap().to_long(), 300);
+    }
+
+    #[test]
+    fn test_zarray_delete_nonexistent() {
+        let mut arr = ZArray::new();
+
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+
+        // Delete non-existent key
+        let removed = arr.remove_int(5);
+        assert!(removed.is_none());
+        assert_eq!(arr.len(), 2);
+
+        // Verify existing elements unaffected
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_packed_mode() {
+        let mut arr = ZArray::new();
+
+        // Insert sequential keys
+        arr.insert_int(0, ZVal::long(10));
+        arr.insert_int(1, ZVal::long(20));
+        arr.insert_int(2, ZVal::long(30));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify order and values
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, ZArrayKey::Int(0));
+        assert_eq!(items[0].1.to_long(), 10);
+        assert_eq!(items[1].0, ZArrayKey::Int(1));
+        assert_eq!(items[1].1.to_long(), 20);
+        assert_eq!(items[2].0, ZArrayKey::Int(2));
+        assert_eq!(items[2].1.to_long(), 30);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_hash_mode_int_keys() {
+        let mut arr = ZArray::new();
+
+        // Insert in non-sequential order
+        arr.insert_int(5, ZVal::long(50));
+        arr.insert_int(1, ZVal::long(10));
+        arr.insert_int(3, ZVal::long(30));
+        arr.insert_int(2, ZVal::long(20));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify insertion order is preserved
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].0, ZArrayKey::Int(5));
+        assert_eq!(items[0].1.to_long(), 50);
+        assert_eq!(items[1].0, ZArrayKey::Int(1));
+        assert_eq!(items[1].1.to_long(), 10);
+        assert_eq!(items[2].0, ZArrayKey::Int(3));
+        assert_eq!(items[2].1.to_long(), 30);
+        assert_eq!(items[3].0, ZArrayKey::Int(2));
+        assert_eq!(items[3].1.to_long(), 20);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_hash_mode_string_keys() {
+        let mut arr = ZArray::new();
+
+        let key1 = ZString::new(b"zebra");
+        let key2 = ZString::new(b"apple");
+        let key3 = ZString::new(b"mango");
+
+        // Insert in specific order (not alphabetical)
+        arr.insert_string(key1.clone(), ZVal::long(1));
+        arr.insert_string(key2.clone(), ZVal::long(2));
+        arr.insert_string(key3.clone(), ZVal::long(3));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify insertion order is preserved (not alphabetical)
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, ZArrayKey::String(key1.clone()));
+        assert_eq!(items[0].1.to_long(), 1);
+        assert_eq!(items[1].0, ZArrayKey::String(key2.clone()));
+        assert_eq!(items[1].1.to_long(), 2);
+        assert_eq!(items[2].0, ZArrayKey::String(key3.clone()));
+        assert_eq!(items[2].1.to_long(), 3);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_mixed_keys() {
+        let mut arr = ZArray::new();
+
+        let key1 = ZString::new(b"name");
+        let key2 = ZString::new(b"city");
+
+        // Insert mixed keys in specific order
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_string(key1.clone(), ZVal::long(200));
+        arr.insert_int(5, ZVal::long(300));
+        arr.insert_string(key2.clone(), ZVal::long(400));
+        arr.insert_int(2, ZVal::long(500));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify insertion order is preserved
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].0, ZArrayKey::Int(0));
+        assert_eq!(items[0].1.to_long(), 100);
+        assert_eq!(items[1].0, ZArrayKey::String(key1.clone()));
+        assert_eq!(items[1].1.to_long(), 200);
+        assert_eq!(items[2].0, ZArrayKey::Int(5));
+        assert_eq!(items[2].1.to_long(), 300);
+        assert_eq!(items[3].0, ZArrayKey::String(key2.clone()));
+        assert_eq!(items[3].1.to_long(), 400);
+        assert_eq!(items[4].0, ZArrayKey::Int(2));
+        assert_eq!(items[4].1.to_long(), 500);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_after_deletion() {
+        let mut arr = ZArray::new();
+
+        // Insert elements
+        arr.insert_int(1, ZVal::long(10));
+        arr.insert_int(2, ZVal::long(20));
+        arr.insert_int(3, ZVal::long(30));
+        arr.insert_int(4, ZVal::long(40));
+
+        // Delete middle element
+        arr.remove_int(2);
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify deletion removes from iteration but preserves order
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, ZArrayKey::Int(1));
+        assert_eq!(items[0].1.to_long(), 10);
+        assert_eq!(items[1].0, ZArrayKey::Int(3));
+        assert_eq!(items[1].1.to_long(), 30);
+        assert_eq!(items[2].0, ZArrayKey::Int(4));
+        assert_eq!(items[2].1.to_long(), 40);
+    }
+
+    #[test]
+    fn test_zarray_iteration_keys_values() {
+        let mut arr = ZArray::new();
+
+        let key = ZString::new(b"name");
+
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_string(key.clone(), ZVal::long(200));
+        arr.insert_int(5, ZVal::long(300));
+
+        // Test keys()
+        let keys = arr.keys();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], ZArrayKey::Int(0));
+        assert_eq!(keys[1], ZArrayKey::String(key.clone()));
+        assert_eq!(keys[2], ZArrayKey::Int(5));
+
+        // Test values()
+        let values = arr.values();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].to_long(), 100);
+        assert_eq!(values[1].to_long(), 200);
+        assert_eq!(values[2].to_long(), 300);
+    }
+
+    #[test]
+    fn test_zarray_iteration_empty_array() {
+        let arr = ZArray::new();
+
+        let items = arr.iter();
+        assert_eq!(items.len(), 0);
+
+        let keys = arr.keys();
+        assert_eq!(keys.len(), 0);
+
+        let values = arr.values();
+        assert_eq!(values.len(), 0);
+    }
+
+    #[test]
+    fn test_zarray_overwrite_preserves_insertion_order() {
+        let mut arr = ZArray::new();
+
+        // Insert in specific order
+        arr.insert_int(1, ZVal::long(10));
+        arr.insert_int(2, ZVal::long(20));
+        arr.insert_int(3, ZVal::long(30));
+
+        // Overwrite middle element
+        arr.insert_int(2, ZVal::long(999));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Order should be preserved, value should be updated
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, ZArrayKey::Int(1));
+        assert_eq!(items[0].1.to_long(), 10);
+        assert_eq!(items[1].0, ZArrayKey::Int(2));
+        assert_eq!(items[1].1.to_long(), 999); // Updated value
+        assert_eq!(items[2].0, ZArrayKey::Int(3));
+        assert_eq!(items[2].1.to_long(), 30);
     }
 }
