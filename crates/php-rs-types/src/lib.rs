@@ -350,6 +350,146 @@ impl ZVal {
             result
         }
     }
+
+    /// Convert this ZVal to a double (f64) using PHP type juggling rules.
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — convert_to_double()
+    ///
+    /// Conversion rules:
+    /// - Null → 0.0
+    /// - False → 0.0
+    /// - True → 1.0
+    /// - Long → convert to f64
+    /// - Double → identity
+    /// - String → parse as float (supports scientific notation)
+    /// - Array → 0.0 for empty, 1.0 for non-empty
+    /// - Object → 1.0 (with notice)
+    /// - Resource → resource ID (as float)
+    pub fn to_double(&self) -> f64 {
+        match self.type_tag {
+            ZValType::Null => 0.0,
+            ZValType::False => 0.0,
+            ZValType::True => 1.0,
+            ZValType::Long => (self.value as i64) as f64,
+            ZValType::Double => f64::from_bits(self.value),
+            ZValType::String => {
+                // SAFETY: We're assuming the pointer is valid for the lifetime of this operation
+                // In a real implementation, this would use proper reference counting
+                let ptr = self.value as usize;
+                if ptr == 0 {
+                    return 0.0;
+                }
+                // SAFETY: For now, this is unsafe. We'll fix this when we properly integrate ZString
+                unsafe {
+                    let zstring = &*(ptr as *const ZString);
+                    Self::string_to_double(zstring.as_bytes())
+                }
+            }
+            ZValType::Array => {
+                // TODO: Check if array is empty (0.0) or non-empty (1.0)
+                // For now, return 1.0 (placeholder)
+                1.0
+            }
+            ZValType::Object => {
+                // TODO: Object conversion (with notice)
+                // For now, return 1.0 (placeholder)
+                1.0
+            }
+            ZValType::Resource => {
+                // Resource ID is stored in the value
+                (self.value as i64) as f64
+            }
+            ZValType::Reference => {
+                // TODO: Dereference and convert
+                // For now, return 0.0 (placeholder)
+                0.0
+            }
+        }
+    }
+
+    /// Helper: Convert string bytes to double using PHP's parsing rules
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — zend_strtod()
+    ///
+    /// Rules:
+    /// - Leading whitespace is skipped
+    /// - Parse float in format: [sign][digits][.digits][(e|E)[sign]digits]
+    /// - If no valid float found, return 0.0 (with warning in real PHP)
+    /// - If float followed by non-float chars, return parsed value (with warning in real PHP)
+    fn string_to_double(bytes: &[u8]) -> f64 {
+        // Skip leading whitespace
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        if i >= bytes.len() {
+            return 0.0; // Empty or whitespace-only string
+        }
+
+        // Try to parse the string as f64 using Rust's standard parser
+        // First, find the end of the numeric part
+        let start = i;
+
+        // Check for sign
+        if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+            i += 1;
+        }
+
+        let mut found_digit = false;
+        let mut found_dot = false;
+        let mut found_e = false;
+
+        // Parse the mantissa (integer and decimal parts)
+        while i < bytes.len() {
+            if bytes[i].is_ascii_digit() {
+                found_digit = true;
+                i += 1;
+            } else if bytes[i] == b'.' && !found_dot && !found_e {
+                found_dot = true;
+                i += 1;
+            } else if (bytes[i] == b'e' || bytes[i] == b'E') && !found_e && found_digit {
+                found_e = true;
+                i += 1;
+                // Parse exponent sign
+                if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+                    i += 1;
+                }
+                // Parse exponent digits
+                let exp_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                // If no exponent digits, backtrack
+                if i == exp_start {
+                    i = exp_start - 1; // Back before the sign
+                    if bytes[i - 1] == b'-' || bytes[i - 1] == b'+' {
+                        i -= 1; // Back before the 'e'
+                    }
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if !found_digit {
+            return 0.0; // No digits found (e.g., "abc")
+        }
+
+        // Extract the numeric substring
+        let numeric_str = &bytes[start..i];
+
+        // Parse using Rust's f64 parser
+        if let Ok(s) = std::str::from_utf8(numeric_str) {
+            if let Ok(value) = s.parse::<f64>() {
+                return value;
+            }
+        }
+
+        // If parsing failed, return 0.0
+        0.0
+    }
 }
 
 impl fmt::Display for ZVal {
@@ -1459,5 +1599,121 @@ mod tests {
         let s = ZString::from_str("0");
         let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
         assert_eq!(val.to_long(), 0);
+    }
+
+    // ========================================================================
+    // String → Float coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_string_to_double_numeric_string() {
+        // Test: Numeric string "1.5" converts to 1.5
+        // Reference: php -r 'var_dump((float)"1.5");' outputs "float(1.5)"
+        let s = ZString::from_str("1.5");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 1.5);
+    }
+
+    #[test]
+    fn test_string_to_double_scientific_notation() {
+        // Test: Scientific notation "1.5e2" converts to 150.0
+        // Reference: php -r 'var_dump((float)"1.5e2");' outputs "float(150)"
+        let s = ZString::from_str("1.5e2");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 150.0);
+    }
+
+    #[test]
+    fn test_string_to_double_negative_exponent() {
+        // Test: Scientific notation with negative exponent "1.5e-2" converts to 0.015
+        // Reference: php -r 'var_dump((float)"1.5e-2");' outputs "float(0.015)"
+        let s = ZString::from_str("1.5e-2");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 0.015);
+    }
+
+    #[test]
+    fn test_string_to_double_integer_string() {
+        // Test: Integer string "42" converts to 42.0
+        // Reference: php -r 'var_dump((float)"42");' outputs "float(42)"
+        let s = ZString::from_str("42");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 42.0);
+    }
+
+    #[test]
+    fn test_string_to_double_negative() {
+        // Test: Negative float string "-3.14" converts to -3.14
+        // Reference: php -r 'var_dump((float)"-3.14");' outputs "float(-3.14)"
+        let s = ZString::from_str("-3.14");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), -3.14);
+    }
+
+    #[test]
+    fn test_string_to_double_zero() {
+        // Test: "0" converts to 0.0
+        // Reference: php -r 'var_dump((float)"0");' outputs "float(0)"
+        let s = ZString::from_str("0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_string_to_double_with_trailing_text() {
+        // Test: "1.5abc" converts to 1.5 with E_WARNING
+        // Reference: php -r 'var_dump((float)"1.5abc");' outputs:
+        //   "Warning: A non well formed numeric value encountered in ..."
+        //   "float(1.5)"
+        let s = ZString::from_str("1.5abc");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 1.5);
+    }
+
+    #[test]
+    fn test_string_to_double_non_numeric() {
+        // Test: "abc" converts to 0.0 with E_WARNING
+        // Reference: php -r 'var_dump((float)"abc");' outputs:
+        //   "Warning: A non-numeric value encountered in ..."
+        //   "float(0)"
+        let s = ZString::from_str("abc");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_string_to_double_empty_string() {
+        // Test: Empty string converts to 0.0
+        // Reference: php -r 'var_dump((float)"");' outputs "float(0)"
+        let s = ZString::from_str("");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_string_to_double_whitespace() {
+        // Test: Leading whitespace is skipped
+        // Reference: php -r 'var_dump((float)"  1.5");' outputs "float(1.5)"
+        let s = ZString::from_str("  1.5");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 1.5);
+    }
+
+    #[test]
+    fn test_string_to_double_positive_sign() {
+        // Test: Positive sign "+1.5" converts to 1.5
+        // Reference: php -r 'var_dump((float)"+1.5");' outputs "float(1.5)"
+        let s = ZString::from_str("+1.5");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 1.5);
+    }
+
+    #[test]
+    fn test_string_to_double_uppercase_e() {
+        // Test: Uppercase E in scientific notation "1.5E2" converts to 150.0
+        // Reference: php -r 'var_dump((float)"1.5E2");' outputs "float(150)"
+        let s = ZString::from_str("1.5E2");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 150.0);
     }
 }
