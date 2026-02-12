@@ -1915,4 +1915,24 @@ mod tests {
         let s = val.to_string();
         assert_eq!(s.as_str(), Some("0.5"));
     }
+
+    // ========================================================================
+    // Bool → Int coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_bool_to_int_true() {
+        // Test: true converts to 1
+        // Reference: php -r 'var_dump((int)true);' outputs "int(1)"
+        let val = ZVal::true_val();
+        assert_eq!(val.to_long(), 1);
+    }
+
+    #[test]
+    fn test_bool_to_int_false() {
+        // Test: false converts to 0
+        // Reference: php -r 'var_dump((int)false);' outputs "int(0)"
+        let val = ZVal::false_val();
+        assert_eq!(val.to_long(), 0);
+    }
 }
