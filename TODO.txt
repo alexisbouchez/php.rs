@@ -129,7 +129,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 2.3.1  Implement variable scanning in double-quoted strings (ST_DOUBLE_QUOTES state)
 [x] 2.3.2  Implement heredoc/nowdoc body scanning (ST_HEREDOC, ST_NOWDOC states)
 [x] 2.3.3  Implement backtick strings (`command`)
-[ ] 2.3.4  Test: multiline strings, heredoc with interpolation
+[x] 2.3.4  Test: multiline strings, heredoc with interpolation
 [ ] 2.3.5  Implement __halt_compiler() token handling
 [ ] 2.3.6  Test: full tokenization of real-world PHP files from php-src/ext/standard/tests/
 

@@ -5520,4 +5520,276 @@ line2"`;
         let (token, _) = lexer.next_token().expect("Multiline backtick");
         assert!(token == Token::ConstantEncapsedString || token == Token::EncapsedAndWhitespace);
     }
+
+    // ========================================================================
+    // Task 2.3.4: Test multiline strings, heredoc with interpolation
+    // ========================================================================
+
+    #[test]
+    fn test_multiline_double_quoted_string_with_newlines() {
+        // Test: Double-quoted string with actual newlines (not \n escapes)
+        let source = "<?php \"Line 1\nLine 2\nLine 3\";";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Multiline double-quoted string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "\"Line 1\nLine 2\nLine 3\"");
+    }
+
+    #[test]
+    fn test_multiline_double_quoted_string_with_variable() {
+        // Test: Multiline double-quoted string with variable interpolation
+        // When a string contains variables, it's tokenized as multiple parts
+        let source = "<?php \"Hello\n$name\nWorld\";";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        // First part: opening quote + text before variable
+        let (token1, span1) = lexer.next_token().expect("First part");
+        assert_eq!(token1, Token::EncapsedAndWhitespace);
+        assert_eq!(span1.extract(source), "\"Hello\n");
+
+        // Variable
+        let (token2, span2) = lexer.next_token().expect("Variable");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$name");
+
+        // Last part: text after variable + closing quote
+        let (token3, span3) = lexer.next_token().expect("Last part");
+        assert_eq!(token3, Token::EncapsedAndWhitespace);
+        assert_eq!(span3.extract(source), "\nWorld\"");
+    }
+
+    #[test]
+    fn test_heredoc_multiline_with_multiple_variables() {
+        // Test: Heredoc with multiple lines and multiple variable interpolations
+        // Reference: php-src/Zend/tests/heredoc_nowdoc/heredoc_003.phpt
+        let source = "<?php <<<EOT\nLine 1 with $var1\nLine 2 with $var2\nLine 3 plain\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        // "Line 1 with "
+        let (token2, span2) = lexer.next_token().expect("Text before var1");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        assert_eq!(span2.extract(source), "Line 1 with ");
+
+        // $var1
+        let (token3, span3) = lexer.next_token().expect("var1");
+        assert_eq!(token3, Token::Variable);
+        assert_eq!(span3.extract(source), "$var1");
+
+        // "\nLine 2 with "
+        let (token4, span4) = lexer.next_token().expect("Text before var2");
+        assert_eq!(token4, Token::EncapsedAndWhitespace);
+        assert_eq!(span4.extract(source), "\nLine 2 with ");
+
+        // $var2
+        let (token5, span5) = lexer.next_token().expect("var2");
+        assert_eq!(token5, Token::Variable);
+        assert_eq!(span5.extract(source), "$var2");
+
+        // "\nLine 3 plain\n"
+        let (token6, span6) = lexer.next_token().expect("Remaining text");
+        assert_eq!(token6, Token::EncapsedAndWhitespace);
+        assert_eq!(span6.extract(source), "\nLine 3 plain\n");
+
+        let (token7, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token7, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_with_escape_sequences() {
+        // Test: Heredoc supports escape sequences like \n, \t, etc.
+        // Reference: php-src/Zend/tests/heredoc_nowdoc/heredoc_015.phpt
+        // Note: In heredoc, escape sequences are NOT processed by the lexer
+        // They are kept as literal text and processed at runtime
+        let source = "<?php <<<EOT\n\\n\\t\\r\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("Body with escapes");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        // Heredoc preserves escape sequences as-is (they're processed at runtime)
+        assert_eq!(span2.extract(source), "\\n\\t\\r\n");
+
+        let (token3, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token3, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_empty_lines() {
+        // Test: Heredoc with empty lines in the middle
+        let source = "<?php <<<EOT\nLine 1\n\nLine 3\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("Body");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        // Should preserve the empty line
+        assert_eq!(span2.extract(source), "Line 1\n\nLine 3\n");
+
+        let (token3, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token3, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_with_variable_at_line_start() {
+        // Test: Variable at the start of a line in heredoc
+        let source = "<?php <<<EOT\n$var\ntext\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        // $var at line start
+        let (token2, span2) = lexer.next_token().expect("Variable at start");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$var");
+
+        // "\ntext\n"
+        let (token3, span3) = lexer.next_token().expect("Remaining");
+        assert_eq!(token3, Token::EncapsedAndWhitespace);
+        assert_eq!(span3.extract(source), "\ntext\n");
+
+        let (token4, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token4, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_with_consecutive_variables() {
+        // Test: Multiple variables in a row without text between them
+        let source = "<?php <<<EOT\n$a$b$c\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("var a");
+        assert_eq!(token2, Token::Variable);
+        assert_eq!(span2.extract(source), "$a");
+
+        let (token3, span3) = lexer.next_token().expect("var b");
+        assert_eq!(token3, Token::Variable);
+        assert_eq!(span3.extract(source), "$b");
+
+        let (token4, span4) = lexer.next_token().expect("var c");
+        assert_eq!(token4, Token::Variable);
+        assert_eq!(span4.extract(source), "$c");
+
+        let (token5, span5) = lexer.next_token().expect("Newline");
+        assert_eq!(token5, Token::EncapsedAndWhitespace);
+        assert_eq!(span5.extract(source), "\n");
+
+        let (token6, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token6, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_nowdoc_multiline_no_interpolation() {
+        // Test: Nowdoc with multiple lines - variables are NOT interpolated
+        let source = "<?php <<<'EOT'\nLine with $var1\nAnother $var2\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        // In nowdoc, everything is literal - no variable interpolation
+        let (token2, span2) = lexer.next_token().expect("Full body");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        assert_eq!(span2.extract(source), "Line with $var1\nAnother $var2\n");
+
+        let (token3, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token3, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_heredoc_indented_multiline_with_variables() {
+        // Test: Flexible heredoc with indentation and variables
+        // Reference: php-src/Zend/tests/heredoc_nowdoc/flexible-heredoc-complex-test4.phpt
+        let source = "<?php <<<EOT\n    Line 1 $var\n    Line 2\n    EOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        // "    Line 1 "
+        let (token2, span2) = lexer.next_token().expect("Text before var");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        assert_eq!(span2.extract(source), "    Line 1 ");
+
+        // $var
+        let (token3, span3) = lexer.next_token().expect("Variable");
+        assert_eq!(token3, Token::Variable);
+        assert_eq!(span3.extract(source), "$var");
+
+        // "\n    Line 2\n"
+        let (token4, span4) = lexer.next_token().expect("Remaining");
+        assert_eq!(token4, Token::EncapsedAndWhitespace);
+        assert_eq!(span4.extract(source), "\n    Line 2\n");
+
+        let (token5, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token5, Token::EndHeredoc);
+    }
+
+    #[test]
+    fn test_multiline_string_preserves_line_and_column() {
+        // Test: Multiline strings correctly track line and column numbers
+        let source = "<?php\n\"Line 1\nLine 2\";";
+        let mut lexer = Lexer::new(source);
+
+        let (token1, span1) = lexer.next_token().expect("OpenTag");
+        assert_eq!(token1, Token::OpenTag);
+        assert_eq!(span1.line, 1);
+
+        let (token2, span2) = lexer.next_token().expect("String");
+        assert_eq!(token2, Token::ConstantEncapsedString);
+        assert_eq!(span2.line, 2); // String starts on line 2
+        assert_eq!(span2.extract(source), "\"Line 1\nLine 2\"");
+    }
+
+    #[test]
+    fn test_heredoc_very_long_multiline() {
+        // Test: Heredoc with many lines to ensure state management is correct
+        let source = "<?php <<<EOT\nLine 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6\nLine 7\nLine 8\nLine 9\nLine 10\nEOT;\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, _) = lexer.next_token().expect("StartHeredoc");
+        assert_eq!(token1, Token::StartHeredoc);
+
+        let (token2, span2) = lexer.next_token().expect("Body");
+        assert_eq!(token2, Token::EncapsedAndWhitespace);
+        let body = span2.extract(source);
+        // Should have all 10 lines
+        assert_eq!(body.lines().count(), 10);
+        assert!(body.contains("Line 1"));
+        assert!(body.contains("Line 10"));
+
+        let (token3, _) = lexer.next_token().expect("EndHeredoc");
+        assert_eq!(token3, Token::EndHeredoc);
+    }
 }
