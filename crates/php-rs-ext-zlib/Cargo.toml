@@ -1,0 +1,12 @@
+[package]
+name = "php-rs-ext-zlib"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+flate2 = "1"
+
+[dev-dependencies]

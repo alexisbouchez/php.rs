@@ -1,0 +1,66 @@
+[package]
+name = "php-rs-vm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["native-io"]
+native-io = ["dep:mysql", "dep:php-rs-ext-curl", "dep:php-rs-ext-pdo", "dep:rusqlite", "dep:bcrypt", "dep:php-rs-ext-openssl", "dep:php-rs-ext-sodium"]
+
+[dependencies]
+php-rs-compiler = { path = "../php-rs-compiler" }
+php-rs-ext-json = { path = "../php-rs-ext-json" }
+php-rs-ext-mbstring = { path = "../php-rs-ext-mbstring" }
+php-rs-ext-hash = { path = "../php-rs-ext-hash" }
+php-rs-ext-date = { path = "../php-rs-ext-date" }
+php-rs-ext-standard = { path = "../php-rs-ext-standard" }
+php-rs-ext-zlib = { path = "../php-rs-ext-zlib" }
+php-rs-ext-random = { path = "../php-rs-ext-random" }
+php-rs-ext-intl = { path = "../php-rs-ext-intl" }
+php-rs-ext-gd = { path = "../php-rs-ext-gd" }
+php-rs-ext-bcmath = { path = "../php-rs-ext-bcmath" }
+php-rs-ext-calendar = { path = "../php-rs-ext-calendar" }
+php-rs-ext-fileinfo = { path = "../php-rs-ext-fileinfo" }
+php-rs-ext-readline = { path = "../php-rs-ext-readline" }
+php-rs-ext-tidy = { path = "../php-rs-ext-tidy" }
+php-rs-ext-iconv = { path = "../php-rs-ext-iconv" }
+php-rs-ext-zip = { path = "../php-rs-ext-zip" }
+php-rs-ext-bz2 = { path = "../php-rs-ext-bz2" }
+php-rs-ext-phar = { path = "../php-rs-ext-phar" }
+php-rs-ext-simplexml = { path = "../php-rs-ext-simplexml" }
+php-rs-ext-xml = { path = "../php-rs-ext-xml" }
+php-rs-ext-xmlreader = { path = "../php-rs-ext-xmlreader" }
+php-rs-ext-sockets = { path = "../php-rs-ext-sockets" }
+php-rs-ext-exif = { path = "../php-rs-ext-exif" }
+php-rs-ext-soap = { path = "../php-rs-ext-soap" }
+php-rs-ext-ldap = { path = "../php-rs-ext-ldap" }
+php-rs-ext-ftp = { path = "../php-rs-ext-ftp" }
+php-rs-ext-odbc = { path = "../php-rs-ext-odbc" }
+php-rs-ext-snmp = { path = "../php-rs-ext-snmp" }
+php-rs-ext-dba = { path = "../php-rs-ext-dba" }
+php-rs-ext-enchant = { path = "../php-rs-ext-enchant" }
+php-rs-ext-sysvsem = { path = "../php-rs-ext-sysvsem" }
+php-rs-ext-sysvshm = { path = "../php-rs-ext-sysvshm" }
+php-rs-ext-sysvmsg = { path = "../php-rs-ext-sysvmsg" }
+php-rs-ext-shmop = { path = "../php-rs-ext-shmop" }
+php-rs-gc = { path = "../php-rs-gc" }
+php-rs-runtime = { path = "../php-rs-runtime" }
+php-rs-ext-curl = { path = "../php-rs-ext-curl", optional = true }
+php-rs-ext-openssl = { path = "../php-rs-ext-openssl", optional = true }
+php-rs-ext-pdo = { path = "../php-rs-ext-pdo", optional = true }
+php-rs-ext-sodium = { path = "../php-rs-ext-sodium", optional = true }
+regex = "1"
+fancy-regex = "0.14"
+mysql = { version = "25.0", optional = true }
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+bcrypt = { version = "0.15", optional = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "vm_benchmarks"
+harness = false

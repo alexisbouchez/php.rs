@@ -1,0 +1,13 @@
+[package]
+name = "php-rs-ext-pdo-pgsql"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+postgres = "0.19"
+php-rs-ext-pdo = { path = "../php-rs-ext-pdo" }
+
+[dev-dependencies]

@@ -1,0 +1,12 @@
+[package]
+name = "php-rs-ext-pcre"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+regex = "1"
+
+[dev-dependencies]

@@ -1,0 +1,136 @@
+.TH PHP-RS 1 "2025" "php.rs 0.1.0" "User Commands"
+.SH NAME
+php\-rs \- PHP interpreter reimplemented in Rust (PHP 8.6 compatible)
+.SH SYNOPSIS
+.B php\-rs
+[\fIoptions\fR] [\fB\-f\fR] \fIfile\fR [\fB\-\-\fR] [\fIargs\fR...]
+.br
+.B php\-rs
+[\fIoptions\fR] \fB\-r\fR \fIcode\fR [\fB\-\-\fR] [\fIargs\fR...]
+.br
+.B php\-rs
+[\fIoptions\fR] \fB\-S\fR \fIaddr\fR:\fIport\fR [\fB\-t\fR \fIdocroot\fR] [\fIrouter\fR]
+.br
+.B php\-rs
+[\fIoptions\fR] [\fB\-a\fR]
+.SH DESCRIPTION
+.B php\-rs
+is a ground-up rewrite of the PHP interpreter in Rust, targeting full
+compatibility with PHP 8.6. It includes the lexer, parser, compiler,
+virtual machine, garbage collector, and standard extensions.
+.PP
+When called without arguments and stdin is a terminal, it enters
+interactive mode (REPL).
+.SH OPTIONS
+.TP
+\fB\-a\fR
+Run interactively (REPL). Each line is executed as PHP code.
+.TP
+\fB\-c\fR \fIpath\fR
+Look for \fBphp.ini\fR in the specified directory or use the specified file.
+.TP
+\fB\-n\fR
+Do not use any configuration (INI) file.
+.TP
+\fB\-d\fR \fIkey\fR[=\fIvalue\fR]
+Define an INI entry. Equivalent to a line in \fBphp.ini\fR.
+Can be specified multiple times.
+.TP
+\fB\-f\fR \fIfile\fR
+Parse and execute the specified PHP file.
+.TP
+\fB\-r\fR \fIcode\fR
+Execute the given PHP code directly, without \fB<?php\fR tags.
+.TP
+\fB\-l\fR
+Syntax check only (lint mode). Reports parse errors without executing.
+.TP
+\fB\-S\fR \fIaddr\fR:\fIport\fR
+Start the built-in web server, listening on the given address and port.
+.TP
+\fB\-t\fR \fIdocroot\fR
+Specify the document root directory for the built-in web server.
+Defaults to the current working directory.
+.TP
+\fB\-s\fR
+Output HTML-syntax-highlighted source code.
+.TP
+\fB\-w\fR
+Output source with comments and whitespace stripped.
+.TP
+\fB\-v\fR
+Display version information and exit.
+.TP
+\fB\-m\fR
+Show the list of compiled-in modules (extensions) and exit.
+.TP
+\fB\-i\fR
+Display PHP configuration information (phpinfo) and exit.
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Display the help message and exit.
+.SH INI DIRECTIVES
+Key directives that affect execution:
+.TP
+\fBmemory_limit\fR (default: 128M)
+Maximum memory the script may consume. Set to \-1 for unlimited.
+.TP
+\fBmax_execution_time\fR (default: 0 in CLI, 30 in FPM)
+Maximum execution time in seconds. 0 means no limit.
+.TP
+\fBdisable_functions\fR (default: empty)
+Comma-separated list of functions to disable for security.
+.TP
+\fBopen_basedir\fR (default: empty)
+Colon-separated list of directories to restrict file access.
+.SH EXIT STATUS
+.TP
+\fB0\fR
+Successful execution.
+.TP
+\fB1\fR
+Generic error.
+.TP
+\fB130\fR
+Script interrupted by SIGINT.
+.TP
+\fB255\fR
+Compilation or fatal runtime error.
+.SH EXAMPLES
+.TP
+Execute a PHP file:
+.B php\-rs script.php
+.TP
+Run inline PHP code:
+.B php\-rs \-r 'echo "Hello, World!\\n";'
+.TP
+Lint a file:
+.B php\-rs \-l script.php
+.TP
+Start development server:
+.B php\-rs \-S localhost:8080 \-t ./public
+.TP
+Disable dangerous functions:
+.B php\-rs \-d disable_functions=exec,system script.php
+.TP
+Set memory limit:
+.B php\-rs \-d memory_limit=256M script.php
+.SH ENVIRONMENT
+.TP
+\fBPHP_INI_DIR\fR
+Directory to search for php.ini (if \fB\-c\fR is not specified).
+.SH FILES
+.TP
+\fBphp.ini\fR
+PHP configuration file, searched in the current directory or
+the path specified by \fB\-c\fR.
+.SH COMPATIBILITY
+php\-rs targets bit-for-bit output compatibility with PHP 8.6 for all
+non-deprecated behaviors, including type coercion rules, operator
+semantics, and error messages.
+.SH AUTHORS
+php.rs contributors
+.SH SEE ALSO
+.BR php (1)
+.SH BUGS
+Report bugs at https://github.com/php/php-rs/issues

@@ -1,0 +1,17 @@
+[package]
+name = "php-rs-ext-sodium"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crypto_secretbox = "0.1"
+crypto_box = "0.9"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+
+[dev-dependencies]

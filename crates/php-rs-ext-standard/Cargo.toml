@@ -1,0 +1,16 @@
+[package]
+name = "php-rs-ext-standard"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["native-io"]
+native-io = ["dep:libc"]
+
+[dependencies]
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]

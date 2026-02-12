@@ -1,0 +1,12 @@
+[package]
+name = "php-rs-ext-curl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ureq = "3"
+
+[dev-dependencies]

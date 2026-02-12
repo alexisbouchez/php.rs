@@ -1,0 +1,2598 @@
+//! PHP CLI SAPI — command-line interface for php.rs
+//!
+//! Equivalent to php-src/sapi/cli/php_cli.c
+//!
+//! Usage: php-rs [options] [-f] <file> [--] [args...]
+//!        php-rs [options] -r <code> [--] [args...]
+//!        php-rs [options] < script.php
+//!
+//! Options:
+//!   -r <code>    Run PHP <code> without <?php tags
+//!   -f <file>    Parse and execute <file>
+//!   -l <file>    Syntax check only (lint)
+//!   -d key=val   Define INI entry
+//!   -c <path>    Look for php.ini in <path>
+//!   -n           No php.ini file
+//!   -v           Version information
+//!   -m           Show compiled-in modules
+//!   -i           PHP information (phpinfo)
+//!   -w <file>    Output source with stripped comments/whitespace
+//!   -s <file>    Output source with syntax highlighting (HTML)
+//!   -a           Run interactively (REPL)
+//!   -h, --help   Display this help message
+
+use std::env;
+use std::io::{self, Read};
+use std::path::PathBuf;
+use std::process;
+use std::sync::atomic::Ordering;
+
+use php_rs_runtime::{IniSystem, Superglobals};
+use php_rs_vm::{PhpArray, Value};
+use std::collections::HashMap;
+
+mod server;
+
+// ── CLI option parsing ──────────────────────────────────────────────────────
+
+/// Parsed CLI options.
+#[allow(dead_code)] // script_args will be used when $argv is wired up
+struct CliOptions {
+    /// Mode of operation.
+    mode: CliMode,
+    /// INI overrides from -d flags.
+    ini_overrides: Vec<(String, String)>,
+    /// Path to php.ini (from -c).
+    ini_path: Option<String>,
+    /// Whether to skip php.ini (from -n).
+    no_ini: bool,
+    /// Extra arguments after -- (available as $argv).
+    script_args: Vec<String>,
+}
+
+/// What the CLI is doing.
+enum CliMode {
+    /// Execute a file: php-rs file.php
+    RunFile(String),
+    /// Execute inline code: php-rs -r 'code'
+    RunCode(String),
+    /// Lint a file: php-rs -l file.php
+    Lint(String),
+    /// Show version: php-rs -v
+    Version,
+    /// Show modules: php-rs -m
+    Modules,
+    /// Show phpinfo: php-rs -i
+    Info,
+    /// Strip comments: php-rs -w file.php
+    Strip(String),
+    /// Syntax highlight: php-rs -s file.php
+    SyntaxHighlight(String),
+    /// Interactive mode: php-rs -a
+    Interactive,
+    /// Built-in web server: php-rs -S localhost:8080
+    Server {
+        listen: String,
+        docroot: Option<String>,
+        router: Option<String>,
+    },
+    /// Line processing mode: php-rs -R/-F with optional -B/-E
+    ProcessLines {
+        begin_code: Option<String>,
+        line_code: Option<String>,
+        line_file: Option<String>,
+        end_code: Option<String>,
+    },
+    /// Show configuration file names: php-rs --ini
+    ShowIni,
+    /// Show function info via reflection: php-rs --rf <name>
+    ReflectFunction(String),
+    /// Show class info via reflection: php-rs --rc <name>
+    ReflectClass(String),
+    /// Show extension info via reflection: php-rs --re <name>
+    ReflectExtension(String),
+    /// Show extension configuration: php-rs --ri <name>
+    ReflectExtensionIni(String),
+    /// Read from stdin: echo 'code' | php-rs
+    Stdin,
+    /// Show help: php-rs -h / --help
+    Help,
+    /// Composer dependency manager: php-rs composer <command> [args...]
+    Composer(Vec<String>),
+}
+
+fn parse_args(args: &[String]) -> Result<CliOptions, String> {
+    let mut mode: Option<CliMode> = None;
+    let mut ini_overrides = Vec::new();
+    let mut ini_path = None;
+    let mut no_ini = false;
+    let mut script_args = Vec::new();
+    let mut server_listen: Option<String> = None;
+    let mut server_docroot: Option<String> = None;
+    // Line processing flags (-B/-R/-F/-E)
+    let mut begin_code: Option<String> = None;
+    let mut line_code: Option<String> = None;
+    let mut line_file: Option<String> = None;
+    let mut end_code: Option<String> = None;
+    let mut i = 1; // skip argv[0]
+    let mut past_separator = false;
+
+    while i < args.len() {
+        if past_separator {
+            script_args.push(args[i].clone());
+            i += 1;
+            continue;
+        }
+
+        match args[i].as_str() {
+            "--" => {
+                past_separator = true;
+                i += 1;
+            }
+            "-r" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -r requires an argument".to_string());
+                }
+                mode = Some(CliMode::RunCode(args[i].clone()));
+                i += 1;
+            }
+            "-f" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -f requires an argument".to_string());
+                }
+                mode = Some(CliMode::RunFile(args[i].clone()));
+                i += 1;
+            }
+            "-l" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -l requires an argument".to_string());
+                }
+                mode = Some(CliMode::Lint(args[i].clone()));
+                i += 1;
+            }
+            "-w" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -w requires an argument".to_string());
+                }
+                mode = Some(CliMode::Strip(args[i].clone()));
+                i += 1;
+            }
+            "-s" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -s requires an argument".to_string());
+                }
+                mode = Some(CliMode::SyntaxHighlight(args[i].clone()));
+                i += 1;
+            }
+            "-d" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -d requires an argument".to_string());
+                }
+                let entry = &args[i];
+                if let Some(eq_pos) = entry.find('=') {
+                    ini_overrides
+                        .push((entry[..eq_pos].to_string(), entry[eq_pos + 1..].to_string()));
+                } else {
+                    ini_overrides.push((entry.clone(), "1".to_string()));
+                }
+                i += 1;
+            }
+            "-c" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -c requires an argument".to_string());
+                }
+                ini_path = Some(args[i].clone());
+                i += 1;
+            }
+            "-n" => {
+                no_ini = true;
+                i += 1;
+            }
+            "-v" | "--version" => {
+                mode = Some(CliMode::Version);
+                i += 1;
+            }
+            "-m" => {
+                mode = Some(CliMode::Modules);
+                i += 1;
+            }
+            "-i" => {
+                mode = Some(CliMode::Info);
+                i += 1;
+            }
+            "-a" => {
+                mode = Some(CliMode::Interactive);
+                i += 1;
+            }
+            "-B" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -B requires an argument".to_string());
+                }
+                begin_code = Some(args[i].clone());
+                i += 1;
+            }
+            "-R" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -R requires an argument".to_string());
+                }
+                line_code = Some(args[i].clone());
+                i += 1;
+            }
+            "-F" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -F requires an argument".to_string());
+                }
+                line_file = Some(args[i].clone());
+                i += 1;
+            }
+            "-E" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -E requires an argument".to_string());
+                }
+                end_code = Some(args[i].clone());
+                i += 1;
+            }
+            "-S" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -S requires an argument (e.g., localhost:8080)".to_string());
+                }
+                server_listen = Some(args[i].clone());
+                i += 1;
+            }
+            "-t" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -t requires an argument".to_string());
+                }
+                server_docroot = Some(args[i].clone());
+                i += 1;
+            }
+            "-h" | "--help" | "-?" => {
+                mode = Some(CliMode::Help);
+                i += 1;
+            }
+            "--ini" => {
+                mode = Some(CliMode::ShowIni);
+                i += 1;
+            }
+            "--rf" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option --rf requires an argument".to_string());
+                }
+                mode = Some(CliMode::ReflectFunction(args[i].clone()));
+                i += 1;
+            }
+            "--rc" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option --rc requires an argument".to_string());
+                }
+                mode = Some(CliMode::ReflectClass(args[i].clone()));
+                i += 1;
+            }
+            "--re" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option --re requires an argument".to_string());
+                }
+                mode = Some(CliMode::ReflectExtension(args[i].clone()));
+                i += 1;
+            }
+            "--ri" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option --ri requires an argument".to_string());
+                }
+                mode = Some(CliMode::ReflectExtensionIni(args[i].clone()));
+                i += 1;
+            }
+            "composer" if mode.is_none() => {
+                // Collect all remaining args for composer
+                let composer_args: Vec<String> = args[i + 1..].to_vec();
+                mode = Some(CliMode::Composer(composer_args));
+                break;
+            }
+            arg if arg.starts_with('-') => {
+                return Err(format!("Unknown option: {}", arg));
+            }
+            _ => {
+                // If -S was given, bare argument is router script
+                if server_listen.is_some() && mode.is_none() {
+                    mode = Some(CliMode::Server {
+                        listen: String::new(), // filled below
+                        docroot: None,
+                        router: Some(args[i].clone()),
+                    });
+                    i += 1;
+                } else {
+                    // Bare argument = filename
+                    mode = Some(CliMode::RunFile(args[i].clone()));
+                    i += 1;
+                    // Remaining args go to script_args
+                    while i < args.len() {
+                        script_args.push(args[i].clone());
+                        i += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // If -S was given, build the Server mode
+    if let Some(listen) = server_listen {
+        let router = match &mode {
+            Some(CliMode::Server { router, .. }) => router.clone(),
+            _ => None,
+        };
+        mode = Some(CliMode::Server {
+            listen,
+            docroot: server_docroot,
+            router: router.map(|r| r.to_string()),
+        });
+    }
+
+    // If -R/-F was given (with optional -B/-E), build ProcessLines mode
+    if line_code.is_some() || line_file.is_some() {
+        mode = Some(CliMode::ProcessLines {
+            begin_code,
+            line_code,
+            line_file,
+            end_code,
+        });
+    }
+
+    // Default: if no mode set and stdin is not a tty, read from stdin
+    let mode = mode.unwrap_or(CliMode::Stdin);
+
+    Ok(CliOptions {
+        mode,
+        ini_overrides,
+        ini_path,
+        no_ini,
+        script_args,
+    })
+}
+
+// ── Version & info ──────────────────────────────────────────────────────────
+
+const PHP_RS_VERSION: &str = "0.1.0";
+const PHP_COMPAT_VERSION: &str = "8.6.0-dev";
+
+fn print_version() {
+    println!(
+        "php.rs {} (cli) — PHP {} compatible",
+        PHP_RS_VERSION, PHP_COMPAT_VERSION
+    );
+    println!("Rust-based PHP interpreter");
+    println!("Copyright (c) php.rs contributors");
+}
+
+fn print_help() {
+    println!(
+        "Usage: php-rs [options] [-f] <file> [--] [args...]
+       php-rs [options] -r <code> [--] [args...]
+       php-rs [options] [-B <begin_code>] -R <code> [-E <end_code>] [--] [args...]
+       php-rs [options] [-B <begin_code>] -F <file> [-E <end_code>] [--] [args...]
+       php-rs [options] -S <addr>:<port> [-t docroot] [router]
+       php-rs [options] -- [args...]
+       php-rs [options] -a
+
+  -a               Run interactively
+  -c <path>|<file> Look for php.ini file in this directory
+  -n               No configuration (ini) files will be used
+  -d foo[=bar]     Define INI entry foo with value 'bar'
+  -e               Generate extended information for debugger/profiler
+  -f <file>        Parse and execute <file>
+  -h               This help
+  -i               PHP information
+  -l               Syntax check only (lint)
+  -m               Show compiled in modules
+  -r <code>        Run PHP <code> without using script tags <?..?>
+  -B <begin_code>  Run PHP <begin_code> before processing input lines
+  -R <code>        Run PHP <code> for every input line
+  -F <file>        Parse and execute <file> for every input line
+  -E <end_code>    Run PHP <end_code> after processing all input lines
+  -H               Hide any passed arguments from external tools
+  -S <addr>:<port> Run with built-in web server
+  -t <docroot>     Specify document root <docroot> for built-in web server
+  -s               Output HTML syntax highlighted source
+  -v               Version number
+  -w               Output source with stripped comments and whitespace
+  -z <file>        Load Zend extension <file>
+
+  args...          Arguments passed to script. Use '--' args when first
+                   argument starts with '-' or script is read from stdin
+
+  --ini            Show configuration file names
+
+  --rf <name>      Show information about function <name>
+  --rc <name>      Show information about class <name>
+  --re <name>      Show information about extension <name>
+  --rz <name>      Show information about Zend extension <name>
+  --ri <name>      Show configuration for extension <name>"
+    );
+}
+
+fn print_modules() {
+    println!("[PHP Modules]");
+    let modules = [
+        "Core",
+        "ctype",
+        "date",
+        "filter",
+        "hash",
+        "json",
+        "mbstring",
+        "pcre",
+        "spl",
+        "standard",
+        "tokenizer",
+    ];
+    for m in &modules {
+        println!("{}", m);
+    }
+    println!();
+    println!("[Zend Modules]");
+    println!();
+}
+
+fn print_phpinfo() {
+    println!("phpinfo()");
+    println!("php.rs Version => {}", PHP_RS_VERSION);
+    println!("PHP Compatibility => {}", PHP_COMPAT_VERSION);
+    println!();
+    println!("System => {} {}", env::consts::OS, env::consts::ARCH);
+    println!("Build Date => {}", env!("CARGO_PKG_VERSION"));
+    println!("Server API => Command Line Interface");
+    println!();
+    println!("Configuration File (php.ini) Path => (none)");
+    println!();
+    print_modules();
+}
+
+// ── Compilation & execution ─────────────────────────────────────────────────
+
+/// Build VM superglobal bindings from runtime Superglobals and CLI argv.
+/// $_SERVER gets argc (int) and argv (array of strings) set from the given argv slice.
+/// Keys use the compiler's CV names (variable name without leading $: _GET, _SERVER, etc.).
+fn superglobals_for_vm(sg: &Superglobals, argv: &[String]) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+
+    // CV names match parser output (leading $ stripped): _GET, _SERVER, etc.
+    map.insert(
+        "_GET".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.get)),
+    );
+    map.insert(
+        "_POST".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.post)),
+    );
+    map.insert(
+        "_ENV".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.env)),
+    );
+    map.insert(
+        "_COOKIE".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.cookie)),
+    );
+    map.insert(
+        "_FILES".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.files)),
+    );
+    map.insert(
+        "_REQUEST".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.request)),
+    );
+    map.insert(
+        "_SESSION".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.session)),
+    );
+
+    // $_SERVER: string map + argc (int) and argv (array of strings)
+    let mut server = PhpArray::from_string_map(&sg.server);
+    server.set_string("argc".to_string(), Value::Long(argv.len() as i64));
+    let mut argv_arr = PhpArray::new();
+    for arg in argv {
+        argv_arr.push(Value::String(arg.clone()));
+    }
+    server.set_string("argv".to_string(), Value::Array(argv_arr.clone()));
+    map.insert("_SERVER".to_string(), Value::Array(server));
+
+    // Bare $argc and $argv variables at script scope (register_argc_argv=1)
+    map.insert("argc".to_string(), Value::Long(argv.len() as i64));
+    map.insert("argv".to_string(), Value::Array(argv_arr));
+
+    map
+}
+
+/// Build a VmConfig from INI settings.
+fn vm_config_from_ini(ini: &IniSystem) -> php_rs_vm::VmConfig {
+    let mut config = php_rs_vm::VmConfig::default();
+
+    // memory_limit
+    let mem = ini.get_long("memory_limit");
+    config.memory_limit = if mem < 0 { 0 } else { mem as usize };
+
+    // max_execution_time (0 = unlimited; CLI defaults to 0 for no limit)
+    let time = ini.get_long("max_execution_time");
+    config.max_execution_time = if time <= 0 { 0 } else { time as u64 };
+
+    // disable_functions
+    config.set_disabled_functions(ini.get("disable_functions"));
+
+    // open_basedir
+    config.set_open_basedir(ini.get("open_basedir"));
+
+    config
+}
+
+/// Compile and execute PHP source code, returning the exit code.
+/// `script_path` is the script name (e.g. "test.php" or "-" for stdin/-r).
+/// `argv` is the full argument list for this run (script path + script args), used for $_SERVER['argv'] and argc.
+fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]) -> i32 {
+    // Compile (use compile_file for file execution to resolve __DIR__/__FILE__)
+    let op_array = if script_path == "-" {
+        // -r mode or stdin — no filename context
+        match php_rs_compiler::compile(source) {
+            ok @ Ok(_) => ok,
+            err @ Err(_) => err,
+        }
+    } else {
+        let abs_path = std::path::Path::new(script_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(script_path));
+        let abs_str = abs_path.to_string_lossy().to_string();
+        php_rs_compiler::compile_file(source, &abs_str)
+    };
+    let op_array = match op_array {
+        Ok(oa) => oa,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 255;
+        }
+    };
+
+    // Debug: print disassembly
+    if std::env::var("PHP_RS_DUMP_OPS").is_ok() {
+        eprintln!("{}", op_array.disassemble());
+    }
+
+    // Build superglobals for this request
+    let mut sg = Superglobals::new();
+    sg.populate_env();
+    sg.populate_server_cli(script_path, argv);
+    sg.build_request("GP");
+    let sg_map = superglobals_for_vm(&sg, argv);
+
+    // Execute with INI-derived limits
+    let config = vm_config_from_ini(ini);
+    let mut vm = php_rs_vm::Vm::with_config(config);
+    match vm.execute(&op_array, Some(&sg_map)) {
+        Ok(output) => {
+            print!("{}", output);
+            0
+        }
+        Err(e) => {
+            // Print any partial output accumulated before the error
+            let partial = vm.get_output();
+            if !partial.is_empty() {
+                print!("{}", partial);
+            }
+            match &e {
+                php_rs_vm::VmError::Thrown(val) => {
+                    if let php_rs_vm::Value::Object(obj) = val {
+                        let class = obj.class_name();
+                        let msg = obj
+                            .get_property("message")
+                            .map(|v| v.to_php_string())
+                            .unwrap_or_default();
+                        eprintln!("Fatal error: Uncaught {}: {} in unknown:0", class, msg);
+                    } else {
+                        eprintln!("Fatal error: {:?}", e);
+                    }
+                }
+                _ => eprintln!("Fatal error: {:?}", e),
+            }
+            255
+        }
+    }
+}
+
+/// Execute PHP and return (exit_code, stdout). Used by tests to assert on output.
+#[cfg(test)]
+fn execute_php_capture(
+    source: &str,
+    ini: &IniSystem,
+    script_path: &str,
+    argv: &[String],
+) -> (i32, String) {
+    let op_array = match php_rs_compiler::compile(source) {
+        Ok(oa) => oa,
+        Err(e) => {
+            eprintln!("{}", e);
+            return (255, String::new());
+        }
+    };
+    let mut sg = Superglobals::new();
+    sg.populate_env();
+    sg.populate_server_cli(script_path, argv);
+    sg.build_request("GP");
+    let sg_map = superglobals_for_vm(&sg, argv);
+    let config = vm_config_from_ini(ini);
+    let mut vm = php_rs_vm::Vm::with_config(config);
+    match vm.execute(&op_array, Some(&sg_map)) {
+        Ok(output) => (0, output),
+        Err(e) => {
+            eprintln!("Fatal error: {:?}", e);
+            (255, String::new())
+        }
+    }
+}
+
+/// Lint (syntax check) PHP source code.
+fn lint_php(source: &str, filename: &str) -> i32 {
+    match php_rs_compiler::compile(source) {
+        Ok(_) => {
+            println!("No syntax errors detected in {}", filename);
+            0
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            255
+        }
+    }
+}
+
+/// Read a file to string, handling errors.
+/// Uses lossy UTF-8 conversion to handle PHP files in ISO-8859-1 or other encodings.
+fn read_file(path: &str) -> Result<String, i32> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())),
+        Err(e) => {
+            eprintln!("Could not open input file: {}: {}", path, e);
+            Err(1)
+        }
+    }
+}
+
+/// Read stdin to string.
+fn read_stdin() -> Result<String, i32> {
+    let mut buf = String::new();
+    match io::stdin().read_to_string(&mut buf) {
+        Ok(_) => Ok(buf),
+        Err(e) => {
+            eprintln!("Failed to read from stdin: {}", e);
+            Err(1)
+        }
+    }
+}
+
+/// Set up the INI system with defaults and CLI overrides.
+fn setup_ini(opts: &CliOptions) -> IniSystem {
+    let mut ini = IniSystem::new();
+
+    // CLI SAPI defaults: no execution time limit (matches PHP CLI behavior)
+    ini.set("max_execution_time", "0");
+
+    // Load php.ini if applicable
+    if !opts.no_ini {
+        if let Some(ref path) = opts.ini_path {
+            ini.load_ini_file(path);
+        } else {
+            // Search default paths for php.ini
+            ini.load_default_ini();
+        }
+    }
+
+    // Apply -d overrides (force_set bypasses permission — CLI -d is system-level)
+    for (key, value) in &opts.ini_overrides {
+        ini.force_set(key, value);
+    }
+
+    ini
+}
+
+// ── Interactive REPL ────────────────────────────────────────────────────────
+
+fn run_interactive() -> i32 {
+    println!(
+        "Interactive shell — php.rs {} (PHP {} compatible)",
+        PHP_RS_VERSION, PHP_COMPAT_VERSION
+    );
+    println!("Type PHP code (without <?php tags). Ctrl+D to exit.");
+    println!();
+
+    let stdin = io::stdin();
+    let mut line = String::new();
+
+    loop {
+        eprint!("php > ");
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) => {
+                // EOF
+                eprintln!();
+                return 0;
+            }
+            Ok(_) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                // Wrap in <?php tags for the compiler
+                let source = format!("<?php {}", trimmed);
+                let op_array = match php_rs_compiler::compile(&source) {
+                    Ok(oa) => oa,
+                    Err(e) => {
+                        eprintln!("{}", e);
+                        continue;
+                    }
+                };
+
+                let mut vm = php_rs_vm::Vm::new();
+                match vm.execute(&op_array, None) {
+                    Ok(output) => {
+                        if !output.is_empty() {
+                            print!("{}", output);
+                            // Add newline if output doesn't end with one
+                            if !output.ends_with('\n') {
+                                println!();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Fatal error: {:?}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error reading input: {}", e);
+                return 1;
+            }
+        }
+    }
+}
+
+// ── Line processing mode (-B/-R/-F/-E) ──────────────────────────────────────
+
+/// Process stdin line-by-line with optional begin/end code.
+/// PHP's `php -R 'echo strtoupper($argn);'` reads each line from stdin,
+/// sets `$argn` to the line content and `$aression` to the 1-based line number.
+fn run_process_lines(
+    begin_code: Option<&str>,
+    line_code: Option<&str>,
+    line_file: Option<&str>,
+    end_code: Option<&str>,
+    ini: &IniSystem,
+) -> i32 {
+    // Execute -B (begin code) if provided
+    if let Some(code) = begin_code {
+        let source = format!("<?php {}", code);
+        let exit = execute_php(&source, ini, "-", &["-".to_string()]);
+        if exit != 0 {
+            return exit;
+        }
+    }
+
+    // Read line_file source if -F was given
+    let file_source = if let Some(path) = line_file {
+        match read_file(path) {
+            Ok(src) => Some(src),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
+
+    // Process each line from stdin
+    let stdin = io::stdin();
+    let mut line = String::new();
+    let mut line_num: i64 = 0;
+
+    loop {
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                line_num += 1;
+                // Strip trailing newline for $argn (PHP behavior)
+                let argn = line.trim_end_matches('\n').trim_end_matches('\r');
+
+                if let Some(code) = line_code {
+                    // -R mode: run code with $argn and $aression set
+                    let source = format!(
+                        "<?php $argn = {}; $aression = {}; {}",
+                        php_string_literal(argn),
+                        line_num,
+                        code
+                    );
+                    let exit = execute_php(&source, ini, "-", &["-".to_string()]);
+                    if exit != 0 {
+                        return exit;
+                    }
+                } else if let Some(ref src) = file_source {
+                    // -F mode: run file with $argn and $aression set
+                    let source = format!(
+                        "<?php $argn = {}; $aression = {}; ?>\n{}",
+                        php_string_literal(argn),
+                        line_num,
+                        src
+                    );
+                    let exit = execute_php(&source, ini, "-", &["-".to_string()]);
+                    if exit != 0 {
+                        return exit;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error reading stdin: {}", e);
+                return 1;
+            }
+        }
+    }
+
+    // Execute -E (end code) if provided
+    if let Some(code) = end_code {
+        let source = format!("<?php {}", code);
+        let exit = execute_php(&source, ini, "-", &["-".to_string()]);
+        if exit != 0 {
+            return exit;
+        }
+    }
+
+    0
+}
+
+/// Escape a string as a PHP single-quoted string literal.
+fn php_string_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        match ch {
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+// ── --ini display ───────────────────────────────────────────────────────────
+
+/// Show configuration file names (--ini flag).
+fn show_ini(ini_path: &Option<String>, no_ini: bool) {
+    println!("Configuration File (php.ini) Path: /etc/php/8.6/cli");
+    if no_ini {
+        println!("Loaded Configuration File:         (none)");
+    } else if let Some(ref path) = ini_path {
+        if std::path::Path::new(path).exists() {
+            println!("Loaded Configuration File:         {}", path);
+        } else {
+            println!("Loaded Configuration File:         (none)");
+        }
+    } else {
+        // Search default paths
+        let default_paths = ["/etc/php.ini", "/usr/local/etc/php.ini"];
+        let mut found = false;
+        for p in &default_paths {
+            if std::path::Path::new(p).exists() {
+                println!("Loaded Configuration File:         {}", p);
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            println!("Loaded Configuration File:         (none)");
+        }
+    }
+    println!("Scan for additional .ini files in: (none)");
+    println!("Additional .ini files parsed:      (none)");
+}
+
+// ── Reflection flags (--rf/--rc/--re/--ri) ──────────────────────────────────
+
+/// Known built-in functions organized by extension.
+fn get_extension_functions() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        (
+            "Core",
+            vec![
+                "strlen",
+                "count",
+                "isset",
+                "unset",
+                "empty",
+                "echo",
+                "print",
+                "var_dump",
+                "print_r",
+                "var_export",
+                "die",
+                "exit",
+                "is_null",
+                "is_bool",
+                "is_int",
+                "is_integer",
+                "is_long",
+                "is_float",
+                "is_double",
+                "is_numeric",
+                "is_string",
+                "is_array",
+                "is_object",
+                "is_callable",
+                "is_countable",
+                "is_iterable",
+                "is_resource",
+                "is_finite",
+                "is_infinite",
+                "is_nan",
+                "gettype",
+                "settype",
+                "get_debug_type",
+                "get_class",
+                "intval",
+                "floatval",
+                "strval",
+                "boolval",
+                "defined",
+                "define",
+                "constant",
+                "function_exists",
+                "class_exists",
+                "interface_exists",
+                "get_defined_vars",
+                "get_defined_functions",
+                "get_defined_constants",
+                "compact",
+                "extract",
+                "trigger_error",
+                "user_error",
+                "set_error_handler",
+                "restore_error_handler",
+                "set_exception_handler",
+                "restore_exception_handler",
+                "error_reporting",
+            ],
+        ),
+        (
+            "standard",
+            vec![
+                "array_push",
+                "array_pop",
+                "array_shift",
+                "array_unshift",
+                "array_slice",
+                "array_splice",
+                "array_merge",
+                "array_combine",
+                "array_keys",
+                "array_values",
+                "array_flip",
+                "array_reverse",
+                "array_unique",
+                "array_search",
+                "array_filter",
+                "array_map",
+                "array_walk",
+                "array_chunk",
+                "array_pad",
+                "array_fill",
+                "array_column",
+                "array_sum",
+                "array_product",
+                "in_array",
+                "sort",
+                "rsort",
+                "asort",
+                "arsort",
+                "ksort",
+                "krsort",
+                "usort",
+                "uasort",
+                "uksort",
+                "array_multisort",
+                "str_contains",
+                "str_starts_with",
+                "str_ends_with",
+                "str_replace",
+                "str_ireplace",
+                "str_pad",
+                "str_repeat",
+                "str_split",
+                "str_word_count",
+                "str_getcsv",
+                "substr",
+                "substr_count",
+                "substr_replace",
+                "strtolower",
+                "strtoupper",
+                "ucfirst",
+                "lcfirst",
+                "ucwords",
+                "trim",
+                "ltrim",
+                "rtrim",
+                "nl2br",
+                "wordwrap",
+                "explode",
+                "implode",
+                "join",
+                "sprintf",
+                "printf",
+                "fprintf",
+                "sscanf",
+                "number_format",
+                "str_rot13",
+                "str_shuffle",
+                "str_increment",
+                "str_decrement",
+                "ord",
+                "chr",
+                "hex2bin",
+                "bin2hex",
+                "htmlspecialchars",
+                "htmlspecialchars_decode",
+                "htmlentities",
+                "html_entity_decode",
+                "strip_tags",
+                "md5",
+                "sha1",
+                "crc32",
+                "base64_encode",
+                "base64_decode",
+                "urlencode",
+                "urldecode",
+                "rawurlencode",
+                "rawurldecode",
+                "http_build_query",
+                "parse_url",
+                "parse_str",
+                "abs",
+                "ceil",
+                "floor",
+                "round",
+                "max",
+                "min",
+                "pow",
+                "sqrt",
+                "log",
+                "log2",
+                "log10",
+                "exp",
+                "fmod",
+                "fdiv",
+                "rand",
+                "mt_rand",
+                "random_int",
+                "random_bytes",
+                "sin",
+                "cos",
+                "tan",
+                "asin",
+                "acos",
+                "atan",
+                "atan2",
+                "pi",
+                "deg2rad",
+                "rad2deg",
+                "file_get_contents",
+                "file_put_contents",
+                "file",
+                "fopen",
+                "fclose",
+                "fread",
+                "fwrite",
+                "fgets",
+                "feof",
+                "fseek",
+                "ftell",
+                "rewind",
+                "fflush",
+                "flock",
+                "ftruncate",
+                "is_file",
+                "is_dir",
+                "is_readable",
+                "is_writable",
+                "file_exists",
+                "filesize",
+                "filetype",
+                "filemtime",
+                "mkdir",
+                "rmdir",
+                "rename",
+                "copy",
+                "unlink",
+                "tempnam",
+                "glob",
+                "scandir",
+                "realpath",
+                "dirname",
+                "basename",
+                "pathinfo",
+                "time",
+                "microtime",
+                "sleep",
+                "usleep",
+                "serialize",
+                "unserialize",
+                "json_encode",
+                "json_decode",
+                "pack",
+                "unpack",
+            ],
+        ),
+        (
+            "date",
+            vec![
+                "date",
+                "time",
+                "mktime",
+                "gmmktime",
+                "strtotime",
+                "strftime",
+                "gmdate",
+                "localtime",
+                "getdate",
+                "checkdate",
+                "date_create",
+                "date_create_immutable",
+                "date_diff",
+                "date_format",
+                "date_modify",
+                "date_timezone_set",
+            ],
+        ),
+        (
+            "pcre",
+            vec![
+                "preg_match",
+                "preg_match_all",
+                "preg_replace",
+                "preg_replace_callback",
+                "preg_replace_callback_array",
+                "preg_split",
+                "preg_grep",
+                "preg_filter",
+                "preg_quote",
+                "preg_last_error",
+                "preg_last_error_msg",
+            ],
+        ),
+        (
+            "json",
+            vec![
+                "json_encode",
+                "json_decode",
+                "json_last_error",
+                "json_last_error_msg",
+            ],
+        ),
+        (
+            "mbstring",
+            vec![
+                "mb_strlen",
+                "mb_substr",
+                "mb_strpos",
+                "mb_strrpos",
+                "mb_strtolower",
+                "mb_strtoupper",
+                "mb_detect_encoding",
+                "mb_convert_encoding",
+                "mb_internal_encoding",
+                "mb_str_split",
+                "mb_ord",
+                "mb_chr",
+                "mb_check_encoding",
+                "mb_substitute_character",
+            ],
+        ),
+        (
+            "spl",
+            vec![
+                "spl_autoload_register",
+                "spl_autoload_unregister",
+                "spl_autoload_functions",
+                "spl_autoload_call",
+                "class_parents",
+                "class_implements",
+                "class_uses",
+                "iterator_to_array",
+                "iterator_count",
+                "iterator_apply",
+            ],
+        ),
+        (
+            "ctype",
+            vec![
+                "ctype_alnum",
+                "ctype_alpha",
+                "ctype_cntrl",
+                "ctype_digit",
+                "ctype_graph",
+                "ctype_lower",
+                "ctype_print",
+                "ctype_punct",
+                "ctype_space",
+                "ctype_upper",
+                "ctype_xdigit",
+            ],
+        ),
+        (
+            "filter",
+            vec![
+                "filter_var",
+                "filter_input",
+                "filter_has_var",
+                "filter_list",
+                "filter_id",
+            ],
+        ),
+        (
+            "hash",
+            vec![
+                "hash",
+                "hash_algos",
+                "hash_file",
+                "hash_hmac",
+                "hash_init",
+                "hash_update",
+                "hash_final",
+            ],
+        ),
+        (
+            "session",
+            vec![
+                "session_start",
+                "session_destroy",
+                "session_id",
+                "session_name",
+                "session_status",
+                "session_write_close",
+                "session_regenerate_id",
+                "session_set_save_handler",
+                "session_cache_limiter",
+                "session_cache_expire",
+            ],
+        ),
+        ("tokenizer", vec!["token_get_all", "token_name"]),
+        (
+            "bcmath",
+            vec![
+                "bcadd", "bcsub", "bcmul", "bcdiv", "bcmod", "bcpow", "bcscale", "bccomp",
+                "bcsqrt", "bcpowmod",
+            ],
+        ),
+        (
+            "calendar",
+            vec![
+                "cal_days_in_month",
+                "cal_from_jd",
+                "cal_to_jd",
+                "easter_date",
+                "easter_days",
+                "jdtogregorian",
+                "gregoriantojd",
+                "jdtojulian",
+                "juliantojd",
+                "jdtounix",
+                "unixtojd",
+            ],
+        ),
+        (
+            "reflection",
+            vec![
+                "ReflectionClass",
+                "ReflectionFunction",
+                "ReflectionMethod",
+                "ReflectionProperty",
+                "ReflectionParameter",
+            ],
+        ),
+    ]
+}
+
+/// Show information about a function (--rf <name>).
+fn reflect_function(name: &str) {
+    let extensions = get_extension_functions();
+    let name_lower = name.to_lowercase();
+
+    // Find which extension this function belongs to
+    let mut found_ext = None;
+    for (ext, funcs) in &extensions {
+        if funcs.iter().any(|f| f.to_lowercase() == name_lower) {
+            found_ext = Some(*ext);
+            break;
+        }
+    }
+
+    println!("Function [ <internal");
+    if let Some(ext) = found_ext {
+        println!("  :internal> function {} {{", name);
+        println!();
+        println!("  - Extension [ {} ]", ext);
+    } else {
+        println!("  :internal> function {} {{", name);
+    }
+    println!();
+    println!("  - Parameters [0] {{");
+    println!("  }}");
+    println!("}}");
+}
+
+/// Show information about a class (--rc <name>).
+fn reflect_class(name: &str) {
+    // Known built-in classes
+    let known_classes = vec![
+        ("stdClass", "Core", None, vec![]),
+        (
+            "Exception",
+            "Core",
+            None,
+            vec![
+                "getMessage",
+                "getCode",
+                "getFile",
+                "getLine",
+                "getTrace",
+                "getTraceAsString",
+                "getPrevious",
+                "__toString",
+            ],
+        ),
+        (
+            "Error",
+            "Core",
+            None,
+            vec![
+                "getMessage",
+                "getCode",
+                "getFile",
+                "getLine",
+                "getTrace",
+                "getTraceAsString",
+                "getPrevious",
+                "__toString",
+            ],
+        ),
+        ("TypeError", "Core", Some("Error"), vec![]),
+        ("ValueError", "Core", Some("Error"), vec![]),
+        ("ArgumentCountError", "Core", Some("TypeError"), vec![]),
+        ("ArithmeticError", "Core", Some("Error"), vec![]),
+        (
+            "DivisionByZeroError",
+            "Core",
+            Some("ArithmeticError"),
+            vec![],
+        ),
+        ("RuntimeException", "spl", Some("Exception"), vec![]),
+        ("LogicException", "spl", Some("Exception"), vec![]),
+        (
+            "InvalidArgumentException",
+            "spl",
+            Some("LogicException"),
+            vec![],
+        ),
+        (
+            "OutOfRangeException",
+            "spl",
+            Some("RuntimeException"),
+            vec![],
+        ),
+        ("OverflowException", "spl", Some("RuntimeException"), vec![]),
+        (
+            "UnderflowException",
+            "spl",
+            Some("RuntimeException"),
+            vec![],
+        ),
+        (
+            "UnexpectedValueException",
+            "spl",
+            Some("RuntimeException"),
+            vec![],
+        ),
+        (
+            "BadMethodCallException",
+            "spl",
+            Some("LogicException"),
+            vec![],
+        ),
+        (
+            "BadFunctionCallException",
+            "spl",
+            Some("LogicException"),
+            vec![],
+        ),
+        ("LengthException", "spl", Some("LogicException"), vec![]),
+        ("DomainException", "spl", Some("LogicException"), vec![]),
+        ("RangeException", "spl", Some("RuntimeException"), vec![]),
+        (
+            "ArrayObject",
+            "spl",
+            None,
+            vec![
+                "__construct",
+                "offsetExists",
+                "offsetGet",
+                "offsetSet",
+                "offsetUnset",
+                "append",
+                "getArrayCopy",
+                "count",
+                "getFlags",
+                "setFlags",
+                "asort",
+                "ksort",
+                "uasort",
+                "uksort",
+                "natsort",
+                "natcasesort",
+                "exchangeArray",
+                "getIterator",
+            ],
+        ),
+        (
+            "ArrayIterator",
+            "spl",
+            None,
+            vec![
+                "__construct",
+                "rewind",
+                "valid",
+                "current",
+                "key",
+                "next",
+                "seek",
+                "count",
+                "offsetExists",
+                "offsetGet",
+                "offsetSet",
+                "offsetUnset",
+                "append",
+            ],
+        ),
+        (
+            "SplFixedArray",
+            "spl",
+            None,
+            vec![
+                "__construct",
+                "count",
+                "getSize",
+                "setSize",
+                "offsetExists",
+                "offsetGet",
+                "offsetSet",
+                "offsetUnset",
+                "toArray",
+                "fromArray",
+                "rewind",
+                "valid",
+                "current",
+                "key",
+                "next",
+            ],
+        ),
+        (
+            "SplDoublyLinkedList",
+            "spl",
+            None,
+            vec![
+                "push", "pop", "shift", "unshift", "top", "bottom", "count", "isEmpty", "rewind",
+                "valid", "current", "key", "next",
+            ],
+        ),
+        ("SplStack", "spl", Some("SplDoublyLinkedList"), vec![]),
+        ("SplQueue", "spl", Some("SplDoublyLinkedList"), vec![]),
+        (
+            "SplHeap",
+            "spl",
+            None,
+            vec![
+                "insert", "extract", "top", "count", "isEmpty", "rewind", "valid", "current",
+                "key", "next",
+            ],
+        ),
+        ("SplMinHeap", "spl", Some("SplHeap"), vec![]),
+        ("SplMaxHeap", "spl", Some("SplHeap"), vec![]),
+        (
+            "SplPriorityQueue",
+            "spl",
+            None,
+            vec!["insert", "extract", "top", "count", "isEmpty"],
+        ),
+        (
+            "SplObjectStorage",
+            "spl",
+            None,
+            vec![
+                "attach", "detach", "contains", "count", "getInfo", "setInfo", "rewind", "valid",
+                "current", "key", "next",
+            ],
+        ),
+        (
+            "SplFileObject",
+            "spl",
+            None,
+            vec![
+                "__construct",
+                "rewind",
+                "valid",
+                "current",
+                "key",
+                "next",
+                "eof",
+                "fgets",
+                "fgetc",
+                "fgetcsv",
+                "fwrite",
+                "seek",
+            ],
+        ),
+        (
+            "DateTime",
+            "date",
+            None,
+            vec![
+                "__construct",
+                "format",
+                "modify",
+                "setDate",
+                "setTime",
+                "setTimezone",
+                "getTimestamp",
+                "getTimezone",
+                "diff",
+                "createFromFormat",
+            ],
+        ),
+        (
+            "DateTimeImmutable",
+            "date",
+            None,
+            vec![
+                "__construct",
+                "format",
+                "modify",
+                "setDate",
+                "setTime",
+                "setTimezone",
+                "getTimestamp",
+                "getTimezone",
+                "diff",
+                "createFromFormat",
+            ],
+        ),
+        (
+            "DateTimeZone",
+            "date",
+            None,
+            vec!["__construct", "getName", "getOffset", "listIdentifiers"],
+        ),
+        (
+            "DateInterval",
+            "date",
+            None,
+            vec!["__construct", "format", "createFromDateString"],
+        ),
+        (
+            "DatePeriod",
+            "date",
+            None,
+            vec![
+                "__construct",
+                "getStartDate",
+                "getEndDate",
+                "getDateInterval",
+                "getRecurrences",
+            ],
+        ),
+    ];
+
+    let name_lower = name.to_lowercase();
+    let class = known_classes
+        .iter()
+        .find(|(n, ..)| n.to_lowercase() == name_lower);
+
+    match class {
+        Some((class_name, ext, parent, methods)) => {
+            println!("Class [ <internal:{ext}> class {class_name}");
+            if let Some(p) = parent {
+                println!("  extends {p}");
+            }
+            println!("] {{");
+            println!();
+            println!("  - Constants [0] {{");
+            println!("  }}");
+            println!();
+            println!("  - Properties [0] {{");
+            println!("  }}");
+            println!();
+            println!("  - Methods [{}] {{", methods.len());
+            for m in methods {
+                println!("    Method [ <internal:{ext}> public method {m} ]");
+            }
+            println!("  }}");
+            println!("}}");
+        }
+        None => {
+            eprintln!("Class '{}' not found", name);
+        }
+    }
+}
+
+/// Show information about an extension (--re <name>).
+fn reflect_extension(name: &str) {
+    let extensions = get_extension_functions();
+    let name_lower = name.to_lowercase();
+
+    let ext = extensions
+        .iter()
+        .find(|(n, _)| n.to_lowercase() == name_lower);
+
+    match ext {
+        Some((ext_name, funcs)) => {
+            println!(
+                "Extension [ <persistent> extension #{} {} version {} ] {{",
+                1, ext_name, PHP_RS_VERSION
+            );
+            println!();
+            println!("  - Functions {{");
+            for f in funcs {
+                println!("    Function [ <internal:{}> function {} ]", ext_name, f);
+            }
+            println!("  }}");
+            println!("}}");
+        }
+        None => {
+            eprintln!("Extension '{}' not found", name);
+        }
+    }
+}
+
+/// Show configuration for an extension (--ri <name>).
+fn reflect_extension_ini(name: &str, ini: &IniSystem) {
+    let name_lower = name.to_lowercase();
+
+    // Map extensions to their INI directives
+    let ext_ini: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        (
+            "Core",
+            vec![
+                ("display_errors", "1"),
+                ("display_startup_errors", "1"),
+                ("error_reporting", "32767"),
+                ("log_errors", "0"),
+                ("max_execution_time", "0"),
+                ("memory_limit", "134217728"),
+                ("open_basedir", ""),
+            ],
+        ),
+        (
+            "date",
+            vec![
+                ("date.timezone", "UTC"),
+                ("date.default_latitude", "31.7667"),
+                ("date.default_longitude", "35.2333"),
+                ("date.sunrise_zenith", "90.833333"),
+                ("date.sunset_zenith", "90.833333"),
+            ],
+        ),
+        (
+            "session",
+            vec![
+                ("session.save_handler", "files"),
+                ("session.save_path", ""),
+                ("session.name", "PHPSESSID"),
+                ("session.auto_start", "0"),
+                ("session.gc_maxlifetime", "1440"),
+                ("session.gc_probability", "1"),
+                ("session.gc_divisor", "100"),
+                ("session.cookie_lifetime", "0"),
+                ("session.cookie_path", "/"),
+                ("session.cookie_domain", ""),
+                ("session.cookie_httponly", "0"),
+                ("session.cookie_secure", "0"),
+                ("session.cookie_samesite", ""),
+                ("session.use_cookies", "1"),
+                ("session.use_only_cookies", "1"),
+                ("session.use_strict_mode", "0"),
+            ],
+        ),
+        (
+            "mbstring",
+            vec![
+                ("mbstring.internal_encoding", ""),
+                ("mbstring.http_input", ""),
+                ("mbstring.http_output", ""),
+                ("mbstring.language", "neutral"),
+                ("mbstring.detect_order", ""),
+                ("mbstring.substitute_character", ""),
+            ],
+        ),
+        (
+            "pcre",
+            vec![
+                ("pcre.backtrack_limit", "1000000"),
+                ("pcre.recursion_limit", "100000"),
+                ("pcre.jit", "1"),
+            ],
+        ),
+        (
+            "filter",
+            vec![
+                ("filter.default", "unsafe_raw"),
+                ("filter.default_flags", ""),
+            ],
+        ),
+        ("bcmath", vec![("bcmath.scale", "0")]),
+    ];
+
+    let found = ext_ini.iter().find(|(n, _)| n.to_lowercase() == name_lower);
+
+    match found {
+        Some((ext_name, directives)) => {
+            println!();
+            println!("{}", ext_name);
+            println!();
+            println!(
+                "{:<40} {:>15} {:>15}",
+                "Directive", "Local Value", "Master Value"
+            );
+            for (key, default) in directives {
+                let local = ini.get(key);
+                let local_val = if local.is_empty() { default } else { &local };
+                println!("{:<40} {:>15} {:>15}", key, local_val, default);
+            }
+        }
+        None => {
+            eprintln!("Extension '{}' not found", name);
+        }
+    }
+}
+
+// ── Strip & highlight (simplified) ──────────────────────────────────────────
+
+/// Strip comments and extra whitespace from PHP source.
+fn strip_source(source: &str) -> String {
+    // Simple approach: use the lexer to tokenize and rebuild without comments
+    use php_rs_compiler::compile;
+    // If it doesn't parse, return original
+    if compile(source).is_err() {
+        return source.to_string();
+    }
+    // Simple comment stripper: remove // and /* */ comments, preserve strings
+    let mut result = String::new();
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                result.push(quote as char);
+                i += 1;
+                while i < bytes.len() && bytes[i] != quote {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        result.push(bytes[i] as char);
+                        i += 1;
+                    }
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    result.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                // Line comment — skip to end of line
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'#' if i + 1 < bytes.len() && bytes[i + 1] != b'[' => {
+                // # comment — skip to end of line
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                // Block comment — skip to */
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                if i + 1 < bytes.len() {
+                    i += 2; // skip */
+                }
+            }
+            _ => {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+    result
+}
+
+/// Simple HTML syntax highlighting for PHP source.
+fn syntax_highlight(source: &str) -> String {
+    let mut html = String::from("<code><span style=\"color: #000000\">\n");
+    // Simplified: just HTML-escape and wrap in <code>
+    for ch in source.chars() {
+        match ch {
+            '<' => html.push_str("&lt;"),
+            '>' => html.push_str("&gt;"),
+            '&' => html.push_str("&amp;"),
+            '"' => html.push_str("&quot;"),
+            '\n' => html.push_str("<br />\n"),
+            _ => html.push(ch),
+        }
+    }
+    html.push_str("</span>\n</code>");
+    html
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+/// Install signal handlers for SIGINT and SIGTERM to enable graceful shutdown.
+fn install_signal_handlers() {
+    #[cfg(unix)]
+    {
+        extern "C" fn signal_handler(_sig: libc::c_int) {
+            php_rs_vm::vm::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+        }
+
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                signal_handler as *const () as libc::sighandler_t,
+            );
+            libc::signal(
+                libc::SIGTERM,
+                signal_handler as *const () as libc::sighandler_t,
+            );
+        }
+    }
+}
+
+fn main() {
+    // Install signal handlers for graceful shutdown (SIGINT, SIGTERM)
+    install_signal_handlers();
+
+    // Register PDO drivers
+    php_rs_ext_pdo::register_pdo_driver("pgsql", || {
+        Box::new(php_rs_ext_pdo_pgsql::PdoPgsqlDriver::new())
+    });
+
+    let args: Vec<String> = env::args().collect();
+
+    let opts = match parse_args(&args) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("php-rs: {}", e);
+            eprintln!("Try 'php-rs --help' for usage information.");
+            process::exit(1);
+        }
+    };
+
+    let ini = setup_ini(&opts);
+
+    let exit_code = match opts.mode {
+        CliMode::Version => {
+            print_version();
+            0
+        }
+        CliMode::Help => {
+            print_help();
+            0
+        }
+        CliMode::Modules => {
+            print_modules();
+            0
+        }
+        CliMode::Info => {
+            print_phpinfo();
+            0
+        }
+        CliMode::Interactive => run_interactive(),
+        CliMode::ShowIni => {
+            show_ini(&opts.ini_path, opts.no_ini);
+            0
+        }
+        CliMode::ReflectFunction(ref name) => {
+            reflect_function(name);
+            0
+        }
+        CliMode::ReflectClass(ref name) => {
+            reflect_class(name);
+            0
+        }
+        CliMode::ReflectExtension(ref name) => {
+            reflect_extension(name);
+            0
+        }
+        CliMode::ReflectExtensionIni(ref name) => {
+            reflect_extension_ini(name, &ini);
+            0
+        }
+        CliMode::ProcessLines {
+            ref begin_code,
+            ref line_code,
+            ref line_file,
+            ref end_code,
+        } => run_process_lines(
+            begin_code.as_deref(),
+            line_code.as_deref(),
+            line_file.as_deref(),
+            end_code.as_deref(),
+            &ini,
+        ),
+        CliMode::Server {
+            listen,
+            docroot,
+            router,
+        } => {
+            let docroot = docroot
+                .map(PathBuf::from)
+                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let router = router.map(PathBuf::from);
+            server::run_server(server::ServerConfig {
+                listen,
+                docroot,
+                router,
+            })
+        }
+        CliMode::RunCode(code) => {
+            // -r wraps in <?php automatically
+            let source = format!("<?php {}", code);
+            let argv: Vec<String> = std::iter::once("-".to_string())
+                .chain(opts.script_args.clone())
+                .collect();
+            execute_php(&source, &ini, "-", &argv)
+        }
+        CliMode::RunFile(path) => match read_file(&path) {
+            Ok(source) => {
+                let argv: Vec<String> = std::iter::once(path.clone())
+                    .chain(opts.script_args.clone())
+                    .collect();
+                execute_php(&source, &ini, &path, &argv)
+            }
+            Err(code) => code,
+        },
+        CliMode::Lint(path) => match read_file(&path) {
+            Ok(source) => lint_php(&source, &path),
+            Err(code) => code,
+        },
+        CliMode::Strip(path) => match read_file(&path) {
+            Ok(source) => {
+                print!("{}", strip_source(&source));
+                0
+            }
+            Err(code) => code,
+        },
+        CliMode::SyntaxHighlight(path) => match read_file(&path) {
+            Ok(source) => {
+                print!("{}", syntax_highlight(&source));
+                0
+            }
+            Err(code) => code,
+        },
+        CliMode::Stdin => match read_stdin() {
+            Ok(source) => execute_php(&source, &ini, "-", &["-".to_string()]),
+            Err(code) => code,
+        },
+        CliMode::Composer(args) => match php_rs_composer::cli::run(args) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
+                1
+            }
+        },
+    };
+
+    process::exit(exit_code);
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Argument parsing tests ──
+
+    #[test]
+    fn test_parse_version() {
+        let args = vec!["php-rs".into(), "-v".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::Version));
+    }
+
+    #[test]
+    fn test_parse_help() {
+        let args = vec!["php-rs".into(), "--help".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::Help));
+    }
+
+    #[test]
+    fn test_parse_run_code() {
+        let args = vec!["php-rs".into(), "-r".into(), "echo 42;".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::RunCode(ref s) if s == "echo 42;"));
+    }
+
+    #[test]
+    fn test_parse_run_file() {
+        let args = vec!["php-rs".into(), "test.php".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::RunFile(ref s) if s == "test.php"));
+    }
+
+    #[test]
+    fn test_parse_run_file_with_f_flag() {
+        let args = vec!["php-rs".into(), "-f".into(), "test.php".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::RunFile(ref s) if s == "test.php"));
+    }
+
+    #[test]
+    fn test_parse_lint() {
+        let args = vec!["php-rs".into(), "-l".into(), "test.php".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::Lint(ref s) if s == "test.php"));
+    }
+
+    #[test]
+    fn test_parse_ini_override() {
+        let args = vec![
+            "php-rs".into(),
+            "-d".into(),
+            "error_reporting=E_ALL".into(),
+            "-r".into(),
+            "echo 1;".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.ini_overrides.len(), 1);
+        assert_eq!(opts.ini_overrides[0].0, "error_reporting");
+        assert_eq!(opts.ini_overrides[0].1, "E_ALL");
+    }
+
+    #[test]
+    fn test_parse_ini_override_no_value() {
+        let args = vec![
+            "php-rs".into(),
+            "-d".into(),
+            "display_errors".into(),
+            "-v".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.ini_overrides[0].1, "1");
+    }
+
+    #[test]
+    fn test_parse_no_ini() {
+        let args = vec!["php-rs".into(), "-n".into(), "-v".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(opts.no_ini);
+    }
+
+    #[test]
+    fn test_parse_config_path() {
+        let args = vec![
+            "php-rs".into(),
+            "-c".into(),
+            "/etc/php.ini".into(),
+            "-v".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.ini_path.as_deref(), Some("/etc/php.ini"));
+    }
+
+    #[test]
+    fn test_parse_modules() {
+        let args = vec!["php-rs".into(), "-m".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::Modules));
+    }
+
+    #[test]
+    fn test_parse_script_args() {
+        let args = vec![
+            "php-rs".into(),
+            "test.php".into(),
+            "arg1".into(),
+            "arg2".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::RunFile(ref s) if s == "test.php"));
+        assert_eq!(opts.script_args, vec!["arg1", "arg2"]);
+    }
+
+    #[test]
+    fn test_parse_separator() {
+        let args = vec![
+            "php-rs".into(),
+            "-r".into(),
+            "echo 1;".into(),
+            "--".into(),
+            "extra".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert_eq!(opts.script_args, vec!["extra"]);
+    }
+
+    #[test]
+    fn test_parse_unknown_option() {
+        let args = vec!["php-rs".into(), "-z".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_missing_argument() {
+        let args = vec!["php-rs".into(), "-r".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    // ── End-to-end execution tests ──
+
+    fn default_argv() -> Vec<String> {
+        vec!["-".to_string()]
+    }
+
+    #[test]
+    fn test_execute_hello_world() {
+        let code = execute_php(
+            "<?php echo \"Hello, World!\n\";",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_execute_echo_number() {
+        let code = execute_php("<?php echo 42;", &IniSystem::new(), "-", &default_argv());
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_execute_variable_assignment() {
+        let code = execute_php(
+            "<?php $x = 10; echo $x;",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_execute_arithmetic() {
+        let code = execute_php(
+            "<?php echo 2 + 3 * 4;",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_execute_string_concat() {
+        let code = execute_php(
+            "<?php echo \"Hello\" . \" \" . \"World\";",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_execute_if_else() {
+        let code = execute_php(
+            "<?php $x = 5; if ($x > 3) { echo \"yes\"; } else { echo \"no\"; }",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_execute_while_loop() {
+        let code = execute_php(
+            "<?php $i = 0; while ($i < 5) { echo $i; $i = $i + 1; }",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_execute_function() {
+        let code = execute_php(
+            "<?php function add($a, $b) { return $a + $b; } echo add(3, 4);",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_execute_parse_error() {
+        let code = execute_php("<?php echo (;", &IniSystem::new(), "-", &default_argv());
+        assert_eq!(code, 255);
+    }
+
+    #[test]
+    fn test_execute_r_flag_wrapping() {
+        // -r wraps in <?php, so code shouldn't include it
+        let source = format!("<?php {}", "echo 42;");
+        let code = execute_php(&source, &IniSystem::new(), "-", &default_argv());
+        assert_eq!(code, 0);
+    }
+
+    // ── Superglobal tests ──
+
+    #[test]
+    fn test_superglobal_server_argc_argv() {
+        // argv = ["-", "a", "b"] => argc = 3, argv[0] = "-", argv[1] = "a", argv[2] = "b"
+        let argv = vec!["-".to_string(), "a".to_string(), "b".to_string()];
+        let (code, out) = execute_php_capture(
+            "<?php echo $_SERVER['argc'];",
+            &IniSystem::new(),
+            "-",
+            &argv,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "3");
+    }
+
+    #[test]
+    fn test_superglobal_server_argv_array() {
+        let argv = vec![
+            "script.php".to_string(),
+            "one".to_string(),
+            "two".to_string(),
+        ];
+        let (code, out) = execute_php_capture(
+            "<?php $a = $_SERVER['argv']; echo $a[0].','.$a[1].','.$a[2];",
+            &IniSystem::new(),
+            "script.php",
+            &argv,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "script.php,one,two");
+    }
+
+    #[test]
+    fn test_superglobal_server_script_filename() {
+        let argv = vec!["/path/to/script.php".to_string()];
+        let (code, out) = execute_php_capture(
+            "<?php echo $_SERVER['SCRIPT_FILENAME'];",
+            &IniSystem::new(),
+            "/path/to/script.php",
+            &argv,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "/path/to/script.php");
+    }
+
+    #[test]
+    fn test_superglobal_get_empty_then_assign() {
+        // $_GET is pre-filled (empty for CLI); script can read and assign
+        let (code, out) = execute_php_capture(
+            "<?php $_GET['x'] = 'y'; echo $_GET['x'];",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "y");
+    }
+
+    #[test]
+    fn test_superglobal_env_available() {
+        // $_ENV is populated from process environment
+        std::env::set_var("PHP_RS_SUPERGLOBAL_TEST", "env_ok");
+        let (code, out) = execute_php_capture(
+            "<?php echo isset($_ENV['PHP_RS_SUPERGLOBAL_TEST']) ? $_ENV['PHP_RS_SUPERGLOBAL_TEST'] : 'missing';",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        std::env::remove_var("PHP_RS_SUPERGLOBAL_TEST");
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "env_ok");
+    }
+
+    #[test]
+    fn test_lint_valid() {
+        let code = lint_php("<?php echo 42;", "test.php");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_lint_invalid() {
+        let code = lint_php("<?php echo (;", "test.php");
+        assert_eq!(code, 255);
+    }
+
+    #[test]
+    fn test_strip_source() {
+        let source = "<?php\n// comment\necho 42; /* block */\n";
+        let stripped = strip_source(source);
+        assert!(!stripped.contains("// comment"));
+        assert!(!stripped.contains("/* block */"));
+        assert!(stripped.contains("echo 42;"));
+    }
+
+    #[test]
+    fn test_strip_preserves_strings() {
+        let source = "<?php echo \"// not a comment\";";
+        let stripped = strip_source(source);
+        assert!(stripped.contains("// not a comment"));
+    }
+
+    #[test]
+    fn test_syntax_highlight_produces_html() {
+        let source = "<?php echo 42;";
+        let html = syntax_highlight(source);
+        assert!(html.contains("<code>"));
+        assert!(html.contains("</code>"));
+        assert!(html.contains("echo 42;"));
+    }
+
+    #[test]
+    fn test_stdin_default_mode() {
+        let args = vec!["php-rs".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::Stdin));
+    }
+
+    // ── Server argument parsing tests ──
+
+    #[test]
+    fn test_parse_server() {
+        let args = vec!["php-rs".into(), "-S".into(), "localhost:8080".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(
+            matches!(opts.mode, CliMode::Server { ref listen, ref docroot, ref router }
+                if listen == "localhost:8080" && docroot.is_none() && router.is_none())
+        );
+    }
+
+    #[test]
+    fn test_parse_server_with_docroot() {
+        let args = vec![
+            "php-rs".into(),
+            "-S".into(),
+            "0.0.0.0:9000".into(),
+            "-t".into(),
+            "/var/www".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(
+            matches!(opts.mode, CliMode::Server { ref listen, ref docroot, .. }
+                if listen == "0.0.0.0:9000" && docroot.as_deref() == Some("/var/www"))
+        );
+    }
+
+    #[test]
+    fn test_parse_server_with_router() {
+        let args = vec![
+            "php-rs".into(),
+            "-S".into(),
+            "localhost:8080".into(),
+            "router.php".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::Server { ref router, .. }
+                if router.as_deref() == Some("router.php")));
+    }
+
+    #[test]
+    fn test_parse_server_with_docroot_and_router() {
+        let args = vec![
+            "php-rs".into(),
+            "-S".into(),
+            "localhost:8080".into(),
+            "-t".into(),
+            "/srv/www".into(),
+            "router.php".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(
+            matches!(opts.mode, CliMode::Server { ref listen, ref docroot, ref router }
+                if listen == "localhost:8080"
+                && docroot.as_deref() == Some("/srv/www")
+                && router.as_deref() == Some("router.php"))
+        );
+    }
+
+    #[test]
+    fn test_parse_server_missing_addr() {
+        let args = vec!["php-rs".into(), "-S".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    // ── New CLI flags: -B/-R/-F/-E argument parsing ──
+
+    #[test]
+    fn test_parse_r_code() {
+        let args = vec![
+            "php-rs".into(),
+            "-R".into(),
+            "echo strtoupper($argn);".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::ProcessLines {
+            ref line_code, ..
+        } if line_code.as_deref() == Some("echo strtoupper($argn);")));
+    }
+
+    #[test]
+    fn test_parse_f_file() {
+        let args = vec!["php-rs".into(), "-F".into(), "process.php".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::ProcessLines {
+            ref line_file, ..
+        } if line_file.as_deref() == Some("process.php")));
+    }
+
+    #[test]
+    fn test_parse_b_r_e_combination() {
+        let args = vec![
+            "php-rs".into(),
+            "-B".into(),
+            "echo 'start';".into(),
+            "-R".into(),
+            "echo $argn;".into(),
+            "-E".into(),
+            "echo 'end';".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::ProcessLines {
+            ref begin_code,
+            ref line_code,
+            ref line_file,
+            ref end_code,
+        } if begin_code.as_deref() == Some("echo 'start';")
+            && line_code.as_deref() == Some("echo $argn;")
+            && line_file.is_none()
+            && end_code.as_deref() == Some("echo 'end';")));
+    }
+
+    #[test]
+    fn test_parse_b_missing_arg() {
+        let args = vec!["php-rs".into(), "-B".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_r_missing_arg() {
+        let args = vec!["php-rs".into(), "-R".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_f_missing_arg() {
+        let args = vec!["php-rs".into(), "-F".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_e_missing_arg() {
+        let args = vec!["php-rs".into(), "-E".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    // ── --ini flag ──
+
+    #[test]
+    fn test_parse_show_ini() {
+        let args = vec!["php-rs".into(), "--ini".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::ShowIni));
+    }
+
+    // ── Reflection flags ──
+
+    #[test]
+    fn test_parse_rf() {
+        let args = vec!["php-rs".into(), "--rf".into(), "strlen".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::ReflectFunction(ref s) if s == "strlen"));
+    }
+
+    #[test]
+    fn test_parse_rc() {
+        let args = vec!["php-rs".into(), "--rc".into(), "stdClass".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::ReflectClass(ref s) if s == "stdClass"));
+    }
+
+    #[test]
+    fn test_parse_re() {
+        let args = vec!["php-rs".into(), "--re".into(), "json".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::ReflectExtension(ref s) if s == "json"));
+    }
+
+    #[test]
+    fn test_parse_ri() {
+        let args = vec!["php-rs".into(), "--ri".into(), "date".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::ReflectExtensionIni(ref s) if s == "date"));
+    }
+
+    #[test]
+    fn test_parse_rf_missing_arg() {
+        let args = vec!["php-rs".into(), "--rf".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_rc_missing_arg() {
+        let args = vec!["php-rs".into(), "--rc".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_re_missing_arg() {
+        let args = vec!["php-rs".into(), "--re".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    #[test]
+    fn test_parse_ri_missing_arg() {
+        let args = vec!["php-rs".into(), "--ri".into()];
+        assert!(parse_args(&args).is_err());
+    }
+
+    // ── Helper function tests ──
+
+    #[test]
+    fn test_php_string_literal_simple() {
+        assert_eq!(php_string_literal("hello"), "'hello'");
+    }
+
+    #[test]
+    fn test_php_string_literal_with_quotes() {
+        assert_eq!(php_string_literal("it's"), "'it\\'s'");
+    }
+
+    #[test]
+    fn test_php_string_literal_with_backslash() {
+        assert_eq!(php_string_literal("a\\b"), "'a\\\\b'");
+    }
+
+    #[test]
+    fn test_php_string_literal_empty() {
+        assert_eq!(php_string_literal(""), "''");
+    }
+}

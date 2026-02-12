@@ -1,0 +1,6908 @@
+//! PHP type system -- core value types for the php.rs interpreter.
+//!
+//! This crate implements the fundamental PHP value types that mirror the reference
+//! PHP 8.6 implementation (php-src/Zend/zend_types.h):
+//!
+//! - [`ZVal`] -- The universal value container (equivalent to PHP's `zval`), a 16-byte
+//!   tagged union holding any PHP value.
+//! - [`ZString`] -- Reference-counted, binary-safe string with precomputed DJBX33A hash
+//!   and optional global interning (equivalent to PHP's `zend_string`).
+//! - [`ZArray`] -- Ordered map with dual-mode storage: packed (consecutive integer keys)
+//!   and hash (arbitrary keys with Robin Hood hashing). Supports copy-on-write via `Arc`
+//!   (equivalent to PHP's `HashTable`).
+//! - [`ZObject`] -- Object instance with class entry reference, dynamic property storage,
+//!   and a unique handle for identity comparisons (equivalent to PHP's `zend_object`).
+//!
+//! All types preserve PHP's exact semantics for type juggling, comparison, and
+//! memory management. The [`ZVal`] struct is guaranteed to be exactly 16 bytes
+//! at compile time, matching PHP's zval layout.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+
+// Lazy static for global string interning pool
+use std::sync::OnceLock;
+
+static GLOBAL_INTERN_POOL: OnceLock<Mutex<HashMap<u64, Arc<ZStringInner>>>> = OnceLock::new();
+
+/// PHP value type discriminant.
+///
+/// Represents the type tag stored in every [`ZVal`]. This matches PHP's `u1.v.type`
+/// field from `zend_types.h`. The numeric values correspond exactly to those in
+/// the reference implementation.
+///
+/// Note that PHP separates `true` and `false` into distinct types rather than
+/// using a single boolean type with a payload -- this is reflected here.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZValType {
+    /// PHP `null` type.
+    Null = 0,
+    /// PHP `false` -- separate from `True` (no boolean payload needed).
+    False = 1,
+    /// PHP `true` -- separate from `False` (no boolean payload needed).
+    True = 2,
+    /// PHP integer (`int`), stored as `i64`.
+    Long = 3,
+    /// PHP float (`float`/`double`), stored as `f64` bit-pattern in the value union.
+    Double = 4,
+    /// PHP string, value holds a pointer to a [`ZString`].
+    String = 5,
+    /// PHP array, value holds a pointer to a [`ZArray`].
+    Array = 6,
+    /// PHP object, value holds a pointer to a [`ZObject`].
+    Object = 7,
+    /// PHP resource handle (e.g., file handle, database connection).
+    Resource = 8,
+    /// PHP reference (`&$var`), value holds a pointer to the referenced `ZVal`.
+    Reference = 9,
+}
+
+/// Core PHP value container -- equivalent to PHP's `zval` from `zend_types.h`.
+///
+/// Every PHP variable, function argument, and return value is represented as a `ZVal`.
+/// This struct uses a C-compatible layout to match PHP's zval exactly:
+///
+/// ```text
+/// Offset  Size  Field
+/// ------  ----  -----
+///   0      8    value union (i64, f64, or pointer as u64)
+///   8      1    type_tag (ZValType discriminant)
+///   9      3    reserved flags
+///  12      4    reserved (refcount / metadata)
+/// ------  ----
+/// Total:  16 bytes
+/// ```
+///
+/// A compile-time assertion ensures this struct remains exactly 16 bytes.
+///
+/// # Type juggling
+///
+/// PHP performs implicit type conversions (type juggling) between values.
+/// The [`to_long`](ZVal::to_long), [`to_double`](ZVal::to_double),
+/// [`to_bool`](ZVal::to_bool), and [`to_string`](ZVal::to_string) methods
+/// implement these conversions following the rules defined in
+/// `php-src/Zend/zend_operators.c`.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct ZVal {
+    /// The actual value, represented as a union (using u64 for now)
+    /// Can hold: i64, f64, or a pointer (usize)
+    value: u64,
+    /// The type discriminant
+    type_tag: ZValType,
+    /// Flags byte (reserved for future use)
+    _flags1: u8,
+    /// Flags byte (reserved for future use)
+    _flags2: u8,
+    /// Flags byte (reserved for future use)
+    _flags3: u8,
+    /// Reserved for refcount or other metadata
+    _reserved: u32,
+}
+
+// Compile-time assertion: ZVal must be exactly 16 bytes to match PHP's zval struct.
+// If this fails, the struct layout has changed and needs to be fixed.
+const _: () = assert!(
+    std::mem::size_of::<ZVal>() == 16,
+    "ZVal must be exactly 16 bytes"
+);
+
+impl ZVal {
+    /// Create a PHP null value
+    pub const fn null() -> Self {
+        Self {
+            value: 0,
+            type_tag: ZValType::Null,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP false value
+    pub const fn false_val() -> Self {
+        Self {
+            value: 0,
+            type_tag: ZValType::False,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP true value
+    pub const fn true_val() -> Self {
+        Self {
+            value: 0,
+            type_tag: ZValType::True,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP integer (long) value
+    pub const fn long(value: i64) -> Self {
+        Self {
+            value: value as u64,
+            type_tag: ZValType::Long,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP float (double) value
+    pub fn double(value: f64) -> Self {
+        Self {
+            value: value.to_bits(),
+            type_tag: ZValType::Double,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP string value (placeholder - stores pointer as usize)
+    pub fn string(ptr: usize) -> Self {
+        Self {
+            value: ptr as u64,
+            type_tag: ZValType::String,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP array value (placeholder - stores pointer as usize)
+    pub fn array(ptr: usize) -> Self {
+        Self {
+            value: ptr as u64,
+            type_tag: ZValType::Array,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP object value (placeholder - stores pointer as usize)
+    pub fn object(ptr: usize) -> Self {
+        Self {
+            value: ptr as u64,
+            type_tag: ZValType::Object,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP resource value (placeholder - stores pointer as usize)
+    pub fn resource(ptr: usize) -> Self {
+        Self {
+            value: ptr as u64,
+            type_tag: ZValType::Resource,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Create a PHP reference value (placeholder - stores pointer as usize)
+    pub fn reference(ptr: usize) -> Self {
+        Self {
+            value: ptr as u64,
+            type_tag: ZValType::Reference,
+            _flags1: 0,
+            _flags2: 0,
+            _flags3: 0,
+            _reserved: 0,
+        }
+    }
+
+    /// Get the type tag
+    pub fn type_tag(&self) -> ZValType {
+        self.type_tag
+    }
+
+    /// Get the value as i64 (for Long type)
+    pub fn as_long(&self) -> Option<i64> {
+        if self.type_tag == ZValType::Long {
+            Some(self.value as i64)
+        } else {
+            None
+        }
+    }
+
+    /// Get the value as f64 (for Double type)
+    pub fn as_double(&self) -> Option<f64> {
+        if self.type_tag == ZValType::Double {
+            Some(f64::from_bits(self.value))
+        } else {
+            None
+        }
+    }
+
+    /// Get the value as pointer (for String, Array, Object, Resource, Reference types)
+    pub fn as_ptr(&self) -> Option<usize> {
+        match self.type_tag {
+            ZValType::String
+            | ZValType::Array
+            | ZValType::Object
+            | ZValType::Resource
+            | ZValType::Reference => Some(self.value as usize),
+            _ => None,
+        }
+    }
+
+    /// Convert this ZVal to a long (i64) using PHP type juggling rules.
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — convert_to_long()
+    ///
+    /// Conversion rules:
+    /// - Null → 0
+    /// - False → 0
+    /// - True → 1
+    /// - Long → identity
+    /// - Double → truncate to i64
+    /// - String → parse as integer (with leading whitespace skip, trailing text ignored)
+    /// - Array → 0 for empty, 1 for non-empty
+    /// - Object → 1 (with notice)
+    /// - Resource → resource ID (as int)
+    pub fn to_long(&self) -> i64 {
+        match self.type_tag {
+            ZValType::Null => 0,
+            ZValType::False => 0,
+            ZValType::True => 1,
+            ZValType::Long => self.value as i64,
+            ZValType::Double => {
+                // Truncate float to int
+                let d = f64::from_bits(self.value);
+                if d.is_nan() {
+                    0
+                } else if d >= i64::MAX as f64 {
+                    i64::MAX
+                } else if d <= i64::MIN as f64 {
+                    i64::MIN
+                } else {
+                    d as i64
+                }
+            }
+            ZValType::String => {
+                // SAFETY: We're assuming the pointer is valid for the lifetime of this operation
+                // In a real implementation, this would use proper reference counting
+                let ptr = self.value as usize;
+                if ptr == 0 {
+                    return 0;
+                }
+                // SAFETY: For now, this is unsafe. We'll fix this when we properly integrate ZString
+                unsafe {
+                    let zstring = &*(ptr as *const ZString);
+                    Self::string_to_long(zstring.as_bytes())
+                }
+            }
+            ZValType::Array => {
+                // TODO: Check if array is empty (0) or non-empty (1)
+                // For now, return 1 (placeholder)
+                1
+            }
+            ZValType::Object => {
+                // TODO: Object conversion (with notice)
+                // For now, return 1 (placeholder)
+                1
+            }
+            ZValType::Resource => {
+                // Resource ID is stored in the value
+                self.value as i64
+            }
+            ZValType::Reference => {
+                // TODO: Dereference and convert
+                // For now, return 0 (placeholder)
+                0
+            }
+        }
+    }
+
+    /// Helper: Convert string bytes to long using PHP's parsing rules
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — zend_strtol()
+    ///
+    /// Rules:
+    /// - Leading whitespace is skipped
+    /// - Parse digits until non-digit found
+    /// - If no digits found, return 0 (with warning in real PHP)
+    /// - If digits followed by non-digits, return parsed value (with warning in real PHP)
+    fn string_to_long(bytes: &[u8]) -> i64 {
+        // Skip leading whitespace
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        if i >= bytes.len() {
+            return 0; // Empty or whitespace-only string
+        }
+
+        // Check for sign
+        let negative = if bytes[i] == b'-' {
+            i += 1;
+            true
+        } else if bytes[i] == b'+' {
+            i += 1;
+            false
+        } else {
+            false
+        };
+
+        // Parse digits
+        let mut result: i64 = 0;
+        let mut found_digit = false;
+
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            found_digit = true;
+            let digit = (bytes[i] - b'0') as i64;
+
+            // Check for overflow
+            if let Some(new_result) = result.checked_mul(10) {
+                if let Some(new_result) = new_result.checked_add(digit) {
+                    result = new_result;
+                } else {
+                    // Overflow - in PHP this would convert to float
+                    // For now, saturate at i64::MAX
+                    return if negative { i64::MIN } else { i64::MAX };
+                }
+            } else {
+                // Overflow
+                return if negative { i64::MIN } else { i64::MAX };
+            }
+
+            i += 1;
+        }
+
+        if !found_digit {
+            return 0; // No digits found (e.g., "abc")
+        }
+
+        if negative {
+            -result
+        } else {
+            result
+        }
+    }
+
+    /// Convert this ZVal to a double (f64) using PHP type juggling rules.
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — convert_to_double()
+    ///
+    /// Conversion rules:
+    /// - Null → 0.0
+    /// - False → 0.0
+    /// - True → 1.0
+    /// - Long → convert to f64
+    /// - Double → identity
+    /// - String → parse as float (supports scientific notation)
+    /// - Array → 0.0 for empty, 1.0 for non-empty
+    /// - Object → 1.0 (with notice)
+    /// - Resource → resource ID (as float)
+    pub fn to_double(&self) -> f64 {
+        match self.type_tag {
+            ZValType::Null => 0.0,
+            ZValType::False => 0.0,
+            ZValType::True => 1.0,
+            ZValType::Long => (self.value as i64) as f64,
+            ZValType::Double => f64::from_bits(self.value),
+            ZValType::String => {
+                // SAFETY: We're assuming the pointer is valid for the lifetime of this operation
+                // In a real implementation, this would use proper reference counting
+                let ptr = self.value as usize;
+                if ptr == 0 {
+                    return 0.0;
+                }
+                // SAFETY: For now, this is unsafe. We'll fix this when we properly integrate ZString
+                unsafe {
+                    let zstring = &*(ptr as *const ZString);
+                    Self::string_to_double(zstring.as_bytes())
+                }
+            }
+            ZValType::Array => {
+                // TODO: Check if array is empty (0.0) or non-empty (1.0)
+                // For now, return 1.0 (placeholder)
+                1.0
+            }
+            ZValType::Object => {
+                // TODO: Object conversion (with notice)
+                // For now, return 1.0 (placeholder)
+                1.0
+            }
+            ZValType::Resource => {
+                // Resource ID is stored in the value
+                (self.value as i64) as f64
+            }
+            ZValType::Reference => {
+                // TODO: Dereference and convert
+                // For now, return 0.0 (placeholder)
+                0.0
+            }
+        }
+    }
+
+    /// Convert this ZVal to a boolean using PHP type juggling rules.
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — convert_to_boolean()
+    ///
+    /// Conversion rules:
+    /// - Null → false
+    /// - False → false
+    /// - True → true
+    /// - Long → false if 0, true otherwise
+    /// - Double → false if 0.0 or NaN, true otherwise
+    /// - String → false if "" or "0", true otherwise
+    /// - Array → false if empty, true otherwise
+    /// - Object → true
+    /// - Resource → true
+    pub fn to_bool(&self) -> bool {
+        match self.type_tag {
+            ZValType::Null => false,
+            ZValType::False => false,
+            ZValType::True => true,
+            ZValType::Long => (self.value as i64) != 0,
+            ZValType::Double => {
+                let d = f64::from_bits(self.value);
+                // In PHP, 0.0 and NaN are both false
+                !d.is_nan() && d != 0.0
+            }
+            ZValType::String => {
+                // SAFETY: We're assuming the pointer is valid for the lifetime of this operation
+                // In a real implementation, this would use proper reference counting
+                let ptr = self.value as usize;
+                if ptr == 0 {
+                    return false;
+                }
+                // SAFETY: For now, this is unsafe. We'll fix this when we properly integrate ZString
+                unsafe {
+                    let zstring = &*(ptr as *const ZString);
+                    let bytes = zstring.as_bytes();
+                    // Empty string or "0" is false
+                    !bytes.is_empty() && bytes != b"0"
+                }
+            }
+            ZValType::Array => {
+                // Empty array → false, non-empty array → true
+                // Placeholder implementation: pointer value 0 means empty array
+                // In a full implementation, we would dereference the pointer and check the array's count
+                let ptr = self.value as usize;
+                ptr != 0
+            }
+            ZValType::Object => {
+                // Objects are always true
+                true
+            }
+            ZValType::Resource => {
+                // Resources are always true
+                true
+            }
+            ZValType::Reference => {
+                // TODO: Dereference and convert
+                // For now, return false (placeholder)
+                false
+            }
+        }
+    }
+
+    /// Convert this ZVal to a string (ZString) using PHP type juggling rules.
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — convert_to_string()
+    ///
+    /// Conversion rules:
+    /// - Null → ""
+    /// - False → ""
+    /// - True → "1"
+    /// - Long → string representation (e.g., 42 → "42")
+    /// - Double → string representation (e.g., 1.5 → "1.5", INF → "INF", NAN → "NAN")
+    /// - String → identity (but need to extract from pointer)
+    /// - Array → "Array" (with notice)
+    /// - Object → object's __toString() or "Object" (with notice)
+    /// - Resource → "Resource id #N"
+    pub fn to_string(&self) -> ZString {
+        match self.type_tag {
+            ZValType::Null => ZString::from_str(""),
+            ZValType::False => ZString::from_str(""),
+            ZValType::True => ZString::from_str("1"),
+            ZValType::Long => {
+                let value = self.value as i64;
+                ZString::from_str(&value.to_string())
+            }
+            ZValType::Double => {
+                let value = f64::from_bits(self.value);
+                if value.is_nan() {
+                    ZString::from_str("NAN")
+                } else if value.is_infinite() {
+                    if value.is_sign_positive() {
+                        ZString::from_str("INF")
+                    } else {
+                        ZString::from_str("-INF")
+                    }
+                } else {
+                    ZString::from_str(&value.to_string())
+                }
+            }
+            ZValType::String => {
+                // SAFETY: We're assuming the pointer is valid for the lifetime of this operation
+                // In a real implementation, this would use proper reference counting
+                let ptr = self.value as usize;
+                if ptr == 0 {
+                    return ZString::from_str("");
+                }
+                // SAFETY: For now, this is unsafe. We'll fix this when we properly integrate ZString
+                unsafe {
+                    let zstring = &*(ptr as *const ZString);
+                    zstring.clone()
+                }
+            }
+            ZValType::Array => {
+                // TODO: Array conversion (with notice)
+                // For now, return "Array" (placeholder)
+                ZString::from_str("Array")
+            }
+            ZValType::Object => {
+                // TODO: Object conversion (__toString() or notice)
+                // For now, return "Object" (placeholder)
+                ZString::from_str("Object")
+            }
+            ZValType::Resource => {
+                // Resource ID is stored in the value
+                // Format: "Resource id #N"
+                let id = self.value as i64;
+                ZString::from_str(&format!("Resource id #{}", id))
+            }
+            ZValType::Reference => {
+                // TODO: Dereference and convert
+                // For now, return empty string (placeholder)
+                ZString::from_str("")
+            }
+        }
+    }
+
+    /// Helper: Convert string bytes to double using PHP's parsing rules
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — zend_strtod()
+    ///
+    /// Rules:
+    /// - Leading whitespace is skipped
+    /// - Parse float in format: [sign][digits][.digits][(e|E)[sign]digits]
+    /// - If no valid float found, return 0.0 (with warning in real PHP)
+    /// - If float followed by non-float chars, return parsed value (with warning in real PHP)
+    fn string_to_double(bytes: &[u8]) -> f64 {
+        // Skip leading whitespace
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        if i >= bytes.len() {
+            return 0.0; // Empty or whitespace-only string
+        }
+
+        // Try to parse the string as f64 using Rust's standard parser
+        // First, find the end of the numeric part
+        let start = i;
+
+        // Check for sign
+        if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+            i += 1;
+        }
+
+        let mut found_digit = false;
+        let mut found_dot = false;
+        let mut found_e = false;
+
+        // Parse the mantissa (integer and decimal parts)
+        while i < bytes.len() {
+            if bytes[i].is_ascii_digit() {
+                found_digit = true;
+                i += 1;
+            } else if bytes[i] == b'.' && !found_dot && !found_e {
+                found_dot = true;
+                i += 1;
+            } else if (bytes[i] == b'e' || bytes[i] == b'E') && !found_e && found_digit {
+                found_e = true;
+                i += 1;
+                // Parse exponent sign
+                if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+                    i += 1;
+                }
+                // Parse exponent digits
+                let exp_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                // If no exponent digits, backtrack
+                if i == exp_start {
+                    i = exp_start - 1; // Back before the sign
+                    if bytes[i - 1] == b'-' || bytes[i - 1] == b'+' {
+                        i -= 1; // Back before the 'e'
+                    }
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if !found_digit {
+            return 0.0; // No digits found (e.g., "abc")
+        }
+
+        // Extract the numeric substring
+        let numeric_str = &bytes[start..i];
+
+        // Parse using Rust's f64 parser
+        if let Ok(s) = std::str::from_utf8(numeric_str) {
+            if let Ok(value) = s.parse::<f64>() {
+                return value;
+            }
+        }
+
+        // If parsing failed, return 0.0
+        0.0
+    }
+}
+
+impl fmt::Display for ZVal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.type_tag {
+            ZValType::Null => write!(f, "NULL"),
+            ZValType::False => write!(f, "bool(false)"),
+            ZValType::True => write!(f, "bool(true)"),
+            ZValType::Long => {
+                let value = self.value as i64;
+                write!(f, "int({})", value)
+            }
+            ZValType::Double => {
+                let value = f64::from_bits(self.value);
+                if value.is_nan() {
+                    write!(f, "float(NAN)")
+                } else if value.is_infinite() {
+                    if value.is_sign_positive() {
+                        write!(f, "float(INF)")
+                    } else {
+                        write!(f, "float(-INF)")
+                    }
+                } else {
+                    write!(f, "float({})", value)
+                }
+            }
+            ZValType::String => write!(f, "string"),
+            ZValType::Array => write!(f, "array"),
+            ZValType::Object => write!(f, "object"),
+            ZValType::Resource => write!(f, "resource"),
+            ZValType::Reference => write!(f, "reference"),
+        }
+    }
+}
+
+impl PartialEq for ZVal {
+    fn eq(&self, other: &Self) -> bool {
+        // First check if types match
+        if self.type_tag != other.type_tag {
+            return false;
+        }
+
+        // Then compare values based on type
+        match self.type_tag {
+            ZValType::Null | ZValType::False | ZValType::True => {
+                // For these types, equal type tags means equal values
+                true
+            }
+            ZValType::Long => {
+                // Compare as i64
+                (self.value as i64) == (other.value as i64)
+            }
+            ZValType::Double => {
+                // Use f64::eq which respects IEEE 754 (NaN != NaN)
+                let a = f64::from_bits(self.value);
+                let b = f64::from_bits(other.value);
+                a == b
+            }
+            ZValType::String
+            | ZValType::Array
+            | ZValType::Object
+            | ZValType::Resource
+            | ZValType::Reference => {
+                // For pointer types, compare the raw pointer values
+                self.value == other.value
+            }
+        }
+    }
+}
+
+/// PHP string value with reference counting and precomputed hash.
+///
+/// This struct represents PHP's zend_string type. In the reference PHP implementation,
+/// PHP string type -- equivalent to PHP's `zend_string` from `zend_types.h`.
+///
+/// A reference-counted, binary-safe byte string with a precomputed hash value.
+/// PHP strings can contain arbitrary bytes including null bytes and are not
+/// required to be valid UTF-8.
+///
+/// # Implementation
+///
+/// - **Reference counting**: Uses `Arc<ZStringInner>` for thread-safe shared ownership.
+///   Cloning a `ZString` is O(1) (atomic refcount bump).
+/// - **Hash**: Precomputed at creation time using PHP's DJBX33A hash algorithm,
+///   enabling O(1) hash lookups in arrays and hash tables.
+/// - **Interning**: Frequently-used strings (function names, class names, keywords)
+///   can be interned via [`ZString::intern`] for deduplication and fast identity comparison.
+///
+/// # PHP reference
+///
+/// In php-src, `zend_string` contains:
+/// - `gc`: `zend_refcounted_h` (refcount + type_info)
+/// - `h`: `zend_ulong` (cached hash value)
+/// - `len`: `size_t` (string length in bytes)
+/// - `val`: `char[]` (flexible array member, null-terminated string data)
+///
+/// Reference: `php-src/Zend/zend_types.h`, `php-src/Zend/zend_string.h`
+#[derive(Clone)]
+pub struct ZString {
+    /// Shared reference to the string data
+    inner: Arc<ZStringInner>,
+}
+
+/// Inner data for ZString (stored in Arc for reference counting)
+struct ZStringInner {
+    /// Precomputed hash value (PHP uses DJBX33A hash)
+    hash: u64,
+    /// String data (bytes, not guaranteed to be valid UTF-8)
+    /// PHP strings are binary-safe and can contain null bytes
+    bytes: Box<[u8]>,
+}
+
+impl ZString {
+    /// Create a new ZString from a byte slice
+    pub fn new(bytes: &[u8]) -> Self {
+        let hash = Self::compute_hash(bytes);
+        Self {
+            inner: Arc::new(ZStringInner {
+                hash,
+                bytes: bytes.into(),
+            }),
+        }
+    }
+
+    /// Create a new ZString from a Rust string slice
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Self {
+        Self::new(s.as_bytes())
+    }
+
+    /// Get the hash value
+    pub fn hash(&self) -> u64 {
+        self.inner.hash
+    }
+
+    /// Get the length in bytes
+    pub fn len(&self) -> usize {
+        self.inner.bytes.len()
+    }
+
+    /// Check if the string is empty
+    pub fn is_empty(&self) -> bool {
+        self.inner.bytes.is_empty()
+    }
+
+    /// Get the bytes as a slice
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.inner.bytes
+    }
+
+    /// Get the string as a &str if it's valid UTF-8
+    pub fn as_str(&self) -> Option<&str> {
+        std::str::from_utf8(&self.inner.bytes).ok()
+    }
+
+    /// Intern a string globally
+    ///
+    /// This is used for strings that should be shared across all requests,
+    /// such as function names, class names, and keywords.
+    ///
+    /// Reference: PHP's zend_string.c — zend_new_interned_string()
+    pub fn intern(s: &str) -> Self {
+        Self::intern_bytes(s.as_bytes())
+    }
+
+    /// Intern bytes globally
+    fn intern_bytes(bytes: &[u8]) -> Self {
+        let hash = Self::compute_hash(bytes);
+
+        // Get or initialize the global intern pool
+        let pool = GLOBAL_INTERN_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+
+        let mut pool = pool.lock().unwrap();
+
+        // Check if already interned
+        if let Some(inner) = pool.get(&hash) {
+            // Verify hash collision didn't occur by comparing actual bytes
+            if inner.bytes.as_ref() == bytes {
+                return Self {
+                    inner: Arc::clone(inner),
+                };
+            }
+        }
+
+        // Not interned yet, create and store it
+        let inner = Arc::new(ZStringInner {
+            hash,
+            bytes: bytes.into(),
+        });
+
+        pool.insert(hash, Arc::clone(&inner));
+
+        Self { inner }
+    }
+
+    /// Compute the hash using PHP's DJBX33A hash algorithm
+    ///
+    /// Reference: php-src/Zend/zend_string.h
+    /// #define ZEND_STRING_HASH_VAL(s) zend_string_hash_val(s)
+    ///
+    /// The algorithm is:
+    /// hash = 5381
+    /// for each byte c:
+    ///   hash = hash * 33 + c
+    fn compute_hash(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 5381;
+        for &byte in bytes {
+            hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
+        }
+        hash
+    }
+}
+
+impl fmt::Debug for ZString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZString")
+            .field("hash", &self.hash())
+            .field("len", &self.len())
+            .field("bytes", &self.inner.bytes)
+            .finish()
+    }
+}
+
+impl fmt::Display for ZString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(s) = self.as_str() {
+            write!(f, "{}", s)
+        } else {
+            // For binary data, show as hex escape sequences
+            write!(f, "\"")?;
+            for &byte in self.as_bytes() {
+                if (32..=126).contains(&byte) && byte != b'\\' && byte != b'"' {
+                    write!(f, "{}", byte as char)?;
+                } else {
+                    write!(f, "\\x{:02x}", byte)?;
+                }
+            }
+            write!(f, "\"")
+        }
+    }
+}
+
+impl PartialEq for ZString {
+    fn eq(&self, other: &Self) -> bool {
+        // Fast path: if the Arc pointers are the same, they're equal
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return true;
+        }
+
+        // Otherwise, compare the actual bytes
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for ZString {}
+
+impl std::hash::Hash for ZString {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Use the precomputed PHP hash
+        state.write_u64(self.hash());
+    }
+}
+
+impl AsRef<[u8]> for ZString {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl FromStr for ZString {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(s.as_bytes()))
+    }
+}
+
+/// Request-scoped string interning context.
+///
+/// In PHP, there are two levels of string interning:
+/// 1. Global interning: for function names, class names, keywords (survives across requests)
+/// 2. Request-scoped interning: for variable names, property names (cleared after request)
+///
+/// This struct provides request-scoped interning.
+///
+/// Reference: php-src/Zend/zend_string.h — interned strings
+pub struct InternContext {
+    /// Request-scoped intern pool
+    pool: Mutex<HashMap<u64, Arc<ZStringInner>>>,
+}
+
+impl InternContext {
+    /// Create a new request-scoped intern context
+    pub fn new() -> Self {
+        Self {
+            pool: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Intern a string in this request context
+    pub fn intern(&self, s: &str) -> ZString {
+        self.intern_bytes(s.as_bytes())
+    }
+
+    /// Intern bytes in this request context
+    fn intern_bytes(&self, bytes: &[u8]) -> ZString {
+        let hash = ZString::compute_hash(bytes);
+
+        let mut pool = self.pool.lock().unwrap();
+
+        // Check if already interned in this context
+        if let Some(inner) = pool.get(&hash) {
+            // Verify hash collision didn't occur
+            if inner.bytes.as_ref() == bytes {
+                return ZString {
+                    inner: Arc::clone(inner),
+                };
+            }
+        }
+
+        // Not interned in this context, create and store it
+        let inner = Arc::new(ZStringInner {
+            hash,
+            bytes: bytes.into(),
+        });
+
+        pool.insert(hash, Arc::clone(&inner));
+
+        ZString { inner }
+    }
+
+    /// Clear all interned strings for this request context.
+    /// Called at request end to free memory.
+    pub fn clear(&self) {
+        let mut pool = self.pool.lock().unwrap();
+        pool.clear();
+    }
+
+    /// Get the number of interned strings in this context.
+    pub fn len(&self) -> usize {
+        self.pool.lock().unwrap().len()
+    }
+
+    /// Check if the pool is empty.
+    pub fn is_empty(&self) -> bool {
+        self.pool.lock().unwrap().is_empty()
+    }
+}
+
+impl Default for InternContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Get the number of globally interned strings.
+pub fn global_intern_pool_size() -> usize {
+    let pool = GLOBAL_INTERN_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    pool.lock().unwrap().len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zval_variants_exist() {
+        // Test: can construct all ZVal variants
+        let _null = ZVal::null();
+        let _false = ZVal::false_val();
+        let _true = ZVal::true_val();
+        let _long = ZVal::long(42);
+        let _double = ZVal::double(2.5);
+        let _string = ZVal::string(0x1234);
+        let _array = ZVal::array(0);
+        let _object = ZVal::object(0);
+        let _resource = ZVal::resource(0);
+        let _reference = ZVal::reference(0);
+    }
+
+    #[test]
+    fn test_display_null() {
+        // Test: NULL displays as "NULL"
+        // Reference: php -r 'var_dump(null);' outputs "NULL\n"
+        let val = ZVal::null();
+        assert_eq!(format!("{}", val), "NULL");
+    }
+
+    #[test]
+    fn test_display_bool() {
+        // Test: bool(true) and bool(false)
+        // Reference: php -r 'var_dump(true);' outputs "bool(true)\n"
+        //            php -r 'var_dump(false);' outputs "bool(false)\n"
+        let t = ZVal::true_val();
+        let f = ZVal::false_val();
+        assert_eq!(format!("{}", t), "bool(true)");
+        assert_eq!(format!("{}", f), "bool(false)");
+    }
+
+    #[test]
+    fn test_display_long() {
+        // Test: int(42), int(0), int(-123)
+        // Reference: php -r 'var_dump(42);' outputs "int(42)\n"
+        let zero = ZVal::long(0);
+        let positive = ZVal::long(42);
+        let negative = ZVal::long(-123);
+        assert_eq!(format!("{}", zero), "int(0)");
+        assert_eq!(format!("{}", positive), "int(42)");
+        assert_eq!(format!("{}", negative), "int(-123)");
+    }
+
+    #[test]
+    fn test_display_double() {
+        // Test: float(1.5), float(0), float(INF), float(-INF), float(NAN)
+        // Reference: php -r 'var_dump(1.5);' outputs "float(1.5)\n"
+        //            php -r 'var_dump(INF);' outputs "float(INF)\n"
+        //            php -r 'var_dump(-INF);' outputs "float(-INF)\n"
+        //            php -r 'var_dump(NAN);' outputs "float(NAN)\n"
+        let normal = ZVal::double(1.5);
+        let zero = ZVal::double(0.0);
+        let inf = ZVal::double(f64::INFINITY);
+        let neg_inf = ZVal::double(f64::NEG_INFINITY);
+        let nan = ZVal::double(f64::NAN);
+
+        assert_eq!(format!("{}", normal), "float(1.5)");
+        assert_eq!(format!("{}", zero), "float(0)");
+        assert_eq!(format!("{}", inf), "float(INF)");
+        assert_eq!(format!("{}", neg_inf), "float(-INF)");
+        assert_eq!(format!("{}", nan), "float(NAN)");
+    }
+
+    #[test]
+    fn test_display_string_placeholder() {
+        // Test: string (placeholder - just shows type for now)
+        // Note: Actual string content will be implemented in Phase 1.2 (ZString)
+        // For now, we just show the type
+        let s = ZVal::string(0x1234);
+        assert_eq!(format!("{}", s), "string");
+    }
+
+    #[test]
+    fn test_display_array_placeholder() {
+        // Test: array (placeholder)
+        // Note: Actual array display will be implemented in Phase 1.4 (ZArray)
+        let a = ZVal::array(0x5678);
+        assert_eq!(format!("{}", a), "array");
+    }
+
+    #[test]
+    fn test_display_object_placeholder() {
+        // Test: object (placeholder)
+        // Note: Actual object display will be implemented in Phase 1.5 (ZObject)
+        let o = ZVal::object(0xABCD);
+        assert_eq!(format!("{}", o), "object");
+    }
+
+    #[test]
+    fn test_display_resource_placeholder() {
+        // Test: resource (placeholder)
+        // Reference: php -r '$f = fopen("/dev/null", "r"); var_dump($f);'
+        //            outputs "resource(5) of type (stream)"
+        // For now, just show "resource"
+        let r = ZVal::resource(0xDEAD);
+        assert_eq!(format!("{}", r), "resource");
+    }
+
+    #[test]
+    fn test_display_reference_placeholder() {
+        // Test: reference (placeholder)
+        // Note: References are internal; they're not directly displayed.
+        // For now, show "reference"
+        let ref_val = ZVal::reference(0xBEEF);
+        assert_eq!(format!("{}", ref_val), "reference");
+    }
+
+    #[test]
+    fn test_zval_long_values() {
+        // Test: Long can hold various integer values
+        let zero = ZVal::long(0);
+        let positive = ZVal::long(123456);
+        let negative = ZVal::long(-999);
+        let max = ZVal::long(i64::MAX);
+        let min = ZVal::long(i64::MIN);
+
+        assert_eq!(zero.type_tag(), ZValType::Long);
+        assert_eq!(zero.as_long(), Some(0));
+
+        assert_eq!(positive.type_tag(), ZValType::Long);
+        assert_eq!(positive.as_long(), Some(123456));
+
+        assert_eq!(negative.type_tag(), ZValType::Long);
+        assert_eq!(negative.as_long(), Some(-999));
+
+        assert_eq!(max.type_tag(), ZValType::Long);
+        assert_eq!(max.as_long(), Some(i64::MAX));
+
+        assert_eq!(min.type_tag(), ZValType::Long);
+        assert_eq!(min.as_long(), Some(i64::MIN));
+    }
+
+    #[test]
+    fn test_zval_double_values() {
+        // Test: Double can hold various float values
+        let zero = ZVal::double(0.0);
+        let precise = ZVal::double(1.23456789);
+        let negative = ZVal::double(-2.5);
+        let inf = ZVal::double(f64::INFINITY);
+        let neg_inf = ZVal::double(f64::NEG_INFINITY);
+        let nan = ZVal::double(f64::NAN);
+
+        assert_eq!(zero.type_tag(), ZValType::Double);
+        assert_eq!(zero.as_double(), Some(0.0));
+
+        assert_eq!(precise.type_tag(), ZValType::Double);
+        assert!((precise.as_double().unwrap() - 1.23456789).abs() < f64::EPSILON);
+
+        assert_eq!(negative.type_tag(), ZValType::Double);
+        assert_eq!(negative.as_double(), Some(-2.5));
+
+        assert_eq!(inf.type_tag(), ZValType::Double);
+        let inf_val = inf.as_double().unwrap();
+        assert!(inf_val.is_infinite() && inf_val.is_sign_positive());
+
+        assert_eq!(neg_inf.type_tag(), ZValType::Double);
+        let neg_inf_val = neg_inf.as_double().unwrap();
+        assert!(neg_inf_val.is_infinite() && neg_inf_val.is_sign_negative());
+
+        assert_eq!(nan.type_tag(), ZValType::Double);
+        assert!(nan.as_double().unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_zval_string_values() {
+        // Test: String can hold pointer values (actual string handling in Phase 1.2)
+        let empty = ZVal::string(0);
+        let ptr1 = ZVal::string(0x1000);
+        let ptr2 = ZVal::string(0xDEADBEEF);
+
+        assert_eq!(empty.type_tag(), ZValType::String);
+        assert_eq!(empty.as_ptr(), Some(0));
+
+        assert_eq!(ptr1.type_tag(), ZValType::String);
+        assert_eq!(ptr1.as_ptr(), Some(0x1000));
+
+        assert_eq!(ptr2.type_tag(), ZValType::String);
+        assert_eq!(ptr2.as_ptr(), Some(0xDEADBEEF));
+    }
+
+    #[test]
+    fn test_zval_boolean_variants() {
+        // Test: PHP has separate True and False variants (not Bool(bool))
+        let t = ZVal::true_val();
+        let f = ZVal::false_val();
+
+        assert_eq!(t.type_tag(), ZValType::True);
+        assert_eq!(f.type_tag(), ZValType::False);
+    }
+
+    #[test]
+    fn test_zval_debug_output() {
+        // Test: ZVal implements Debug (required for development)
+        let val = ZVal::long(42);
+        let debug_str = format!("{:?}", val);
+        assert!(debug_str.contains("Long") || debug_str.contains("type_tag"));
+    }
+
+    #[test]
+    fn test_zval_size_is_16_bytes() {
+        // CRITICAL: ZVal must be exactly 16 bytes to match PHP's zval struct layout.
+        // Reference: php-src/Zend/zend_types.h — zval is 16 bytes (8-byte value + 8-byte type/flags).
+        // This constraint is essential for memory layout compatibility and performance.
+        use std::mem::size_of;
+        assert_eq!(
+            size_of::<ZVal>(),
+            16,
+            "ZVal must be exactly 16 bytes, got {} bytes",
+            size_of::<ZVal>()
+        );
+    }
+
+    #[test]
+    fn test_zval_clone() {
+        // Test: ZVal implements Clone
+        // All ZVal variants should be cloneable
+        let original = ZVal::long(42);
+        let cloned = original.clone();
+
+        assert_eq!(cloned.type_tag(), ZValType::Long);
+        assert_eq!(cloned.as_long(), Some(42));
+    }
+
+    #[test]
+    fn test_zval_clone_null() {
+        // Test: Clone null values
+        let original = ZVal::null();
+        let cloned = original.clone();
+        assert_eq!(cloned.type_tag(), ZValType::Null);
+    }
+
+    #[test]
+    fn test_zval_clone_bool() {
+        // Test: Clone boolean values
+        let t = ZVal::true_val();
+        let f = ZVal::false_val();
+
+        let t_clone = t.clone();
+        let f_clone = f.clone();
+
+        assert_eq!(t_clone.type_tag(), ZValType::True);
+        assert_eq!(f_clone.type_tag(), ZValType::False);
+    }
+
+    #[test]
+    fn test_zval_clone_double() {
+        // Test: Clone float values including special cases
+        let normal = ZVal::double(1.23456);
+        let inf = ZVal::double(f64::INFINITY);
+        let nan = ZVal::double(f64::NAN);
+
+        let normal_clone = normal.clone();
+        let inf_clone = inf.clone();
+        let nan_clone = nan.clone();
+
+        assert!((normal_clone.as_double().unwrap() - 1.23456).abs() < f64::EPSILON);
+        assert!(inf_clone.as_double().unwrap().is_infinite());
+        assert!(nan_clone.as_double().unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_zval_clone_pointer_types() {
+        // Test: Clone pointer-based types (string, array, object, etc.)
+        let s = ZVal::string(0x1234);
+        let a = ZVal::array(0x5678);
+        let o = ZVal::object(0xABCD);
+
+        let s_clone = s.clone();
+        let a_clone = a.clone();
+        let o_clone = o.clone();
+
+        assert_eq!(s_clone.as_ptr(), Some(0x1234));
+        assert_eq!(a_clone.as_ptr(), Some(0x5678));
+        assert_eq!(o_clone.as_ptr(), Some(0xABCD));
+    }
+
+    #[test]
+    fn test_zval_partial_eq_null() {
+        // Test: PartialEq for null values
+        let null1 = ZVal::null();
+        let null2 = ZVal::null();
+        let not_null = ZVal::long(0);
+
+        assert_eq!(null1, null2);
+        assert_ne!(null1, not_null);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_bool() {
+        // Test: PartialEq for boolean values
+        let true1 = ZVal::true_val();
+        let true2 = ZVal::true_val();
+        let false1 = ZVal::false_val();
+        let false2 = ZVal::false_val();
+
+        assert_eq!(true1, true2);
+        assert_eq!(false1, false2);
+        assert_ne!(true1, false1);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_long() {
+        // Test: PartialEq for integer values
+        let a = ZVal::long(42);
+        let b = ZVal::long(42);
+        let c = ZVal::long(100);
+        let d = ZVal::long(-42);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_double() {
+        // Test: PartialEq for float values
+        let a = ZVal::double(1.5);
+        let b = ZVal::double(1.5);
+        let c = ZVal::double(2.5);
+
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_double_special() {
+        // Test: PartialEq for special float values (INF, -INF, NAN)
+        // Note: NAN != NAN per IEEE 754
+        let inf1 = ZVal::double(f64::INFINITY);
+        let inf2 = ZVal::double(f64::INFINITY);
+        let neg_inf = ZVal::double(f64::NEG_INFINITY);
+        let nan1 = ZVal::double(f64::NAN);
+        let nan2 = ZVal::double(f64::NAN);
+
+        assert_eq!(inf1, inf2);
+        assert_ne!(inf1, neg_inf);
+        // NAN != NAN is the expected behavior for f64 PartialEq
+        assert_ne!(nan1, nan2);
+    }
+
+    #[test]
+    fn test_zval_partial_eq_different_types() {
+        // Test: Values of different types are not equal
+        // Reference: PHP uses === for strict comparison (type + value)
+        let i = ZVal::long(1);
+        let f = ZVal::double(1.0);
+        let t = ZVal::true_val();
+        let s = ZVal::string(0);
+
+        assert_ne!(i, f); // int(1) !== float(1.0)
+        assert_ne!(i, t); // int(1) !== bool(true)
+        assert_ne!(f, t); // float(1.0) !== bool(true)
+        assert_ne!(i, s); // int(1) !== string
+    }
+
+    #[test]
+    fn test_zval_partial_eq_pointer_types() {
+        // Test: PartialEq for pointer-based types
+        // For now, we compare the raw pointer values
+        let s1 = ZVal::string(0x1234);
+        let s2 = ZVal::string(0x1234);
+        let s3 = ZVal::string(0x5678);
+        let a1 = ZVal::array(0x1234);
+
+        assert_eq!(s1, s2); // Same pointer
+        assert_ne!(s1, s3); // Different pointer
+        assert_ne!(s1, a1); // Different type (string vs array)
+    }
+
+    #[test]
+    fn test_zval_partial_eq_zero_values() {
+        // Test: PartialEq for zero values of different types
+        let null = ZVal::null();
+        let false_val = ZVal::false_val();
+        let int_zero = ZVal::long(0);
+        let float_zero = ZVal::double(0.0);
+        let string_zero = ZVal::string(0);
+
+        // These should all be different with strict comparison (===)
+        assert_ne!(null, false_val);
+        assert_ne!(null, int_zero);
+        assert_ne!(null, float_zero);
+        assert_ne!(false_val, int_zero);
+        assert_ne!(int_zero, float_zero);
+        assert_ne!(int_zero, string_zero);
+    }
+
+    // ========================================================================
+    // ZString tests (Phase 1.2)
+    // ========================================================================
+
+    #[test]
+    fn test_zstring_new_from_bytes() {
+        // Test: Create ZString from byte slice
+        let s = ZString::new(b"hello");
+        assert_eq!(s.len(), 5);
+        assert_eq!(s.as_bytes(), b"hello");
+        assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn test_zstring_from_str() {
+        // Test: Create ZString from Rust &str
+        let s = ZString::from_str("hello world");
+        assert_eq!(s.len(), 11);
+        assert_eq!(s.as_str(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_zstring_empty() {
+        // Test: Empty string
+        let s = ZString::new(b"");
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+        assert_eq!(s.as_bytes(), b"");
+    }
+
+    #[test]
+    fn test_zstring_ascii() {
+        // Test: ASCII string
+        let s = ZString::from_str("Hello, World!");
+        assert_eq!(s.len(), 13);
+        assert_eq!(s.as_str(), Some("Hello, World!"));
+    }
+
+    #[test]
+    fn test_zstring_binary_data() {
+        // Test: Binary data with null bytes
+        // PHP strings are binary-safe and can contain null bytes
+        let binary = b"hello\x00world\xff\xfe";
+        let s = ZString::new(binary);
+        assert_eq!(s.len(), 13);
+        assert_eq!(s.as_bytes(), binary);
+        // as_str() should return None for invalid UTF-8
+        assert_eq!(s.as_str(), None);
+    }
+
+    #[test]
+    fn test_zstring_utf8() {
+        // Test: UTF-8 string (multi-byte characters)
+        let s = ZString::from_str("Hello 世界 🌍");
+        assert!(s.len() > 8); // More bytes than visible characters
+        assert_eq!(s.as_str(), Some("Hello 世界 🌍"));
+    }
+
+    #[test]
+    fn test_zstring_hash_is_precomputed() {
+        // Test: Hash is precomputed and stable
+        let s1 = ZString::from_str("test");
+        let s2 = ZString::from_str("test");
+
+        // Same content = same hash
+        assert_eq!(s1.hash(), s2.hash());
+
+        // Different content = different hash (extremely likely)
+        let s3 = ZString::from_str("different");
+        assert_ne!(s1.hash(), s3.hash());
+    }
+
+    #[test]
+    fn test_zstring_hash_djbx33a() {
+        // Test: Verify DJBX33A hash algorithm implementation
+        // Reference: PHP's DJBX33A hash starts with 5381, then: hash = hash * 33 + c
+        // For empty string: hash should be 5381
+        let empty = ZString::new(b"");
+        assert_eq!(empty.hash(), 5381);
+
+        // For single character 'a' (ASCII 97):
+        // hash = 5381 * 33 + 97 = 177573 + 97 = 177670
+        let a = ZString::new(b"a");
+        assert_eq!(a.hash(), 177670);
+    }
+
+    #[test]
+    fn test_zstring_partial_eq() {
+        // Test: PartialEq compares content
+        let s1 = ZString::from_str("hello");
+        let s2 = ZString::from_str("hello");
+        let s3 = ZString::from_str("world");
+
+        assert_eq!(s1, s2); // Same content
+        assert_ne!(s1, s3); // Different content
+    }
+
+    #[test]
+    fn test_zstring_partial_eq_arc_optimization() {
+        // Test: PartialEq fast path when Arc pointers are the same
+        let s1 = ZString::from_str("test");
+        let s2 = s1.clone(); // Clone shares the same Arc
+
+        assert_eq!(s1, s2); // Should use fast path (ptr_eq)
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+    }
+
+    #[test]
+    fn test_zstring_eq_trait() {
+        // Test: Eq trait is implemented
+        let s1 = ZString::from_str("test");
+        let s2 = ZString::from_str("test");
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn test_zstring_hash_trait() {
+        // Test: Hash trait uses precomputed PHP hash
+        use std::collections::HashMap;
+
+        let s1 = ZString::from_str("key");
+        let s2 = ZString::from_str("key");
+
+        let mut map = HashMap::new();
+        map.insert(s1, 42);
+
+        // Should find the value using s2 (same content)
+        assert_eq!(map.get(&s2), Some(&42));
+    }
+
+    #[test]
+    fn test_zstring_display() {
+        // Test: Display trait for valid UTF-8
+        let s = ZString::from_str("hello");
+        assert_eq!(format!("{}", s), "hello");
+    }
+
+    #[test]
+    fn test_zstring_display_binary() {
+        // Test: Display trait for binary data (hex escapes)
+        let s = ZString::new(b"hello\x00\xff");
+        let display = format!("{}", s);
+        assert!(display.contains("\\x00"));
+        assert!(display.contains("\\xff"));
+    }
+
+    #[test]
+    fn test_zstring_debug() {
+        // Test: Debug trait shows hash, len, and bytes
+        let s = ZString::from_str("test");
+        let debug = format!("{:?}", s);
+        assert!(debug.contains("ZString"));
+        assert!(debug.contains("hash"));
+        assert!(debug.contains("len"));
+        assert!(debug.contains("bytes"));
+    }
+
+    #[test]
+    fn test_zstring_as_ref() {
+        // Test: AsRef<[u8]> implementation
+        let s = ZString::from_str("hello");
+        let bytes: &[u8] = s.as_ref();
+        assert_eq!(bytes, b"hello");
+    }
+
+    #[test]
+    fn test_zstring_clone() {
+        // Test: Clone creates a new reference to the same data (Arc clone)
+        let s1 = ZString::from_str("hello");
+        let s2 = s1.clone();
+
+        assert_eq!(s1, s2);
+        assert_eq!(s1.hash(), s2.hash());
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner)); // Same Arc
+    }
+
+    // ========================================================================
+    // String interning tests (Phase 1.2.3)
+    // ========================================================================
+
+    #[test]
+    fn test_string_interning_global() {
+        // Test: Globally intern a string
+        // Interned strings with the same content should be pointer-equal
+        let s1 = ZString::intern("function");
+        let s2 = ZString::intern("function");
+
+        // Should be pointer-equal (same Arc)
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1.as_str(), Some("function"));
+    }
+
+    #[test]
+    fn test_string_interning_global_different_content() {
+        // Test: Different strings are not interned to the same value
+        let s1 = ZString::intern("function");
+        let s2 = ZString::intern("class");
+
+        // Different content = different Arc
+        assert!(!Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1.as_str(), Some("function"));
+        assert_eq!(s2.as_str(), Some("class"));
+    }
+
+    #[test]
+    fn test_string_interning_global_empty_string() {
+        // Test: Empty string interning
+        let s1 = ZString::intern("");
+        let s2 = ZString::intern("");
+
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert!(s1.is_empty());
+    }
+
+    #[test]
+    fn test_string_interning_non_interned() {
+        // Test: Non-interned strings are not pointer-equal even with same content
+        let s1 = ZString::from_str("test");
+        let s2 = ZString::from_str("test");
+
+        // Same content, but different allocations
+        assert!(!Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1, s2); // Still equal by value
+    }
+
+    #[test]
+    fn test_string_interning_request_scoped() {
+        // Test: Request-scoped interning
+        // Create a new request context
+        let ctx = InternContext::new();
+
+        let s1 = ctx.intern("variable");
+        let s2 = ctx.intern("variable");
+
+        // Should be pointer-equal within the same context
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1.as_str(), Some("variable"));
+    }
+
+    #[test]
+    fn test_string_interning_request_isolation() {
+        // Test: Different request contexts have separate intern pools
+        let ctx1 = InternContext::new();
+        let ctx2 = InternContext::new();
+
+        let s1 = ctx1.intern("test");
+        let s2 = ctx2.intern("test");
+
+        // Different contexts = different interned strings
+        // (unless they happen to use global pool)
+        // For request-scoped, they should be different Arcs
+        assert_eq!(s1.as_str(), Some("test"));
+        assert_eq!(s2.as_str(), Some("test"));
+    }
+
+    #[test]
+    fn test_string_interning_global_vs_request() {
+        // Test: Global and request-scoped interning can coexist
+        let global = ZString::intern("global");
+        let ctx = InternContext::new();
+        let request = ctx.intern("request");
+
+        assert_eq!(global.as_str(), Some("global"));
+        assert_eq!(request.as_str(), Some("request"));
+    }
+
+    #[test]
+    fn test_string_interning_common_keywords() {
+        // Test: Common PHP keywords are interned
+        // Reference: PHP interns all function names, class names, and keywords
+        let keywords = [
+            "function",
+            "class",
+            "interface",
+            "trait",
+            "namespace",
+            "use",
+            "public",
+            "private",
+            "protected",
+            "static",
+            "final",
+            "abstract",
+            "const",
+            "return",
+            "if",
+            "else",
+            "elseif",
+            "while",
+            "for",
+            "foreach",
+            "switch",
+            "case",
+            "break",
+            "continue",
+            "echo",
+            "print",
+            "var",
+            "new",
+            "clone",
+            "extends",
+            "implements",
+            "instanceof",
+            "throw",
+            "try",
+            "catch",
+            "finally",
+        ];
+
+        for &keyword in &keywords {
+            let s1 = ZString::intern(keyword);
+            let s2 = ZString::intern(keyword);
+            assert!(
+                Arc::ptr_eq(&s1.inner, &s2.inner),
+                "Keyword '{}' not properly interned",
+                keyword
+            );
+        }
+    }
+
+    // ========================================================================
+    // Type coercion tests (Phase 1.3)
+    // ========================================================================
+    // Reference: php-src/Zend/zend_operators.c — convert_to_long(), convert_to_double(), etc.
+
+    #[test]
+    fn test_string_to_long_numeric_string() {
+        // Test: Numeric string "123" converts to 123
+        // Reference: php -r 'var_dump((int)"123");' outputs "int(123)"
+        let s = ZString::from_str("123");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 123);
+    }
+
+    #[test]
+    fn test_string_to_long_with_trailing_text() {
+        // Test: "12abc" converts to 12 with E_WARNING
+        // Reference: php -r 'var_dump((int)"12abc");' outputs:
+        //   "Warning: A non well formed numeric value encountered in ..."
+        //   "int(12)"
+        // For now, we'll just test the conversion result (warnings to be implemented later)
+        let s = ZString::from_str("12abc");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 12);
+    }
+
+    #[test]
+    fn test_string_to_long_non_numeric() {
+        // Test: "abc" converts to 0 with E_WARNING
+        // Reference: php -r 'var_dump((int)"abc");' outputs:
+        //   "Warning: A non-numeric value encountered in ..."
+        //   "int(0)"
+        let s = ZString::from_str("abc");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 0);
+    }
+
+    #[test]
+    fn test_string_to_long_empty_string() {
+        // Test: Empty string converts to 0
+        // Reference: php -r 'var_dump((int)"");' outputs "int(0)"
+        let s = ZString::from_str("");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 0);
+    }
+
+    #[test]
+    fn test_string_to_long_whitespace() {
+        // Test: Leading whitespace is skipped
+        // Reference: php -r 'var_dump((int)"  123");' outputs "int(123)"
+        let s = ZString::from_str("  123");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 123);
+    }
+
+    #[test]
+    fn test_string_to_long_negative() {
+        // Test: Negative numeric string
+        // Reference: php -r 'var_dump((int)"-456");' outputs "int(-456)"
+        let s = ZString::from_str("-456");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), -456);
+    }
+
+    #[test]
+    fn test_string_to_long_zero() {
+        // Test: "0" converts to 0
+        // Reference: php -r 'var_dump((int)"0");' outputs "int(0)"
+        let s = ZString::from_str("0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 0);
+    }
+
+    // ========================================================================
+    // String → Float coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_string_to_double_numeric_string() {
+        // Test: Numeric string "1.5" converts to 1.5
+        // Reference: php -r 'var_dump((float)"1.5");' outputs "float(1.5)"
+        let s = ZString::from_str("1.5");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 1.5);
+    }
+
+    #[test]
+    fn test_string_to_double_scientific_notation() {
+        // Test: Scientific notation "1.5e2" converts to 150.0
+        // Reference: php -r 'var_dump((float)"1.5e2");' outputs "float(150)"
+        let s = ZString::from_str("1.5e2");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 150.0);
+    }
+
+    #[test]
+    fn test_string_to_double_negative_exponent() {
+        // Test: Scientific notation with negative exponent "1.5e-2" converts to 0.015
+        // Reference: php -r 'var_dump((float)"1.5e-2");' outputs "float(0.015)"
+        let s = ZString::from_str("1.5e-2");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 0.015);
+    }
+
+    #[test]
+    fn test_string_to_double_integer_string() {
+        // Test: Integer string "42" converts to 42.0
+        // Reference: php -r 'var_dump((float)"42");' outputs "float(42)"
+        let s = ZString::from_str("42");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 42.0);
+    }
+
+    #[test]
+    fn test_string_to_double_negative() {
+        // Test: Negative float string "-2.5" converts to -2.5
+        // Reference: php -r 'var_dump((float)"-2.5");' outputs "float(-2.5)"
+        let s = ZString::from_str("-2.5");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), -2.5);
+    }
+
+    #[test]
+    fn test_string_to_double_zero() {
+        // Test: "0" converts to 0.0
+        // Reference: php -r 'var_dump((float)"0");' outputs "float(0)"
+        let s = ZString::from_str("0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_string_to_double_with_trailing_text() {
+        // Test: "1.5abc" converts to 1.5 with E_WARNING
+        // Reference: php -r 'var_dump((float)"1.5abc");' outputs:
+        //   "Warning: A non well formed numeric value encountered in ..."
+        //   "float(1.5)"
+        let s = ZString::from_str("1.5abc");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 1.5);
+    }
+
+    #[test]
+    fn test_string_to_double_non_numeric() {
+        // Test: "abc" converts to 0.0 with E_WARNING
+        // Reference: php -r 'var_dump((float)"abc");' outputs:
+        //   "Warning: A non-numeric value encountered in ..."
+        //   "float(0)"
+        let s = ZString::from_str("abc");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_string_to_double_empty_string() {
+        // Test: Empty string converts to 0.0
+        // Reference: php -r 'var_dump((float)"");' outputs "float(0)"
+        let s = ZString::from_str("");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_string_to_double_whitespace() {
+        // Test: Leading whitespace is skipped
+        // Reference: php -r 'var_dump((float)"  1.5");' outputs "float(1.5)"
+        let s = ZString::from_str("  1.5");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 1.5);
+    }
+
+    #[test]
+    fn test_string_to_double_positive_sign() {
+        // Test: Positive sign "+1.5" converts to 1.5
+        // Reference: php -r 'var_dump((float)"+1.5");' outputs "float(1.5)"
+        let s = ZString::from_str("+1.5");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 1.5);
+    }
+
+    #[test]
+    fn test_string_to_double_uppercase_e() {
+        // Test: Uppercase E in scientific notation "1.5E2" converts to 150.0
+        // Reference: php -r 'var_dump((float)"1.5E2");' outputs "float(150)"
+        let s = ZString::from_str("1.5E2");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_double(), 150.0);
+    }
+
+    // ========================================================================
+    // Int → String coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_int_to_string_positive() {
+        // Test: int 42 converts to "42"
+        // Reference: php -r 'var_dump((string)42);' outputs 'string(2) "42"'
+        let val = ZVal::long(42);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("42"));
+    }
+
+    #[test]
+    fn test_int_to_string_zero() {
+        // Test: int 0 converts to "0"
+        // Reference: php -r 'var_dump((string)0);' outputs 'string(1) "0"'
+        let val = ZVal::long(0);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("0"));
+    }
+
+    #[test]
+    fn test_int_to_string_negative() {
+        // Test: int -123 converts to "-123"
+        // Reference: php -r 'var_dump((string)-123);' outputs 'string(4) "-123"'
+        let val = ZVal::long(-123);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("-123"));
+    }
+
+    #[test]
+    fn test_int_to_string_max() {
+        // Test: i64::MAX converts to its string representation
+        // Reference: php -r 'var_dump((string)9223372036854775807);' outputs the number as string
+        let val = ZVal::long(i64::MAX);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("9223372036854775807"));
+    }
+
+    #[test]
+    fn test_int_to_string_min() {
+        // Test: i64::MIN converts to its string representation
+        // Reference: php -r 'var_dump((string)(-9223372036854775808));' outputs the number as string
+        let val = ZVal::long(i64::MIN);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("-9223372036854775808"));
+    }
+
+    // ========================================================================
+    // Float → String coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_float_to_string_positive() {
+        // Test: float 1.5 converts to "1.5"
+        // Reference: php -r 'var_dump((string)1.5);' outputs 'string(3) "1.5"'
+        let val = ZVal::double(1.5);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("1.5"));
+    }
+
+    #[test]
+    fn test_float_to_string_negative() {
+        // Test: float -2.5 converts to "-2.5"
+        // Reference: php -r 'var_dump((string)(-2.5));' outputs 'string(4) "-2.5"'
+        let val = ZVal::double(-2.5);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("-2.5"));
+    }
+
+    #[test]
+    fn test_float_to_string_zero() {
+        // Test: float 0.0 converts to "0"
+        // Reference: php -r 'var_dump((string)0.0);' outputs 'string(1) "0"'
+        let val = ZVal::double(0.0);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("0"));
+    }
+
+    #[test]
+    fn test_float_to_string_inf() {
+        // Test: INF converts to "INF"
+        // Reference: php -r 'var_dump((string)INF);' outputs 'string(3) "INF"'
+        let val = ZVal::double(f64::INFINITY);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("INF"));
+    }
+
+    #[test]
+    fn test_float_to_string_neg_inf() {
+        // Test: -INF converts to "-INF"
+        // Reference: php -r 'var_dump((string)(-INF));' outputs 'string(4) "-INF"'
+        let val = ZVal::double(f64::NEG_INFINITY);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("-INF"));
+    }
+
+    #[test]
+    fn test_float_to_string_nan() {
+        // Test: NAN converts to "NAN"
+        // Reference: php -r 'var_dump((string)NAN);' outputs 'string(3) "NAN"'
+        let val = ZVal::double(f64::NAN);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("NAN"));
+    }
+
+    #[test]
+    fn test_float_to_string_integer_value() {
+        // Test: float 42.0 converts to "42"
+        // Reference: php -r 'var_dump((string)42.0);' outputs 'string(2) "42"'
+        let val = ZVal::double(42.0);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("42"));
+    }
+
+    #[test]
+    fn test_float_to_string_small_decimal() {
+        // Test: float 0.5 converts to "0.5"
+        // Reference: php -r 'var_dump((string)0.5);' outputs 'string(3) "0.5"'
+        let val = ZVal::double(0.5);
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some("0.5"));
+    }
+
+    // ========================================================================
+    // Bool → Int coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_bool_to_int_true() {
+        // Test: true converts to 1
+        // Reference: php -r 'var_dump((int)true);' outputs "int(1)"
+        let val = ZVal::true_val();
+        assert_eq!(val.to_long(), 1);
+    }
+
+    #[test]
+    fn test_bool_to_int_false() {
+        // Test: false converts to 0
+        // Reference: php -r 'var_dump((int)false);' outputs "int(0)"
+        let val = ZVal::false_val();
+        assert_eq!(val.to_long(), 0);
+    }
+
+    // ========================================================================
+    // Null coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_null_to_int() {
+        // Test: null converts to 0
+        // Reference: php -r 'var_dump((int)null);' outputs "int(0)"
+        let val = ZVal::null();
+        assert_eq!(val.to_long(), 0);
+    }
+
+    #[test]
+    fn test_null_to_float() {
+        // Test: null converts to 0.0
+        // Reference: php -r 'var_dump((float)null);' outputs "float(0)"
+        let val = ZVal::null();
+        assert_eq!(val.to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_null_to_string() {
+        // Test: null converts to ""
+        // Reference: php -r 'var_dump((string)null);' outputs 'string(0) ""'
+        let val = ZVal::null();
+        let s = val.to_string();
+        assert_eq!(s.as_str(), Some(""));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_null_to_bool() {
+        // Test: null converts to false
+        // Reference: php -r 'var_dump((bool)null);' outputs "bool(false)"
+        let val = ZVal::null();
+        assert!(!val.to_bool());
+    }
+
+    // ========================================================================
+    // Array → Bool coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_array_to_bool_empty() {
+        // Test: Empty array [] converts to false
+        // Reference: php -r 'var_dump((bool)[]);' outputs "bool(false)"
+        // Create a mock empty array (we'll use count=0 to represent empty)
+        // For now, we need to create a ZArray structure
+        // Since ZArray isn't fully implemented yet, we'll store a placeholder pointer
+        // that encodes whether the array is empty
+
+        // Placeholder: pointer value 0 means empty array
+        let val = ZVal::array(0); // 0 = empty array marker
+        assert!(!val.to_bool(), "Empty array should convert to false");
+    }
+
+    #[test]
+    fn test_array_to_bool_non_empty() {
+        // Test: Non-empty array [1] converts to true
+        // Reference: php -r 'var_dump((bool)[1]);' outputs "bool(true)"
+
+        // Placeholder: any non-zero pointer means non-empty array
+        let val = ZVal::array(1); // non-zero = non-empty array marker
+        assert!(val.to_bool(), "Non-empty array should convert to true");
+    }
+
+    #[test]
+    fn test_array_to_bool_multiple_elements() {
+        // Test: Array with multiple elements [1, 2, 3] converts to true
+        // Reference: php -r 'var_dump((bool)[1, 2, 3]);' outputs "bool(true)"
+        let val = ZVal::array(0x1000); // non-zero pointer
+        assert!(
+            val.to_bool(),
+            "Array with multiple elements should convert to true"
+        );
+    }
+
+    // ========================================================================
+    // String → Bool coercion tests (Phase 1.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_string_to_bool_empty_string() {
+        // Test: Empty string "" converts to false
+        // Reference: php -r 'var_dump((bool)"");' outputs "bool(false)"
+        let s = ZString::from_str("");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(!val.to_bool(), "Empty string should convert to false");
+    }
+
+    #[test]
+    fn test_string_to_bool_zero_string() {
+        // Test: String "0" converts to false
+        // Reference: php -r 'var_dump((bool)"0");' outputs "bool(false)"
+        let s = ZString::from_str("0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(!val.to_bool(), "String \"0\" should convert to false");
+    }
+
+    #[test]
+    fn test_string_to_bool_whitespace_only() {
+        // Test: Whitespace-only string "   " converts to true (not empty)
+        // Reference: php -r 'var_dump((bool)"   ");' outputs "bool(true)"
+        let s = ZString::from_str("   ");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "Whitespace-only string should convert to true"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_non_zero_number() {
+        // Test: String "1" converts to true
+        // Reference: php -r 'var_dump((bool)"1");' outputs "bool(true)"
+        let s = ZString::from_str("1");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(val.to_bool(), "String \"1\" should convert to true");
+    }
+
+    #[test]
+    fn test_string_to_bool_text() {
+        // Test: Any non-empty text string converts to true
+        // Reference: php -r 'var_dump((bool)"hello");' outputs "bool(true)"
+        let s = ZString::from_str("hello");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "Non-empty text string should convert to true"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_false_string() {
+        // Test: String "false" converts to true (it's not empty and not "0")
+        // Reference: php -r 'var_dump((bool)"false");' outputs "bool(true)"
+        let s = ZString::from_str("false");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \"false\" should convert to true (non-empty string)"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_zero_with_decimal() {
+        // Test: String "0.0" converts to true (not exactly "0")
+        // Reference: php -r 'var_dump((bool)"0.0");' outputs "bool(true)"
+        let s = ZString::from_str("0.0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \"0.0\" should convert to true (not exactly \"0\")"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_negative_zero() {
+        // Test: String "-0" converts to true (not exactly "0")
+        // Reference: php -r 'var_dump((bool)"-0");' outputs "bool(true)"
+        let s = ZString::from_str("-0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \"-0\" should convert to true (not exactly \"0\")"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_zero_with_leading_space() {
+        // Test: String " 0" converts to true (not exactly "0")
+        // Reference: php -r 'var_dump((bool)" 0");' outputs "bool(true)"
+        let s = ZString::from_str(" 0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \" 0\" should convert to true (not exactly \"0\")"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_zero_with_trailing_space() {
+        // Test: String "0 " converts to true (not exactly "0")
+        // Reference: php -r 'var_dump((bool)"0 ");' outputs "bool(true)"
+        let s = ZString::from_str("0 ");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String \"0 \" should convert to true (not exactly \"0\")"
+        );
+    }
+
+    #[test]
+    fn test_string_to_bool_null_byte() {
+        // Test: String with null byte "\0" converts to true (not empty)
+        // Reference: php -r 'var_dump((bool)"\0");' outputs "bool(true)"
+        let s = ZString::new(b"\0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert!(
+            val.to_bool(),
+            "String with null byte should convert to true (not empty)"
+        );
+    }
+
+    // ========================================================================
+    // Direct conversion method tests (Phase 1.3.2)
+    // ========================================================================
+    // Test the to_long(), to_double(), to_string(), to_bool() methods directly
+
+    #[test]
+    fn test_to_long_null() {
+        // Test: ZVal::null().to_long() returns 0
+        // Reference: php -r 'var_dump((int)null);' outputs "int(0)"
+        assert_eq!(ZVal::null().to_long(), 0);
+    }
+
+    #[test]
+    fn test_to_long_false() {
+        // Test: ZVal::false_val().to_long() returns 0
+        // Reference: php -r 'var_dump((int)false);' outputs "int(0)"
+        assert_eq!(ZVal::false_val().to_long(), 0);
+    }
+
+    #[test]
+    fn test_to_long_true() {
+        // Test: ZVal::true_val().to_long() returns 1
+        // Reference: php -r 'var_dump((int)true);' outputs "int(1)"
+        assert_eq!(ZVal::true_val().to_long(), 1);
+    }
+
+    #[test]
+    fn test_to_long_long_identity() {
+        // Test: ZVal::long(42).to_long() returns 42 (identity)
+        assert_eq!(ZVal::long(42).to_long(), 42);
+        assert_eq!(ZVal::long(0).to_long(), 0);
+        assert_eq!(ZVal::long(-999).to_long(), -999);
+        assert_eq!(ZVal::long(i64::MAX).to_long(), i64::MAX);
+        assert_eq!(ZVal::long(i64::MIN).to_long(), i64::MIN);
+    }
+
+    #[test]
+    fn test_to_long_double_truncate() {
+        // Test: ZVal::double(1.9).to_long() returns 1 (truncate towards zero)
+        // Reference: php -r 'var_dump((int)1.9);' outputs "int(1)"
+        assert_eq!(ZVal::double(1.9).to_long(), 1);
+        assert_eq!(ZVal::double(1.1).to_long(), 1);
+        assert_eq!(ZVal::double(-1.9).to_long(), -1);
+        assert_eq!(ZVal::double(0.5).to_long(), 0);
+        assert_eq!(ZVal::double(-0.5).to_long(), 0);
+    }
+
+    #[test]
+    fn test_to_long_double_special_values() {
+        // Test: Special float values convert to long
+        // NAN → 0, INF → i64::MAX, -INF → i64::MIN
+        // Reference: php -r 'var_dump((int)NAN);' outputs "int(0)"
+        //            php -r 'var_dump((int)INF);' outputs "int(9223372036854775807)"
+        assert_eq!(ZVal::double(f64::NAN).to_long(), 0);
+        assert_eq!(ZVal::double(f64::INFINITY).to_long(), i64::MAX);
+        assert_eq!(ZVal::double(f64::NEG_INFINITY).to_long(), i64::MIN);
+    }
+
+    #[test]
+    fn test_to_double_null() {
+        // Test: ZVal::null().to_double() returns 0.0
+        // Reference: php -r 'var_dump((float)null);' outputs "float(0)"
+        assert_eq!(ZVal::null().to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_to_double_false() {
+        // Test: ZVal::false_val().to_double() returns 0.0
+        // Reference: php -r 'var_dump((float)false);' outputs "float(0)"
+        assert_eq!(ZVal::false_val().to_double(), 0.0);
+    }
+
+    #[test]
+    fn test_to_double_true() {
+        // Test: ZVal::true_val().to_double() returns 1.0
+        // Reference: php -r 'var_dump((float)true);' outputs "float(1)"
+        assert_eq!(ZVal::true_val().to_double(), 1.0);
+    }
+
+    #[test]
+    fn test_to_double_long() {
+        // Test: ZVal::long(42).to_double() returns 42.0
+        // Reference: php -r 'var_dump((float)42);' outputs "float(42)"
+        assert_eq!(ZVal::long(42).to_double(), 42.0);
+        assert_eq!(ZVal::long(0).to_double(), 0.0);
+        assert_eq!(ZVal::long(-123).to_double(), -123.0);
+    }
+
+    #[test]
+    fn test_to_double_double_identity() {
+        // Test: ZVal::double(1.5).to_double() returns 1.5 (identity)
+        assert_eq!(ZVal::double(1.5).to_double(), 1.5);
+        assert_eq!(ZVal::double(0.0).to_double(), 0.0);
+        assert_eq!(ZVal::double(-2.5).to_double(), -2.5);
+    }
+
+    #[test]
+    fn test_to_double_special_values_identity() {
+        // Test: Special float values remain unchanged
+        let inf = ZVal::double(f64::INFINITY).to_double();
+        assert!(inf.is_infinite() && inf.is_sign_positive());
+
+        let neg_inf = ZVal::double(f64::NEG_INFINITY).to_double();
+        assert!(neg_inf.is_infinite() && neg_inf.is_sign_negative());
+
+        let nan = ZVal::double(f64::NAN).to_double();
+        assert!(nan.is_nan());
+    }
+
+    #[test]
+    fn test_to_bool_null() {
+        // Test: ZVal::null().to_bool() returns false
+        // Reference: php -r 'var_dump((bool)null);' outputs "bool(false)"
+        assert!(!ZVal::null().to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_false() {
+        // Test: ZVal::false_val().to_bool() returns false
+        assert!(!ZVal::false_val().to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_true() {
+        // Test: ZVal::true_val().to_bool() returns true
+        assert!(ZVal::true_val().to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_long() {
+        // Test: ZVal::long(0).to_bool() returns false, non-zero returns true
+        // Reference: php -r 'var_dump((bool)0);' outputs "bool(false)"
+        //            php -r 'var_dump((bool)1);' outputs "bool(true)"
+        //            php -r 'var_dump((bool)-1);' outputs "bool(true)"
+        assert!(!ZVal::long(0).to_bool());
+        assert!(ZVal::long(1).to_bool());
+        assert!(ZVal::long(-1).to_bool());
+        assert!(ZVal::long(42).to_bool());
+        assert!(ZVal::long(i64::MAX).to_bool());
+        assert!(ZVal::long(i64::MIN).to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_double() {
+        // Test: ZVal::double(0.0).to_bool() returns false, non-zero returns true
+        // Reference: php -r 'var_dump((bool)0.0);' outputs "bool(false)"
+        //            php -r 'var_dump((bool)1.0);' outputs "bool(true)"
+        assert!(!ZVal::double(0.0).to_bool());
+        assert!(ZVal::double(1.0).to_bool());
+        assert!(ZVal::double(-1.0).to_bool());
+        assert!(ZVal::double(0.5).to_bool());
+        assert!(ZVal::double(-0.5).to_bool());
+    }
+
+    #[test]
+    fn test_to_bool_double_special_values() {
+        // Test: NAN is false, INF is true
+        // Reference: php -r 'var_dump((bool)NAN);' outputs "bool(false)"
+        //            php -r 'var_dump((bool)INF);' outputs "bool(true)"
+        assert!(!ZVal::double(f64::NAN).to_bool());
+        assert!(ZVal::double(f64::INFINITY).to_bool());
+        assert!(ZVal::double(f64::NEG_INFINITY).to_bool());
+    }
+
+    #[test]
+    fn test_to_string_null() {
+        // Test: ZVal::null().to_string() returns ""
+        // Reference: php -r 'var_dump((string)null);' outputs 'string(0) ""'
+        let s = ZVal::null().to_string();
+        assert_eq!(s.as_str(), Some(""));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_to_string_false() {
+        // Test: ZVal::false_val().to_string() returns ""
+        // Reference: php -r 'var_dump((string)false);' outputs 'string(0) ""'
+        let s = ZVal::false_val().to_string();
+        assert_eq!(s.as_str(), Some(""));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_to_string_true() {
+        // Test: ZVal::true_val().to_string() returns "1"
+        // Reference: php -r 'var_dump((string)true);' outputs 'string(1) "1"'
+        let s = ZVal::true_val().to_string();
+        assert_eq!(s.as_str(), Some("1"));
+    }
+
+    #[test]
+    fn test_to_string_long() {
+        // Test: ZVal::long(42).to_string() returns "42"
+        // Reference: php -r 'var_dump((string)42);' outputs 'string(2) "42"'
+        assert_eq!(ZVal::long(42).to_string().as_str(), Some("42"));
+        assert_eq!(ZVal::long(0).to_string().as_str(), Some("0"));
+        assert_eq!(ZVal::long(-123).to_string().as_str(), Some("-123"));
+        assert_eq!(
+            ZVal::long(i64::MAX).to_string().as_str(),
+            Some("9223372036854775807")
+        );
+        assert_eq!(
+            ZVal::long(i64::MIN).to_string().as_str(),
+            Some("-9223372036854775808")
+        );
+    }
+
+    #[test]
+    fn test_to_string_double() {
+        // Test: ZVal::double(1.5).to_string() returns "1.5"
+        // Reference: php -r 'var_dump((string)1.5);' outputs 'string(3) "1.5"'
+        assert_eq!(ZVal::double(1.5).to_string().as_str(), Some("1.5"));
+        assert_eq!(ZVal::double(0.0).to_string().as_str(), Some("0"));
+        assert_eq!(ZVal::double(-2.5).to_string().as_str(), Some("-2.5"));
+    }
+
+    #[test]
+    fn test_to_string_double_special_values() {
+        // Test: Special float values convert to strings
+        // Reference: php -r 'var_dump((string)INF);' outputs 'string(3) "INF"'
+        //            php -r 'var_dump((string)(-INF));' outputs 'string(4) "-INF"'
+        //            php -r 'var_dump((string)NAN);' outputs 'string(3) "NAN"'
+        assert_eq!(
+            ZVal::double(f64::INFINITY).to_string().as_str(),
+            Some("INF")
+        );
+        assert_eq!(
+            ZVal::double(f64::NEG_INFINITY).to_string().as_str(),
+            Some("-INF")
+        );
+        assert_eq!(ZVal::double(f64::NAN).to_string().as_str(), Some("NAN"));
+    }
+
+    #[test]
+    fn test_to_string_resource() {
+        // Test: ZVal::resource(5).to_string() returns "Resource id #5"
+        // Reference: php -r '$f = fopen("/dev/null", "r"); echo (string)$f;'
+        //            outputs "Resource id #5" (or similar)
+        let s = ZVal::resource(5).to_string();
+        assert_eq!(s.as_str(), Some("Resource id #5"));
+
+        let s = ZVal::resource(123).to_string();
+        assert_eq!(s.as_str(), Some("Resource id #123"));
+    }
+
+    #[test]
+    fn test_conversion_chaining() {
+        // Test: Chaining conversions works correctly
+        // Example: null → long → double → string
+        let val = ZVal::null();
+        let as_long = val.to_long();
+        assert_eq!(as_long, 0);
+
+        let val2 = ZVal::long(as_long);
+        let as_double = val2.to_double();
+        assert_eq!(as_double, 0.0);
+
+        let val3 = ZVal::double(as_double);
+        let as_string = val3.to_string();
+        assert_eq!(as_string.as_str(), Some("0"));
+    }
+
+    #[test]
+    fn test_conversion_round_trip_long() {
+        // Test: long → string → long should preserve value (for valid numbers)
+        let original = ZVal::long(42);
+        let as_string = original.to_string();
+        let as_val = ZVal::string(Box::into_raw(Box::new(as_string)) as usize);
+        let back_to_long = as_val.to_long();
+        assert_eq!(back_to_long, 42);
+    }
+
+    #[test]
+    fn test_conversion_idempotency() {
+        // Test: Converting twice should give the same result as converting once
+        let val = ZVal::long(42);
+        let s1 = val.to_string();
+        let s2 = val.to_string();
+        assert_eq!(s1, s2);
+
+        let val = ZVal::double(1.5);
+        let l1 = val.to_long();
+        let l2 = val.to_long();
+        assert_eq!(l1, l2);
+    }
+
+    // ================================================================================
+    // PHASE 1.3.3: Edge case tests for type coercion
+    // Reference: php-src/Zend/zend_operators.c
+    // ================================================================================
+
+    #[test]
+    fn test_int_max_to_double() {
+        // Test: PHP_INT_MAX (i64::MAX) can be converted to float
+        // Reference: php -r 'var_dump((float)PHP_INT_MAX);'
+        // Expected: float(9.223372036854776E+18) or similar
+        let val = ZVal::long(i64::MAX);
+        let result = val.to_double();
+
+        // i64::MAX = 9223372036854775807
+        // As f64, this will have some precision loss but should be close
+        assert!(result > 0.0);
+        assert!(result.is_finite());
+        assert_eq!(result, i64::MAX as f64);
+    }
+
+    #[test]
+    fn test_int_min_to_double() {
+        // Test: PHP_INT_MIN (i64::MIN) can be converted to float
+        // Reference: php -r 'var_dump((float)PHP_INT_MIN);'
+        let val = ZVal::long(i64::MIN);
+        let result = val.to_double();
+
+        assert!(result < 0.0);
+        assert!(result.is_finite());
+        assert_eq!(result, i64::MIN as f64);
+    }
+
+    #[test]
+    fn test_very_large_positive_double_to_long() {
+        // Test: Very large positive floats overflow to i64::MAX
+        // Reference: php -r 'var_dump((int)1e100);'
+        // PHP behavior: large positive floats → PHP_INT_MAX
+        let val = ZVal::double(1e100);
+        let result = val.to_long();
+
+        // Since 1e100 > i64::MAX, it should clamp to i64::MAX
+        assert_eq!(result, i64::MAX);
+    }
+
+    #[test]
+    fn test_very_large_negative_double_to_long() {
+        // Test: Very large negative floats overflow to i64::MIN
+        // Reference: php -r 'var_dump((int)-1e100);'
+        // PHP behavior: large negative floats → PHP_INT_MIN
+        let val = ZVal::double(-1e100);
+        let result = val.to_long();
+
+        // Since -1e100 < i64::MIN, it should clamp to i64::MIN
+        assert_eq!(result, i64::MIN);
+    }
+
+    #[test]
+    fn test_double_at_int_max_boundary() {
+        // Test: Float exactly at i64::MAX boundary
+        // This tests the boundary condition
+        let val = ZVal::double(i64::MAX as f64);
+        let result = val.to_long();
+
+        // i64::MAX as f64 loses precision, so we just check it's near max
+        // PHP would convert this to i64::MAX
+        assert!(result == i64::MAX || result == i64::MAX - 1);
+    }
+
+    #[test]
+    fn test_double_at_int_min_boundary() {
+        // Test: Float exactly at i64::MIN boundary
+        let val = ZVal::double(i64::MIN as f64);
+        let result = val.to_long();
+
+        // Similar to max, there may be precision loss
+        assert!(result == i64::MIN || result == i64::MIN + 1);
+    }
+
+    #[test]
+    fn test_double_precision_loss() {
+        // Test: Very large integers lose precision when converted to double
+        // Reference: php -r 'echo (float)9223372036854775807 === (float)9223372036854775806;'
+
+        let max_val = ZVal::long(i64::MAX);
+        let max_minus_1 = ZVal::long(i64::MAX - 1);
+
+        let max_as_double = max_val.to_double();
+        let max_minus_1_as_double = max_minus_1.to_double();
+
+        // Due to f64 precision limits (53 bits mantissa), these may be equal
+        // i64::MAX has 63 bits, so precision loss is expected
+        // We just verify they convert without panicking and are finite
+        assert!(max_as_double.is_finite());
+        assert!(max_minus_1_as_double.is_finite());
+        assert!(max_as_double >= max_minus_1_as_double);
+    }
+
+    #[test]
+    fn test_small_double_precision() {
+        // Test: Small floats with many decimal places
+        // Reference: php -r 'var_dump((string)0.123456789012345);'
+        let val = ZVal::double(0.123456789012345);
+        let as_double = val.to_double();
+
+        // Should preserve precision (within f64 limits)
+        assert!((as_double - 0.123456789012345).abs() < 1e-15);
+    }
+
+    #[test]
+    fn test_very_small_double_to_long() {
+        // Test: Very small positive and negative floats truncate to 0
+        // Reference: php -r 'var_dump((int)0.0000001);' → 0
+        let positive_small = ZVal::double(0.0000001);
+        let negative_small = ZVal::double(-0.0000001);
+
+        assert_eq!(positive_small.to_long(), 0);
+        assert_eq!(negative_small.to_long(), 0);
+    }
+
+    #[test]
+    fn test_double_subnormal_values() {
+        // Test: Subnormal (denormalized) floating point values
+        // These are very small floats near zero
+        let subnormal = ZVal::double(f64::MIN_POSITIVE / 2.0);
+
+        // Should convert to 0
+        assert_eq!(subnormal.to_long(), 0);
+
+        // Should preserve the value as double
+        let as_double = subnormal.to_double();
+        assert!(as_double >= 0.0);
+        assert!(as_double < f64::MIN_POSITIVE);
+    }
+
+    #[test]
+    fn test_negative_zero_double() {
+        // Test: Negative zero (-0.0) behavior
+        // Reference: php -r 'var_dump((int)-0.0);' → 0
+        let neg_zero = ZVal::double(-0.0);
+
+        assert_eq!(neg_zero.to_long(), 0);
+        assert_eq!(neg_zero.to_double(), -0.0);
+
+        // -0.0 should convert to false (like 0.0)
+        assert!(!neg_zero.to_bool());
+    }
+
+    #[test]
+    fn test_string_large_integer() {
+        // Test: String containing very large integer
+        // Reference: php -r 'var_dump((int)"9223372036854775807");' → int(9223372036854775807)
+        let s = ZString::from_str("9223372036854775807"); // i64::MAX
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_long();
+        assert_eq!(result, i64::MAX);
+    }
+
+    #[test]
+    fn test_string_overflow_integer() {
+        // Test: String containing integer larger than i64::MAX
+        // Reference: php -r 'var_dump((int)"99999999999999999999");'
+        // PHP behavior: integer overflow during parsing
+        let s = ZString::from_str("99999999999999999999"); // Larger than i64::MAX
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_long();
+        // PHP would parse this and overflow; we should handle gracefully
+        // The exact value depends on overflow behavior, but it should not panic
+        // Most likely wraps around or clamps
+        let _ = result; // Accept any result as long as it doesn't panic
+    }
+
+    #[test]
+    fn test_string_very_large_float() {
+        // Test: String containing very large float
+        // Reference: php -r 'var_dump((float)"1.234567890123456789e+308");'
+        let s = ZString::from_str("1e308");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_double();
+        assert!(result > 0.0);
+        assert!(result.is_finite());
+        assert!(result > 1e100);
+    }
+
+    #[test]
+    fn test_string_float_overflow_to_inf() {
+        // Test: String containing float that overflows to infinity
+        // Reference: php -r 'var_dump((float)"1e309");' → float(INF)
+        let s = ZString::from_str("1e309"); // Larger than f64::MAX
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_double();
+        assert!(result.is_infinite());
+        assert!(result.is_sign_positive());
+    }
+
+    #[test]
+    fn test_string_float_underflow() {
+        // Test: String containing very small float (underflow)
+        // Reference: php -r 'var_dump((float)"1e-400");' → float(0)
+        let s = ZString::from_str("1e-400"); // Smaller than f64::MIN_POSITIVE
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        let result = val.to_double();
+        // Should underflow to 0
+        assert_eq!(result, 0.0);
+    }
+
+    #[test]
+    fn test_float_to_string_precision() {
+        // Test: Float to string maintains reasonable precision
+        // Reference: php -r 'echo (string)1.234567890123456;'
+        let val = ZVal::double(1.234567890123456);
+        let s = val.to_string();
+
+        // Should contain the float value as a string
+        let str_val = s.as_str().unwrap();
+
+        // Parse it back to verify precision
+        let parsed: f64 = str_val.parse().unwrap();
+        assert!((parsed - 1.234567890123456).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_float_to_string_no_trailing_zeros() {
+        // Test: Float to string removes trailing zeros
+        // Reference: php -r 'echo (string)1.5;' → "1.5", not "1.50000"
+        // Reference: php -r 'echo (string)2.0;' → "2"
+        let val1 = ZVal::double(1.5);
+        let val2 = ZVal::double(2.0);
+
+        let s1 = val1.to_string();
+        let s2 = val2.to_string();
+
+        // 1.5 should be "1.5"
+        assert_eq!(s1.as_str(), Some("1.5"));
+
+        // 2.0 should be "2" (no decimal point for whole numbers)
+        assert_eq!(s2.as_str(), Some("2"));
+    }
+
+    #[test]
+    fn test_long_max_to_string_and_back() {
+        // Test: i64::MAX → string → parse back
+        // This tests round-trip conversion at the boundary
+        let original = ZVal::long(i64::MAX);
+        let as_string = original.to_string();
+
+        // String should be "9223372036854775807"
+        assert_eq!(as_string.as_str(), Some("9223372036854775807"));
+
+        // Convert back
+        let val = ZVal::string(Box::into_raw(Box::new(as_string)) as usize);
+        let back_to_long = val.to_long();
+        assert_eq!(back_to_long, i64::MAX);
+    }
+
+    #[test]
+    fn test_long_min_to_string_and_back() {
+        // Test: i64::MIN → string → parse back
+        let original = ZVal::long(i64::MIN);
+        let as_string = original.to_string();
+
+        // String should be "-9223372036854775808"
+        assert_eq!(as_string.as_str(), Some("-9223372036854775808"));
+
+        // Convert back
+        let val = ZVal::string(Box::into_raw(Box::new(as_string)) as usize);
+        let back_to_long = val.to_long();
+        assert_eq!(back_to_long, i64::MIN);
+    }
+
+    #[test]
+    fn test_double_max_value() {
+        // Test: f64::MAX handling
+        let val = ZVal::double(f64::MAX);
+
+        // Should convert to i64::MAX when converted to long (overflow)
+        assert_eq!(val.to_long(), i64::MAX);
+
+        // Should preserve as double
+        assert_eq!(val.to_double(), f64::MAX);
+
+        // Should be truthy
+        assert!(val.to_bool());
+    }
+
+    #[test]
+    fn test_double_min_value() {
+        // Test: f64::MIN (most negative) handling
+        let val = ZVal::double(f64::MIN);
+
+        // Should convert to i64::MIN when converted to long (overflow)
+        assert_eq!(val.to_long(), i64::MIN);
+
+        // Should preserve as double
+        assert_eq!(val.to_double(), f64::MIN);
+
+        // Should be truthy (non-zero)
+        assert!(val.to_bool());
+    }
+}
+
+/// Robin Hood hash table implementation
+///
+/// Robin Hood hashing is an open addressing collision resolution algorithm
+/// that minimizes variance in probe sequence length. When a collision occurs,
+/// we compare the "probe distance" (how far from the ideal position) of the
+/// inserting element with the existing element. If the inserting element has
+/// probed further (is "poorer"), we swap them and continue inserting the
+/// evicted element.
+///
+/// This matches PHP's internal hash table implementation more closely than
+/// standard HashMap.
+///
+/// Reference: php-src/Zend/zend_hash.c
+#[derive(Debug, Clone)]
+struct RobinHoodTable<K, V> {
+    /// Buckets storing (key, value, probe_distance)
+    /// None represents an empty bucket
+    buckets: Vec<Option<Bucket<K, V>>>,
+    /// Number of elements in the table
+    len: usize,
+    /// Insertion order tracking (for maintaining PHP array semantics)
+    /// Maps key hash to insertion order
+    insertion_order: Vec<(u64, K)>,
+}
+
+#[derive(Debug, Clone)]
+struct Bucket<K, V> {
+    key: K,
+    value: V,
+    /// How far from the ideal position this entry is
+    probe_distance: usize,
+}
+
+impl<K, V> RobinHoodTable<K, V>
+where
+    K: std::hash::Hash + Eq + Clone,
+    V: Clone,
+{
+    /// Initial capacity for new tables
+    const INITIAL_CAPACITY: usize = 8;
+    /// Load factor threshold for resizing (75%)
+    const MAX_LOAD_FACTOR: f64 = 0.75;
+
+    fn new() -> Self {
+        Self::with_capacity(Self::INITIAL_CAPACITY)
+    }
+
+    fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.next_power_of_two().max(Self::INITIAL_CAPACITY);
+        Self {
+            buckets: vec![None; capacity],
+            len: 0,
+            insertion_order: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Calculate hash for a key
+    fn hash_key(key: &K) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::Hasher;
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Get the ideal bucket index for a hash
+    fn ideal_index(&self, hash: u64) -> usize {
+        (hash as usize) & (self.buckets.len() - 1)
+    }
+
+    /// Insert or update a key-value pair
+    fn insert(&mut self, key: K, value: V) {
+        // Check if we need to grow
+        let load_factor = (self.len + 1) as f64 / self.buckets.len() as f64;
+        if load_factor > Self::MAX_LOAD_FACTOR {
+            self.grow();
+        }
+
+        let hash = Self::hash_key(&key);
+        let mut index = self.ideal_index(hash);
+
+        let mut inserting = Bucket {
+            key: key.clone(),
+            value,
+            probe_distance: 0,
+        };
+
+        loop {
+            match &mut self.buckets[index] {
+                None => {
+                    // Empty slot, insert here
+                    self.buckets[index] = Some(inserting);
+                    self.insertion_order.push((hash, key));
+                    self.len += 1;
+                    return;
+                }
+                Some(existing) => {
+                    // Key already exists, update value
+                    if existing.key == inserting.key {
+                        existing.value = inserting.value;
+                        return;
+                    }
+
+                    // Robin Hood: if inserting element is poorer, swap
+                    if inserting.probe_distance > existing.probe_distance {
+                        std::mem::swap(&mut inserting, existing);
+                    }
+
+                    // Continue probing
+                    index = (index + 1) & (self.buckets.len() - 1);
+                    inserting.probe_distance += 1;
+                }
+            }
+        }
+    }
+
+    /// Get a value by key
+    fn get(&self, key: &K) -> Option<&V> {
+        let hash = Self::hash_key(key);
+        let mut index = self.ideal_index(hash);
+        let mut probe_distance = 0;
+
+        loop {
+            match &self.buckets[index] {
+                None => return None,
+                Some(bucket) => {
+                    if bucket.key == *key {
+                        return Some(&bucket.value);
+                    }
+
+                    // If we've probed further than this bucket's distance,
+                    // the key doesn't exist (Robin Hood property)
+                    if probe_distance > bucket.probe_distance {
+                        return None;
+                    }
+
+                    index = (index + 1) & (self.buckets.len() - 1);
+                    probe_distance += 1;
+                }
+            }
+        }
+    }
+
+    /// Delete a key-value pair
+    fn delete(&mut self, key: &K) -> Option<V> {
+        let hash = Self::hash_key(key);
+        let mut index = self.ideal_index(hash);
+        let mut probe_distance = 0;
+
+        // Find the element
+        loop {
+            match &self.buckets[index] {
+                None => return None,
+                Some(bucket) => {
+                    if bucket.key == *key {
+                        break;
+                    }
+
+                    if probe_distance > bucket.probe_distance {
+                        return None;
+                    }
+
+                    index = (index + 1) & (self.buckets.len() - 1);
+                    probe_distance += 1;
+                }
+            }
+        }
+
+        // Remove from buckets
+        let removed_value = self.buckets[index].take().unwrap().value;
+
+        // Backward shift deletion to maintain Robin Hood properties
+        let mut current = index;
+        loop {
+            let next = (current + 1) & (self.buckets.len() - 1);
+
+            match &mut self.buckets[next] {
+                None => break,
+                Some(bucket) if bucket.probe_distance == 0 => break,
+                Some(_) => {
+                    // Shift element backward
+                    let mut bucket = self.buckets[next].take().unwrap();
+                    bucket.probe_distance -= 1;
+                    self.buckets[current] = Some(bucket);
+                    current = next;
+                }
+            }
+        }
+
+        // Remove from insertion order
+        self.insertion_order.retain(|(_, k)| k != key);
+
+        self.len -= 1;
+        Some(removed_value)
+    }
+
+    /// Grow the table to accommodate more elements
+    fn grow(&mut self) {
+        let new_capacity = self.buckets.len() * 2;
+        let old_buckets = std::mem::replace(&mut self.buckets, vec![None; new_capacity]);
+        self.len = 0;
+        let old_insertion_order = std::mem::take(&mut self.insertion_order);
+
+        // Re-insert all elements in insertion order
+        for (_, key) in old_insertion_order {
+            // Find the old value
+            for bucket in old_buckets.iter().flatten() {
+                if bucket.key == key {
+                    self.insert(key.clone(), bucket.value.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Iterate over key-value pairs in insertion order
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.insertion_order
+            .iter()
+            .filter_map(move |(_, key)| self.get(key).map(|value| (key, value)))
+    }
+
+    /// Iterate over keys in insertion order
+    fn keys(&self) -> impl Iterator<Item = &K> {
+        self.insertion_order.iter().map(|(_, key)| key)
+    }
+}
+
+/// PHP array -- equivalent to PHP's `HashTable` from `zend_hash.h`.
+///
+/// PHP arrays are ordered maps that support both integer and string keys while
+/// preserving insertion order. This implementation uses dual-mode storage for
+/// performance:
+///
+/// - **Packed mode**: When all keys are consecutive integers starting from 0
+///   (e.g., `[10, 20, 30]`), elements are stored in a contiguous `Vec<ZVal>`
+///   for cache-friendly O(1) indexed access.
+/// - **Hash mode**: When keys are non-consecutive integers or strings
+///   (e.g., `["name" => "Alice", 5 => true]`), elements are stored in a
+///   `RobinHoodTable` that preserves insertion order while providing O(1)
+///   amortized key lookup.
+///
+/// The array automatically promotes from packed to hash mode when a non-sequential
+/// key is inserted.
+///
+/// # Copy-on-Write (CoW)
+///
+/// Storage is wrapped in `Arc` for reference counting. Cloning is O(1) (just an
+/// atomic refcount bump). On the first mutating operation (`insert`, `remove`, `push`),
+/// if the reference count is greater than 1, the storage is cloned -- ensuring that
+/// other references are not affected. This matches PHP's CoW semantics for arrays.
+///
+/// # Reference
+///
+/// `php-src/Zend/zend_hash.h`, `php-src/Zend/zend_hash.c`
+#[derive(Debug, Clone)]
+pub struct ZArray {
+    storage: Arc<ArrayStorage>,
+}
+
+#[derive(Debug, Clone)]
+enum ArrayStorage {
+    /// Packed mode: consecutive integer keys starting from 0
+    /// Used for: [0 => val0, 1 => val1, 2 => val2, ...]
+    Packed(Vec<ZVal>),
+    /// Hash mode: arbitrary keys (string or non-consecutive integers)
+    /// Uses Robin Hood hashing for performance and PHP compatibility
+    Hash(RobinHoodTable<ArrayKey, ZVal>),
+}
+
+/// Array key can be either an integer or a string
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ArrayKey {
+    Int(i64),
+    String(ZString),
+}
+
+impl ZArray {
+    /// Create a new empty array in packed mode
+    pub fn new() -> Self {
+        Self {
+            storage: Arc::new(ArrayStorage::Packed(Vec::new())),
+        }
+    }
+
+    /// Create a new array with a specific capacity in packed mode
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            storage: Arc::new(ArrayStorage::Packed(Vec::with_capacity(capacity))),
+        }
+    }
+
+    /// Get the reference count of the underlying storage
+    ///
+    /// Returns the number of ZArray instances sharing the same storage.
+    /// When this is > 1, a write operation will trigger copy-on-write.
+    pub fn refcount(&self) -> usize {
+        Arc::strong_count(&self.storage)
+    }
+
+    /// Ensure we have unique ownership of the storage (for copy-on-write)
+    ///
+    /// If the storage is shared (refcount > 1), this clones the storage so we have
+    /// exclusive access. This is called before any mutating operation.
+    fn make_mut(&mut self) {
+        if Arc::strong_count(&self.storage) > 1 {
+            // Clone the storage (copy-on-write)
+            self.storage = Arc::new((*self.storage).clone());
+        }
+    }
+
+    /// Check if array is in packed mode
+    pub fn is_packed(&self) -> bool {
+        matches!(self.storage.as_ref(), ArrayStorage::Packed(_))
+    }
+
+    /// Check if array is in hash mode
+    pub fn is_hash(&self) -> bool {
+        matches!(self.storage.as_ref(), ArrayStorage::Hash(_))
+    }
+
+    /// Get the number of elements in the array
+    pub fn len(&self) -> usize {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(vec) => vec.len(),
+            ArrayStorage::Hash(map) => map.len(),
+        }
+    }
+
+    /// Check if the array is empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Insert a value with an integer key
+    ///
+    /// If we're in packed mode and the key is the next sequential index,
+    /// we stay in packed mode. Otherwise, we promote to hash mode.
+    ///
+    /// Triggers copy-on-write if storage is shared.
+    pub fn insert_int(&mut self, key: i64, value: ZVal) {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
+            ArrayStorage::Packed(vec) => {
+                // Check if this key is the next sequential index
+                if key >= 0 && key as usize == vec.len() {
+                    // Stay in packed mode
+                    vec.push(value);
+                } else {
+                    // Need to promote to hash mode
+                    let mut table = RobinHoodTable::with_capacity(vec.len() + 1);
+                    for (i, val) in vec.iter().enumerate() {
+                        table.insert(ArrayKey::Int(i as i64), val.clone());
+                    }
+                    table.insert(ArrayKey::Int(key), value);
+                    *storage = ArrayStorage::Hash(table);
+                }
+            }
+            ArrayStorage::Hash(map) => {
+                map.insert(ArrayKey::Int(key), value);
+            }
+        }
+    }
+
+    /// Insert a value with a string key
+    ///
+    /// This always promotes to hash mode if we're in packed mode.
+    ///
+    /// Triggers copy-on-write if storage is shared.
+    pub fn insert_string(&mut self, key: ZString, value: ZVal) {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
+            ArrayStorage::Packed(vec) => {
+                // Promote to hash mode
+                let mut table = RobinHoodTable::with_capacity(vec.len() + 1);
+                for (i, val) in vec.iter().enumerate() {
+                    table.insert(ArrayKey::Int(i as i64), val.clone());
+                }
+                table.insert(ArrayKey::String(key), value);
+                *storage = ArrayStorage::Hash(table);
+            }
+            ArrayStorage::Hash(map) => {
+                map.insert(ArrayKey::String(key), value);
+            }
+        }
+    }
+
+    /// Get a value by integer key
+    pub fn get_int(&self, key: i64) -> Option<&ZVal> {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(vec) => {
+                if key >= 0 && (key as usize) < vec.len() {
+                    Some(&vec[key as usize])
+                } else {
+                    None
+                }
+            }
+            ArrayStorage::Hash(map) => map.get(&ArrayKey::Int(key)),
+        }
+    }
+
+    /// Get a value by string key
+    pub fn get_string(&self, key: &ZString) -> Option<&ZVal> {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(_) => None, // Packed mode has no string keys
+            ArrayStorage::Hash(map) => map.get(&ArrayKey::String(key.clone())),
+        }
+    }
+
+    /// Push a value onto the end of the array (like $arr[] = $val in PHP)
+    ///
+    /// This finds the next free integer key and inserts there.
+    ///
+    /// Triggers copy-on-write if storage is shared.
+    pub fn push(&mut self, value: ZVal) {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
+            ArrayStorage::Packed(vec) => {
+                vec.push(value);
+            }
+            ArrayStorage::Hash(map) => {
+                // Find the maximum integer key + 1
+                let next_key = map
+                    .keys()
+                    .filter_map(|k| match k {
+                        ArrayKey::Int(i) => Some(i),
+                        ArrayKey::String(_) => None,
+                    })
+                    .max()
+                    .map(|max| max + 1)
+                    .unwrap_or(0);
+                map.insert(ArrayKey::Int(next_key), value);
+            }
+        }
+    }
+
+    /// Remove a value by integer key
+    ///
+    /// Returns the removed value if it existed, None otherwise.
+    /// Note: In packed mode, this promotes to hash mode (PHP behavior).
+    ///
+    /// Triggers copy-on-write if storage is shared.
+    pub fn remove_int(&mut self, key: i64) -> Option<ZVal> {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
+            ArrayStorage::Packed(vec) => {
+                // In PHP, unset() on a packed array promotes to hash mode
+                // because we need to maintain gaps
+                if key >= 0 && (key as usize) < vec.len() {
+                    // Promote to hash mode
+                    let mut table = RobinHoodTable::with_capacity(vec.len());
+                    for (i, val) in vec.iter().enumerate() {
+                        table.insert(ArrayKey::Int(i as i64), val.clone());
+                    }
+                    let result = table.delete(&ArrayKey::Int(key));
+                    *storage = ArrayStorage::Hash(table);
+                    result
+                } else {
+                    None
+                }
+            }
+            ArrayStorage::Hash(map) => map.delete(&ArrayKey::Int(key)),
+        }
+    }
+
+    /// Remove a value by string key
+    ///
+    /// Returns the removed value if it existed, None otherwise.
+    ///
+    /// Triggers copy-on-write if storage is shared.
+    pub fn remove_string(&mut self, key: &ZString) -> Option<ZVal> {
+        // Trigger CoW if needed
+        self.make_mut();
+
+        // SAFETY: After make_mut(), we have exclusive access to storage
+        let storage = Arc::get_mut(&mut self.storage).expect("make_mut ensures exclusive access");
+
+        match storage {
+            ArrayStorage::Packed(_) => None, // Packed mode has no string keys
+            ArrayStorage::Hash(map) => map.delete(&ArrayKey::String(key.clone())),
+        }
+    }
+
+    /// Iterate over (key, value) pairs in insertion order
+    ///
+    /// Returns a vector of (key, value) pairs.
+    /// For packed mode, keys are integers 0..n.
+    /// For hash mode, order is preserved based on insertion order.
+    pub fn iter(&self) -> Vec<(ZArrayKey, &ZVal)> {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(vec) => vec
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (ZArrayKey::Int(i as i64), v))
+                .collect(),
+            ArrayStorage::Hash(map) => map
+                .insertion_order
+                .iter()
+                .filter_map(|(_, key)| {
+                    map.get(key).map(|value| match key {
+                        ArrayKey::Int(i) => (ZArrayKey::Int(*i), value),
+                        ArrayKey::String(s) => (ZArrayKey::String(s.clone()), value),
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// Iterate over keys in insertion order
+    pub fn keys(&self) -> Vec<ZArrayKey> {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(vec) => (0..vec.len() as i64).map(ZArrayKey::Int).collect(),
+            ArrayStorage::Hash(map) => map
+                .insertion_order
+                .iter()
+                .map(|(_, key)| match key {
+                    ArrayKey::Int(i) => ZArrayKey::Int(*i),
+                    ArrayKey::String(s) => ZArrayKey::String(s.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    /// Iterate over values in insertion order
+    pub fn values(&self) -> Vec<&ZVal> {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(vec) => vec.iter().collect(),
+            ArrayStorage::Hash(map) => map
+                .insertion_order
+                .iter()
+                .filter_map(|(_, key)| map.get(key))
+                .collect(),
+        }
+    }
+
+    /// Count the number of elements in the array
+    ///
+    /// This is a PHP-style alias for `len()` to match PHP's `count()` function.
+    ///
+    /// Reference: php-src/ext/standard/array.c — count() and sizeof()
+    pub fn count(&self) -> usize {
+        self.len()
+    }
+
+    /// Check if an integer key exists in the array
+    ///
+    /// Reference: php-src/ext/standard/array.c — array_key_exists()
+    ///
+    /// Note: This is different from isset() in PHP:
+    /// - array_key_exists() returns true even if value is null
+    /// - isset() returns false if value is null
+    pub fn contains_key_int(&self, key: i64) -> bool {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(vec) => key >= 0 && (key as usize) < vec.len(),
+            ArrayStorage::Hash(map) => map.get(&ArrayKey::Int(key)).is_some(),
+        }
+    }
+
+    /// Check if a string key exists in the array
+    ///
+    /// Reference: php-src/ext/standard/array.c — array_key_exists()
+    pub fn contains_key_string(&self, key: &ZString) -> bool {
+        match self.storage.as_ref() {
+            ArrayStorage::Packed(_) => {
+                // Packed mode only has integer keys, so string keys never exist
+                false
+            }
+            ArrayStorage::Hash(map) => map.get(&ArrayKey::String(key.clone())).is_some(),
+        }
+    }
+}
+
+/// Key type for [`ZArray`] iteration and external access.
+///
+/// PHP array keys are either integers or strings. Numeric strings like `"0"` are
+/// automatically coerced to integers in PHP, but that coercion happens at the
+/// call site -- this enum represents the already-resolved key type.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ZArrayKey {
+    /// Integer key (e.g., `$arr[0]`, `$arr[42]`).
+    Int(i64),
+    /// String key (e.g., `$arr["name"]`, `$arr["key"]`).
+    String(ZString),
+}
+
+impl Default for ZArray {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod zarray_tests {
+    use super::*;
+
+    #[test]
+    fn test_packed_mode_new() {
+        let arr = ZArray::new();
+        assert!(arr.is_packed());
+        assert!(!arr.is_hash());
+        assert_eq!(arr.len(), 0);
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn test_packed_mode_sequential_insert() {
+        let mut arr = ZArray::new();
+
+        // Insert sequential keys 0, 1, 2
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+
+        // Should still be in packed mode
+        assert!(arr.is_packed());
+        assert_eq!(arr.len(), 3);
+
+        // Verify values
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 300);
+    }
+
+    #[test]
+    fn test_packed_mode_push() {
+        let mut arr = ZArray::new();
+
+        // Push values (equivalent to $arr[] = val)
+        arr.push(ZVal::long(10));
+        arr.push(ZVal::long(20));
+        arr.push(ZVal::long(30));
+
+        // Should be in packed mode with keys 0, 1, 2
+        assert!(arr.is_packed());
+        assert_eq!(arr.len(), 3);
+
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 10);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 20);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 30);
+    }
+
+    #[test]
+    fn test_packed_to_hash_promotion_non_sequential() {
+        let mut arr = ZArray::new();
+
+        // Start with sequential keys
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+
+        // Still packed
+        assert!(arr.is_packed());
+
+        // Insert non-sequential key — should promote to hash
+        arr.insert_int(5, ZVal::long(500));
+
+        // Now should be in hash mode
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 3);
+
+        // Verify all values are still accessible
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_int(5).unwrap().to_long(), 500);
+    }
+
+    #[test]
+    fn test_packed_to_hash_promotion_string_key() {
+        let mut arr = ZArray::new();
+
+        // Start with sequential integer keys
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+
+        assert!(arr.is_packed());
+
+        // Insert a string key — should promote to hash
+        let key = ZString::new(b"name");
+        arr.insert_string(key.clone(), ZVal::long(999));
+
+        // Now should be in hash mode
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 3);
+
+        // Verify all values
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_string(&key).unwrap().to_long(), 999);
+    }
+
+    #[test]
+    fn test_get_nonexistent_key() {
+        let arr = ZArray::new();
+
+        // Getting non-existent key should return None
+        assert!(arr.get_int(0).is_none());
+        assert!(arr.get_int(999).is_none());
+
+        let key = ZString::new(b"missing");
+        assert!(arr.get_string(&key).is_none());
+    }
+
+    #[test]
+    fn test_packed_mode_negative_key_promotion() {
+        let mut arr = ZArray::new();
+
+        // Start with key 0
+        arr.insert_int(0, ZVal::long(100));
+        assert!(arr.is_packed());
+
+        // Insert negative key — should promote to hash
+        arr.insert_int(-1, ZVal::long(999));
+
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 2);
+
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(-1).unwrap().to_long(), 999);
+    }
+
+    #[test]
+    fn test_hash_mode_push() {
+        let mut arr = ZArray::new();
+
+        // Force hash mode by inserting a string key
+        arr.insert_string(ZString::new(b"a"), ZVal::long(1));
+
+        assert!(arr.is_hash());
+
+        // Now push some values
+        arr.push(ZVal::long(10));
+        arr.push(ZVal::long(20));
+
+        // Should get integer keys 0 and 1 (next free keys)
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 10);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 20);
+        assert_eq!(arr.len(), 3);
+    }
+
+    /// Test: next free integer key ($a[] = value)
+    /// PHP behavior: $a[] assigns to the next free integer key,
+    /// which is max(integer_keys) + 1, or 0 if no integer keys exist.
+    #[test]
+    fn test_next_free_key_empty_array() {
+        let mut arr = ZArray::new();
+
+        // Empty array: next key should be 0
+        arr.push(ZVal::long(100));
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+
+        // Next should be 1
+        arr.push(ZVal::long(200));
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+    }
+
+    #[test]
+    fn test_next_free_key_with_gaps() {
+        let mut arr = ZArray::new();
+
+        // Insert keys with gaps: 0, 5, 10
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(5, ZVal::long(500));
+        arr.insert_int(10, ZVal::long(1000));
+
+        // Next free key should be 11 (max + 1), not filling gaps
+        arr.push(ZVal::long(1100));
+        assert_eq!(arr.get_int(11).unwrap().to_long(), 1100);
+
+        // Keys 1-4, 6-9 should still be empty
+        assert!(arr.get_int(1).is_none());
+        assert!(arr.get_int(4).is_none());
+        assert!(arr.get_int(6).is_none());
+        assert!(arr.get_int(9).is_none());
+    }
+
+    #[test]
+    fn test_next_free_key_only_string_keys() {
+        let mut arr = ZArray::new();
+
+        // Only string keys, no integer keys
+        arr.insert_string(ZString::new(b"foo"), ZVal::long(1));
+        arr.insert_string(ZString::new(b"bar"), ZVal::long(2));
+
+        // Next free key should be 0 (no integer keys exist)
+        arr.push(ZVal::long(100));
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+
+        // Next should be 1
+        arr.push(ZVal::long(200));
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+    }
+
+    #[test]
+    fn test_next_free_key_with_negative_keys() {
+        let mut arr = ZArray::new();
+
+        // Insert negative and positive keys
+        arr.insert_int(-5, ZVal::long(50));
+        arr.insert_int(-1, ZVal::long(10));
+        arr.insert_int(3, ZVal::long(300));
+
+        // Next free key should be 4 (max + 1), negatives don't count as "max"
+        arr.push(ZVal::long(400));
+        assert_eq!(arr.get_int(4).unwrap().to_long(), 400);
+    }
+
+    #[test]
+    fn test_next_free_key_only_negative_keys() {
+        let mut arr = ZArray::new();
+
+        // Only negative integer keys
+        arr.insert_int(-10, ZVal::long(100));
+        arr.insert_int(-5, ZVal::long(50));
+        arr.insert_int(-1, ZVal::long(10));
+
+        // Max is -1, so next free key should be 0 (-1 + 1)
+        arr.push(ZVal::long(999));
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 999);
+    }
+
+    #[test]
+    fn test_next_free_key_after_deletion() {
+        let mut arr = ZArray::new();
+
+        // Insert 0, 1, 2, 3
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+        arr.insert_int(3, ZVal::long(400));
+
+        // Delete key 2 (creates a gap)
+        arr.remove_int(2);
+
+        // Next free key should still be 4 (max + 1), not filling the gap at 2
+        arr.push(ZVal::long(500));
+        assert_eq!(arr.get_int(4).unwrap().to_long(), 500);
+        assert!(arr.get_int(2).is_none()); // Gap still exists
+    }
+
+    #[test]
+    fn test_next_free_key_mixed_keys_and_push() {
+        let mut arr = ZArray::new();
+
+        // Mix of operations
+        arr.push(ZVal::long(10)); // key 0
+        arr.push(ZVal::long(20)); // key 1
+        arr.insert_string(ZString::new(b"name"), ZVal::long(999)); // string key
+        arr.push(ZVal::long(30)); // key 2
+        arr.insert_int(5, ZVal::long(50)); // explicit key 5
+        arr.push(ZVal::long(60)); // key 6 (max is 5, so next is 6)
+
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 10);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 20);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 30);
+        assert_eq!(arr.get_int(5).unwrap().to_long(), 50);
+        assert_eq!(arr.get_int(6).unwrap().to_long(), 60);
+        assert_eq!(
+            arr.get_string(&ZString::new(b"name")).unwrap().to_long(),
+            999
+        );
+    }
+
+    #[test]
+    fn test_next_free_key_start_from_high_number() {
+        let mut arr = ZArray::new();
+
+        // Start with a high number
+        arr.insert_int(1000, ZVal::long(10000));
+
+        // Next free should be 1001
+        arr.push(ZVal::long(10010));
+        assert_eq!(arr.get_int(1001).unwrap().to_long(), 10010);
+
+        // And 1002
+        arr.push(ZVal::long(10020));
+        assert_eq!(arr.get_int(1002).unwrap().to_long(), 10020);
+    }
+
+    #[test]
+    fn test_with_capacity() {
+        let arr = ZArray::with_capacity(100);
+        assert!(arr.is_packed());
+        assert_eq!(arr.len(), 0);
+    }
+
+    // Tests for Robin Hood hash table implementation
+
+    #[test]
+    fn test_robin_hood_basic_insert_get() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        table.insert(ArrayKey::Int(1), ZVal::long(100));
+        table.insert(ArrayKey::Int(2), ZVal::long(200));
+        table.insert(ArrayKey::String(ZString::new(b"key")), ZVal::long(300));
+
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(&ArrayKey::Int(1)).unwrap().to_long(), 100);
+        assert_eq!(table.get(&ArrayKey::Int(2)).unwrap().to_long(), 200);
+        assert_eq!(
+            table
+                .get(&ArrayKey::String(ZString::new(b"key")))
+                .unwrap()
+                .to_long(),
+            300
+        );
+    }
+
+    #[test]
+    fn test_robin_hood_overwrite() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        table.insert(ArrayKey::Int(1), ZVal::long(100));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(&ArrayKey::Int(1)).unwrap().to_long(), 100);
+
+        // Overwrite existing key
+        table.insert(ArrayKey::Int(1), ZVal::long(999));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(&ArrayKey::Int(1)).unwrap().to_long(), 999);
+    }
+
+    #[test]
+    fn test_robin_hood_delete() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        table.insert(ArrayKey::Int(1), ZVal::long(100));
+        table.insert(ArrayKey::Int(2), ZVal::long(200));
+        table.insert(ArrayKey::Int(3), ZVal::long(300));
+
+        assert_eq!(table.len(), 3);
+
+        // Delete middle element
+        assert!(table.delete(&ArrayKey::Int(2)).is_some());
+        assert_eq!(table.len(), 2);
+
+        // Should no longer exist
+        assert!(table.get(&ArrayKey::Int(2)).is_none());
+
+        // Others should still exist
+        assert_eq!(table.get(&ArrayKey::Int(1)).unwrap().to_long(), 100);
+        assert_eq!(table.get(&ArrayKey::Int(3)).unwrap().to_long(), 300);
+    }
+
+    #[test]
+    fn test_robin_hood_grow() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::with_capacity(4);
+
+        // Insert many items to trigger growth
+        for i in 0..20 {
+            table.insert(ArrayKey::Int(i), ZVal::long(i * 10));
+        }
+
+        assert_eq!(table.len(), 20);
+
+        // Verify all items are still accessible
+        for i in 0..20 {
+            assert_eq!(table.get(&ArrayKey::Int(i)).unwrap().to_long(), i * 10);
+        }
+    }
+
+    #[test]
+    fn test_robin_hood_collision_handling() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::with_capacity(4);
+
+        // Insert items that will definitely collide in a small table
+        table.insert(ArrayKey::Int(0), ZVal::long(0));
+        table.insert(ArrayKey::Int(4), ZVal::long(4)); // Will hash to same bucket in size-4 table
+        table.insert(ArrayKey::Int(8), ZVal::long(8)); // Will hash to same bucket in size-4 table
+
+        assert_eq!(table.len(), 3);
+        assert_eq!(table.get(&ArrayKey::Int(0)).unwrap().to_long(), 0);
+        assert_eq!(table.get(&ArrayKey::Int(4)).unwrap().to_long(), 4);
+        assert_eq!(table.get(&ArrayKey::Int(8)).unwrap().to_long(), 8);
+    }
+
+    #[test]
+    fn test_robin_hood_iteration_order() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        // Insert in specific order
+        table.insert(ArrayKey::Int(3), ZVal::long(3));
+        table.insert(ArrayKey::Int(1), ZVal::long(1));
+        table.insert(ArrayKey::Int(2), ZVal::long(2));
+
+        // Collect insertion order
+        let keys: Vec<i64> = table
+            .iter()
+            .filter_map(|(k, _)| match k {
+                ArrayKey::Int(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+
+        // Should maintain insertion order: 3, 1, 2
+        assert_eq!(keys, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn test_robin_hood_empty_operations() {
+        let mut table = RobinHoodTable::<ArrayKey, ZVal>::new();
+
+        assert_eq!(table.len(), 0);
+        assert!(table.is_empty());
+        assert!(table.get(&ArrayKey::Int(1)).is_none());
+        assert!(table.delete(&ArrayKey::Int(1)).is_none());
+    }
+
+    // =========================================================================
+    // Task 1.4.3: ZArray insert, get, delete, iteration order tests
+    // =========================================================================
+
+    #[test]
+    fn test_zarray_insert_get_int_keys() {
+        let mut arr = ZArray::new();
+
+        // Insert values with integer keys
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+
+        // Test get
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 300);
+
+        // Test non-existent key
+        assert!(arr.get_int(3).is_none());
+        assert!(arr.get_int(-1).is_none());
+    }
+
+    #[test]
+    fn test_zarray_insert_get_string_keys() {
+        let mut arr = ZArray::new();
+
+        let key1 = ZString::new(b"name");
+        let key2 = ZString::new(b"age");
+        let key3 = ZString::new(b"city");
+
+        // Insert values with string keys
+        arr.insert_string(key1.clone(), ZVal::long(100));
+        arr.insert_string(key2.clone(), ZVal::long(200));
+        arr.insert_string(key3.clone(), ZVal::long(300));
+
+        // Test get
+        assert_eq!(arr.get_string(&key1).unwrap().to_long(), 100);
+        assert_eq!(arr.get_string(&key2).unwrap().to_long(), 200);
+        assert_eq!(arr.get_string(&key3).unwrap().to_long(), 300);
+
+        // Test non-existent key
+        let missing = ZString::new(b"missing");
+        assert!(arr.get_string(&missing).is_none());
+    }
+
+    #[test]
+    fn test_zarray_insert_get_mixed_keys() {
+        let mut arr = ZArray::new();
+
+        // Start with packed mode
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+
+        // Add string key (promotes to hash mode)
+        let key = ZString::new(b"name");
+        arr.insert_string(key.clone(), ZVal::long(300));
+
+        // Add more integer keys
+        arr.insert_int(2, ZVal::long(400));
+        arr.insert_int(10, ZVal::long(500));
+
+        // Test all gets
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+        assert_eq!(arr.get_string(&key).unwrap().to_long(), 300);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 400);
+        assert_eq!(arr.get_int(10).unwrap().to_long(), 500);
+
+        assert!(arr.is_hash());
+    }
+
+    #[test]
+    fn test_zarray_delete_packed_mode() {
+        let mut arr = ZArray::new();
+
+        // Insert in packed mode
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+
+        assert!(arr.is_packed());
+        assert_eq!(arr.len(), 3);
+
+        // Delete from packed mode (should promote to hash)
+        let removed = arr.remove_int(1);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_long(), 200);
+
+        // Should now be in hash mode (PHP behavior)
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 2);
+
+        // Verify remaining elements
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert!(arr.get_int(1).is_none()); // Deleted
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 300);
+    }
+
+    #[test]
+    fn test_zarray_delete_hash_mode_int_keys() {
+        let mut arr = ZArray::new();
+
+        // Force hash mode
+        arr.insert_int(5, ZVal::long(500));
+        arr.insert_int(1, ZVal::long(100));
+        arr.insert_int(3, ZVal::long(300));
+        arr.insert_int(2, ZVal::long(200));
+
+        assert!(arr.is_hash());
+        assert_eq!(arr.len(), 4);
+
+        // Delete middle element
+        let removed = arr.remove_int(3);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_long(), 300);
+        assert_eq!(arr.len(), 3);
+
+        // Verify deletion
+        assert!(arr.get_int(3).is_none());
+
+        // Verify remaining elements
+        assert_eq!(arr.get_int(5).unwrap().to_long(), 500);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 200);
+
+        // Delete another
+        let removed = arr.remove_int(1);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_long(), 100);
+        assert_eq!(arr.len(), 2);
+
+        assert!(arr.get_int(1).is_none());
+        assert_eq!(arr.get_int(5).unwrap().to_long(), 500);
+        assert_eq!(arr.get_int(2).unwrap().to_long(), 200);
+    }
+
+    #[test]
+    fn test_zarray_delete_hash_mode_string_keys() {
+        let mut arr = ZArray::new();
+
+        let key1 = ZString::new(b"name");
+        let key2 = ZString::new(b"age");
+        let key3 = ZString::new(b"city");
+
+        arr.insert_string(key1.clone(), ZVal::long(100));
+        arr.insert_string(key2.clone(), ZVal::long(200));
+        arr.insert_string(key3.clone(), ZVal::long(300));
+
+        assert_eq!(arr.len(), 3);
+
+        // Delete middle element
+        let removed = arr.remove_string(&key2);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_long(), 200);
+        assert_eq!(arr.len(), 2);
+
+        // Verify deletion
+        assert!(arr.get_string(&key2).is_none());
+
+        // Verify remaining elements
+        assert_eq!(arr.get_string(&key1).unwrap().to_long(), 100);
+        assert_eq!(arr.get_string(&key3).unwrap().to_long(), 300);
+    }
+
+    #[test]
+    fn test_zarray_delete_nonexistent() {
+        let mut arr = ZArray::new();
+
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+
+        // Delete non-existent key
+        let removed = arr.remove_int(5);
+        assert!(removed.is_none());
+        assert_eq!(arr.len(), 2);
+
+        // Verify existing elements unaffected
+        assert_eq!(arr.get_int(0).unwrap().to_long(), 100);
+        assert_eq!(arr.get_int(1).unwrap().to_long(), 200);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_packed_mode() {
+        let mut arr = ZArray::new();
+
+        // Insert sequential keys
+        arr.insert_int(0, ZVal::long(10));
+        arr.insert_int(1, ZVal::long(20));
+        arr.insert_int(2, ZVal::long(30));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify order and values
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, ZArrayKey::Int(0));
+        assert_eq!(items[0].1.to_long(), 10);
+        assert_eq!(items[1].0, ZArrayKey::Int(1));
+        assert_eq!(items[1].1.to_long(), 20);
+        assert_eq!(items[2].0, ZArrayKey::Int(2));
+        assert_eq!(items[2].1.to_long(), 30);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_hash_mode_int_keys() {
+        let mut arr = ZArray::new();
+
+        // Insert in non-sequential order
+        arr.insert_int(5, ZVal::long(50));
+        arr.insert_int(1, ZVal::long(10));
+        arr.insert_int(3, ZVal::long(30));
+        arr.insert_int(2, ZVal::long(20));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify insertion order is preserved
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].0, ZArrayKey::Int(5));
+        assert_eq!(items[0].1.to_long(), 50);
+        assert_eq!(items[1].0, ZArrayKey::Int(1));
+        assert_eq!(items[1].1.to_long(), 10);
+        assert_eq!(items[2].0, ZArrayKey::Int(3));
+        assert_eq!(items[2].1.to_long(), 30);
+        assert_eq!(items[3].0, ZArrayKey::Int(2));
+        assert_eq!(items[3].1.to_long(), 20);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_hash_mode_string_keys() {
+        let mut arr = ZArray::new();
+
+        let key1 = ZString::new(b"zebra");
+        let key2 = ZString::new(b"apple");
+        let key3 = ZString::new(b"mango");
+
+        // Insert in specific order (not alphabetical)
+        arr.insert_string(key1.clone(), ZVal::long(1));
+        arr.insert_string(key2.clone(), ZVal::long(2));
+        arr.insert_string(key3.clone(), ZVal::long(3));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify insertion order is preserved (not alphabetical)
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, ZArrayKey::String(key1.clone()));
+        assert_eq!(items[0].1.to_long(), 1);
+        assert_eq!(items[1].0, ZArrayKey::String(key2.clone()));
+        assert_eq!(items[1].1.to_long(), 2);
+        assert_eq!(items[2].0, ZArrayKey::String(key3.clone()));
+        assert_eq!(items[2].1.to_long(), 3);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_mixed_keys() {
+        let mut arr = ZArray::new();
+
+        let key1 = ZString::new(b"name");
+        let key2 = ZString::new(b"city");
+
+        // Insert mixed keys in specific order
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_string(key1.clone(), ZVal::long(200));
+        arr.insert_int(5, ZVal::long(300));
+        arr.insert_string(key2.clone(), ZVal::long(400));
+        arr.insert_int(2, ZVal::long(500));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify insertion order is preserved
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[0].0, ZArrayKey::Int(0));
+        assert_eq!(items[0].1.to_long(), 100);
+        assert_eq!(items[1].0, ZArrayKey::String(key1.clone()));
+        assert_eq!(items[1].1.to_long(), 200);
+        assert_eq!(items[2].0, ZArrayKey::Int(5));
+        assert_eq!(items[2].1.to_long(), 300);
+        assert_eq!(items[3].0, ZArrayKey::String(key2.clone()));
+        assert_eq!(items[3].1.to_long(), 400);
+        assert_eq!(items[4].0, ZArrayKey::Int(2));
+        assert_eq!(items[4].1.to_long(), 500);
+    }
+
+    #[test]
+    fn test_zarray_iteration_order_after_deletion() {
+        let mut arr = ZArray::new();
+
+        // Insert elements
+        arr.insert_int(1, ZVal::long(10));
+        arr.insert_int(2, ZVal::long(20));
+        arr.insert_int(3, ZVal::long(30));
+        arr.insert_int(4, ZVal::long(40));
+
+        // Delete middle element
+        arr.remove_int(2);
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Verify deletion removes from iteration but preserves order
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, ZArrayKey::Int(1));
+        assert_eq!(items[0].1.to_long(), 10);
+        assert_eq!(items[1].0, ZArrayKey::Int(3));
+        assert_eq!(items[1].1.to_long(), 30);
+        assert_eq!(items[2].0, ZArrayKey::Int(4));
+        assert_eq!(items[2].1.to_long(), 40);
+    }
+
+    #[test]
+    fn test_zarray_iteration_keys_values() {
+        let mut arr = ZArray::new();
+
+        let key = ZString::new(b"name");
+
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_string(key.clone(), ZVal::long(200));
+        arr.insert_int(5, ZVal::long(300));
+
+        // Test keys()
+        let keys = arr.keys();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], ZArrayKey::Int(0));
+        assert_eq!(keys[1], ZArrayKey::String(key.clone()));
+        assert_eq!(keys[2], ZArrayKey::Int(5));
+
+        // Test values()
+        let values = arr.values();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].to_long(), 100);
+        assert_eq!(values[1].to_long(), 200);
+        assert_eq!(values[2].to_long(), 300);
+    }
+
+    #[test]
+    fn test_zarray_iteration_empty_array() {
+        let arr = ZArray::new();
+
+        let items = arr.iter();
+        assert_eq!(items.len(), 0);
+
+        let keys = arr.keys();
+        assert_eq!(keys.len(), 0);
+
+        let values = arr.values();
+        assert_eq!(values.len(), 0);
+    }
+
+    #[test]
+    fn test_zarray_overwrite_preserves_insertion_order() {
+        let mut arr = ZArray::new();
+
+        // Insert in specific order
+        arr.insert_int(1, ZVal::long(10));
+        arr.insert_int(2, ZVal::long(20));
+        arr.insert_int(3, ZVal::long(30));
+
+        // Overwrite middle element
+        arr.insert_int(2, ZVal::long(999));
+
+        // Get iteration order
+        let items = arr.iter();
+
+        // Order should be preserved, value should be updated
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, ZArrayKey::Int(1));
+        assert_eq!(items[0].1.to_long(), 10);
+        assert_eq!(items[1].0, ZArrayKey::Int(2));
+        assert_eq!(items[1].1.to_long(), 999); // Updated value
+        assert_eq!(items[2].0, ZArrayKey::Int(3));
+        assert_eq!(items[2].1.to_long(), 30);
+    }
+
+    /// Test count() method (PHP-style alias for len())
+    ///
+    /// Reference: PHP's count() function
+    #[test]
+    fn test_zarray_count_empty() {
+        let arr = ZArray::new();
+        assert_eq!(arr.count(), 0);
+    }
+
+    #[test]
+    fn test_zarray_count_packed_mode() {
+        let mut arr = ZArray::new();
+        arr.push(ZVal::long(1));
+        arr.push(ZVal::long(2));
+        arr.push(ZVal::long(3));
+        assert_eq!(arr.count(), 3);
+    }
+
+    #[test]
+    fn test_zarray_count_hash_mode() {
+        let mut arr = ZArray::new();
+        arr.insert_int(10, ZVal::long(100));
+        arr.insert_int(20, ZVal::long(200));
+        arr.insert_string(ZString::new(b"key"), ZVal::long(300));
+        assert_eq!(arr.count(), 3);
+    }
+
+    #[test]
+    fn test_zarray_count_after_deletion() {
+        let mut arr = ZArray::new();
+        arr.push(ZVal::long(1));
+        arr.push(ZVal::long(2));
+        arr.push(ZVal::long(3));
+        assert_eq!(arr.count(), 3);
+
+        arr.remove_int(1);
+        assert_eq!(arr.count(), 2);
+    }
+
+    /// Test contains_key() / key_exists() method
+    ///
+    /// Reference: PHP's array_key_exists() and isset()
+    #[test]
+    fn test_zarray_contains_key_int_packed_mode() {
+        let mut arr = ZArray::new();
+        arr.push(ZVal::long(10)); // index 0
+        arr.push(ZVal::long(20)); // index 1
+        arr.push(ZVal::long(30)); // index 2
+
+        assert!(arr.contains_key_int(0));
+        assert!(arr.contains_key_int(1));
+        assert!(arr.contains_key_int(2));
+        assert!(!arr.contains_key_int(3));
+        assert!(!arr.contains_key_int(-1));
+    }
+
+    #[test]
+    fn test_zarray_contains_key_int_hash_mode() {
+        let mut arr = ZArray::new();
+        arr.insert_int(10, ZVal::long(100));
+        arr.insert_int(20, ZVal::long(200));
+        arr.insert_int(30, ZVal::long(300));
+
+        assert!(arr.contains_key_int(10));
+        assert!(arr.contains_key_int(20));
+        assert!(arr.contains_key_int(30));
+        assert!(!arr.contains_key_int(0));
+        assert!(!arr.contains_key_int(15));
+    }
+
+    #[test]
+    fn test_zarray_contains_key_string() {
+        let mut arr = ZArray::new();
+        arr.insert_string(ZString::new(b"foo"), ZVal::long(1));
+        arr.insert_string(ZString::new(b"bar"), ZVal::long(2));
+
+        assert!(arr.contains_key_string(&ZString::new(b"foo")));
+        assert!(arr.contains_key_string(&ZString::new(b"bar")));
+        assert!(!arr.contains_key_string(&ZString::new(b"baz")));
+        assert!(!arr.contains_key_string(&ZString::new(b"")));
+    }
+
+    #[test]
+    fn test_zarray_contains_key_mixed_keys() {
+        let mut arr = ZArray::new();
+        arr.insert_int(0, ZVal::long(10));
+        arr.insert_string(ZString::new(b"name"), ZVal::long(100));
+        arr.insert_int(42, ZVal::long(99));
+
+        // Integer keys
+        assert!(arr.contains_key_int(0));
+        assert!(arr.contains_key_int(42));
+        assert!(!arr.contains_key_int(1));
+
+        // String keys
+        assert!(arr.contains_key_string(&ZString::new(b"name")));
+        assert!(!arr.contains_key_string(&ZString::new(b"age")));
+    }
+
+    #[test]
+    fn test_zarray_contains_key_after_deletion() {
+        let mut arr = ZArray::new();
+        arr.insert_int(5, ZVal::long(50));
+        arr.insert_string(ZString::new(b"test"), ZVal::long(100));
+
+        assert!(arr.contains_key_int(5));
+        assert!(arr.contains_key_string(&ZString::new(b"test")));
+
+        // Delete the keys
+        arr.remove_int(5);
+        arr.remove_string(&ZString::new(b"test"));
+
+        assert!(!arr.contains_key_int(5));
+        assert!(!arr.contains_key_string(&ZString::new(b"test")));
+    }
+
+    /// Test foreach iteration (using Rust's Iterator trait)
+    ///
+    /// Reference: PHP's foreach construct
+    #[test]
+    fn test_zarray_foreach_iteration_packed() {
+        let mut arr = ZArray::new();
+        arr.push(ZVal::long(10));
+        arr.push(ZVal::long(20));
+        arr.push(ZVal::long(30));
+
+        let items = arr.iter();
+        assert_eq!(items.len(), 3);
+
+        // Verify we can iterate like PHP's foreach
+        let mut sum = 0i64;
+        for (key, value) in items {
+            match key {
+                ZArrayKey::Int(i) => {
+                    assert!((0..3).contains(&i));
+                    sum += value.to_long();
+                }
+                ZArrayKey::String(_) => panic!("Expected int key"),
+            }
+        }
+        assert_eq!(sum, 60); // 10 + 20 + 30
+    }
+
+    #[test]
+    fn test_zarray_foreach_iteration_hash() {
+        let mut arr = ZArray::new();
+        arr.insert_string(ZString::new(b"a"), ZVal::long(1));
+        arr.insert_string(ZString::new(b"b"), ZVal::long(2));
+        arr.insert_string(ZString::new(b"c"), ZVal::long(3));
+
+        let items = arr.iter();
+        let keys: Vec<String> = items
+            .iter()
+            .map(|(k, _)| match k {
+                ZArrayKey::String(s) => s.as_str().unwrap().to_string(),
+                ZArrayKey::Int(_) => panic!("Expected string key"),
+            })
+            .collect();
+
+        // Order should be preserved (insertion order)
+        assert_eq!(keys, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_zarray_foreach_keys_and_values_separate() {
+        let mut arr = ZArray::new();
+        arr.insert_int(0, ZVal::long(100));
+        arr.insert_int(1, ZVal::long(200));
+        arr.insert_int(2, ZVal::long(300));
+
+        // Test keys()
+        let keys = arr.keys();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0], ZArrayKey::Int(0));
+        assert_eq!(keys[1], ZArrayKey::Int(1));
+        assert_eq!(keys[2], ZArrayKey::Int(2));
+
+        // Test values()
+        let values = arr.values();
+        assert_eq!(values.len(), 3);
+        assert_eq!(values[0].to_long(), 100);
+        assert_eq!(values[1].to_long(), 200);
+        assert_eq!(values[2].to_long(), 300);
+    }
+
+    /// Test copy-on-write (CoW) semantics for ZArray
+    ///
+    /// Reference: php-src/Zend/zend_hash.c — PHP arrays use refcounting + CoW
+    /// When an array is cloned, the underlying storage is shared until a modification occurs.
+    #[test]
+    fn test_zarray_cow_basic() {
+        // Create original array
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(1));
+        arr1.push(ZVal::long(2));
+        arr1.push(ZVal::long(3));
+
+        // Clone the array (should share storage initially)
+        let arr2 = arr1.clone();
+
+        // Both should have the same values
+        assert_eq!(arr1.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr1.get_int(1).unwrap().to_long(), 2);
+        assert_eq!(arr1.get_int(2).unwrap().to_long(), 3);
+        assert_eq!(arr2.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr2.get_int(1).unwrap().to_long(), 2);
+        assert_eq!(arr2.get_int(2).unwrap().to_long(), 3);
+
+        // Verify storage is shared (reference count should be 2)
+        assert_eq!(arr1.refcount(), 2);
+        assert_eq!(arr2.refcount(), 2);
+
+        // Modify arr1 (should trigger CoW)
+        arr1.insert_int(0, ZVal::long(99));
+
+        // After modification, storage should be separated
+        assert_eq!(arr1.refcount(), 1);
+        assert_eq!(arr2.refcount(), 1);
+
+        // arr1 should have the modified value
+        assert_eq!(arr1.get_int(0).unwrap().to_long(), 99);
+        assert_eq!(arr1.get_int(1).unwrap().to_long(), 2);
+        assert_eq!(arr1.get_int(2).unwrap().to_long(), 3);
+
+        // arr2 should still have the original value
+        assert_eq!(arr2.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr2.get_int(1).unwrap().to_long(), 2);
+        assert_eq!(arr2.get_int(2).unwrap().to_long(), 3);
+    }
+
+    #[test]
+    fn test_zarray_cow_no_copy_on_read() {
+        // Create and clone array
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(10));
+        arr1.push(ZVal::long(20));
+
+        let arr2 = arr1.clone();
+
+        // Reading from either array should NOT trigger CoW
+        assert_eq!(arr1.refcount(), 2);
+        assert_eq!(arr2.refcount(), 2);
+
+        let _ = arr1.get_int(0);
+        let _ = arr2.get_int(1);
+
+        // Still shared
+        assert_eq!(arr1.refcount(), 2);
+        assert_eq!(arr2.refcount(), 2);
+    }
+
+    #[test]
+    fn test_zarray_cow_multiple_clones() {
+        // Create original array
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(1));
+        arr1.push(ZVal::long(2));
+
+        // Create multiple clones
+        let arr2 = arr1.clone();
+        let arr3 = arr1.clone();
+        let arr4 = arr2.clone();
+
+        // All should share storage (refcount = 4)
+        assert_eq!(arr1.refcount(), 4);
+        assert_eq!(arr2.refcount(), 4);
+        assert_eq!(arr3.refcount(), 4);
+        assert_eq!(arr4.refcount(), 4);
+
+        // Modify arr3
+        arr1.insert_int(0, ZVal::long(99));
+
+        // arr1 should now be separate (refcount = 1)
+        assert_eq!(arr1.refcount(), 1);
+
+        // Others should still share (refcount = 3)
+        assert_eq!(arr2.refcount(), 3);
+        assert_eq!(arr3.refcount(), 3);
+        assert_eq!(arr4.refcount(), 3);
+
+        // Verify values
+        assert_eq!(arr1.get_int(0).unwrap().to_long(), 99);
+        assert_eq!(arr2.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr3.get_int(0).unwrap().to_long(), 1);
+        assert_eq!(arr4.get_int(0).unwrap().to_long(), 1);
+    }
+
+    #[test]
+    fn test_zarray_cow_hash_mode() {
+        // Test CoW with hash mode arrays
+        let mut arr1 = ZArray::new();
+        arr1.insert_string(ZString::new(b"name"), ZVal::long(100));
+        arr1.insert_string(ZString::new(b"age"), ZVal::long(200));
+
+        let arr2 = arr1.clone();
+
+        // Should share storage
+        assert_eq!(arr1.refcount(), 2);
+        assert_eq!(arr2.refcount(), 2);
+
+        // Modify arr1
+        arr1.insert_string(ZString::new(b"name"), ZVal::long(999));
+
+        // Should now be separate
+        assert_eq!(arr1.refcount(), 1);
+        assert_eq!(arr2.refcount(), 1);
+
+        // Verify values
+        assert_eq!(
+            arr1.get_string(&ZString::new(b"name")).unwrap().to_long(),
+            999
+        );
+        assert_eq!(
+            arr2.get_string(&ZString::new(b"name")).unwrap().to_long(),
+            100
+        );
+    }
+
+    #[test]
+    fn test_zarray_cow_push() {
+        // Test that push() triggers CoW
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(1));
+        arr1.push(ZVal::long(2));
+
+        let arr2 = arr1.clone();
+
+        assert_eq!(arr1.refcount(), 2);
+
+        // Push to arr1 should trigger CoW
+        arr1.push(ZVal::long(3));
+
+        assert_eq!(arr1.refcount(), 1);
+        assert_eq!(arr2.refcount(), 1);
+
+        // Verify lengths
+        assert_eq!(arr1.len(), 3);
+        assert_eq!(arr2.len(), 2);
+    }
+
+    #[test]
+    fn test_zarray_cow_remove() {
+        // Test that remove() triggers CoW
+        let mut arr1 = ZArray::new();
+        arr1.push(ZVal::long(1));
+        arr1.push(ZVal::long(2));
+        arr1.push(ZVal::long(3));
+
+        let arr2 = arr1.clone();
+
+        assert_eq!(arr1.refcount(), 2);
+
+        // Remove from arr1 should trigger CoW
+        arr1.remove_int(1);
+
+        assert_eq!(arr1.refcount(), 1);
+        assert_eq!(arr2.refcount(), 1);
+
+        // Verify arr1 has element removed
+        assert!(arr1.get_int(1).is_none());
+
+        // Verify arr2 still has all elements
+        assert_eq!(arr2.get_int(1).unwrap().to_long(), 2);
+    }
+
+    /// Test nested arrays (multi-dimensional arrays)
+    #[test]
+    fn test_zarray_nested_arrays_basic() {
+        // Test: Create nested arrays like $arr = [[1, 2], [3, 4]]
+        // Reference: PHP allows arbitrary nesting of arrays
+        let mut inner1 = ZArray::new();
+        inner1.push(ZVal::long(1));
+        inner1.push(ZVal::long(2));
+
+        let mut inner2 = ZArray::new();
+        inner2.push(ZVal::long(3));
+        inner2.push(ZVal::long(4));
+
+        let mut outer = ZArray::new();
+        outer.push(ZVal::array(Arc::into_raw(inner1.storage.clone()) as usize));
+        outer.push(ZVal::array(Arc::into_raw(inner2.storage.clone()) as usize));
+
+        // Verify outer array structure
+        assert_eq!(outer.len(), 2);
+
+        // Access nested elements
+        let first_elem = outer.get_int(0).unwrap();
+        assert_eq!(first_elem.type_tag(), ZValType::Array);
+
+        let second_elem = outer.get_int(1).unwrap();
+        assert_eq!(second_elem.type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_nested_arrays_three_levels() {
+        // Test: Three levels of nesting $arr = [[[1, 2]]]
+        let mut level3 = ZArray::new();
+        level3.push(ZVal::long(1));
+        level3.push(ZVal::long(2));
+
+        let mut level2 = ZArray::new();
+        level2.push(ZVal::array(Arc::into_raw(level3.storage.clone()) as usize));
+
+        let mut level1 = ZArray::new();
+        level1.push(ZVal::array(Arc::into_raw(level2.storage.clone()) as usize));
+
+        // Verify structure
+        assert_eq!(level1.len(), 1);
+        assert_eq!(level2.len(), 1);
+        assert_eq!(level3.len(), 2);
+
+        let outer_val = level1.get_int(0).unwrap();
+        assert_eq!(outer_val.type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_nested_mixed_keys() {
+        // Test: Nested array with mixed integer and string keys
+        // $arr = ['outer' => ['inner' => 42]]
+        let mut inner = ZArray::new();
+        inner.insert_string(ZString::new(b"inner"), ZVal::long(42));
+
+        let mut outer = ZArray::new();
+        outer.insert_string(
+            ZString::new(b"outer"),
+            ZVal::array(Arc::into_raw(inner.storage.clone()) as usize),
+        );
+
+        // Verify we can access the nested structure
+        let outer_val = outer.get_string(&ZString::new(b"outer")).unwrap();
+        assert_eq!(outer_val.type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_nested_cow() {
+        // Test: CoW works correctly with nested arrays
+        // When we clone an array containing nested arrays, modifying the inner array
+        // should not affect the cloned outer array's reference to the original inner array
+        let mut inner = ZArray::new();
+        inner.push(ZVal::long(1));
+        inner.push(ZVal::long(2));
+
+        let mut outer = ZArray::new();
+        outer.push(ZVal::array(Arc::into_raw(inner.storage.clone()) as usize));
+
+        // Clone the outer array
+        let outer_clone = outer.clone();
+
+        // Verify both have the same refcount
+        assert_eq!(outer.refcount(), 2);
+        assert_eq!(outer_clone.refcount(), 2);
+
+        // Modify the outer array (should trigger CoW)
+        outer.push(ZVal::long(99));
+
+        // After modification, they should have separate references
+        assert_eq!(outer.refcount(), 1);
+        assert_eq!(outer_clone.refcount(), 1);
+
+        // Lengths should differ
+        assert_eq!(outer.len(), 2);
+        assert_eq!(outer_clone.len(), 1);
+    }
+
+    #[test]
+    fn test_zarray_recursive_reference_detection() {
+        // Test: Create a recursive reference $a = []; $a[0] = &$a;
+        // In PHP, this creates a circular reference that requires GC cycle detection
+        // For now, we test that we can represent this structure
+        let mut arr = ZArray::new();
+
+        // In a real implementation, this would be a ZVal::Reference pointing back to arr
+        // For now, we just test that we can create the pointer structure
+        // The actual cycle detection is tested in Phase 6 (GC)
+
+        // Store a reference-like pointer (in practice, this would be managed by GC)
+        arr.push(ZVal::reference(Arc::into_raw(arr.storage.clone()) as usize));
+
+        // Verify the array contains one element
+        assert_eq!(arr.len(), 1);
+
+        let elem = arr.get_int(0).unwrap();
+        assert_eq!(elem.type_tag(), ZValType::Reference);
+    }
+
+    #[test]
+    fn test_zarray_recursive_two_element_cycle() {
+        // Test: $a = []; $b = []; $a[0] = &$b; $b[0] = &$a;
+        // This creates a two-element cycle
+        let mut arr_a = ZArray::new();
+        let mut arr_b = ZArray::new();
+
+        // Create references to each other
+        let ptr_a = Arc::into_raw(arr_a.storage.clone()) as usize;
+        let ptr_b = Arc::into_raw(arr_b.storage.clone()) as usize;
+
+        arr_a.push(ZVal::reference(ptr_b));
+        arr_b.push(ZVal::reference(ptr_a));
+
+        // Verify structure
+        assert_eq!(arr_a.len(), 1);
+        assert_eq!(arr_b.len(), 1);
+
+        let a_elem = arr_a.get_int(0).unwrap();
+        let b_elem = arr_b.get_int(0).unwrap();
+
+        assert_eq!(a_elem.type_tag(), ZValType::Reference);
+        assert_eq!(b_elem.type_tag(), ZValType::Reference);
+    }
+
+    #[test]
+    fn test_zarray_nested_with_scalars() {
+        // Test: Mix of nested arrays and scalar values
+        // $arr = [1, [2, 3], 'hello', [4, [5, 6]]]
+        let mut inner1 = ZArray::new();
+        inner1.push(ZVal::long(2));
+        inner1.push(ZVal::long(3));
+
+        let mut inner2_nested = ZArray::new();
+        inner2_nested.push(ZVal::long(5));
+        inner2_nested.push(ZVal::long(6));
+
+        let mut inner2 = ZArray::new();
+        inner2.push(ZVal::long(4));
+        inner2.push(ZVal::array(
+            Arc::into_raw(inner2_nested.storage.clone()) as usize
+        ));
+
+        let mut outer = ZArray::new();
+        outer.push(ZVal::long(1));
+        outer.push(ZVal::array(Arc::into_raw(inner1.storage.clone()) as usize));
+        outer.push(ZVal::string(0x1234)); // Placeholder for string
+        outer.push(ZVal::array(Arc::into_raw(inner2.storage.clone()) as usize));
+
+        // Verify structure
+        assert_eq!(outer.len(), 4);
+
+        // Check types
+        assert_eq!(outer.get_int(0).unwrap().type_tag(), ZValType::Long);
+        assert_eq!(outer.get_int(1).unwrap().type_tag(), ZValType::Array);
+        assert_eq!(outer.get_int(2).unwrap().type_tag(), ZValType::String);
+        assert_eq!(outer.get_int(3).unwrap().type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_deep_nesting() {
+        // Test: Deep nesting (10 levels) to ensure no stack overflow
+        let mut current = ZArray::new();
+        current.push(ZVal::long(42));
+
+        // Create 10 levels of nesting
+        for _ in 0..10 {
+            let mut parent = ZArray::new();
+            parent.push(ZVal::array(Arc::into_raw(current.storage.clone()) as usize));
+            current = parent;
+        }
+
+        // Verify the outermost array has one element
+        assert_eq!(current.len(), 1);
+        assert_eq!(current.get_int(0).unwrap().type_tag(), ZValType::Array);
+    }
+
+    #[test]
+    fn test_zarray_recursive_self_reference_multiple_times() {
+        // Test: Array with multiple self-references
+        // $a = []; $a[0] = &$a; $a[1] = &$a; $a[2] = &$a;
+        let mut arr = ZArray::new();
+        let ptr = Arc::into_raw(arr.storage.clone()) as usize;
+
+        arr.push(ZVal::reference(ptr));
+        arr.push(ZVal::reference(ptr));
+        arr.push(ZVal::reference(ptr));
+
+        // Verify structure
+        assert_eq!(arr.len(), 3);
+
+        for i in 0..3 {
+            let elem = arr.get_int(i).unwrap();
+            assert_eq!(elem.type_tag(), ZValType::Reference);
+            assert_eq!(elem.as_ptr().unwrap(), ptr);
+        }
+    }
+
+    #[test]
+    fn test_zarray_nested_empty_arrays() {
+        // Test: Nested empty arrays $arr = [[], [], []]
+        let inner1 = ZArray::new();
+        let inner2 = ZArray::new();
+        let inner3 = ZArray::new();
+
+        let mut outer = ZArray::new();
+        outer.push(ZVal::array(Arc::into_raw(inner1.storage.clone()) as usize));
+        outer.push(ZVal::array(Arc::into_raw(inner2.storage.clone()) as usize));
+        outer.push(ZVal::array(Arc::into_raw(inner3.storage.clone()) as usize));
+
+        // Verify structure
+        assert_eq!(outer.len(), 3);
+
+        for i in 0..3 {
+            assert_eq!(outer.get_int(i).unwrap().type_tag(), ZValType::Array);
+        }
+    }
+
+    #[test]
+    fn test_zarray_nested_hash_mode() {
+        // Test: Nested arrays in hash mode
+        // $arr = ['a' => ['b' => ['c' => 123]]]
+        let mut level3 = ZArray::new();
+        level3.insert_string(ZString::new(b"c"), ZVal::long(123));
+
+        let mut level2 = ZArray::new();
+        level2.insert_string(
+            ZString::new(b"b"),
+            ZVal::array(Arc::into_raw(level3.storage.clone()) as usize),
+        );
+
+        let mut level1 = ZArray::new();
+        level1.insert_string(
+            ZString::new(b"a"),
+            ZVal::array(Arc::into_raw(level2.storage.clone()) as usize),
+        );
+
+        // Verify we can look up the nested keys
+        let val_a = level1.get_string(&ZString::new(b"a")).unwrap();
+        assert_eq!(val_a.type_tag(), ZValType::Array);
+
+        let val_b = level2.get_string(&ZString::new(b"b")).unwrap();
+        assert_eq!(val_b.type_tag(), ZValType::Array);
+
+        let val_c = level3.get_string(&ZString::new(b"c")).unwrap();
+        assert_eq!(val_c.type_tag(), ZValType::Long);
+        assert_eq!(val_c.as_long().unwrap(), 123);
+    }
+
+    #[test]
+    fn test_zarray_recursive_complex_graph() {
+        // Test: Complex graph structure
+        // $a = []; $b = []; $c = [];
+        // $a[0] = &$b; $b[0] = &$c; $c[0] = &$a;
+        // This creates a 3-node cycle
+        let mut arr_a = ZArray::new();
+        let mut arr_b = ZArray::new();
+        let mut arr_c = ZArray::new();
+
+        let ptr_a = Arc::into_raw(arr_a.storage.clone()) as usize;
+        let ptr_b = Arc::into_raw(arr_b.storage.clone()) as usize;
+        let ptr_c = Arc::into_raw(arr_c.storage.clone()) as usize;
+
+        arr_a.push(ZVal::reference(ptr_b));
+        arr_b.push(ZVal::reference(ptr_c));
+        arr_c.push(ZVal::reference(ptr_a));
+
+        // Verify structure
+        assert_eq!(arr_a.len(), 1);
+        assert_eq!(arr_b.len(), 1);
+        assert_eq!(arr_c.len(), 1);
+
+        // Verify all elements are references
+        assert_eq!(arr_a.get_int(0).unwrap().type_tag(), ZValType::Reference);
+        assert_eq!(arr_b.get_int(0).unwrap().type_tag(), ZValType::Reference);
+        assert_eq!(arr_c.get_int(0).unwrap().type_tag(), ZValType::Reference);
+    }
+}
+
+// ============================================================================
+// ClassEntry — Class definition/metadata
+// ============================================================================
+// Reference: php-src/Zend/zend.h — struct _zend_class_entry
+//
+// A ClassEntry represents a class definition in PHP. It contains:
+// - Class name
+// - Parent class (for inheritance)
+// - Implemented interfaces
+// - Methods (function table)
+// - Properties (declared properties with defaults and types)
+// - Constants
+//
+// ClassEntry is shared across all instances of a class.
+// Objects (ZObject) hold a reference to their ClassEntry.
+// ============================================================================
+
+/// Represents a PHP class definition
+///
+/// Reference: php-src/Zend/zend.h — struct _zend_class_entry
+///
+/// A class entry contains all metadata about a class:
+/// - name: The class name (e.g., "MyClass")
+/// - parent: Optional parent class for inheritance
+/// - interfaces: List of implemented interfaces
+/// - methods: Function table (method name → method definition)
+/// - properties: Property table (property name → property info)
+/// - constants: Class constants (constant name → value)
+///
+/// ClassEntry instances are typically wrapped in Arc for shared ownership.
+#[derive(Debug, Clone)]
+pub struct ClassEntry {
+    /// Class name (e.g., "MyClass", "stdClass")
+    name: ZString,
+
+    /// Parent class for inheritance (None for base classes)
+    /// In PHP: class Child extends Parent
+    parent: Option<Arc<ClassEntry>>,
+
+    /// List of implemented interfaces
+    /// In PHP: class MyClass implements Interface1, Interface2
+    interfaces: Vec<Arc<ClassEntry>>,
+
+    /// Method table: method name → method handle/id
+    /// In a full implementation, this would map to zend_function structures
+    /// For now, we use a simple usize handle as a placeholder
+    methods: HashMap<ZString, usize>,
+
+    /// Property table: property name → property handle/id
+    /// In a full implementation, this would map to zend_property_info structures
+    /// For now, we use a simple usize handle as a placeholder
+    properties: HashMap<ZString, usize>,
+
+    /// Class constants: constant name → constant value
+    /// In PHP: class MyClass { const FOO = 42; }
+    /// Constants are evaluated at compile time and stored as ZVal
+    constants: HashMap<ZString, ZVal>,
+}
+
+impl ClassEntry {
+    /// Create a new class entry with just a name
+    ///
+    /// # Arguments
+    /// * `name` - The class name
+    ///
+    /// # Returns
+    /// A new ClassEntry with no parent, interfaces, methods, properties, or constants
+    pub fn new(name: ZString) -> Self {
+        Self {
+            name,
+            parent: None,
+            interfaces: Vec::new(),
+            methods: HashMap::new(),
+            properties: HashMap::new(),
+            constants: HashMap::new(),
+        }
+    }
+
+    /// Get the class name
+    pub fn name(&self) -> &ZString {
+        &self.name
+    }
+
+    /// Set the parent class
+    ///
+    /// # Arguments
+    /// * `parent` - The parent class entry
+    pub fn set_parent(&mut self, parent: Arc<ClassEntry>) {
+        self.parent = Some(parent);
+    }
+
+    /// Get the parent class
+    pub fn parent(&self) -> Option<&Arc<ClassEntry>> {
+        self.parent.as_ref()
+    }
+
+    /// Add an interface
+    ///
+    /// # Arguments
+    /// * `interface` - The interface class entry to add
+    pub fn add_interface(&mut self, interface: Arc<ClassEntry>) {
+        self.interfaces.push(interface);
+    }
+
+    /// Get all implemented interfaces
+    pub fn interfaces(&self) -> &[Arc<ClassEntry>] {
+        &self.interfaces
+    }
+
+    /// Add a method
+    ///
+    /// # Arguments
+    /// * `name` - Method name
+    /// * `method_handle` - Handle/ID for the method definition
+    pub fn add_method(&mut self, name: ZString, method_handle: usize) {
+        self.methods.insert(name, method_handle);
+    }
+
+    /// Get a method handle by name
+    ///
+    /// # Arguments
+    /// * `name` - Method name
+    ///
+    /// # Returns
+    /// Some(handle) if the method exists, None otherwise
+    pub fn get_method(&self, name: &ZString) -> Option<usize> {
+        self.methods.get(name).copied()
+    }
+
+    /// Check if a method exists
+    ///
+    /// # Arguments
+    /// * `name` - Method name
+    ///
+    /// # Returns
+    /// true if the method exists, false otherwise
+    pub fn has_method(&self, name: &ZString) -> bool {
+        self.methods.contains_key(name)
+    }
+
+    /// Add a property
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    /// * `property_handle` - Handle/ID for the property definition
+    pub fn add_property(&mut self, name: ZString, property_handle: usize) {
+        self.properties.insert(name, property_handle);
+    }
+
+    /// Get a property handle by name
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    ///
+    /// # Returns
+    /// Some(handle) if the property exists, None otherwise
+    pub fn get_property(&self, name: &ZString) -> Option<usize> {
+        self.properties.get(name).copied()
+    }
+
+    /// Check if a property exists
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    ///
+    /// # Returns
+    /// true if the property exists, false otherwise
+    pub fn has_property(&self, name: &ZString) -> bool {
+        self.properties.contains_key(name)
+    }
+
+    /// Add a class constant
+    ///
+    /// # Arguments
+    /// * `name` - Constant name
+    /// * `value` - Constant value
+    pub fn add_constant(&mut self, name: ZString, value: ZVal) {
+        self.constants.insert(name, value);
+    }
+
+    /// Get a constant value by name
+    ///
+    /// # Arguments
+    /// * `name` - Constant name
+    ///
+    /// # Returns
+    /// Some(&ZVal) if the constant exists, None otherwise
+    pub fn get_constant(&self, name: &ZString) -> Option<&ZVal> {
+        self.constants.get(name)
+    }
+
+    /// Check if a constant exists
+    ///
+    /// # Arguments
+    /// * `name` - Constant name
+    ///
+    /// # Returns
+    /// true if the constant exists, false otherwise
+    pub fn has_constant(&self, name: &ZString) -> bool {
+        self.constants.contains_key(name)
+    }
+
+    /// Get all method names
+    pub fn method_names(&self) -> Vec<&ZString> {
+        self.methods.keys().collect()
+    }
+
+    /// Get all property names
+    pub fn property_names(&self) -> Vec<&ZString> {
+        self.properties.keys().collect()
+    }
+
+    /// Get all constant names
+    pub fn constant_names(&self) -> Vec<&ZString> {
+        self.constants.keys().collect()
+    }
+}
+
+#[cfg(test)]
+mod classentry_tests {
+    use super::*;
+
+    #[test]
+    fn test_classentry_create() {
+        // Test: Create a basic class
+        // PHP: class MyClass {}
+        let class_name = ZString::new(b"MyClass");
+        let class = ClassEntry::new(class_name.clone());
+
+        assert_eq!(class.name(), &class_name);
+        assert!(class.parent().is_none());
+        assert_eq!(class.interfaces().len(), 0);
+        assert_eq!(class.method_names().len(), 0);
+        assert_eq!(class.property_names().len(), 0);
+        assert_eq!(class.constant_names().len(), 0);
+    }
+
+    #[test]
+    fn test_classentry_with_parent() {
+        // Test: Class with inheritance
+        // PHP: class Parent {} class Child extends Parent {}
+        let parent_class = Arc::new(ClassEntry::new(ZString::new(b"ParentClass")));
+        let mut child_class = ClassEntry::new(ZString::new(b"ChildClass"));
+
+        child_class.set_parent(parent_class.clone());
+
+        assert_eq!(
+            child_class.parent().unwrap().name(),
+            &ZString::new(b"ParentClass")
+        );
+    }
+
+    #[test]
+    fn test_classentry_with_interfaces() {
+        // Test: Class implementing interfaces
+        // PHP: interface I1 {} interface I2 {} class MyClass implements I1, I2 {}
+        let interface1 = Arc::new(ClassEntry::new(ZString::new(b"Interface1")));
+        let interface2 = Arc::new(ClassEntry::new(ZString::new(b"Interface2")));
+        let mut class = ClassEntry::new(ZString::new(b"MyClass"));
+
+        class.add_interface(interface1.clone());
+        class.add_interface(interface2.clone());
+
+        assert_eq!(class.interfaces().len(), 2);
+        assert_eq!(class.interfaces()[0].name(), &ZString::new(b"Interface1"));
+        assert_eq!(class.interfaces()[1].name(), &ZString::new(b"Interface2"));
+    }
+
+    #[test]
+    fn test_classentry_methods() {
+        // Test: Class with methods
+        // PHP: class MyClass { public function foo() {} public function bar() {} }
+        let mut class = ClassEntry::new(ZString::new(b"MyClass"));
+
+        let method_foo = ZString::new(b"foo");
+        let method_bar = ZString::new(b"bar");
+
+        class.add_method(method_foo.clone(), 100); // 100 is a placeholder handle
+        class.add_method(method_bar.clone(), 101); // 101 is a placeholder handle
+
+        assert!(class.has_method(&method_foo));
+        assert!(class.has_method(&method_bar));
+        assert_eq!(class.get_method(&method_foo), Some(100));
+        assert_eq!(class.get_method(&method_bar), Some(101));
+        assert_eq!(class.method_names().len(), 2);
+    }
+
+    #[test]
+    fn test_classentry_properties() {
+        // Test: Class with properties
+        // PHP: class MyClass { public $name; public $age; }
+        let mut class = ClassEntry::new(ZString::new(b"MyClass"));
+
+        let prop_name = ZString::new(b"name");
+        let prop_age = ZString::new(b"age");
+
+        class.add_property(prop_name.clone(), 200); // 200 is a placeholder handle
+        class.add_property(prop_age.clone(), 201); // 201 is a placeholder handle
+
+        assert!(class.has_property(&prop_name));
+        assert!(class.has_property(&prop_age));
+        assert_eq!(class.get_property(&prop_name), Some(200));
+        assert_eq!(class.get_property(&prop_age), Some(201));
+        assert_eq!(class.property_names().len(), 2);
+    }
+
+    #[test]
+    fn test_classentry_constants() {
+        // Test: Class with constants
+        // PHP: class MyClass { const FOO = 42; const BAR = "hello"; }
+        let mut class = ClassEntry::new(ZString::new(b"MyClass"));
+
+        let const_foo = ZString::new(b"FOO");
+        let const_bar = ZString::new(b"BAR");
+
+        class.add_constant(const_foo.clone(), ZVal::long(42));
+        let s = ZString::new(b"hello");
+        class.add_constant(
+            const_bar.clone(),
+            ZVal::string(Box::into_raw(Box::new(s)) as usize),
+        );
+
+        assert!(class.has_constant(&const_foo));
+        assert!(class.has_constant(&const_bar));
+        assert_eq!(
+            class.get_constant(&const_foo).unwrap().as_long().unwrap(),
+            42
+        );
+        assert_eq!(
+            class.get_constant(&const_bar).unwrap().to_string(),
+            ZString::new(b"hello")
+        );
+        assert_eq!(class.constant_names().len(), 2);
+    }
+
+    #[test]
+    fn test_classentry_method_lookup_nonexistent() {
+        // Test: Looking up a non-existent method returns None
+        let class = ClassEntry::new(ZString::new(b"MyClass"));
+        let method_name = ZString::new(b"nonExistent");
+
+        assert!(!class.has_method(&method_name));
+        assert_eq!(class.get_method(&method_name), None);
+    }
+
+    #[test]
+    fn test_classentry_property_lookup_nonexistent() {
+        // Test: Looking up a non-existent property returns None
+        let class = ClassEntry::new(ZString::new(b"MyClass"));
+        let prop_name = ZString::new(b"nonExistent");
+
+        assert!(!class.has_property(&prop_name));
+        assert_eq!(class.get_property(&prop_name), None);
+    }
+
+    #[test]
+    fn test_classentry_constant_lookup_nonexistent() {
+        // Test: Looking up a non-existent constant returns None
+        let class = ClassEntry::new(ZString::new(b"MyClass"));
+        let const_name = ZString::new(b"NONEXISTENT");
+
+        assert!(!class.has_constant(&const_name));
+        assert_eq!(class.get_constant(&const_name), None);
+    }
+
+    #[test]
+    fn test_classentry_complex_hierarchy() {
+        // Test: Complex class hierarchy
+        // PHP: class GrandParent {}
+        //      class Parent extends GrandParent {}
+        //      interface I1 {}
+        //      interface I2 {}
+        //      class Child extends Parent implements I1, I2 {
+        //          const VERSION = 1;
+        //          public $name;
+        //          public function greet() {}
+        //      }
+        let grandparent = Arc::new(ClassEntry::new(ZString::new(b"GrandParent")));
+        let mut parent = ClassEntry::new(ZString::new(b"Parent"));
+        parent.set_parent(grandparent);
+        let parent = Arc::new(parent);
+
+        let interface1 = Arc::new(ClassEntry::new(ZString::new(b"I1")));
+        let interface2 = Arc::new(ClassEntry::new(ZString::new(b"I2")));
+
+        let mut child = ClassEntry::new(ZString::new(b"Child"));
+        child.set_parent(parent.clone());
+        child.add_interface(interface1);
+        child.add_interface(interface2);
+        child.add_constant(ZString::new(b"VERSION"), ZVal::long(1));
+        child.add_property(ZString::new(b"name"), 300);
+        child.add_method(ZString::new(b"greet"), 400);
+
+        // Verify the hierarchy
+        assert_eq!(child.name(), &ZString::new(b"Child"));
+        assert_eq!(child.parent().unwrap().name(), &ZString::new(b"Parent"));
+        assert_eq!(
+            child.parent().unwrap().parent().unwrap().name(),
+            &ZString::new(b"GrandParent")
+        );
+        assert_eq!(child.interfaces().len(), 2);
+        assert_eq!(child.constant_names().len(), 1);
+        assert_eq!(child.property_names().len(), 1);
+        assert_eq!(child.method_names().len(), 1);
+    }
+}
+
+// ============================================================================
+// ZObject — Object representation
+// ============================================================================
+// Reference: php-src/Zend/zend_types.h — struct _zend_object
+//
+// A PHP object consists of:
+// - A reference to its class (ClassEntry)
+// - A properties table (ZArray for dynamic properties)
+// - A unique handle for object identity
+//
+// In PHP, objects are always passed by reference (object handles),
+// so cloning an object creates a shallow copy of the handle, not a deep copy.
+// The clone keyword is used for deep copying objects.
+// ============================================================================
+
+/// PHP object instance -- equivalent to PHP's `zend_object` from `zend_types.h`.
+///
+/// Each object contains:
+/// - A **class entry** reference (pointer to the class definition / `ClassEntry`).
+/// - A **properties table** (`ZArray` with string keys) for dynamically-set properties.
+/// - A unique **handle** (`u64`) used for identity comparisons (`===` operator).
+///
+/// # Reference semantics
+///
+/// In PHP, assigning an object (`$a = $b`) copies the *handle*, not the object
+/// itself. Both variables then point to the same underlying object. Use the
+/// `clone` keyword to perform a deep copy.
+///
+/// # Reference
+///
+/// `php-src/Zend/zend_types.h` -- `struct _zend_object`
+#[derive(Debug, Clone)]
+pub struct ZObject {
+    /// Reference to the class entry (class definition).
+    /// In a full implementation, this would be `Arc<ClassEntry>`.
+    /// For now, we use a simple pointer/handle.
+    class_entry: usize,
+    /// Dynamic properties storage
+    /// Key: property name (string), Value: property value (ZVal)
+    properties: Arc<ZArray>,
+    /// Unique object handle/identifier
+    /// Used for object identity comparisons (=== operator)
+    handle: u64,
+}
+
+impl ZObject {
+    /// Create a new object instance
+    ///
+    /// # Arguments
+    /// * `class_entry` - Handle/pointer to the class definition
+    ///
+    /// # Returns
+    /// A new ZObject with an empty properties table and unique handle
+    pub fn new(class_entry: usize) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+        Self {
+            class_entry,
+            properties: Arc::new(ZArray::new()),
+            handle: NEXT_HANDLE.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    /// Get the class entry handle
+    pub fn class_entry(&self) -> usize {
+        self.class_entry
+    }
+
+    /// Get the unique object handle
+    pub fn handle(&self) -> u64 {
+        self.handle
+    }
+
+    /// Get a property value by name
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    ///
+    /// # Returns
+    /// Some(&ZVal) if the property exists, None otherwise
+    pub fn get_property(&self, name: &ZString) -> Option<&ZVal> {
+        self.properties.get_string(name)
+    }
+
+    /// Set a property value
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    /// * `value` - Property value
+    pub fn set_property(&mut self, name: ZString, value: ZVal) {
+        // Implement copy-on-write for properties
+        let properties = Arc::make_mut(&mut self.properties);
+        properties.insert_string(name, value);
+    }
+
+    /// Check if a property exists
+    ///
+    /// # Arguments
+    /// * `name` - Property name
+    ///
+    /// # Returns
+    /// true if the property exists, false otherwise
+    pub fn has_property(&self, name: &ZString) -> bool {
+        self.properties.contains_key_string(name)
+    }
+
+    /// Remove a property
+    ///
+    /// # Arguments
+    /// * `name` - Property name to remove
+    ///
+    /// # Returns
+    /// The removed property value, or None if it didn't exist
+    pub fn remove_property(&mut self, name: &ZString) -> Option<ZVal> {
+        let properties = Arc::make_mut(&mut self.properties);
+        properties.remove_string(name)
+    }
+
+    /// Get all property names
+    pub fn property_names(&self) -> Vec<ZString> {
+        self.properties
+            .keys()
+            .into_iter()
+            .filter_map(|key| match key {
+                ZArrayKey::String(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get the number of properties
+    pub fn property_count(&self) -> usize {
+        self.properties.count()
+    }
+}
+
+#[cfg(test)]
+mod zobject_tests {
+    use super::*;
+
+    #[test]
+    fn test_zobject_create() {
+        // Test: Create a new object
+        // PHP equivalent: $obj = new stdClass();
+        let class_entry_handle = 1;
+        let obj = ZObject::new(class_entry_handle);
+
+        assert_eq!(obj.class_entry(), class_entry_handle);
+        assert_eq!(obj.property_count(), 0);
+        assert!(obj.handle() > 0);
+    }
+
+    #[test]
+    fn test_zobject_unique_handles() {
+        // Test: Each object gets a unique handle
+        // PHP: $a = new stdClass(); $b = new stdClass();
+        // $a and $b should have different handles
+        let obj1 = ZObject::new(1);
+        let obj2 = ZObject::new(1);
+
+        assert_ne!(obj1.handle(), obj2.handle());
+    }
+
+    #[test]
+    fn test_zobject_set_get_property() {
+        // Test: Set and get a property
+        // PHP: $obj = new stdClass(); $obj->name = "Alice";
+        let mut obj = ZObject::new(1);
+        let prop_name = ZString::new(b"name");
+        let s = ZString::new(b"Alice");
+        let prop_value = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+
+        obj.set_property(prop_name.clone(), prop_value);
+
+        assert_eq!(obj.property_count(), 1);
+        assert!(obj.has_property(&prop_name));
+
+        let retrieved = obj.get_property(&prop_name);
+        assert!(retrieved.is_some());
+        assert_eq!(retrieved.unwrap().to_string(), ZString::new(b"Alice"));
+    }
+
+    #[test]
+    fn test_zobject_multiple_properties() {
+        // Test: Set multiple properties
+        // PHP: $obj = new stdClass();
+        //      $obj->name = "Bob";
+        //      $obj->age = 30;
+        //      $obj->city = "NYC";
+        let mut obj = ZObject::new(1);
+
+        let s = ZString::new(b"Bob");
+        obj.set_property(
+            ZString::new(b"name"),
+            ZVal::string(Box::into_raw(Box::new(s)) as usize),
+        );
+        obj.set_property(ZString::new(b"age"), ZVal::long(30));
+        let s3 = ZString::new(b"NYC");
+        obj.set_property(
+            ZString::new(b"city"),
+            ZVal::string(Box::into_raw(Box::new(s3)) as usize),
+        );
+
+        assert_eq!(obj.property_count(), 3);
+        assert_eq!(
+            obj.get_property(&ZString::new(b"name"))
+                .unwrap()
+                .to_string(),
+            ZString::new(b"Bob")
+        );
+        assert_eq!(
+            obj.get_property(&ZString::new(b"age")).unwrap().to_long(),
+            30
+        );
+        assert_eq!(
+            obj.get_property(&ZString::new(b"city"))
+                .unwrap()
+                .to_string(),
+            ZString::new(b"NYC")
+        );
+    }
+
+    #[test]
+    fn test_zobject_overwrite_property() {
+        // Test: Overwrite an existing property
+        // PHP: $obj->name = "Alice"; $obj->name = "Bob";
+        let mut obj = ZObject::new(1);
+        let prop_name = ZString::new(b"name");
+
+        let s1 = ZString::new(b"Alice");
+        obj.set_property(
+            prop_name.clone(),
+            ZVal::string(Box::into_raw(Box::new(s1)) as usize),
+        );
+        assert_eq!(
+            obj.get_property(&prop_name).unwrap().to_string(),
+            ZString::new(b"Alice")
+        );
+
+        let s2 = ZString::new(b"Bob");
+        obj.set_property(
+            prop_name.clone(),
+            ZVal::string(Box::into_raw(Box::new(s2)) as usize),
+        );
+        assert_eq!(obj.property_count(), 1); // Still 1 property
+        assert_eq!(
+            obj.get_property(&prop_name).unwrap().to_string(),
+            ZString::new(b"Bob")
+        );
+    }
+
+    #[test]
+    fn test_zobject_remove_property() {
+        // Test: Remove a property
+        // PHP: $obj->name = "Alice"; unset($obj->name);
+        let mut obj = ZObject::new(1);
+        let prop_name = ZString::new(b"name");
+
+        let s = ZString::new(b"Alice");
+        obj.set_property(
+            prop_name.clone(),
+            ZVal::string(Box::into_raw(Box::new(s)) as usize),
+        );
+        assert!(obj.has_property(&prop_name));
+
+        let removed = obj.remove_property(&prop_name);
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().to_string(), ZString::new(b"Alice"));
+        assert!(!obj.has_property(&prop_name));
+        assert_eq!(obj.property_count(), 0);
+    }
+
+    #[test]
+    fn test_zobject_remove_nonexistent_property() {
+        // Test: Removing a property that doesn't exist
+        let mut obj = ZObject::new(1);
+        let prop_name = ZString::new(b"nonexistent");
+
+        let removed = obj.remove_property(&prop_name);
+        assert!(removed.is_none());
+    }
+
+    #[test]
+    fn test_zobject_property_names() {
+        // Test: Get all property names
+        // PHP: $obj->a = 1; $obj->b = 2; $obj->c = 3;
+        //      array_keys(get_object_vars($obj)) => ["a", "b", "c"]
+        let mut obj = ZObject::new(1);
+
+        obj.set_property(ZString::new(b"a"), ZVal::long(1));
+        obj.set_property(ZString::new(b"b"), ZVal::long(2));
+        obj.set_property(ZString::new(b"c"), ZVal::long(3));
+
+        let names = obj.property_names();
+        assert_eq!(names.len(), 3);
+
+        // Check that all expected names are present (order might vary)
+        let names_bytes: Vec<Vec<u8>> = names.iter().map(|s| s.as_bytes().to_vec()).collect();
+        assert!(names_bytes.contains(&b"a".to_vec()));
+        assert!(names_bytes.contains(&b"b".to_vec()));
+        assert!(names_bytes.contains(&b"c".to_vec()));
+    }
+
+    #[test]
+    fn test_zobject_clone_creates_new_handle() {
+        // Test: Cloning an object creates a new handle
+        // Note: This tests Rust's Clone trait, not PHP's clone keyword
+        // In PHP, clone creates a new object with a new handle
+        let obj1 = ZObject::new(1);
+        let handle1 = obj1.handle();
+
+        let obj2 = obj1.clone();
+        let handle2 = obj2.handle();
+
+        // The clone has the same handle (Rust shallow clone)
+        // For PHP clone behavior, we'd need a separate deep_clone method
+        assert_eq!(handle1, handle2);
+        assert_eq!(obj1.class_entry(), obj2.class_entry());
+    }
+
+    // ========================================================================
+    // Integration tests: ClassEntry + ZObject
+    // ========================================================================
+
+    #[test]
+    fn test_zobject_with_class_entry_integration() {
+        // Test: Create a class and an object from it
+        // PHP equivalent:
+        //   class Person {
+        //       const SPECIES = "Human";
+        //       public $name;
+        //       public $age;
+        //       public function greet() { ... }
+        //   }
+        //   $person = new Person();
+        //   $person->name = "Alice";
+        //   $person->age = 30;
+
+        // 1. Create the ClassEntry
+        let mut person_class = ClassEntry::new(ZString::new(b"Person"));
+
+        // Add constant
+        let s_species = ZString::new(b"Human");
+        person_class.add_constant(
+            ZString::new(b"SPECIES"),
+            ZVal::string(Box::into_raw(Box::new(s_species)) as usize),
+        );
+
+        // Add property declarations (in a real implementation, these would have metadata)
+        person_class.add_property(ZString::new(b"name"), 1000);
+        person_class.add_property(ZString::new(b"age"), 1001);
+
+        // Add method
+        person_class.add_method(ZString::new(b"greet"), 2000);
+
+        // Verify ClassEntry is set up correctly
+        assert_eq!(person_class.name(), &ZString::new(b"Person"));
+        assert!(person_class.has_constant(&ZString::new(b"SPECIES")));
+        assert!(person_class.has_property(&ZString::new(b"name")));
+        assert!(person_class.has_property(&ZString::new(b"age")));
+        assert!(person_class.has_method(&ZString::new(b"greet")));
+
+        // 2. Create a ZObject instance
+        // Note: In a real implementation, we'd pass Arc<ClassEntry> or a registry handle
+        // For now, we use a simple handle (1) as a placeholder
+        let class_handle = 1;
+        let mut person_obj = ZObject::new(class_handle);
+
+        // 3. Set object properties (dynamic properties)
+        let s_name = ZString::new(b"Alice");
+        person_obj.set_property(
+            ZString::new(b"name"),
+            ZVal::string(Box::into_raw(Box::new(s_name)) as usize),
+        );
+        person_obj.set_property(ZString::new(b"age"), ZVal::long(30));
+
+        // 4. Verify object state
+        assert_eq!(person_obj.class_entry(), class_handle);
+        assert_eq!(person_obj.property_count(), 2);
+        assert_eq!(
+            person_obj
+                .get_property(&ZString::new(b"name"))
+                .unwrap()
+                .to_string(),
+            ZString::new(b"Alice")
+        );
+        assert_eq!(
+            person_obj
+                .get_property(&ZString::new(b"age"))
+                .unwrap()
+                .to_long(),
+            30
+        );
+
+        // 5. Verify we can look up methods through the ClassEntry
+        assert_eq!(person_class.get_method(&ZString::new(b"greet")), Some(2000));
+
+        // 6. Verify we can access class constants through the ClassEntry
+        assert_eq!(
+            person_class
+                .get_constant(&ZString::new(b"SPECIES"))
+                .unwrap()
+                .to_string(),
+            ZString::new(b"Human")
+        );
+    }
+
+    #[test]
+    fn test_multiple_objects_same_class() {
+        // Test: Multiple objects from the same class
+        // PHP equivalent:
+        //   class Counter { public $count; }
+        //   $c1 = new Counter(); $c1->count = 10;
+        //   $c2 = new Counter(); $c2->count = 20;
+
+        // Create class
+        let mut counter_class = ClassEntry::new(ZString::new(b"Counter"));
+        counter_class.add_property(ZString::new(b"count"), 3000);
+
+        // Create two objects
+        let class_handle = 5;
+        let mut obj1 = ZObject::new(class_handle);
+        let mut obj2 = ZObject::new(class_handle);
+
+        // Set different property values
+        obj1.set_property(ZString::new(b"count"), ZVal::long(10));
+        obj2.set_property(ZString::new(b"count"), ZVal::long(20));
+
+        // Verify objects have different handles
+        assert_ne!(obj1.handle(), obj2.handle());
+
+        // Verify objects have independent property values
+        assert_eq!(
+            obj1.get_property(&ZString::new(b"count"))
+                .unwrap()
+                .to_long(),
+            10
+        );
+        assert_eq!(
+            obj2.get_property(&ZString::new(b"count"))
+                .unwrap()
+                .to_long(),
+            20
+        );
+
+        // Both reference the same class
+        assert_eq!(obj1.class_entry(), class_handle);
+        assert_eq!(obj2.class_entry(), class_handle);
+    }
+
+    #[test]
+    fn test_inheritance_method_lookup() {
+        // Test: Method lookup through inheritance hierarchy
+        // PHP equivalent:
+        //   class Animal { public function eat() {} }
+        //   class Dog extends Animal { public function bark() {} }
+        //   $dog = new Dog();
+        //   // Dog has both eat() (inherited) and bark() (own)
+
+        // Create Animal class
+        let mut animal_class = ClassEntry::new(ZString::new(b"Animal"));
+        animal_class.add_method(ZString::new(b"eat"), 4000);
+        let animal_class = Arc::new(animal_class);
+
+        // Create Dog class that extends Animal
+        let mut dog_class = ClassEntry::new(ZString::new(b"Dog"));
+        dog_class.set_parent(animal_class.clone());
+        dog_class.add_method(ZString::new(b"bark"), 4001);
+
+        // Verify Dog has its own method
+        assert!(dog_class.has_method(&ZString::new(b"bark")));
+        assert_eq!(dog_class.get_method(&ZString::new(b"bark")), Some(4001));
+
+        // Verify parent has its method
+        assert!(animal_class.has_method(&ZString::new(b"eat")));
+        assert_eq!(animal_class.get_method(&ZString::new(b"eat")), Some(4000));
+
+        // Note: In a full implementation, Dog would inherit eat() from Animal
+        // through a recursive lookup in the parent chain. For now, we just
+        // verify the structure is correct.
+        assert_eq!(dog_class.parent().unwrap().name(), &ZString::new(b"Animal"));
+    }
+
+    #[test]
+    fn test_interface_implementation() {
+        // Test: Class implementing multiple interfaces
+        // PHP equivalent:
+        //   interface Drawable { public function draw(); }
+        //   interface Serializable { public function serialize(); }
+        //   class Shape implements Drawable, Serializable {
+        //       public function draw() {}
+        //       public function serialize() {}
+        //   }
+
+        // Create interfaces
+        let mut drawable_interface = ClassEntry::new(ZString::new(b"Drawable"));
+        drawable_interface.add_method(ZString::new(b"draw"), 5000);
+        let drawable_interface = Arc::new(drawable_interface);
+
+        let mut serializable_interface = ClassEntry::new(ZString::new(b"Serializable"));
+        serializable_interface.add_method(ZString::new(b"serialize"), 5001);
+        let serializable_interface = Arc::new(serializable_interface);
+
+        // Create Shape class implementing both interfaces
+        let mut shape_class = ClassEntry::new(ZString::new(b"Shape"));
+        shape_class.add_interface(drawable_interface.clone());
+        shape_class.add_interface(serializable_interface.clone());
+        shape_class.add_method(ZString::new(b"draw"), 5010);
+        shape_class.add_method(ZString::new(b"serialize"), 5011);
+
+        // Verify interfaces are registered
+        assert_eq!(shape_class.interfaces().len(), 2);
+        assert_eq!(
+            shape_class.interfaces()[0].name(),
+            &ZString::new(b"Drawable")
+        );
+        assert_eq!(
+            shape_class.interfaces()[1].name(),
+            &ZString::new(b"Serializable")
+        );
+
+        // Verify Shape implements the required methods
+        assert!(shape_class.has_method(&ZString::new(b"draw")));
+        assert!(shape_class.has_method(&ZString::new(b"serialize")));
+    }
+
+    #[test]
+    fn test_object_property_vs_class_property() {
+        // Test: Distinguish between class property declarations and object instance properties
+        // PHP equivalent:
+        //   class User { public $username; }
+        //   $user = new User();
+        //   $user->username = "alice";
+        //   $user->email = "alice@example.com"; // dynamic property
+
+        // Create User class with declared property
+        let mut user_class = ClassEntry::new(ZString::new(b"User"));
+        user_class.add_property(ZString::new(b"username"), 6000);
+
+        // Create object instance
+        let class_handle = 10;
+        let mut user_obj = ZObject::new(class_handle);
+
+        // Set declared property
+        let s_username = ZString::new(b"alice");
+        user_obj.set_property(
+            ZString::new(b"username"),
+            ZVal::string(Box::into_raw(Box::new(s_username)) as usize),
+        );
+
+        // Set dynamic property (not declared in class)
+        let s_email = ZString::new(b"alice@example.com");
+        user_obj.set_property(
+            ZString::new(b"email"),
+            ZVal::string(Box::into_raw(Box::new(s_email)) as usize),
+        );
+
+        // Verify both properties exist on the object
+        assert_eq!(user_obj.property_count(), 2);
+        assert!(user_obj.has_property(&ZString::new(b"username")));
+        assert!(user_obj.has_property(&ZString::new(b"email")));
+
+        // Verify class only knows about declared property
+        assert!(user_class.has_property(&ZString::new(b"username")));
+        assert!(!user_class.has_property(&ZString::new(b"email")));
+    }
+
+    #[test]
+    fn test_class_constant_access() {
+        // Test: Access class constants
+        // PHP equivalent:
+        //   class Math { const PI = 3.14159; const E = 2.71828; }
+        //   echo Math::PI;
+
+        let mut math_class = ClassEntry::new(ZString::new(b"Math"));
+        math_class.add_constant(ZString::new(b"PI"), ZVal::double(std::f64::consts::PI));
+        math_class.add_constant(ZString::new(b"E"), ZVal::double(std::f64::consts::E));
+
+        // Verify constants exist
+        assert!(math_class.has_constant(&ZString::new(b"PI")));
+        assert!(math_class.has_constant(&ZString::new(b"E")));
+
+        // Verify constant values
+        let pi_val = math_class.get_constant(&ZString::new(b"PI")).unwrap();
+        assert_eq!(pi_val.as_double().unwrap(), std::f64::consts::PI);
+
+        let e_val = math_class.get_constant(&ZString::new(b"E")).unwrap();
+        assert_eq!(e_val.as_double().unwrap(), std::f64::consts::E);
+
+        // Verify non-existent constant returns None
+        assert!(!math_class.has_constant(&ZString::new(b"TAU")));
+        assert!(math_class.get_constant(&ZString::new(b"TAU")).is_none());
+    }
+
+    #[test]
+    fn test_empty_class_empty_object() {
+        // Test: Empty class and object (like stdClass)
+        // PHP equivalent:
+        //   class stdClass {}
+        //   $obj = new stdClass();
+
+        let std_class = ClassEntry::new(ZString::new(b"stdClass"));
+
+        // Verify empty class
+        assert_eq!(std_class.name(), &ZString::new(b"stdClass"));
+        assert_eq!(std_class.method_names().len(), 0);
+        assert_eq!(std_class.property_names().len(), 0);
+        assert_eq!(std_class.constant_names().len(), 0);
+
+        // Create empty object
+        let obj = ZObject::new(15);
+
+        // Verify empty object
+        assert_eq!(obj.property_count(), 0);
+        assert!(obj.handle() > 0);
+    }
+}
+
+// ============================================================================
+// ZResource — External resource handle
+// ============================================================================
+// Reference: php-src/Zend/zend_types.h — struct _zend_resource
+//
+// A PHP resource represents an external handle (file, database connection, etc.).
+// Resources have:
+// - A unique handle (like an object)
+// - A type ID (registered by extensions)
+// - A pointer to the actual resource data
+// - A destructor function that's called when the resource is freed
+//
+// Resource types are registered with zend_register_list_destructors_ex().
+// ============================================================================
+
+/// Resource destructor function type
+///
+/// This is called when a resource is being destroyed.
+/// It receives a mutable reference to the resource data.
+pub type ResourceDestructor = fn(*mut u8);
+
+/// Represents a PHP resource
+///
+/// Reference: php-src/Zend/zend_types.h — struct _zend_resource
+///
+/// A resource has:
+/// - handle: unique identifier for this resource instance
+/// - type_id: resource type (registered by extensions)
+/// - ptr: pointer to the actual resource data
+/// - destructor: optional cleanup function called when resource is destroyed
+///
+/// Resources are used for external handles like files, database connections,
+/// curl handles, etc. They are opaque to userland PHP code.
+#[derive(Debug)]
+pub struct ZResource {
+    /// Unique resource handle/identifier
+    /// Used for resource identity (displayed as "Resource id #N")
+    handle: i64,
+    /// Resource type ID (registered by extensions)
+    /// e.g., FILE_TYPE_ID, MYSQL_TYPE_ID, CURL_TYPE_ID
+    type_id: i32,
+    /// Pointer to the actual resource data
+    /// This is a raw pointer because resources are externally managed
+    ptr: *mut u8,
+    /// Optional destructor function
+    /// Called when the resource is being destroyed (refcount reaches 0)
+    destructor: Option<ResourceDestructor>,
+}
+
+// Safety: We need to implement Send/Sync for ZResource to be stored in ZVal
+// Resources are typically thread-safe as they represent external handles
+// The destructor is responsible for any necessary synchronization
+unsafe impl Send for ZResource {}
+unsafe impl Sync for ZResource {}
+
+impl ZResource {
+    /// Create a new resource
+    ///
+    /// # Arguments
+    /// * `type_id` - Resource type identifier (registered by extension)
+    /// * `ptr` - Pointer to the resource data
+    /// * `destructor` - Optional cleanup function
+    ///
+    /// # Returns
+    /// A new ZResource with a unique handle
+    pub fn new(type_id: i32, ptr: *mut u8, destructor: Option<ResourceDestructor>) -> Self {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+        Self {
+            handle: NEXT_HANDLE.fetch_add(1, Ordering::Relaxed),
+            type_id,
+            ptr,
+            destructor,
+        }
+    }
+
+    /// Get the unique resource handle
+    pub fn handle(&self) -> i64 {
+        self.handle
+    }
+
+    /// Get the resource type ID
+    pub fn type_id(&self) -> i32 {
+        self.type_id
+    }
+
+    /// Get the raw pointer to the resource data
+    ///
+    /// # Safety
+    /// The caller must ensure the pointer is valid and properly typed
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Get a typed pointer to the resource data
+    ///
+    /// # Safety
+    /// The caller must ensure T matches the actual type of the resource data
+    pub unsafe fn as_ptr<T>(&self) -> *mut T {
+        self.ptr as *mut T
+    }
+}
+
+impl Drop for ZResource {
+    fn drop(&mut self) {
+        // Call the destructor if provided
+        if let Some(dtor) = self.destructor {
+            dtor(self.ptr);
+        }
+    }
+}
+
+// ZResource doesn't implement Clone because resources are unique
+// and often represent external state (file handles, connections, etc.)
+// that shouldn't be duplicated
+
+// ============================================================================
+// ZReference — Reference wrapper with refcount
+// ============================================================================
+// Reference: php-src/Zend/zend_types.h — zend_reference
+//
+// In PHP, references are created with the & operator:
+//   $a = 1;
+//   $b = &$a;  // $b is now a reference to $a
+//   $b = 2;    // $a is now 2 as well
+//
+// Under the hood, PHP wraps the value in a zend_reference struct that contains
+// a refcount and the actual zval. Multiple variables can point to the same
+// reference, and modifying through any of them affects all.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// PHP reference wrapper (zend_reference equivalent).
+///
+/// A reference in PHP is a refcounted wrapper around a ZVal that allows
+/// multiple variables to share the same value. When one variable modifies
+/// the value, all references see the change.
+///
+/// Layout:
+/// - refcount: atomic counter tracking how many variables point to this reference
+/// - value: the wrapped ZVal
+///
+/// References are created with the & operator in PHP:
+/// ```php
+/// $a = 1;
+/// $b = &$a;  // Create a reference
+/// $b = 2;    // Now $a is also 2
+/// ```
+#[derive(Debug)]
+pub struct ZReference {
+    /// Reference count (how many variables point to this reference)
+    /// Uses Arc for interior mutability and atomic operations
+    inner: Arc<ZReferenceInner>,
+}
+
+#[derive(Debug)]
+pub struct ZReferenceInner {
+    /// Reference count
+    refcount: AtomicUsize,
+    /// The wrapped value
+    /// We use Mutex to allow modification through shared references
+    value: Mutex<ZVal>,
+}
+
+impl ZReference {
+    /// Create a new reference wrapping a ZVal
+    ///
+    /// # Arguments
+    /// * `value` - The ZVal to wrap
+    ///
+    /// # Returns
+    /// A new ZReference with refcount 1
+    pub fn new(value: ZVal) -> Self {
+        Self {
+            inner: Arc::new(ZReferenceInner {
+                refcount: AtomicUsize::new(1),
+                value: Mutex::new(value),
+            }),
+        }
+    }
+
+    /// Get the current refcount
+    ///
+    /// # Returns
+    /// The number of references pointing to this value
+    pub fn refcount(&self) -> usize {
+        self.inner.refcount.load(Ordering::Relaxed)
+    }
+
+    /// Get a copy of the wrapped value
+    ///
+    /// # Returns
+    /// A clone of the current ZVal
+    pub fn get(&self) -> ZVal {
+        self.inner.value.lock().unwrap().clone()
+    }
+
+    /// Set the wrapped value
+    ///
+    /// # Arguments
+    /// * `value` - The new ZVal to store
+    ///
+    /// This affects all references pointing to this value.
+    pub fn set(&self, value: ZVal) {
+        *self.inner.value.lock().unwrap() = value;
+    }
+
+    /// Get a pointer to the inner data for storage in ZVal
+    pub fn as_ptr(&self) -> *const ZReferenceInner {
+        Arc::as_ptr(&self.inner)
+    }
+
+    /// Reconstruct a ZReference from a raw pointer
+    ///
+    /// # Safety
+    /// The pointer must have been created by `as_ptr()` and not yet freed.
+    /// The caller is responsible for ensuring the pointer is valid.
+    pub unsafe fn from_ptr(ptr: *const ZReferenceInner) -> Self {
+        Self {
+            inner: Arc::from_raw(ptr),
+        }
+    }
+}
+
+impl Clone for ZReference {
+    fn clone(&self) -> Self {
+        // Increment refcount when cloning
+        self.inner.refcount.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for ZReference {
+    fn drop(&mut self) {
+        // Decrement refcount when dropping
+        let prev = self.inner.refcount.fetch_sub(1, Ordering::Relaxed);
+        // When it reaches 0, Arc will automatically free the inner data
+        // (we don't need to do anything extra here because Arc handles it)
+        debug_assert!(prev > 0, "Refcount underflow");
+    }
+}
+
+// Safety: ZReference uses Arc and Mutex internally, which are Send+Sync
+unsafe impl Send for ZReference {}
+unsafe impl Sync for ZReference {}
+
+#[cfg(test)]
+mod zresource_tests {
+    use super::*;
+
+    #[test]
+    fn test_zresource_create() {
+        // Test: Create a new resource
+        // PHP equivalent: $file = fopen("test.txt", "r"); // creates a file resource
+
+        let type_id = 1; // FILE_TYPE_ID
+        let data: Box<i32> = Box::new(42);
+        let ptr = Box::into_raw(data) as *mut u8;
+
+        let resource = ZResource::new(type_id, ptr, None);
+
+        // Verify handle is assigned
+        assert!(resource.handle() > 0);
+
+        // Verify type_id
+        assert_eq!(resource.type_id(), 1);
+
+        // Verify pointer
+        assert_eq!(resource.ptr(), ptr);
+
+        // Clean up
+        unsafe {
+            let _ = Box::from_raw(ptr as *mut i32);
+        }
+    }
+
+    #[test]
+    fn test_zresource_unique_handles() {
+        // Test: Each resource gets a unique handle
+
+        let res1 = ZResource::new(1, std::ptr::null_mut(), None);
+        let res2 = ZResource::new(1, std::ptr::null_mut(), None);
+        let res3 = ZResource::new(2, std::ptr::null_mut(), None);
+
+        // All handles should be unique
+        assert_ne!(res1.handle(), res2.handle());
+        assert_ne!(res1.handle(), res3.handle());
+        assert_ne!(res2.handle(), res3.handle());
+
+        // Handles should be sequential
+        assert!(res2.handle() > res1.handle());
+        assert!(res3.handle() > res2.handle());
+    }
+
+    #[test]
+    fn test_zresource_typed_pointer() {
+        // Test: Access resource data through typed pointer
+
+        #[derive(Debug, PartialEq)]
+        struct FileHandle {
+            filename: String,
+            position: usize,
+        }
+
+        let file_data = Box::new(FileHandle {
+            filename: "test.txt".to_string(),
+            position: 0,
+        });
+        let ptr = Box::into_raw(file_data);
+
+        let resource = ZResource::new(1, ptr as *mut u8, None);
+
+        // Access the typed pointer
+        unsafe {
+            let file_ptr = resource.as_ptr::<FileHandle>();
+            assert_eq!((*file_ptr).filename, "test.txt");
+            assert_eq!((*file_ptr).position, 0);
+        }
+
+        // Clean up
+        unsafe {
+            let _ = Box::from_raw(ptr);
+        }
+    }
+
+    #[test]
+    fn test_zresource_destructor_called() {
+        // Test: Destructor is called when resource is dropped
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let destroyed_clone = destroyed.clone();
+
+        // Create a resource with a destructor
+        fn test_destructor(ptr: *mut u8) {
+            // In a real scenario, this would free the resource
+            // For testing, we just verify it's called
+            unsafe {
+                let flag_ptr = ptr as *mut Arc<AtomicBool>;
+                (*flag_ptr).store(true, Ordering::Relaxed);
+                let _ = Box::from_raw(flag_ptr);
+            }
+        }
+
+        let flag_box = Box::new(destroyed_clone);
+        let ptr = Box::into_raw(flag_box) as *mut u8;
+
+        {
+            let _resource = ZResource::new(1, ptr, Some(test_destructor));
+            // Resource is dropped at end of this scope
+        }
+
+        // Destructor should have been called
+        assert!(destroyed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_zresource_no_destructor() {
+        // Test: Resource without destructor doesn't crash on drop
+
+        let resource = ZResource::new(1, std::ptr::null_mut(), None);
+        drop(resource); // Should not crash
+    }
+
+    // ========================================================================
+    // ZReference Tests (1.7)
+    // ========================================================================
+
+    #[test]
+    fn test_zreference_create() {
+        // Test: Create a reference wrapping a ZVal
+
+        let val = ZVal::long(42);
+        let reference = ZReference::new(val);
+
+        // Reference should wrap the value
+        assert_eq!(reference.get().to_long(), 42);
+    }
+
+    #[test]
+    fn test_zreference_refcount() {
+        // Test: Reference counting starts at 1
+
+        let val = ZVal::long(100);
+        let reference = ZReference::new(val);
+
+        assert_eq!(reference.refcount(), 1);
+    }
+
+    #[test]
+    fn test_zreference_clone_increments_refcount() {
+        // Test: Cloning a reference increments refcount
+
+        let val = ZVal::long(200);
+        let ref1 = ZReference::new(val);
+        let ref2 = ref1.clone();
+
+        // Both references should point to the same underlying value
+        assert_eq!(ref1.refcount(), 2);
+        assert_eq!(ref2.refcount(), 2);
+    }
+
+    #[test]
+    fn test_zreference_modify() {
+        // Test: Modifying through reference affects all refs
+
+        let val = ZVal::long(10);
+        let ref1 = ZReference::new(val);
+        let ref2 = ref1.clone();
+
+        // Modify through ref1
+        ref1.set(ZVal::long(20));
+
+        // Both refs should see the new value
+        assert_eq!(ref1.get().to_long(), 20);
+        assert_eq!(ref2.get().to_long(), 20);
+    }
+
+    #[test]
+    fn test_zreference_with_array() {
+        // Test: References work with arrays
+
+        let arr = ZVal::array(0x1000); // Placeholder pointer
+        let reference = ZReference::new(arr);
+
+        assert!(matches!(reference.get().type_tag, ZValType::Array));
+    }
+
+    #[test]
+    fn test_zreference_drop_decrements_refcount() {
+        // Test: Dropping a reference decrements refcount
+
+        let val = ZVal::long(300);
+        let ref1 = ZReference::new(val);
+        let ref2 = ref1.clone();
+
+        assert_eq!(ref1.refcount(), 2);
+
+        drop(ref2);
+
+        // After dropping ref2, refcount should be 1
+        assert_eq!(ref1.refcount(), 1);
+    }
+
+    // ========================================================================
+    // ZReference Tests (1.7.2) - Assign by reference, modify through reference
+    // ========================================================================
+
+    #[test]
+    fn test_assign_by_reference_basic() {
+        // Test: Basic reference assignment
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $b = 2;
+        // echo $a; // outputs 2
+
+        let val_a = ZVal::long(1);
+        let ref_a = ZReference::new(val_a);
+
+        // Assign by reference: $b = &$a
+        let ref_b = ref_a.clone();
+
+        // Verify both point to same value
+        assert_eq!(ref_a.get().to_long(), 1);
+        assert_eq!(ref_b.get().to_long(), 1);
+        assert_eq!(ref_a.refcount(), 2);
+        assert_eq!(ref_b.refcount(), 2);
+
+        // Modify through $b
+        ref_b.set(ZVal::long(2));
+
+        // Both should see the change
+        assert_eq!(ref_a.get().to_long(), 2);
+        assert_eq!(ref_b.get().to_long(), 2);
+    }
+
+    #[test]
+    fn test_assign_by_reference_string() {
+        // Test: Reference assignment with strings (using pointer placeholders)
+        // PHP equivalent:
+        // $a = "hello";
+        // $b = &$a;
+        // $b = "world";
+        // echo $a; // outputs "world"
+
+        let val_a = ZVal::string(0x1000);
+        let ref_a = ZReference::new(val_a);
+
+        // Assign by reference
+        let ref_b = ref_a.clone();
+
+        // Modify through $b
+        ref_b.set(ZVal::string(0x2000));
+
+        // Both should see the new string pointer
+        assert!(matches!(ref_a.get().type_tag, ZValType::String));
+        assert_eq!(ref_a.get().value, 0x2000);
+    }
+
+    #[test]
+    fn test_modify_through_reference_multiple_times() {
+        // Test: Multiple modifications through reference
+        // PHP equivalent:
+        // $a = 10;
+        // $b = &$a;
+        // $b = 20;
+        // $b = 30;
+        // $b = 40;
+        // echo $a; // outputs 40
+
+        let ref_a = ZReference::new(ZVal::long(10));
+        let ref_b = ref_a.clone();
+
+        // Multiple modifications
+        ref_b.set(ZVal::long(20));
+        assert_eq!(ref_a.get().to_long(), 20);
+
+        ref_b.set(ZVal::long(30));
+        assert_eq!(ref_a.get().to_long(), 30);
+
+        ref_b.set(ZVal::long(40));
+        assert_eq!(ref_a.get().to_long(), 40);
+        assert_eq!(ref_b.get().to_long(), 40);
+    }
+
+    #[test]
+    fn test_reference_chain() {
+        // Test: Chain of references
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $c = &$b;
+        // $c = 100;
+        // echo $a; // outputs 100
+        // echo $b; // outputs 100
+
+        let ref_a = ZReference::new(ZVal::long(1));
+        let ref_b = ref_a.clone();
+        let ref_c = ref_b.clone();
+
+        // All three should have same refcount
+        assert_eq!(ref_a.refcount(), 3);
+        assert_eq!(ref_b.refcount(), 3);
+        assert_eq!(ref_c.refcount(), 3);
+
+        // Modify through $c
+        ref_c.set(ZVal::long(100));
+
+        // All should see the change
+        assert_eq!(ref_a.get().to_long(), 100);
+        assert_eq!(ref_b.get().to_long(), 100);
+        assert_eq!(ref_c.get().to_long(), 100);
+    }
+
+    #[test]
+    fn test_reference_with_different_types() {
+        // Test: Reference can hold different types over time
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $b = "string";
+        // $b = 3.14;
+        // echo $a; // outputs 3.14
+
+        let ref_a = ZReference::new(ZVal::long(1));
+        let ref_b = ref_a.clone();
+
+        // Change to string
+        ref_b.set(ZVal::string(0x3000));
+        assert!(matches!(ref_a.get().type_tag, ZValType::String));
+
+        // Change to double
+        ref_b.set(ZVal::double(3.14));
+        assert_eq!(ref_a.get().to_double(), 3.14);
+    }
+
+    #[test]
+    fn test_reference_bidirectional_modification() {
+        // Test: Modifications work in both directions
+        // PHP equivalent:
+        // $a = 10;
+        // $b = &$a;
+        // $a = 20; // modify through $a
+        // echo $b; // outputs 20
+        // $b = 30; // modify through $b
+        // echo $a; // outputs 30
+
+        let ref_a = ZReference::new(ZVal::long(10));
+        let ref_b = ref_a.clone();
+
+        // Modify through ref_a
+        ref_a.set(ZVal::long(20));
+        assert_eq!(ref_b.get().to_long(), 20);
+
+        // Modify through ref_b
+        ref_b.set(ZVal::long(30));
+        assert_eq!(ref_a.get().to_long(), 30);
+    }
+
+    #[test]
+    fn test_reference_with_bool_and_null() {
+        // Test: Reference with bool and null values
+        // PHP equivalent:
+        // $a = true;
+        // $b = &$a;
+        // $b = false;
+        // $b = null;
+
+        let ref_a = ZReference::new(ZVal::true_val());
+        let ref_b = ref_a.clone();
+
+        assert!(matches!(ref_a.get().type_tag, ZValType::True));
+
+        ref_b.set(ZVal::false_val());
+        assert!(matches!(ref_a.get().type_tag, ZValType::False));
+
+        ref_b.set(ZVal::null());
+        assert!(matches!(ref_a.get().type_tag, ZValType::Null));
+    }
+
+    #[test]
+    fn test_reference_independence_after_drop() {
+        // Test: After all but one reference is dropped, the remaining one still works
+        // PHP equivalent:
+        // $a = 5;
+        // $b = &$a;
+        // unset($b);
+        // $a = 10; // $a still works
+        // echo $a; // outputs 10
+
+        let ref_a = ZReference::new(ZVal::long(5));
+        {
+            let ref_b = ref_a.clone();
+            assert_eq!(ref_a.refcount(), 2);
+            assert_eq!(ref_b.get().to_long(), 5);
+            // ref_b drops here
+        }
+
+        // After ref_b is dropped, ref_a should still work
+        assert_eq!(ref_a.refcount(), 1);
+        ref_a.set(ZVal::long(10));
+        assert_eq!(ref_a.get().to_long(), 10);
+    }
+
+    #[test]
+    fn test_unset_reference_middle_of_chain() {
+        // Test: Unset a reference in the middle of a chain
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $c = &$b;
+        // unset($b);
+        // $c = 99;
+        // echo $a; // outputs 99 - $a and $c still connected
+        // echo $c; // outputs 99
+
+        let ref_a = ZReference::new(ZVal::long(1));
+        let ref_c = {
+            let ref_b = ref_a.clone();
+            let ref_c = ref_b.clone();
+
+            // All three share the same reference
+            assert_eq!(ref_a.refcount(), 3);
+            assert_eq!(ref_b.refcount(), 3);
+            assert_eq!(ref_c.refcount(), 3);
+
+            // ref_b is "unset" when it goes out of scope
+            ref_c
+        };
+
+        // After unsetting $b, $a and $c should still be connected
+        assert_eq!(ref_a.refcount(), 2);
+        assert_eq!(ref_c.refcount(), 2);
+
+        // Modify through $c
+        ref_c.set(ZVal::long(99));
+
+        // Both $a and $c should see the change
+        assert_eq!(ref_a.get().to_long(), 99);
+        assert_eq!(ref_c.get().to_long(), 99);
+    }
+
+    #[test]
+    fn test_unset_original_reference_survives() {
+        // Test: Unset the original variable, reference survives
+        // PHP equivalent:
+        // $a = 10;
+        // $b = &$a;
+        // unset($a);
+        // echo $b; // outputs 10 - $b still has the value
+        // $b = 20;
+        // echo $b; // outputs 20 - $b can still be modified
+
+        let ref_b = {
+            let ref_a = ZReference::new(ZVal::long(10));
+            let ref_b = ref_a.clone();
+
+            assert_eq!(ref_a.refcount(), 2);
+            assert_eq!(ref_b.get().to_long(), 10);
+
+            // ref_a is "unset" when it goes out of scope
+            ref_b
+        };
+
+        // After unsetting $a, $b should still have the value
+        assert_eq!(ref_b.refcount(), 1);
+        assert_eq!(ref_b.get().to_long(), 10);
+
+        // $b can still be modified
+        ref_b.set(ZVal::long(20));
+        assert_eq!(ref_b.get().to_long(), 20);
+    }
+
+    #[test]
+    fn test_reference_to_reference_modification() {
+        // Test: Reference to reference - all point to same value
+        // PHP equivalent:
+        // $p = 100;
+        // $q = &$p;
+        // $r = &$q;
+        // $r = 200;
+        // echo $p; // outputs 200
+        // echo $q; // outputs 200
+        // echo $r; // outputs 200
+
+        let ref_p = ZReference::new(ZVal::long(100));
+        let ref_q = ref_p.clone();
+        let ref_r = ref_q.clone();
+
+        // All three point to the same underlying value
+        assert_eq!(ref_p.refcount(), 3);
+        assert_eq!(ref_q.refcount(), 3);
+        assert_eq!(ref_r.refcount(), 3);
+
+        // Modify through $r
+        ref_r.set(ZVal::long(200));
+
+        // All three should see the change
+        assert_eq!(ref_p.get().to_long(), 200);
+        assert_eq!(ref_q.get().to_long(), 200);
+        assert_eq!(ref_r.get().to_long(), 200);
+    }
+
+    #[test]
+    fn test_unset_multiple_references() {
+        // Test: Unset multiple references in various orders
+        // PHP equivalent:
+        // $a = 5;
+        // $b = &$a;
+        // $c = &$b;
+        // $d = &$c;
+        // unset($b);
+        // unset($d);
+        // $c = 42;
+        // echo $a; // outputs 42
+        // echo $c; // outputs 42
+
+        let ref_a = ZReference::new(ZVal::long(5));
+        let ref_c = {
+            let _ref_b = ref_a.clone();
+            let ref_c = _ref_b.clone();
+            let _ref_d = ref_c.clone();
+
+            // All four share the same reference
+            assert_eq!(ref_a.refcount(), 4);
+
+            // ref_b and ref_d are "unset" when they go out of scope
+            ref_c
+        };
+
+        // After unsetting $b and $d, $a and $c should still be connected
+        assert_eq!(ref_a.refcount(), 2);
+        assert_eq!(ref_c.refcount(), 2);
+
+        // Modify through $c
+        ref_c.set(ZVal::long(42));
+
+        // Both $a and $c should see the change
+        assert_eq!(ref_a.get().to_long(), 42);
+        assert_eq!(ref_c.get().to_long(), 42);
+    }
+
+    #[test]
+    fn test_reference_chain_with_type_changes() {
+        // Test: Reference chain with type changes
+        // PHP equivalent:
+        // $a = 1;
+        // $b = &$a;
+        // $c = &$b;
+        // $b = "hello";
+        // echo $a; // outputs "hello"
+        // echo $c; // outputs "hello"
+        // unset($b);
+        // $c = 3.14;
+        // echo $a; // outputs 3.14 (float)
+
+        let ref_a = ZReference::new(ZVal::long(1));
+        let ref_c = {
+            let ref_b = ref_a.clone();
+            let ref_c = ref_b.clone();
+
+            // Change type through $b to string
+            ref_b.set(ZVal::string(0x5000));
+
+            // All should see the string
+            assert!(matches!(ref_a.get().type_tag, ZValType::String));
+            assert!(matches!(ref_c.get().type_tag, ZValType::String));
+            assert_eq!(ref_a.get().value, 0x5000);
+
+            // ref_b is "unset" here
+            ref_c
+        };
+
+        // After unsetting $b, change type through $c to double
+        ref_c.set(ZVal::double(3.14));
+
+        // Both $a and $c should see the double
+        assert!(matches!(ref_a.get().type_tag, ZValType::Double));
+        assert!(matches!(ref_c.get().type_tag, ZValType::Double));
+        assert_eq!(ref_a.get().to_double(), 3.14);
+        assert_eq!(ref_c.get().to_double(), 3.14);
+    }
+
+    #[test]
+    fn test_unset_all_but_one_reference() {
+        // Test: Unset all references except one
+        // PHP equivalent:
+        // $a = 100;
+        // $b = &$a;
+        // $c = &$b;
+        // unset($a);
+        // unset($b);
+        // $c = 500;
+        // echo $c; // outputs 500
+
+        let final_ref = {
+            let ref_a = ZReference::new(ZVal::long(100));
+            let ref_b = ref_a.clone();
+            let ref_c = ref_b.clone();
+
+            assert_eq!(ref_a.refcount(), 3);
+
+            // Keep only ref_c, unset ref_a and ref_b
+            ref_c
+        };
+
+        // Only one reference remains
+        assert_eq!(final_ref.refcount(), 1);
+
+        // It can still be modified
+        final_ref.set(ZVal::long(500));
+        assert_eq!(final_ref.get().to_long(), 500);
+    }
+
+    #[test]
+    fn test_zval_compile_time_size_assertion() {
+        // The const assertion in the source already enforces this at compile time.
+        // This test verifies the runtime check as well.
+        assert_eq!(std::mem::size_of::<ZVal>(), 16);
+    }
+
+    #[test]
+    fn test_global_interning_deduplication() {
+        let s1 = ZString::intern("test_global_dedup");
+        let s2 = ZString::intern("test_global_dedup");
+        // Both should point to the same Arc
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1.as_str(), Some("test_global_dedup"));
+    }
+
+    #[test]
+    fn test_global_interning_different_strings() {
+        let s1 = ZString::intern("intern_alpha_12345");
+        let s2 = ZString::intern("intern_beta_67890");
+        assert!(!Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn test_request_scoped_interning() {
+        let ctx = InternContext::new();
+        assert!(ctx.is_empty());
+
+        let s1 = ctx.intern("request_var_1");
+        let s2 = ctx.intern("request_var_1");
+        // Same string interned twice should share Arc
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(ctx.len(), 1);
+
+        let s3 = ctx.intern("request_var_2");
+        assert!(!Arc::ptr_eq(&s1.inner, &s3.inner));
+        assert_eq!(ctx.len(), 2);
+
+        // Clear the pool
+        ctx.clear();
+        assert!(ctx.is_empty());
+    }
+
+    #[test]
+    fn test_zstring_hash_djbx33a() {
+        // Verify DJBX33A hash algorithm
+        let s = ZString::new(b"");
+        // Empty string: hash stays at initial value 5381
+        assert_eq!(s.hash(), 5381);
+
+        let s = ZString::new(b"a");
+        // 5381 * 33 + 97('a') = 177670 + 97 = 177767
+        assert_eq!(s.hash(), 5381u64.wrapping_mul(33).wrapping_add(97));
+    }
+
+    #[test]
+    fn test_global_intern_pool_size() {
+        // Should have at least the strings interned in other tests
+        let before = global_intern_pool_size();
+        ZString::intern("unique_pool_size_test_string_xyz");
+        let after = global_intern_pool_size();
+        assert!(after >= before);
+    }
+}

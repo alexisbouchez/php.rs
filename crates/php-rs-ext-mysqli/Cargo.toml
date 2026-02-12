@@ -1,0 +1,13 @@
+[package]
+name = "php-rs-ext-mysqli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+php-rs-ext-mysqlnd = { path = "../php-rs-ext-mysqlnd" }
+mysql = "25"
+
+[dev-dependencies]

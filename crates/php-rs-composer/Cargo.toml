@@ -1,0 +1,26 @@
+[package]
+name = "php-rs-composer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Composer-compatible dependency manager for php-rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+tokio = { version = "1", features = ["full"] }
+flate2 = "1"
+tar = "0.4"
+zip = "2"
+sha2 = "0.10"
+md-5 = "0.10"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
+thiserror = "2"
+regex = "1"
+
+[dev-dependencies]
+pretty_assertions = "1"
