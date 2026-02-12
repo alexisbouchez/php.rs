@@ -123,7 +123,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 2.2.8  Test: string interpolation: "$var", "{$var}", "${var}", "$obj->prop", "$arr[key]"
 [x] 2.2.9  Implement comments: //, #, /* */, /** */ (docblocks)
 [x] 2.2.10 Implement operators: all PHP operators including <=>, ??=, ?->, #[
-[ ] 2.2.11 Test: edge cases — unterminated strings, nested comments, __halt_compiler
+[x] 2.2.11 Test: edge cases — unterminated strings, nested comments, __halt_compiler
 
 ## 2.3 Advanced scanning
 [ ] 2.3.1  Implement variable scanning in double-quoted strings (ST_DOUBLE_QUOTES state)

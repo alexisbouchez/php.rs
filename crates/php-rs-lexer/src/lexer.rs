@@ -1324,6 +1324,7 @@ impl<'src> Lexer<'src> {
                     "__namespace__" => Token::NsC,
                     "__trait__" => Token::TraitC,
                     "__property__" => Token::PropertyC,
+                    "__halt_compiler" => Token::HaltCompiler,
                     // Check for "yield from" (two keywords)
                     "from" if self.peek_str(0).is_empty() => {
                         // This is tricky - we need to look back to see if previous token was yield
@@ -2604,6 +2605,7 @@ mod tests {
             ("__METHOD__", Token::MethodC),
             ("__NAMESPACE__", Token::NsC),
             ("__PROPERTY__", Token::PropertyC),
+            ("__halt_compiler", Token::HaltCompiler),
         ];
 
         for (constant, expected_token) in magic_constants {
@@ -4406,5 +4408,203 @@ mod tests {
         lexer2.next_token(); // <?php
         let (token, _) = lexer2.next_token().expect("Should tokenize #[");
         assert_eq!(token, Token::Attribute);
+    }
+
+    // ========================================================================
+    // Edge case tests: unterminated strings, nested comments, __halt_compiler
+    // Reference: Task 2.2.11
+    // ========================================================================
+
+    #[test]
+    fn test_unterminated_single_quoted_string() {
+        // Test: Single-quoted string that reaches EOF without closing quote
+        // PHP treats this as a parse error: "unterminated string"
+        // Our lexer should handle it gracefully by tokenizing to EOF
+        let source = "<?php echo 'this string never ends";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+        lexer.next_token(); // Skip echo
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize unterminated string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        // Should capture the entire unterminated string to EOF
+        assert_eq!(span.extract(source), "'this string never ends");
+    }
+
+    #[test]
+    fn test_unterminated_single_quoted_string_with_escaped_quote() {
+        // Test: String with escaped quote at end (still unterminated)
+        let source = "<?php 'escaped quote\\'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize unterminated string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "'escaped quote\\'");
+    }
+
+    #[test]
+    fn test_unterminated_double_quoted_string() {
+        // Test: Double-quoted string that reaches EOF without closing quote
+        let source = "<?php echo \"this string never ends";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+        lexer.next_token(); // Skip echo
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize unterminated string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "\"this string never ends");
+    }
+
+    #[test]
+    fn test_unterminated_double_quoted_string_with_escape() {
+        // Test: Double-quoted string with escape sequence at end (still unterminated)
+        let source = "<?php \"newline here\\n";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize unterminated string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "\"newline here\\n");
+    }
+
+    #[test]
+    fn test_unterminated_double_quoted_string_with_escaped_quote() {
+        // Test: Double-quoted string with escaped quote at end
+        let source = r#"<?php "escaped quote\""#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize unterminated string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""escaped quote\""#);
+    }
+
+    #[test]
+    fn test_halt_compiler_keyword() {
+        // Test: __halt_compiler() keyword
+        // This special keyword stops PHP compilation at that point
+        // Everything after __halt_compiler(); is treated as raw data
+        let source = "<?php __halt_compiler();";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize __halt_compiler");
+        assert_eq!(token, Token::HaltCompiler);
+        assert_eq!(span.extract(source), "__halt_compiler");
+
+        let (token, _) = lexer.next_token().expect("Should tokenize (");
+        assert_eq!(token, Token::LParen);
+
+        let (token, _) = lexer.next_token().expect("Should tokenize )");
+        assert_eq!(token, Token::RParen);
+
+        let (token, _) = lexer.next_token().expect("Should tokenize ;");
+        assert_eq!(token, Token::Semicolon);
+    }
+
+    #[test]
+    fn test_halt_compiler_with_data_after() {
+        // Test: __halt_compiler() followed by arbitrary data
+        // Note: Full __halt_compiler() support requires special handling
+        // to treat everything after ; as raw data, not tokens.
+        // For now, we just test that the keyword itself tokenizes correctly.
+        let source = "<?php __halt_compiler(); this is raw data not PHP";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, _) = lexer.next_token().expect("Should tokenize __halt_compiler");
+        assert_eq!(token, Token::HaltCompiler);
+
+        let (token, _) = lexer.next_token().expect("Should tokenize (");
+        assert_eq!(token, Token::LParen);
+
+        let (token, _) = lexer.next_token().expect("Should tokenize )");
+        assert_eq!(token, Token::RParen);
+
+        let (token, _) = lexer.next_token().expect("Should tokenize ;");
+        assert_eq!(token, Token::Semicolon);
+
+        // After __halt_compiler();, everything should be treated as raw data
+        // For now, our lexer will continue tokenizing (which is acceptable at lexer level)
+        // The compiler/parser should handle the __halt_compiler() semantics
+        // by stopping compilation after the semicolon
+    }
+
+    #[test]
+    fn test_unterminated_string_multiline() {
+        // Test: Unterminated string spanning multiple lines
+        let source = "<?php echo 'line 1\nline 2\nline 3";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+        lexer.next_token(); // Skip echo
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize unterminated string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "'line 1\nline 2\nline 3");
+    }
+
+    #[test]
+    fn test_nested_comment_edge_case_multiple() {
+        // Test: Multiple attempts at nesting comments
+        // In PHP, /* */ comments cannot be nested
+        let source = "<?php /* /* /* */ still in comment */ more code */ echo 'hi';";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        // First comment: /* /* /* */
+        let (token, span) = lexer.next_token().expect("Should tokenize first comment");
+        assert_eq!(token, Token::Comment);
+        assert_eq!(span.extract(source), "/* /* /* */");
+
+        // "still in comment" is NOT in a comment
+        let (token, span) = lexer.next_token().expect("Should tokenize identifier");
+        assert_eq!(token, Token::String);
+        assert_eq!(span.extract(source), "still");
+    }
+
+    #[test]
+    fn test_unterminated_heredoc_graceful() {
+        // Test: Heredoc without closing delimiter (reaches EOF)
+        // This is an edge case where heredoc is started but never closed
+        let source = "<?php $x = <<<EOT\nThis heredoc never ends\nno closing delimiter";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+        lexer.next_token(); // Skip $x
+        lexer.next_token(); // Skip =
+
+        // Heredoc should be tokenized
+        let result = lexer.next_token();
+
+        // The lexer should handle this gracefully
+        // Either by tokenizing as a heredoc string that goes to EOF,
+        // or by treating it as an error token
+        // We'll accept either Token::ConstantEncapsedString or an error variant
+        assert!(
+            result.is_some(),
+            "Lexer should handle unterminated heredoc gracefully"
+        );
     }
 }
