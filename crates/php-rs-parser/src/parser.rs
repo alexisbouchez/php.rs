@@ -101,6 +101,8 @@ impl<'a> Parser<'a> {
             Token::Switch => self.parse_switch_statement(),
             Token::Match => self.parse_match_statement(),
             Token::Try => self.parse_try_statement(),
+            Token::Namespace => self.parse_namespace_statement(),
+            Token::Use => self.parse_use_statement(),
             Token::Function => self.parse_function_statement(),
             Token::Class | Token::Abstract | Token::Final | Token::Readonly => {
                 self.parse_class_statement()
@@ -687,16 +689,17 @@ impl<'a> Parser<'a> {
     /// Parse a qualified name (e.g., Exception, \Foo\Bar, namespace\Baz)
     fn parse_qualified_name(&mut self) -> Result<Name, ParseError> {
         let mut parts = Vec::new();
-        let fully_qualified = if self.current_token == Token::NsSeparator {
-            self.advance();
-            true
-        } else {
-            false
-        };
+        let fully_qualified =
+            if self.current_token == Token::NsSeparator || self.current_token == Token::Backslash {
+                self.advance();
+                true
+            } else {
+                false
+            };
 
         let relative = if self.current_token == Token::Namespace {
             // Check if next is separator (namespace\...)
-            if matches!(self.peek(), Token::NsSeparator) {
+            if matches!(self.peek(), Token::NsSeparator | Token::Backslash) {
                 self.advance(); // consume namespace
                 self.advance(); // consume \
                 true
@@ -716,8 +719,10 @@ impl<'a> Parser<'a> {
                 parts.push(part);
                 self.advance();
 
-                // Check for namespace separator
-                if self.current_token == Token::NsSeparator {
+                // Check for namespace separator (\ can be NsSeparator or Backslash)
+                if self.current_token == Token::NsSeparator
+                    || self.current_token == Token::Backslash
+                {
                     self.advance();
                     continue;
                 }
@@ -1026,6 +1031,154 @@ impl<'a> Parser<'a> {
             implements,
             members,
             attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
+    }
+
+    /// Parse namespace statement
+    /// Syntax: namespace [Name];  (simple form)
+    ///     or: namespace [Name] { statements }  (bracketed form)
+    ///     or: namespace { statements }  (global namespace)
+    fn parse_namespace_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+
+        // Expect 'namespace' keyword
+        self.expect(Token::Namespace)?;
+
+        // Check if this is a bracketed global namespace: namespace { }
+        if self.current_token == Token::LBrace {
+            self.advance(); // consume {
+            let mut statements = Vec::new();
+
+            // Parse statements until }
+            while self.current_token != Token::RBrace && self.current_token != Token::End {
+                statements.push(self.parse_statement()?);
+            }
+
+            self.expect(Token::RBrace)?;
+
+            return Ok(Statement::Namespace {
+                name: None, // Global namespace
+                statements,
+                span: start_span,
+            });
+        }
+
+        // Parse namespace name (if not global)
+        let name = if self.current_token == Token::String
+            || self.current_token == Token::NsSeparator
+            || self.current_token == Token::Backslash
+        {
+            Some(self.parse_qualified_name()?)
+        } else {
+            None
+        };
+
+        // Check if this is simple form (;) or bracketed form ({ })
+        if self.current_token == Token::Semicolon {
+            self.advance();
+            // Simple form - no statements block
+            Ok(Statement::Namespace {
+                name,
+                statements: Vec::new(),
+                span: start_span,
+            })
+        } else if self.current_token == Token::LBrace {
+            self.advance(); // consume {
+            let mut statements = Vec::new();
+
+            // Parse statements until }
+            while self.current_token != Token::RBrace && self.current_token != Token::End {
+                statements.push(self.parse_statement()?);
+            }
+
+            self.expect(Token::RBrace)?;
+
+            Ok(Statement::Namespace {
+                name,
+                statements,
+                span: start_span,
+            })
+        } else {
+            Err(ParseError::UnexpectedToken {
+                expected: "';' or '{'".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            })
+        }
+    }
+
+    /// Parse use statement
+    /// Syntax: use Name [as Alias] [, Name [as Alias]]...;
+    ///     or: use function Name [as Alias] [, ...]...;
+    ///     or: use const Name [as Alias] [, ...]...;
+    fn parse_use_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+
+        // Expect 'use' keyword
+        self.expect(Token::Use)?;
+
+        // Check for optional 'function' or 'const' keyword
+        let kind = match self.current_token {
+            Token::Function => {
+                self.advance();
+                UseKind::Function
+            }
+            Token::Const => {
+                self.advance();
+                UseKind::Const
+            }
+            _ => UseKind::Normal,
+        };
+
+        // Parse use declarations (comma-separated list)
+        let mut uses = Vec::new();
+
+        loop {
+            // Parse the name
+            let name = self.parse_qualified_name()?;
+
+            // Check for optional 'as Alias'
+            let alias = if self.current_token == Token::As {
+                self.advance(); // consume 'as'
+
+                // Parse the alias (should be an identifier)
+                if let Token::String = self.current_token {
+                    let a = self.lexer.source_text(&self.current_span).to_string();
+                    self.advance();
+                    Some(a)
+                } else {
+                    return Err(ParseError::UnexpectedToken {
+                        expected: "alias identifier".to_string(),
+                        found: self.current_token.clone(),
+                        span: self.current_span,
+                    });
+                }
+            } else {
+                None
+            };
+
+            uses.push(UseDeclaration { name, alias });
+
+            // Check for comma (more declarations) or semicolon (end)
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            } else if self.current_token == Token::Semicolon {
+                self.advance();
+                break;
+            } else {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "',' or ';'".to_string(),
+                    found: self.current_token.clone(),
+                    span: self.current_span,
+                });
+            }
+        }
+
+        Ok(Statement::Use {
+            uses,
+            kind,
             span: start_span,
         })
     }
@@ -3739,6 +3892,196 @@ mod tests {
                 assert_eq!(implements[1].parts[0], "Baz");
             }
             _ => panic!("Expected enum declaration"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_simple() {
+        // Test: namespace MyNamespace;
+        let source = "<?php namespace MyNamespace;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Namespace {
+                name, statements, ..
+            } => {
+                assert!(name.is_some());
+                let ns = name.unwrap();
+                assert_eq!(ns.parts.len(), 1);
+                assert_eq!(ns.parts[0], "MyNamespace");
+                assert!(!ns.fully_qualified);
+                assert!(!ns.relative);
+                assert_eq!(statements.len(), 0); // Simple form has no block
+            }
+            _ => panic!("Expected namespace declaration, got {:?}", stmt),
+        }
+    }
+
+    #[test]
+    fn test_namespace_qualified() {
+        // Test: namespace Foo\Bar\Baz;
+        let source = "<?php namespace Foo\\Bar\\Baz;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Namespace { name, .. } => {
+                assert!(name.is_some());
+                let ns = name.unwrap();
+                assert_eq!(ns.parts.len(), 3);
+                assert_eq!(ns.parts[0], "Foo");
+                assert_eq!(ns.parts[1], "Bar");
+                assert_eq!(ns.parts[2], "Baz");
+            }
+            _ => panic!("Expected namespace declaration"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_with_block() {
+        // Test: namespace MyNamespace { }
+        let source = "<?php namespace MyNamespace { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Namespace {
+                name, statements, ..
+            } => {
+                assert!(name.is_some());
+                let ns = name.unwrap();
+                assert_eq!(ns.parts[0], "MyNamespace");
+                assert_eq!(statements.len(), 0);
+            }
+            _ => panic!("Expected namespace declaration"),
+        }
+    }
+
+    #[test]
+    fn test_namespace_global() {
+        // Test: namespace { } (global namespace)
+        let source = "<?php namespace { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Namespace {
+                name, statements, ..
+            } => {
+                assert!(name.is_none()); // Global namespace has no name
+                assert_eq!(statements.len(), 0);
+            }
+            _ => panic!("Expected namespace declaration"),
+        }
+    }
+
+    #[test]
+    fn test_use_single() {
+        // Test: use Foo\Bar;
+        let source = "<?php use Foo\\Bar;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Use { uses, kind, .. } => {
+                assert_eq!(kind, UseKind::Normal);
+                assert_eq!(uses.len(), 1);
+                assert_eq!(uses[0].name.parts.len(), 2);
+                assert_eq!(uses[0].name.parts[0], "Foo");
+                assert_eq!(uses[0].name.parts[1], "Bar");
+                assert!(uses[0].alias.is_none());
+            }
+            _ => panic!("Expected use declaration"),
+        }
+    }
+
+    #[test]
+    fn test_use_with_alias() {
+        // Test: use Foo\Bar as Baz;
+        let source = "<?php use Foo\\Bar as Baz;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Use { uses, .. } => {
+                assert_eq!(uses.len(), 1);
+                assert_eq!(uses[0].name.parts[1], "Bar");
+                assert_eq!(uses[0].alias, Some("Baz".to_string()));
+            }
+            _ => panic!("Expected use declaration"),
+        }
+    }
+
+    #[test]
+    fn test_use_multiple() {
+        // Test: use Foo\Bar, Baz\Qux;
+        let source = "<?php use Foo\\Bar, Baz\\Qux;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Use { uses, .. } => {
+                assert_eq!(uses.len(), 2);
+                assert_eq!(uses[0].name.parts[0], "Foo");
+                assert_eq!(uses[0].name.parts[1], "Bar");
+                assert_eq!(uses[1].name.parts[0], "Baz");
+                assert_eq!(uses[1].name.parts[1], "Qux");
+            }
+            _ => panic!("Expected use declaration"),
+        }
+    }
+
+    #[test]
+    fn test_use_function() {
+        // Test: use function Foo\bar;
+        let source = "<?php use function Foo\\bar;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Use { uses, kind, .. } => {
+                assert_eq!(kind, UseKind::Function);
+                assert_eq!(uses.len(), 1);
+                assert_eq!(uses[0].name.parts[0], "Foo");
+                assert_eq!(uses[0].name.parts[1], "bar");
+            }
+            _ => panic!("Expected use function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_use_const() {
+        // Test: use const Foo\BAR;
+        let source = "<?php use const Foo\\BAR;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Use { uses, kind, .. } => {
+                assert_eq!(kind, UseKind::Const);
+                assert_eq!(uses.len(), 1);
+                assert_eq!(uses[0].name.parts[1], "BAR");
+            }
+            _ => panic!("Expected use const declaration"),
         }
     }
 }
