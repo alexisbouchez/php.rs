@@ -47,7 +47,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 
 ## 1.1 ZVal — Core value container (16 bytes)
 [x] 1.1.1  Define ZVal enum: Null, False, True, Long(i64), Double(f64), String, Array, Object, Resource, Reference
-[ ] 1.1.2  Test: size_of::<ZVal>() == 16
+[x] 1.1.2  Test: size_of::<ZVal>() == 16
 [ ] 1.1.3  Implement Display for ZVal (PHP-compatible var_dump-style output)
 [ ] 1.1.4  Implement Clone, PartialEq, Debug
 
