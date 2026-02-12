@@ -101,11 +101,17 @@ impl<'a> Parser<'a> {
             Token::Switch => self.parse_switch_statement(),
             Token::Match => self.parse_match_statement(),
             Token::Try => self.parse_try_statement(),
-            _ => Err(ParseError::UnexpectedToken {
-                expected: "statement".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            }),
+            Token::Function => self.parse_function_statement(),
+            _ => {
+                // Default case: try to parse as expression statement
+                let start_span = self.current_span;
+                let expr = self.parse_expression(0)?;
+                self.expect(Token::Semicolon)?;
+                Ok(Statement::Expression {
+                    expr,
+                    span: start_span,
+                })
+            }
         }
     }
 
@@ -699,8 +705,9 @@ impl<'a> Parser<'a> {
         loop {
             // Expect an identifier (String token)
             if let Token::String = self.current_token {
-                // TODO: extract actual string value from token
-                parts.push(String::from("Exception")); // placeholder
+                // Extract the actual identifier from source
+                let part = self.lexer.source_text(&self.current_span).to_string();
+                parts.push(part);
                 self.advance();
 
                 // Check for namespace separator
@@ -722,6 +729,216 @@ impl<'a> Parser<'a> {
             parts,
             fully_qualified,
             relative,
+        })
+    }
+
+    /// Parse function declaration statement
+    /// Syntax: function [&] name(params) [: return_type] { body }
+    fn parse_function_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Function)?;
+
+        // Check for return by reference (&)
+        let by_ref = if self.current_token == Token::Ampersand {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // Parse function name (identifier)
+        let name = if let Token::String = self.current_token {
+            let n = self.lexer.source_text(&self.current_span).to_string();
+            self.advance();
+            n
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "function name".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            });
+        };
+
+        // Parse parameter list
+        self.expect(Token::LParen)?;
+        let params = self.parse_parameter_list()?;
+        self.expect(Token::RParen)?;
+
+        // Parse optional return type
+        let return_type = if self.current_token == Token::Colon {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        // Parse function body
+        self.expect(Token::LBrace)?;
+        let mut body = Vec::new();
+        while self.current_token != Token::RBrace {
+            body.push(self.parse_statement()?);
+        }
+        self.expect(Token::RBrace)?;
+
+        Ok(Statement::Function {
+            name,
+            params,
+            return_type,
+            body,
+            by_ref,
+            attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
+    }
+
+    /// Parse parameter list (comma-separated parameters)
+    fn parse_parameter_list(&mut self) -> Result<Vec<Parameter>, ParseError> {
+        let mut params = Vec::new();
+
+        // Empty parameter list
+        if self.current_token == Token::RParen {
+            return Ok(params);
+        }
+
+        loop {
+            params.push(self.parse_parameter()?);
+
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+
+        Ok(params)
+    }
+
+    /// Parse a single parameter
+    /// Syntax: [type] [&] [...]$name [= default]
+    fn parse_parameter(&mut self) -> Result<Parameter, ParseError> {
+        let start_span = self.current_span;
+
+        // Parse optional type
+        let param_type = if self.is_type_token() {
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        // Parse optional & (by reference)
+        let by_ref = if self.current_token == Token::Ampersand {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // Parse optional ... (variadic)
+        let variadic = if self.current_token == Token::Ellipsis {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // Parse variable name
+        let name = if let Token::Variable = self.current_token {
+            let n = self.lexer.source_text(&self.current_span).to_string();
+            self.advance();
+            n
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "parameter name (variable)".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            });
+        };
+
+        // Parse optional default value
+        let default = if self.current_token == Token::Equals {
+            self.advance();
+            Some(self.parse_expression(0)?)
+        } else {
+            None
+        };
+
+        Ok(Parameter {
+            name,
+            param_type,
+            default,
+            by_ref,
+            variadic,
+            attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
+    }
+
+    /// Check if current token can start a type annotation
+    fn is_type_token(&self) -> bool {
+        matches!(
+            self.current_token,
+            Token::String // For class names and built-in types (int, string, etc.)
+                | Token::Question // For nullable types (?Type)
+                | Token::NsSeparator // For fully-qualified types (\Foo\Bar)
+        )
+    }
+
+    /// Parse a type annotation
+    /// Syntax: Type | ?Type | Type1|Type2 | Type1&Type2 | (Type1&Type2)|Type3
+    fn parse_type(&mut self) -> Result<Type, ParseError> {
+        let start_span = self.current_span;
+
+        // Handle nullable type: ?Type
+        if self.current_token == Token::Question {
+            self.advance();
+            let inner = Box::new(self.parse_single_type()?);
+            return Ok(Type::Nullable {
+                inner,
+                span: start_span,
+            });
+        }
+
+        // Parse first type
+        let mut types = vec![self.parse_single_type()?];
+
+        // Check for union (|) or intersection (&)
+        if self.current_token == Token::VerticalBar {
+            // Union type: Type1|Type2|Type3
+            while self.current_token == Token::VerticalBar {
+                self.advance();
+                types.push(self.parse_single_type()?);
+            }
+            Ok(Type::Union {
+                types,
+                span: start_span,
+            })
+        } else if self.current_token == Token::Ampersand {
+            // Intersection type: Type1&Type2&Type3
+            while self.current_token == Token::Ampersand {
+                self.advance();
+                types.push(self.parse_single_type()?);
+            }
+            Ok(Type::Intersection {
+                types,
+                span: start_span,
+            })
+        } else {
+            // Single type
+            Ok(types.into_iter().next().unwrap())
+        }
+    }
+
+    /// Parse a single type (no union/intersection)
+    fn parse_single_type(&mut self) -> Result<Type, ParseError> {
+        let start_span = self.current_span;
+
+        // For now, just parse as a qualified name
+        // TODO: Handle DNF types (A&B)|C
+        let name = self.parse_qualified_name()?;
+
+        Ok(Type::Named {
+            name,
+            span: start_span,
         })
     }
 
@@ -1085,12 +1302,210 @@ impl<'a> Parser<'a> {
                 })
             }
 
+            // Closure: function(...) use (...) { ... }
+            Token::Function => self.parse_closure_expression(),
+
+            // Arrow function: fn(...) => expr
+            Token::Fn => self.parse_arrow_function_expression(),
+
+            // Static closure: static function(...) { ... }
+            Token::Static => {
+                self.advance();
+                // Must be followed by function keyword
+                if self.current_token == Token::Function {
+                    self.parse_closure_expression_static()
+                } else {
+                    Err(ParseError::UnexpectedToken {
+                        expected: "function after static".to_string(),
+                        found: self.current_token.clone(),
+                        span: self.current_span,
+                    })
+                }
+            }
+
+            // Identifier - could be null, true, false, or a function/constant name
+            Token::String => {
+                let text = self.lexer.source_text(&span).to_lowercase();
+
+                // Check for special keywords: null, true, false (case-insensitive)
+                if text == "null" {
+                    self.advance();
+                    Ok(Expression::Null { span })
+                } else if text == "true" {
+                    self.advance();
+                    Ok(Expression::BoolLiteral { value: true, span })
+                } else if text == "false" {
+                    self.advance();
+                    Ok(Expression::BoolLiteral { value: false, span })
+                } else {
+                    // TODO: Handle regular identifiers (constants, function calls)
+                    // For now, return an error to avoid unimplemented paths
+                    Err(ParseError::UnexpectedToken {
+                        expected: "null, true, or false".to_string(),
+                        found: token.clone(),
+                        span,
+                    })
+                }
+            }
+
             _ => Err(ParseError::UnexpectedToken {
                 expected: "expression".to_string(),
                 found: token,
                 span,
             }),
         }
+    }
+
+    /// Parse closure expression: function(...) use (...) { ... }
+    fn parse_closure_expression(&mut self) -> Result<Expression, ParseError> {
+        self.parse_closure_expression_impl(false)
+    }
+
+    /// Parse static closure expression: static function(...) { ... }
+    fn parse_closure_expression_static(&mut self) -> Result<Expression, ParseError> {
+        self.parse_closure_expression_impl(true)
+    }
+
+    /// Parse closure expression implementation
+    fn parse_closure_expression_impl(&mut self, is_static: bool) -> Result<Expression, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Function)?;
+
+        // Check for return by reference (&)
+        let by_ref = if self.current_token == Token::Ampersand {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // Parse parameter list
+        self.expect(Token::LParen)?;
+        let params = self.parse_parameter_list()?;
+        self.expect(Token::RParen)?;
+
+        // Parse optional use clause: use ($var1, &$var2)
+        let uses = if self.current_token == Token::Use {
+            self.advance();
+            self.expect(Token::LParen)?;
+            let u = self.parse_use_list()?;
+            self.expect(Token::RParen)?;
+            u
+        } else {
+            Vec::new()
+        };
+
+        // Parse optional return type
+        let return_type = if self.current_token == Token::Colon {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        // Parse closure body
+        self.expect(Token::LBrace)?;
+        let mut body = Vec::new();
+        while self.current_token != Token::RBrace {
+            body.push(self.parse_statement()?);
+        }
+        self.expect(Token::RBrace)?;
+
+        Ok(Expression::Closure {
+            params,
+            return_type,
+            body,
+            uses,
+            by_ref,
+            is_static,
+            attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
+    }
+
+    /// Parse use list for closures: $var1, &$var2
+    fn parse_use_list(&mut self) -> Result<Vec<ClosureUse>, ParseError> {
+        let mut uses = Vec::new();
+
+        // Empty use list
+        if self.current_token == Token::RParen {
+            return Ok(uses);
+        }
+
+        loop {
+            // Parse optional & (by reference)
+            let by_ref = if self.current_token == Token::Ampersand {
+                self.advance();
+                true
+            } else {
+                false
+            };
+
+            // Parse variable name
+            let name = if let Token::Variable = self.current_token {
+                let n = self.lexer.source_text(&self.current_span).to_string();
+                self.advance();
+                n
+            } else {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "variable in use clause".to_string(),
+                    found: self.current_token.clone(),
+                    span: self.current_span,
+                });
+            };
+
+            uses.push(ClosureUse { name, by_ref });
+
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+
+        Ok(uses)
+    }
+
+    /// Parse arrow function: fn(...) => expr
+    fn parse_arrow_function_expression(&mut self) -> Result<Expression, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Fn)?;
+
+        // Check for return by reference (&)
+        let by_ref = if self.current_token == Token::Ampersand {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        // Parse parameter list
+        self.expect(Token::LParen)?;
+        let params = self.parse_parameter_list()?;
+        self.expect(Token::RParen)?;
+
+        // Parse optional return type
+        let return_type = if self.current_token == Token::Colon {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        // Expect =>
+        self.expect(Token::DoubleArrow)?;
+
+        // Parse body expression
+        let body = Box::new(self.parse_expression(0)?);
+
+        Ok(Expression::ArrowFunction {
+            params,
+            return_type,
+            body,
+            by_ref,
+            attributes: Vec::new(), // TODO: Parse attributes
+            span: start_span,
+        })
     }
 
     /// Parse an infix expression (binary operators, ternary, etc.)
@@ -2442,6 +2857,354 @@ mod tests {
                 assert_eq!(catches.len(), 1);
             }
             _ => panic!("Expected try statement"),
+        }
+    }
+
+    // ========================================================================
+    // FUNCTION DECLARATION TESTS
+    // ========================================================================
+
+    #[test]
+    fn test_simple_function() {
+        // Test: function test() { return 42; }
+        let source = "<?php function test() { return 42; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function {
+                name,
+                params,
+                return_type,
+                body,
+                by_ref,
+                ..
+            } => {
+                assert_eq!(name, "test");
+                assert_eq!(params.len(), 0);
+                assert!(return_type.is_none());
+                assert!(!by_ref);
+                assert_eq!(body.len(), 1);
+                assert!(matches!(body[0], Statement::Return { .. }));
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_with_params() {
+        // Test: function add($a, $b) { return $a + $b; }
+        let source = "<?php function add($a, $b) { return $a + $b; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function {
+                name, params, body, ..
+            } => {
+                assert_eq!(name, "add");
+                assert_eq!(params.len(), 2);
+                assert_eq!(params[0].name, "$a");
+                assert_eq!(params[1].name, "$b");
+                assert_eq!(body.len(), 1);
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_with_type_hints() {
+        // Test: function greet(string $name): string { return $name; }
+        let source = "<?php function greet(string $name): string { return $name; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function {
+                params,
+                return_type,
+                ..
+            } => {
+                assert_eq!(params.len(), 1);
+                // Parameter should have type
+                assert!(params[0].param_type.is_some());
+                // Return type should be set
+                assert!(return_type.is_some());
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_with_default_params() {
+        // Test: function greet($name = "World") { return $name; }
+        let source = "<?php function greet($name = \"World\") { return $name; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function { params, .. } => {
+                assert_eq!(params.len(), 1);
+                assert!(params[0].default.is_some());
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_variadic() {
+        // Test: function sum(...$numbers) { return 0; }
+        let source = "<?php function sum(...$numbers) { return 0; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function { params, .. } => {
+                assert_eq!(params.len(), 1);
+                assert!(params[0].variadic);
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_by_reference() {
+        // Test: function &getRef() { return $x; }
+        let source = "<?php function &getRef() { return $x; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function { by_ref, .. } => {
+                assert!(by_ref);
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_reference_parameter() {
+        // Test: function swap(&$a, &$b) { }
+        let source = "<?php function swap(&$a, &$b) { }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function { params, .. } => {
+                assert_eq!(params.len(), 2);
+                assert!(params[0].by_ref);
+                assert!(params[1].by_ref);
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_closure_simple() {
+        // Test: $fn = function() { return 42; };
+        let source = "<?php $fn = function() { return 42; };";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Expression { expr, .. } => match expr {
+                Expression::Assign { rhs, .. } => match rhs.as_ref() {
+                    Expression::Closure {
+                        params,
+                        body,
+                        uses,
+                        is_static,
+                        ..
+                    } => {
+                        assert_eq!(params.len(), 0);
+                        assert_eq!(uses.len(), 0);
+                        assert!(!is_static);
+                        assert_eq!(body.len(), 1);
+                    }
+                    _ => panic!("Expected closure in assignment"),
+                },
+                _ => panic!("Expected assignment"),
+            },
+            _ => panic!("Expected expression statement"),
+        }
+    }
+
+    #[test]
+    fn test_closure_with_use() {
+        // Test: $fn = function($x) use ($y) { return $x + $y; };
+        let source = "<?php $fn = function($x) use ($y) { return $x + $y; };";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Expression { expr, .. } => match expr {
+                Expression::Assign { rhs, .. } => match rhs.as_ref() {
+                    Expression::Closure { uses, .. } => {
+                        assert_eq!(uses.len(), 1);
+                        assert_eq!(uses[0].name, "$y");
+                        assert!(!uses[0].by_ref);
+                    }
+                    _ => panic!("Expected closure"),
+                },
+                _ => panic!("Expected assignment"),
+            },
+            _ => panic!("Expected expression statement"),
+        }
+    }
+
+    #[test]
+    fn test_closure_use_by_reference() {
+        // Test: $fn = function() use (&$x) { return $x; };
+        let source = "<?php $fn = function() use (&$x) { return $x; };";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Expression { expr, .. } => match expr {
+                Expression::Assign { rhs, .. } => match rhs.as_ref() {
+                    Expression::Closure { uses, .. } => {
+                        assert_eq!(uses.len(), 1);
+                        assert!(uses[0].by_ref);
+                    }
+                    _ => panic!("Expected closure"),
+                },
+                _ => panic!("Expected assignment"),
+            },
+            _ => panic!("Expected expression statement"),
+        }
+    }
+
+    #[test]
+    fn test_closure_static() {
+        // Test: $fn = static function() { return 42; };
+        let source = "<?php $fn = static function() { return 42; };";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Expression { expr, .. } => match expr {
+                Expression::Assign { rhs, .. } => match rhs.as_ref() {
+                    Expression::Closure { is_static, .. } => {
+                        assert!(is_static);
+                    }
+                    _ => panic!("Expected closure"),
+                },
+                _ => panic!("Expected assignment"),
+            },
+            _ => panic!("Expected expression statement"),
+        }
+    }
+
+    #[test]
+    fn test_arrow_function() {
+        // Test: $fn = fn($x) => $x * 2;
+        let source = "<?php $fn = fn($x) => $x * 2;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Expression { expr, .. } => match expr {
+                Expression::Assign { rhs, .. } => match rhs.as_ref() {
+                    Expression::ArrowFunction { params, body, .. } => {
+                        assert_eq!(params.len(), 1);
+                        assert!(matches!(body.as_ref(), Expression::BinaryOp { .. }));
+                    }
+                    _ => panic!("Expected arrow function"),
+                },
+                _ => panic!("Expected assignment"),
+            },
+            _ => panic!("Expected expression statement"),
+        }
+    }
+
+    #[test]
+    fn test_arrow_function_with_return_type() {
+        // Test: $fn = fn(int $x): int => $x * 2;
+        let source = "<?php $fn = fn(int $x): int => $x * 2;";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Expression { expr, .. } => match expr {
+                Expression::Assign { rhs, .. } => match rhs.as_ref() {
+                    Expression::ArrowFunction { return_type, .. } => {
+                        assert!(return_type.is_some());
+                    }
+                    _ => panic!("Expected arrow function"),
+                },
+                _ => panic!("Expected assignment"),
+            },
+            _ => panic!("Expected expression statement"),
+        }
+    }
+
+    #[test]
+    fn test_function_nullable_return_type() {
+        // Test: function test(): ?string { return null; }
+        let source = "<?php function test(): ?string { return null; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function { return_type, .. } => {
+                assert!(return_type.is_some());
+                match return_type.unwrap() {
+                    Type::Nullable { .. } => {}
+                    _ => panic!("Expected nullable type"),
+                }
+            }
+            _ => panic!("Expected function declaration"),
+        }
+    }
+
+    #[test]
+    fn test_function_union_return_type() {
+        // Test: function test(): int|string { return 42; }
+        let source = "<?php function test(): int|string { return 42; }";
+        let mut parser = Parser::new(source);
+        parser.advance(); // Skip <?php
+
+        let stmt = parser.parse_statement().unwrap();
+
+        match stmt {
+            Statement::Function { return_type, .. } => {
+                assert!(return_type.is_some());
+                match return_type.unwrap() {
+                    Type::Union { types, .. } => {
+                        assert_eq!(types.len(), 2);
+                    }
+                    _ => panic!("Expected union type"),
+                }
+            }
+            _ => panic!("Expected function declaration"),
         }
     }
 }

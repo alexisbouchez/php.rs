@@ -69,6 +69,13 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Get the source text for a given span
+    pub fn source_text(&self, span: &Span) -> &'src str {
+        let start = span.start.min(self.source.len());
+        let end = span.end.min(self.source.len());
+        &self.source[start..end]
+    }
+
     /// Peek at the current character without consuming it
     fn peek(&self) -> Option<char> {
         self.source[self.pos..].chars().next()
