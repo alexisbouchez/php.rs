@@ -344,6 +344,60 @@ impl<'src> Lexer<'src> {
         }
     }
 
+    /// Scan a single-quoted string literal
+    /// Single-quoted strings in PHP only recognize two escape sequences:
+    /// - \\ (escaped backslash)
+    /// - \' (escaped single quote)
+    /// All other characters (including \n, \t, etc.) are treated literally.
+    fn scan_single_quoted_string(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Consume opening single quote
+        self.consume(); // '
+
+        loop {
+            match self.peek() {
+                None => {
+                    // Unterminated string - reached EOF
+                    // For now, return what we have as a string
+                    // (A proper implementation might want to emit an error)
+                    return Some((
+                        Token::ConstantEncapsedString,
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some('\\') => {
+                    // Check if it's an escape sequence
+                    self.consume(); // consume backslash
+                    match self.peek() {
+                        Some('\\') | Some('\'') => {
+                            // Valid escape sequence: \\ or \'
+                            self.consume();
+                        }
+                        _ => {
+                            // Not an escape sequence, backslash is literal
+                            // The backslash is already consumed, continue
+                        }
+                    }
+                }
+                Some('\'') => {
+                    // Closing single quote
+                    self.consume();
+                    return Some((
+                        Token::ConstantEncapsedString,
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some(_) => {
+                    // Regular character
+                    self.consume();
+                }
+            }
+        }
+    }
+
     /// Scan in ST_IN_SCRIPTING state - inside PHP code
     fn scan_scripting(&mut self) -> Option<(Token, Span)> {
         // Skip whitespace
@@ -609,6 +663,10 @@ impl<'src> Lexer<'src> {
         // Single-character operators and punctuation
         let ch = self.peek()?;
         match ch {
+            '\'' => {
+                // Single-quoted string
+                self.scan_single_quoted_string()
+            }
             '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '&' | '|' | '^' | '~' | '('
             | ')' | '{' | '}' | '[' | ']' | ';' | ',' | '.' | ':' | '?' | '@' | '#' | '\\' => {
                 self.consume();
@@ -2612,5 +2670,149 @@ mod tests {
             assert_eq!(token, expected_token, "Failed for: {}", source);
             assert_eq!(span.extract(source), expected_text);
         }
+    }
+
+    #[test]
+    fn test_single_quoted_string_simple() {
+        // Test: simple single-quoted string
+        let source = "<?php 'hello'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "'hello'");
+    }
+
+    #[test]
+    fn test_single_quoted_string_empty() {
+        // Test: empty single-quoted string
+        let source = "<?php ''";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize empty string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "''");
+    }
+
+    #[test]
+    fn test_single_quoted_string_escaped_backslash() {
+        // Test: single-quoted string with escaped backslash
+        let source = r"<?php 'hello\\world'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with \\\\");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r"'hello\\world'");
+    }
+
+    #[test]
+    fn test_single_quoted_string_escaped_quote() {
+        // Test: single-quoted string with escaped single quote
+        let source = r"<?php 'hello\'world'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string with \\'");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r"'hello\'world'");
+    }
+
+    #[test]
+    fn test_single_quoted_string_no_variable_interpolation() {
+        // Test: single-quoted strings do NOT interpolate variables
+        let source = "<?php 'hello $var world'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "'hello $var world'");
+    }
+
+    #[test]
+    fn test_single_quoted_string_no_escape_sequences() {
+        // Test: single-quoted strings do NOT process most escape sequences
+        let source = r"<?php 'hello\nworld\t'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r"'hello\nworld\t'");
+    }
+
+    #[test]
+    fn test_single_quoted_string_multiple() {
+        // Test: multiple single-quoted strings in sequence
+        let source = "<?php 'hello' 'world'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, span1) = lexer.next_token().expect("Should tokenize first string");
+        assert_eq!(token1, Token::ConstantEncapsedString);
+        assert_eq!(span1.extract(source), "'hello'");
+
+        let (token2, span2) = lexer.next_token().expect("Should tokenize second string");
+        assert_eq!(token2, Token::ConstantEncapsedString);
+        assert_eq!(span2.extract(source), "'world'");
+    }
+
+    #[test]
+    fn test_single_quoted_string_multiline() {
+        // Test: single-quoted string spanning multiple lines
+        let source = "<?php 'hello\nworld\ntest'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize multiline string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), "'hello\nworld\ntest'");
+        // Verify line tracking
+        assert_eq!(span.line, 1); // Starts on line 1
+    }
+
+    #[test]
+    fn test_single_quoted_string_backslash_at_end() {
+        // Test: single-quoted string with backslash before closing quote
+        let source = r"<?php 'test\\'";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with \\\\");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r"'test\\'");
+    }
+
+    #[test]
+    fn test_single_quoted_string_special_chars() {
+        // Test: single-quoted string with special characters
+        let source = r#"<?php 'hello"world'"#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer
+            .next_token()
+            .expect("Should tokenize string with double quotes");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#"'hello"world'"#);
     }
 }
