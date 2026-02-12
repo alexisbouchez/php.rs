@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/php-rs-types",
+    "crates/php-rs-lexer",
+    "crates/php-rs-parser",
+    "crates/php-rs-compiler",
+    "crates/php-rs-vm",
+    "crates/php-rs-gc",
+    "crates/php-rs-runtime",
+    "crates/php-rs-ext-standard",
+    "crates/php-rs-sapi-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["php.rs contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/php/php-rs"
+
+[workspace.dependencies]
+# Shared dependencies across the workspace

@@ -18,7 +18,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 # PHASE 0: PROJECT SCAFFOLDING
 ################################################################################
 
-[ ] 0.1  Initialize Cargo workspace at php.rs/ with workspace members
+[x] 0.1  Initialize Cargo workspace at php.rs/ with workspace members
 [ ] 0.2  Create crate stubs:
          [ ] crates/php-rs-types/
          [ ] crates/php-rs-lexer/
