@@ -623,6 +623,96 @@ impl<'src> Lexer<'src> {
     }
 
     /// Scan in ST_IN_SCRIPTING state - inside PHP code
+    /// Scan a single-line comment (// or #)
+    /// Consumes until end of line or EOF
+    fn scan_single_line_comment(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Consume // or #
+        if self.peek_str(2) == "//" {
+            self.consume_bytes(2);
+        } else if self.peek() == Some('#') {
+            // Check that it's not #[ (attribute syntax)
+            if self.peek_str(2) == "#[" {
+                return None; // Not a comment, it's an attribute
+            }
+            self.consume();
+        } else {
+            return None;
+        }
+
+        // Consume until newline or EOF
+        while let Some(ch) = self.peek() {
+            if ch == '\n' {
+                // Don't consume the newline - leave it for whitespace handling
+                break;
+            }
+            self.consume();
+        }
+
+        Some((
+            Token::Comment,
+            Span::new(start_pos, self.pos, start_line, start_column),
+        ))
+    }
+
+    /// Scan a multi-line comment (/* ... */) or doc comment (/** ... */)
+    /// Consumes until */ or EOF
+    fn scan_multi_line_comment(&mut self) -> Option<(Token, Span)> {
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Check for /** (doc comment) or /* (regular comment)
+        let is_doc_comment = self.peek_str(3) == "/**";
+
+        // Consume /* or /**
+        self.consume_bytes(2); // /*
+        if is_doc_comment && self.peek() == Some('*') {
+            self.consume(); // third *
+        }
+
+        // Consume until */ or EOF
+        loop {
+            match self.peek() {
+                None => {
+                    // Unterminated comment - reached EOF
+                    // Return what we have
+                    return Some((
+                        if is_doc_comment {
+                            Token::DocComment
+                        } else {
+                            Token::Comment
+                        },
+                        Span::new(start_pos, self.pos, start_line, start_column),
+                    ));
+                }
+                Some('*') => {
+                    self.consume();
+                    // Check if next is /
+                    if self.peek() == Some('/') {
+                        self.consume();
+                        // End of comment
+                        return Some((
+                            if is_doc_comment {
+                                Token::DocComment
+                            } else {
+                                Token::Comment
+                            },
+                            Span::new(start_pos, self.pos, start_line, start_column),
+                        ));
+                    }
+                    // Otherwise, continue (the * was just part of the comment content)
+                }
+                Some(_) => {
+                    self.consume();
+                }
+            }
+        }
+    }
+
     fn scan_scripting(&mut self) -> Option<(Token, Span)> {
         // Skip whitespace
         while let Some(ch) = self.peek() {
@@ -640,6 +730,26 @@ impl<'src> Lexer<'src> {
         let start_pos = self.pos;
         let start_line = self.line;
         let start_column = self.column;
+
+        // Check for attribute syntax #[ before checking for # comment
+        if self.peek_str(2) == "#[" {
+            self.consume_bytes(2);
+            return Some((
+                Token::Attribute,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+
+        // Check for comments (before operators, since // could be confused with /)
+        // Multi-line comments: /* */ or /** */
+        if self.peek_str(2) == "/*" {
+            return self.scan_multi_line_comment();
+        }
+
+        // Single-line comments: // or #
+        if self.peek_str(2) == "//" || self.peek() == Some('#') {
+            return self.scan_single_line_comment();
+        }
 
         // Try to match multi-character operators first (longest match wins)
         // Three-character operators
@@ -888,13 +998,6 @@ impl<'src> Lexer<'src> {
             self.consume_bytes(2);
             return Some((
                 Token::PaamayimNekudotayim,
-                Span::new(start_pos, self.pos, start_line, start_column),
-            ));
-        }
-        if self.peek_str(2) == "#[" {
-            self.consume_bytes(2);
-            return Some((
-                Token::Attribute,
                 Span::new(start_pos, self.pos, start_line, start_column),
             ));
         }
@@ -3743,5 +3846,201 @@ mod tests {
 
         assert_eq!(token, Token::ConstantEncapsedString);
         assert_eq!(span.extract(source), r#""$123""#);
+    }
+
+    #[test]
+    fn test_single_line_comment_double_slash() {
+        // Test: // comment (single-line comment)
+        // Reference: php-src/Zend/zend_language_scanner.l
+        let source = "<?php // this is a comment\necho 'test';";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize comment");
+        assert_eq!(token, Token::Comment);
+        assert_eq!(span.extract(source), "// this is a comment");
+
+        let (token, _) = lexer.next_token().expect("Should tokenize echo");
+        assert_eq!(token, Token::Echo);
+    }
+
+    #[test]
+    fn test_single_line_comment_hash() {
+        // Test: # comment (single-line comment, Unix shell style)
+        let source = "<?php # this is a comment\necho 'test';";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize comment");
+        assert_eq!(token, Token::Comment);
+        assert_eq!(span.extract(source), "# this is a comment");
+
+        let (token, _) = lexer.next_token().expect("Should tokenize echo");
+        assert_eq!(token, Token::Echo);
+    }
+
+    #[test]
+    fn test_multi_line_comment() {
+        // Test: /* multi-line comment */
+        let source = "<?php /* this is a\nmulti-line comment */ echo 'test';";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize comment");
+        assert_eq!(token, Token::Comment);
+        assert_eq!(span.extract(source), "/* this is a\nmulti-line comment */");
+
+        let (token, _) = lexer.next_token().expect("Should tokenize echo");
+        assert_eq!(token, Token::Echo);
+    }
+
+    #[test]
+    fn test_doc_comment() {
+        // Test: /** doc comment */ (PHPDoc style)
+        let source = "<?php /** This is a doc comment */ function test() {}";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize doc comment");
+        assert_eq!(token, Token::DocComment);
+        assert_eq!(span.extract(source), "/** This is a doc comment */");
+
+        let (token, _) = lexer.next_token().expect("Should tokenize function");
+        assert_eq!(token, Token::Function);
+    }
+
+    #[test]
+    fn test_doc_comment_multiline() {
+        // Test: Multi-line doc comment
+        let source = "<?php /**\n * This is a multi-line\n * doc comment\n */ class Test {}";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize doc comment");
+        assert_eq!(token, Token::DocComment);
+        assert_eq!(
+            span.extract(source),
+            "/**\n * This is a multi-line\n * doc comment\n */"
+        );
+
+        let (token, _) = lexer.next_token().expect("Should tokenize class");
+        assert_eq!(token, Token::Class);
+    }
+
+    #[test]
+    fn test_comment_at_end_of_file() {
+        // Test: Comment at the end of file (no newline after)
+        let source = "<?php echo 'test'; // comment at end";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+        lexer.next_token(); // Skip echo
+        lexer.next_token(); // Skip 'test'
+        lexer.next_token(); // Skip ;
+
+        let (token, span) = lexer.next_token().expect("Should tokenize comment");
+        assert_eq!(token, Token::Comment);
+        assert_eq!(span.extract(source), "// comment at end");
+
+        assert!(lexer.next_token().is_none(), "Should be at EOF");
+    }
+
+    #[test]
+    fn test_nested_comment_not_allowed() {
+        // Test: Nested /* */ comments are NOT allowed in PHP
+        // The first */ closes the comment
+        let source = "<?php /* outer /* inner */ still_comment */ echo 'test';";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize comment");
+        assert_eq!(token, Token::Comment);
+        // Should end at the first */
+        assert_eq!(span.extract(source), "/* outer /* inner */");
+
+        // "still_comment" should be tokenized as an identifier
+        let (token, span) = lexer.next_token().expect("Should tokenize identifier");
+        assert_eq!(token, Token::String);
+        assert_eq!(span.extract(source), "still_comment");
+    }
+
+    #[test]
+    fn test_unterminated_multiline_comment() {
+        // Test: Unterminated /* comment (reaches EOF)
+        // PHP treats this as an error, but our lexer should handle it gracefully
+        let source = "<?php /* this comment never ends";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize comment");
+        assert_eq!(token, Token::Comment);
+        assert_eq!(span.extract(source), "/* this comment never ends");
+    }
+
+    #[test]
+    fn test_comment_with_special_chars() {
+        // Test: Comments can contain any characters
+        let source = "<?php // comment with <tags> and $vars and 'quotes'\necho 'test';";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token, span) = lexer.next_token().expect("Should tokenize comment");
+        assert_eq!(token, Token::Comment);
+        assert_eq!(
+            span.extract(source),
+            "// comment with <tags> and $vars and 'quotes'"
+        );
+    }
+
+    #[test]
+    fn test_multiple_comments_in_sequence() {
+        // Test: Multiple comments in a row
+        let source = "<?php // first comment\n// second comment\n/* third comment */ echo 'test';";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+
+        let (token1, span1) = lexer.next_token().expect("Should tokenize first comment");
+        assert_eq!(token1, Token::Comment);
+        assert_eq!(span1.extract(source), "// first comment");
+
+        let (token2, span2) = lexer.next_token().expect("Should tokenize second comment");
+        assert_eq!(token2, Token::Comment);
+        assert_eq!(span2.extract(source), "// second comment");
+
+        let (token3, span3) = lexer.next_token().expect("Should tokenize third comment");
+        assert_eq!(token3, Token::Comment);
+        assert_eq!(span3.extract(source), "/* third comment */");
+
+        let (token4, _) = lexer.next_token().expect("Should tokenize echo");
+        assert_eq!(token4, Token::Echo);
+    }
+
+    #[test]
+    fn test_comment_does_not_interfere_with_strings() {
+        // Test: // inside a string should not start a comment
+        let source = r#"<?php echo "// not a comment"; // actual comment"#;
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // Skip <?php
+        lexer.next_token(); // Skip echo
+
+        let (token, span) = lexer.next_token().expect("Should tokenize string");
+        assert_eq!(token, Token::ConstantEncapsedString);
+        assert_eq!(span.extract(source), r#""// not a comment""#);
+
+        lexer.next_token(); // Skip ;
+
+        let (token, span) = lexer.next_token().expect("Should tokenize comment");
+        assert_eq!(token, Token::Comment);
+        assert_eq!(span.extract(source), "// actual comment");
     }
 }
