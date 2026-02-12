@@ -214,6 +214,117 @@ pub struct PhptOutput {
     pub exit_code: i32,
 }
 
+/// Result of comparing test output against expected output
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareResult {
+    /// Output matches expected
+    Match,
+    /// Output does not match expected
+    Mismatch {
+        expected: String,
+        actual: String,
+        details: String,
+    },
+}
+
+/// Compare actual output against expected output
+pub fn compare_output(expected: &PhptExpect, actual: &str) -> CompareResult {
+    match expected {
+        PhptExpect::Exact(expected_str) => {
+            if actual == expected_str {
+                CompareResult::Match
+            } else {
+                CompareResult::Mismatch {
+                    expected: expected_str.clone(),
+                    actual: actual.to_string(),
+                    details: format!(
+                        "Exact match failed:\nExpected:\n{}\nActual:\n{}",
+                        expected_str, actual
+                    ),
+                }
+            }
+        }
+        PhptExpect::Format(format_str) => compare_format(format_str, actual),
+    }
+}
+
+/// Compare actual output against a format string with placeholders
+///
+/// Supported placeholders:
+/// - %s: any string (non-greedy match)
+/// - %d: integer (optional sign + digits)
+/// - %f: float (optional sign + digits + optional decimal + optional exponent)
+/// - %i: integer (same as %d)
+/// - %u: unsigned integer (digits only)
+/// - %x: hexadecimal (0-9a-fA-F)
+/// - %c: single character
+/// - %%: literal percent sign
+fn compare_format(format_str: &str, actual: &str) -> CompareResult {
+    // Build a regex pattern from the format string
+    let mut pattern = String::new();
+    let mut chars = format_str.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            if let Some(&next_ch) = chars.peek() {
+                chars.next(); // consume the format specifier
+                match next_ch {
+                    's' => pattern.push_str(r".*?"),            // non-greedy any string
+                    'd' | 'i' => pattern.push_str(r"[+-]?\d+"), // integer
+                    'u' => pattern.push_str(r"\d+"),            // unsigned integer
+                    'f' => pattern.push_str(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"), // float
+                    'x' => pattern.push_str(r"[0-9a-fA-F]+"),   // hexadecimal
+                    'c' => pattern.push('.'),                   // single character
+                    '%' => pattern.push('%'),                   // literal %
+                    _ => {
+                        // Unknown format specifier - treat literally
+                        pattern.push('%');
+                        pattern.push(next_ch);
+                    }
+                }
+            } else {
+                // Trailing % - treat literally
+                pattern.push('%');
+            }
+        } else {
+            // Escape regex special characters
+            if r"\.+*?()|[]{}^$".contains(ch) {
+                pattern.push('\\');
+            }
+            pattern.push(ch);
+        }
+    }
+
+    // Anchor the pattern to match the entire string
+    let full_pattern = format!("^{}$", pattern);
+
+    // Compile and test the regex
+    match regex::Regex::new(&full_pattern) {
+        Ok(re) => {
+            if re.is_match(actual) {
+                CompareResult::Match
+            } else {
+                CompareResult::Mismatch {
+                    expected: format_str.to_string(),
+                    actual: actual.to_string(),
+                    details: format!(
+                        "Format match failed:\nExpected format:\n{}\nActual:\n{}\nRegex pattern: {}",
+                        format_str, actual, full_pattern
+                    ),
+                }
+            }
+        }
+        Err(e) => CompareResult::Mismatch {
+            expected: format_str.to_string(),
+            actual: actual.to_string(),
+            details: format!(
+                "Failed to compile regex pattern: {}\nPattern: {}",
+                e, full_pattern
+            ),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +601,197 @@ echo $a + $b;
 
         // This test just verifies the ARGS handling code doesn't crash
         let _ = execute_phpt(&test);
+    }
+
+    #[test]
+    fn test_compare_exact_match() {
+        let expected = PhptExpect::Exact("Hello, World!".to_string());
+        let result = compare_output(&expected, "Hello, World!");
+        assert_eq!(result, CompareResult::Match);
+    }
+
+    #[test]
+    fn test_compare_exact_mismatch() {
+        let expected = PhptExpect::Exact("Hello, World!".to_string());
+        let result = compare_output(&expected, "Hello, PHP!");
+        match result {
+            CompareResult::Mismatch {
+                expected: e,
+                actual: a,
+                ..
+            } => {
+                assert_eq!(e, "Hello, World!");
+                assert_eq!(a, "Hello, PHP!");
+            }
+            _ => panic!("Expected mismatch"),
+        }
+    }
+
+    #[test]
+    fn test_compare_format_string_placeholder() {
+        let expected = PhptExpect::Format("Hello, %s!".to_string());
+        assert_eq!(
+            compare_output(&expected, "Hello, World!"),
+            CompareResult::Match
+        );
+        assert_eq!(
+            compare_output(&expected, "Hello, PHP!"),
+            CompareResult::Match
+        );
+        assert_eq!(
+            compare_output(&expected, "Hello, Rust!"),
+            CompareResult::Match
+        );
+    }
+
+    #[test]
+    fn test_compare_format_integer_placeholder() {
+        let expected = PhptExpect::Format("Number: %d".to_string());
+        assert_eq!(
+            compare_output(&expected, "Number: 123"),
+            CompareResult::Match
+        );
+        assert_eq!(
+            compare_output(&expected, "Number: -456"),
+            CompareResult::Match
+        );
+        assert_eq!(
+            compare_output(&expected, "Number: +789"),
+            CompareResult::Match
+        );
+
+        // Should not match non-integers
+        match compare_output(&expected, "Number: abc") {
+            CompareResult::Mismatch { .. } => {}
+            _ => panic!("Expected mismatch for non-integer"),
+        }
+    }
+
+    #[test]
+    fn test_compare_format_float_placeholder() {
+        let expected = PhptExpect::Format("Float: %f".to_string());
+        assert_eq!(
+            compare_output(&expected, "Float: 123.456"),
+            CompareResult::Match
+        );
+        assert_eq!(
+            compare_output(&expected, "Float: -0.5"),
+            CompareResult::Match
+        );
+        assert_eq!(
+            compare_output(&expected, "Float: 1.5e10"),
+            CompareResult::Match
+        );
+        assert_eq!(
+            compare_output(&expected, "Float: 3.14E-5"),
+            CompareResult::Match
+        );
+        assert_eq!(compare_output(&expected, "Float: 42"), CompareResult::Match);
+        // Integer is valid float
+    }
+
+    #[test]
+    fn test_compare_format_unsigned_placeholder() {
+        let expected = PhptExpect::Format("Unsigned: %u".to_string());
+        assert_eq!(
+            compare_output(&expected, "Unsigned: 123"),
+            CompareResult::Match
+        );
+
+        // Should not match negative numbers
+        match compare_output(&expected, "Unsigned: -123") {
+            CompareResult::Mismatch { .. } => {}
+            _ => panic!("Expected mismatch for negative number"),
+        }
+    }
+
+    #[test]
+    fn test_compare_format_hex_placeholder() {
+        let expected = PhptExpect::Format("Hex: %x".to_string());
+        assert_eq!(
+            compare_output(&expected, "Hex: 1234567890abcdefABCDEF"),
+            CompareResult::Match
+        );
+
+        // Should not match non-hex
+        match compare_output(&expected, "Hex: xyz") {
+            CompareResult::Mismatch { .. } => {}
+            _ => panic!("Expected mismatch for non-hex"),
+        }
+    }
+
+    #[test]
+    fn test_compare_format_char_placeholder() {
+        let expected = PhptExpect::Format("Char: %c".to_string());
+        assert_eq!(compare_output(&expected, "Char: A"), CompareResult::Match);
+        assert_eq!(compare_output(&expected, "Char: 5"), CompareResult::Match);
+
+        // Should not match multiple characters
+        match compare_output(&expected, "Char: AB") {
+            CompareResult::Mismatch { .. } => {}
+            _ => panic!("Expected mismatch for multiple characters"),
+        }
+    }
+
+    #[test]
+    fn test_compare_format_literal_percent() {
+        let expected = PhptExpect::Format("Progress: 50%%".to_string());
+        assert_eq!(
+            compare_output(&expected, "Progress: 50%"),
+            CompareResult::Match
+        );
+    }
+
+    #[test]
+    fn test_compare_format_multiple_placeholders() {
+        let expected = PhptExpect::Format("Name: %s, Age: %d, Score: %f".to_string());
+        assert_eq!(
+            compare_output(&expected, "Name: Alice, Age: 30, Score: 95.5"),
+            CompareResult::Match
+        );
+        assert_eq!(
+            compare_output(&expected, "Name: Bob, Age: -5, Score: 0.0"),
+            CompareResult::Match
+        );
+    }
+
+    #[test]
+    fn test_compare_format_multiline() {
+        let expected = PhptExpect::Format("Line 1: %s\nLine 2: %d\nLine 3: %f".to_string());
+        assert_eq!(
+            compare_output(&expected, "Line 1: test\nLine 2: 42\nLine 3: 3.14"),
+            CompareResult::Match
+        );
+    }
+
+    #[test]
+    fn test_compare_format_regex_special_chars() {
+        // Test that regex special characters in the format string are properly escaped
+        let expected = PhptExpect::Format("Test: [%d]".to_string());
+        assert_eq!(
+            compare_output(&expected, "Test: [42]"),
+            CompareResult::Match
+        );
+
+        // Should not match without brackets
+        match compare_output(&expected, "Test: 42") {
+            CompareResult::Mismatch { .. } => {}
+            _ => panic!("Expected mismatch without brackets"),
+        }
+    }
+
+    #[test]
+    fn test_compare_format_complex_php_output() {
+        // Simulate a typical PHP var_dump output pattern
+        let expected = PhptExpect::Format(
+            "array(%d) {\n  [0]=>\n  string(%d) \"%s\"\n  [1]=>\n  int(%d)\n}".to_string(),
+        );
+        assert_eq!(
+            compare_output(
+                &expected,
+                "array(2) {\n  [0]=>\n  string(5) \"hello\"\n  [1]=>\n  int(42)\n}"
+            ),
+            CompareResult::Match
+        );
     }
 }

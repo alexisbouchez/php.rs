@@ -34,3 +34,4 @@ repository.workspace = true
 # Integration test dependencies
 
 [dev-dependencies]
+regex = "1"
