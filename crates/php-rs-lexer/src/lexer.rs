@@ -60,8 +60,23 @@ impl<'src> Lexer<'src> {
     }
 
     /// Peek at the next N bytes as a string slice
+    /// Returns empty string if the slice would be invalid UTF-8
     fn peek_str(&self, n: usize) -> &'src str {
         let end = (self.pos + n).min(self.source.len());
+
+        // Ensure we're at a valid UTF-8 boundary
+        if !self.source.is_char_boundary(self.pos) {
+            return "";
+        }
+
+        // Try to peek, but handle invalid boundary gracefully
+        if !self.source.is_char_boundary(end) {
+            // If end is not a char boundary, we can't slice there
+            // This can happen when we're in the middle of a multi-byte character
+            // Return empty string to signal no match
+            return "";
+        }
+
         &self.source[self.pos..end]
     }
 
@@ -80,7 +95,8 @@ impl<'src> Lexer<'src> {
         Some(ch)
     }
 
-    /// Consume N bytes (used when we've already peeked a multi-byte sequence)
+    /// Consume N bytes (used when we've already peeked a multi-byte ASCII sequence)
+    /// Note: This is only safe to use with ASCII sequences where byte count = char count
     fn consume_bytes(&mut self, n: usize) {
         for _ in 0..n {
             if self.peek().is_some() {
@@ -294,5 +310,276 @@ mod tests {
 
         // Verify state changed
         assert_eq!(lexer.state, State::InScripting);
+    }
+
+    // ======================================================================
+    // Task 2.2.2: Test inline HTML passthrough before <?php
+    // ======================================================================
+
+    #[test]
+    fn test_inline_html_simple_text_before_php() {
+        // Test: Simple text before <?php should be tokenized as InlineHtml
+        let source = "Hello World<?php";
+        let mut lexer = Lexer::new(source);
+
+        // Should get InlineHtml tokens until we hit <?php
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.extract(source).to_string()));
+        }
+
+        // Last token should be OpenTag
+        assert_eq!(tokens.last().unwrap().0, Token::OpenTag);
+        assert_eq!(tokens.last().unwrap().1, "<?php");
+
+        // All preceding tokens should be InlineHtml
+        for (token, _) in tokens.iter().take(tokens.len() - 1) {
+            assert_eq!(*token, Token::InlineHtml);
+        }
+
+        // When we concatenate all InlineHtml tokens, we should get "Hello World"
+        let html: String = tokens
+            .iter()
+            .take(tokens.len() - 1)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(html, "Hello World");
+    }
+
+    #[test]
+    fn test_inline_html_doctype_before_php() {
+        // Test: HTML doctype before <?php
+        let source = "<!DOCTYPE html>\n<?php";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.extract(source).to_string()));
+        }
+
+        // Last token should be OpenTag
+        assert_eq!(tokens.last().unwrap().0, Token::OpenTag);
+        assert_eq!(tokens.last().unwrap().1, "<?php");
+
+        // Concatenate HTML parts
+        let html: String = tokens
+            .iter()
+            .take(tokens.len() - 1)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(html, "<!DOCTYPE html>\n");
+    }
+
+    #[test]
+    fn test_inline_html_complete_html_document() {
+        // Test: Complete HTML document with embedded PHP
+        let source = r#"<!DOCTYPE html>
+<html>
+<head>
+    <title>Test</title>
+</head>
+<body>
+    <?php echo 'Hello'; ?>
+</body>
+</html>"#;
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token.clone(), span.extract(source).to_string()));
+        }
+
+        // Should have InlineHtml tokens, then OpenTag
+        let mut found_open_tag = false;
+        for (token, text) in &tokens {
+            match token {
+                Token::InlineHtml => {
+                    assert!(
+                        !found_open_tag,
+                        "InlineHtml should only appear before first OpenTag"
+                    );
+                }
+                Token::OpenTag => {
+                    found_open_tag = true;
+                    assert_eq!(text, "<?php");
+                }
+                _ => {}
+            }
+        }
+
+        assert!(found_open_tag, "Should have found at least one OpenTag");
+
+        // Collect all HTML before first <?php
+        let html: String = tokens
+            .iter()
+            .take_while(|(token, _)| *token == Token::InlineHtml)
+            .map(|(_, text)| text.as_str())
+            .collect();
+
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("<body>"));
+    }
+
+    #[test]
+    fn test_inline_html_empty_before_php() {
+        // Test: No HTML before <?php (file starts with <?php)
+        let source = "<?php echo 'test';";
+        let mut lexer = Lexer::new(source);
+
+        // First token should be OpenTag
+        let (token, span) = lexer.next_token().expect("Should have OpenTag");
+        assert_eq!(token, Token::OpenTag);
+        assert_eq!(span.extract(source), "<?php");
+
+        // No InlineHtml tokens should have been emitted
+    }
+
+    #[test]
+    fn test_inline_html_single_char_before_php() {
+        // Test: Single character before <?php
+        let source = "x<?php";
+        let mut lexer = Lexer::new(source);
+
+        let (token1, span1) = lexer.next_token().expect("Should have InlineHtml");
+        assert_eq!(token1, Token::InlineHtml);
+        assert_eq!(span1.extract(source), "x");
+
+        let (token2, span2) = lexer.next_token().expect("Should have OpenTag");
+        assert_eq!(token2, Token::OpenTag);
+        assert_eq!(span2.extract(source), "<?php");
+    }
+
+    #[test]
+    fn test_inline_html_special_chars() {
+        // Test: Inline HTML with special characters
+        let source = "Test: <>&\"'\t\n\r<?php";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.extract(source).to_string()));
+        }
+
+        assert_eq!(tokens.last().unwrap().0, Token::OpenTag);
+
+        let html: String = tokens
+            .iter()
+            .take(tokens.len() - 1)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(html, "Test: <>&\"'\t\n\r");
+    }
+
+    #[test]
+    fn test_inline_html_looks_like_php_tag_but_isnt() {
+        // Test: Text that looks like it might be a PHP tag but isn't
+        let source = "<?phpinfo() is not a tag\n<?php";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.extract(source).to_string()));
+        }
+
+        // Last token should be the real <?php tag
+        assert_eq!(tokens.last().unwrap().0, Token::OpenTag);
+        assert_eq!(tokens.last().unwrap().1, "<?php");
+
+        // Everything before should be InlineHtml
+        let html: String = tokens
+            .iter()
+            .take(tokens.len() - 1)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(html, "<?phpinfo() is not a tag\n");
+    }
+
+    #[test]
+    fn test_inline_html_unicode_before_php() {
+        // Test: Unicode text before <?php
+        let source = "你好世界 Hello 🌍\n<?php";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.extract(source).to_string()));
+        }
+
+        assert_eq!(tokens.last().unwrap().0, Token::OpenTag);
+
+        let html: String = tokens
+            .iter()
+            .take(tokens.len() - 1)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(html, "你好世界 Hello 🌍\n");
+    }
+
+    #[test]
+    fn test_inline_html_multiline_before_php() {
+        // Test: Multiple lines of HTML before <?php
+        let source = "Line 1\nLine 2\nLine 3\n<?php";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            let line = span.line;
+            tokens.push((token, span.extract(source).to_string(), line));
+        }
+
+        // Last token should be OpenTag on line 4
+        assert_eq!(tokens.last().unwrap().0, Token::OpenTag);
+        assert_eq!(tokens.last().unwrap().2, 4);
+
+        // Concatenate HTML
+        let html: String = tokens
+            .iter()
+            .take(tokens.len() - 1)
+            .map(|(_, text, _)| text.as_str())
+            .collect();
+        assert_eq!(html, "Line 1\nLine 2\nLine 3\n");
+    }
+
+    #[test]
+    fn test_inline_html_with_open_tag_with_echo() {
+        // Test: HTML before <?= tag
+        let source = "HTML content<?= 'value' ?>";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.extract(source).to_string()));
+        }
+
+        // Should find OpenTagWithEcho
+        assert!(tokens
+            .iter()
+            .any(|(token, _)| *token == Token::OpenTagWithEcho));
+
+        // Collect HTML before <?=
+        let html: String = tokens
+            .iter()
+            .take_while(|(token, _)| *token == Token::InlineHtml)
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(html, "HTML content");
+    }
+
+    #[test]
+    fn test_inline_html_line_and_column_tracking() {
+        // Test: Line and column numbers are tracked correctly through inline HTML
+        let source = "abc\ndef\n<?php";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.line, span.column));
+        }
+
+        // Last token (<?php) should be on line 3, column 1
+        let last = tokens.last().unwrap();
+        assert_eq!(last.0, Token::OpenTag);
+        assert_eq!(last.1, 3); // line 3
+        assert_eq!(last.2, 1); // column 1
     }
 }
