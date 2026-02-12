@@ -88,8 +88,8 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 1.5.3  Test: create object, set/get properties, method lookup
 
 ## 1.6 ZResource — External resource handle
-[ ] 1.6.1  Define ZResource: type id, pointer, destructor
-[ ] 1.6.2  Test: create, access, destroy callback
+[x] 1.6.1  Define ZResource: type id, pointer, destructor
+[x] 1.6.2  Test: create, access, destroy callback
 
 ## 1.7 References
 [ ] 1.7.1  Define ZReference: refcount + wrapped ZVal

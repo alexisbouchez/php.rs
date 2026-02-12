@@ -5868,3 +5868,241 @@ mod zobject_tests {
         assert!(obj.handle() > 0);
     }
 }
+
+// ============================================================================
+// ZResource — External resource handle
+// ============================================================================
+// Reference: php-src/Zend/zend_types.h — struct _zend_resource
+//
+// A PHP resource represents an external handle (file, database connection, etc.).
+// Resources have:
+// - A unique handle (like an object)
+// - A type ID (registered by extensions)
+// - A pointer to the actual resource data
+// - A destructor function that's called when the resource is freed
+//
+// Resource types are registered with zend_register_list_destructors_ex().
+// ============================================================================
+
+/// Resource destructor function type
+///
+/// This is called when a resource is being destroyed.
+/// It receives a mutable reference to the resource data.
+pub type ResourceDestructor = fn(*mut u8);
+
+/// Represents a PHP resource
+///
+/// Reference: php-src/Zend/zend_types.h — struct _zend_resource
+///
+/// A resource has:
+/// - handle: unique identifier for this resource instance
+/// - type_id: resource type (registered by extensions)
+/// - ptr: pointer to the actual resource data
+/// - destructor: optional cleanup function called when resource is destroyed
+///
+/// Resources are used for external handles like files, database connections,
+/// curl handles, etc. They are opaque to userland PHP code.
+#[derive(Debug)]
+pub struct ZResource {
+    /// Unique resource handle/identifier
+    /// Used for resource identity (displayed as "Resource id #N")
+    handle: i64,
+    /// Resource type ID (registered by extensions)
+    /// e.g., FILE_TYPE_ID, MYSQL_TYPE_ID, CURL_TYPE_ID
+    type_id: i32,
+    /// Pointer to the actual resource data
+    /// This is a raw pointer because resources are externally managed
+    ptr: *mut u8,
+    /// Optional destructor function
+    /// Called when the resource is being destroyed (refcount reaches 0)
+    destructor: Option<ResourceDestructor>,
+}
+
+// Safety: We need to implement Send/Sync for ZResource to be stored in ZVal
+// Resources are typically thread-safe as they represent external handles
+// The destructor is responsible for any necessary synchronization
+unsafe impl Send for ZResource {}
+unsafe impl Sync for ZResource {}
+
+impl ZResource {
+    /// Create a new resource
+    ///
+    /// # Arguments
+    /// * `type_id` - Resource type identifier (registered by extension)
+    /// * `ptr` - Pointer to the resource data
+    /// * `destructor` - Optional cleanup function
+    ///
+    /// # Returns
+    /// A new ZResource with a unique handle
+    pub fn new(type_id: i32, ptr: *mut u8, destructor: Option<ResourceDestructor>) -> Self {
+        use std::sync::atomic::{AtomicI64, Ordering};
+        static NEXT_HANDLE: AtomicI64 = AtomicI64::new(1);
+
+        Self {
+            handle: NEXT_HANDLE.fetch_add(1, Ordering::Relaxed),
+            type_id,
+            ptr,
+            destructor,
+        }
+    }
+
+    /// Get the unique resource handle
+    pub fn handle(&self) -> i64 {
+        self.handle
+    }
+
+    /// Get the resource type ID
+    pub fn type_id(&self) -> i32 {
+        self.type_id
+    }
+
+    /// Get the raw pointer to the resource data
+    ///
+    /// # Safety
+    /// The caller must ensure the pointer is valid and properly typed
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Get a typed pointer to the resource data
+    ///
+    /// # Safety
+    /// The caller must ensure T matches the actual type of the resource data
+    pub unsafe fn as_ptr<T>(&self) -> *mut T {
+        self.ptr as *mut T
+    }
+}
+
+impl Drop for ZResource {
+    fn drop(&mut self) {
+        // Call the destructor if provided
+        if let Some(dtor) = self.destructor {
+            dtor(self.ptr);
+        }
+    }
+}
+
+// ZResource doesn't implement Clone because resources are unique
+// and often represent external state (file handles, connections, etc.)
+// that shouldn't be duplicated
+
+#[cfg(test)]
+mod zresource_tests {
+    use super::*;
+
+    #[test]
+    fn test_zresource_create() {
+        // Test: Create a new resource
+        // PHP equivalent: $file = fopen("test.txt", "r"); // creates a file resource
+
+        let type_id = 1; // FILE_TYPE_ID
+        let data: Box<i32> = Box::new(42);
+        let ptr = Box::into_raw(data) as *mut u8;
+
+        let resource = ZResource::new(type_id, ptr, None);
+
+        // Verify handle is assigned
+        assert!(resource.handle() > 0);
+
+        // Verify type_id
+        assert_eq!(resource.type_id(), 1);
+
+        // Verify pointer
+        assert_eq!(resource.ptr(), ptr);
+
+        // Clean up
+        unsafe {
+            let _ = Box::from_raw(ptr as *mut i32);
+        }
+    }
+
+    #[test]
+    fn test_zresource_unique_handles() {
+        // Test: Each resource gets a unique handle
+
+        let res1 = ZResource::new(1, std::ptr::null_mut(), None);
+        let res2 = ZResource::new(1, std::ptr::null_mut(), None);
+        let res3 = ZResource::new(2, std::ptr::null_mut(), None);
+
+        // All handles should be unique
+        assert_ne!(res1.handle(), res2.handle());
+        assert_ne!(res1.handle(), res3.handle());
+        assert_ne!(res2.handle(), res3.handle());
+
+        // Handles should be sequential
+        assert!(res2.handle() > res1.handle());
+        assert!(res3.handle() > res2.handle());
+    }
+
+    #[test]
+    fn test_zresource_typed_pointer() {
+        // Test: Access resource data through typed pointer
+
+        #[derive(Debug, PartialEq)]
+        struct FileHandle {
+            filename: String,
+            position: usize,
+        }
+
+        let file_data = Box::new(FileHandle {
+            filename: "test.txt".to_string(),
+            position: 0,
+        });
+        let ptr = Box::into_raw(file_data);
+
+        let resource = ZResource::new(1, ptr as *mut u8, None);
+
+        // Access the typed pointer
+        unsafe {
+            let file_ptr = resource.as_ptr::<FileHandle>();
+            assert_eq!((*file_ptr).filename, "test.txt");
+            assert_eq!((*file_ptr).position, 0);
+        }
+
+        // Clean up
+        unsafe {
+            let _ = Box::from_raw(ptr);
+        }
+    }
+
+    #[test]
+    fn test_zresource_destructor_called() {
+        // Test: Destructor is called when resource is dropped
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let destroyed = Arc::new(AtomicBool::new(false));
+        let destroyed_clone = destroyed.clone();
+
+        // Create a resource with a destructor
+        fn test_destructor(ptr: *mut u8) {
+            // In a real scenario, this would free the resource
+            // For testing, we just verify it's called
+            unsafe {
+                let flag_ptr = ptr as *mut Arc<AtomicBool>;
+                (*flag_ptr).store(true, Ordering::Relaxed);
+                let _ = Box::from_raw(flag_ptr);
+            }
+        }
+
+        let flag_box = Box::new(destroyed_clone);
+        let ptr = Box::into_raw(flag_box) as *mut u8;
+
+        {
+            let _resource = ZResource::new(1, ptr, Some(test_destructor));
+            // Resource is dropped at end of this scope
+        }
+
+        // Destructor should have been called
+        assert!(destroyed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn test_zresource_no_destructor() {
+        // Test: Resource without destructor doesn't crash on drop
+
+        let resource = ZResource::new(1, std::ptr::null_mut(), None);
+        drop(resource); // Should not crash
+    }
+}
