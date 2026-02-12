@@ -35,6 +35,9 @@ pub struct Lexer<'src> {
     allow_short_tags: bool,
     /// Heredoc/nowdoc label (used to match closing marker)
     heredoc_label: Option<String>,
+    /// Track state for __halt_compiler() handling
+    /// 0 = not seen, 1 = seen __halt_compiler, 2 = seen (, 3 = seen ), 4 = stop after ;
+    halt_compiler_state: u8,
 }
 
 impl<'src> Lexer<'src> {
@@ -48,6 +51,7 @@ impl<'src> Lexer<'src> {
             state: State::Initial,
             allow_short_tags: false,
             heredoc_label: None,
+            halt_compiler_state: 0,
         }
     }
 
@@ -61,6 +65,7 @@ impl<'src> Lexer<'src> {
             state: State::Initial,
             allow_short_tags: true,
             heredoc_label: None,
+            halt_compiler_state: 0,
         }
     }
 
@@ -122,13 +127,35 @@ impl<'src> Lexer<'src> {
 
     /// Scan the next token
     pub fn next_token(&mut self) -> Option<(Token, Span)> {
-        match self.state {
+        // If we've hit __halt_compiler(); stop lexing
+        // Reference: php-src/Zend/zend_compile.c::zend_stop_lexing()
+        if self.halt_compiler_state >= 4 {
+            return None;
+        }
+
+        let result = match self.state {
             State::Initial => self.scan_initial(),
             State::InScripting => self.scan_scripting(),
             State::DoubleQuotes => self.scan_double_quotes_state(),
             State::Heredoc => self.scan_heredoc_state(),
             State::Nowdoc => self.scan_nowdoc_state(),
+        };
+
+        // Track __halt_compiler() sequence: __halt_compiler ( ) ;
+        // When we see this exact sequence, we stop lexing after the semicolon
+        if let Some((ref token, _)) = result {
+            match (self.halt_compiler_state, token) {
+                (0, Token::HaltCompiler) => self.halt_compiler_state = 1,
+                (1, Token::LParen) => self.halt_compiler_state = 2,
+                (2, Token::RParen) => self.halt_compiler_state = 3,
+                (3, Token::Semicolon) => self.halt_compiler_state = 4,
+                // If we see anything else after __halt_compiler, reset
+                (1..=3, _) => self.halt_compiler_state = 0,
+                _ => {}
+            }
         }
+
+        result
     }
 
     /// Scan in INITIAL state - looking for <?php, <?=, or <? (if short_open_tag)
@@ -5791,5 +5818,112 @@ line2"`;
 
         let (token3, _) = lexer.next_token().expect("EndHeredoc");
         assert_eq!(token3, Token::EndHeredoc);
+    }
+
+    // ======================================================================
+    // __halt_compiler() special handling
+    // Reference: php-src/Zend/zend_compile.c (zend_stop_lexing)
+    // ======================================================================
+
+    #[test]
+    fn test_halt_compiler_stops_lexing() {
+        // Test: __halt_compiler(); should cause the lexer to stop
+        // after the semicolon, treating everything after as raw data
+        //
+        // In PHP, __halt_compiler(); causes the lexer to stop immediately
+        // after the semicolon. Everything after is accessible via __COMPILER_HALT_OFFSET__
+        // but is not tokenized as PHP code.
+        //
+        // Reference: php-src/Zend/zend_compile.c::zend_stop_lexing()
+        // which sets yy_cursor = yy_limit to stop the scanner
+        let source = "<?php __halt_compiler(); this should not be tokenized";
+        let mut lexer = Lexer::new(source);
+
+        // Token 1: <?php
+        let (token, _) = lexer.next_token().expect("Should get OpenTag");
+        assert_eq!(token, Token::OpenTag);
+
+        // Token 2: __halt_compiler
+        let (token, _) = lexer.next_token().expect("Should get HaltCompiler");
+        assert_eq!(token, Token::HaltCompiler);
+
+        // Token 3: (
+        let (token, _) = lexer.next_token().expect("Should get LParen");
+        assert_eq!(token, Token::LParen);
+
+        // Token 4: )
+        let (token, _) = lexer.next_token().expect("Should get RParen");
+        assert_eq!(token, Token::RParen);
+
+        // Token 5: ;
+        let (token, _) = lexer.next_token().expect("Should get Semicolon");
+        assert_eq!(token, Token::Semicolon);
+
+        // After semicolon, the lexer should stop and return None
+        // (or return End token, depending on implementation)
+        let result = lexer.next_token();
+        assert!(
+            result.is_none(),
+            "Lexer should stop after __halt_compiler();"
+        );
+    }
+
+    #[test]
+    fn test_halt_compiler_with_newlines() {
+        // Test: __halt_compiler() followed by multiple lines of data
+        let source = "<?php\n__halt_compiler();\nBinary data\nMore data\n<?php echo 'ignored';";
+        let mut lexer = Lexer::new(source);
+
+        // Consume tokens up to and including the semicolon
+        lexer.next_token(); // <?php
+        lexer.next_token(); // __halt_compiler
+        lexer.next_token(); // (
+        lexer.next_token(); // )
+        lexer.next_token(); // ;
+
+        // After semicolon, no more tokens
+        let result = lexer.next_token();
+        assert!(result.is_none(), "No tokens after __halt_compiler();");
+    }
+
+    #[test]
+    fn test_halt_compiler_with_special_chars() {
+        // Test: __halt_compiler() followed by special characters
+        // This is a common use case in PHAR archives
+        let source = "<?php __halt_compiler(); \x00\x01\x02 garbage data \t\n";
+        let mut lexer = Lexer::new(source);
+
+        // Consume up to semicolon
+        for _ in 0..5 {
+            // <?php, __halt_compiler, (, ), ;
+            lexer.next_token();
+        }
+
+        // Should stop even with special chars after
+        assert!(lexer.next_token().is_none());
+    }
+
+    #[test]
+    fn test_halt_compiler_offset_tracking() {
+        // Test: Track the byte offset where __halt_compiler(); ends
+        // This offset is used for __COMPILER_HALT_OFFSET__ constant
+        let source = "<?php __halt_compiler(); DATA STARTS HERE";
+        let mut lexer = Lexer::new(source);
+
+        lexer.next_token(); // <?php
+        lexer.next_token(); // __halt_compiler
+        lexer.next_token(); // (
+        lexer.next_token(); // )
+
+        let (token, span) = lexer.next_token().expect("Get semicolon");
+        assert_eq!(token, Token::Semicolon);
+
+        // The byte offset after the semicolon is where raw data starts
+        // In this case: "<?php __halt_compiler();" is 24 bytes
+        let halt_offset = span.end;
+        assert_eq!(halt_offset, 24);
+
+        // Verify that the data after halt_offset is " DATA STARTS HERE"
+        assert_eq!(&source[halt_offset..], " DATA STARTS HERE");
     }
 }
