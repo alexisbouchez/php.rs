@@ -5570,4 +5570,301 @@ mod zobject_tests {
         assert_eq!(handle1, handle2);
         assert_eq!(obj1.class_entry(), obj2.class_entry());
     }
+
+    // ========================================================================
+    // Integration tests: ClassEntry + ZObject
+    // ========================================================================
+
+    #[test]
+    fn test_zobject_with_class_entry_integration() {
+        // Test: Create a class and an object from it
+        // PHP equivalent:
+        //   class Person {
+        //       const SPECIES = "Human";
+        //       public $name;
+        //       public $age;
+        //       public function greet() { ... }
+        //   }
+        //   $person = new Person();
+        //   $person->name = "Alice";
+        //   $person->age = 30;
+
+        // 1. Create the ClassEntry
+        let mut person_class = ClassEntry::new(ZString::new(b"Person"));
+
+        // Add constant
+        let s_species = ZString::new(b"Human");
+        person_class.add_constant(
+            ZString::new(b"SPECIES"),
+            ZVal::string(Box::into_raw(Box::new(s_species)) as usize),
+        );
+
+        // Add property declarations (in a real implementation, these would have metadata)
+        person_class.add_property(ZString::new(b"name"), 1000);
+        person_class.add_property(ZString::new(b"age"), 1001);
+
+        // Add method
+        person_class.add_method(ZString::new(b"greet"), 2000);
+
+        // Verify ClassEntry is set up correctly
+        assert_eq!(person_class.name(), &ZString::new(b"Person"));
+        assert!(person_class.has_constant(&ZString::new(b"SPECIES")));
+        assert!(person_class.has_property(&ZString::new(b"name")));
+        assert!(person_class.has_property(&ZString::new(b"age")));
+        assert!(person_class.has_method(&ZString::new(b"greet")));
+
+        // 2. Create a ZObject instance
+        // Note: In a real implementation, we'd pass Arc<ClassEntry> or a registry handle
+        // For now, we use a simple handle (1) as a placeholder
+        let class_handle = 1;
+        let mut person_obj = ZObject::new(class_handle);
+
+        // 3. Set object properties (dynamic properties)
+        let s_name = ZString::new(b"Alice");
+        person_obj.set_property(
+            ZString::new(b"name"),
+            ZVal::string(Box::into_raw(Box::new(s_name)) as usize),
+        );
+        person_obj.set_property(ZString::new(b"age"), ZVal::long(30));
+
+        // 4. Verify object state
+        assert_eq!(person_obj.class_entry(), class_handle);
+        assert_eq!(person_obj.property_count(), 2);
+        assert_eq!(
+            person_obj
+                .get_property(&ZString::new(b"name"))
+                .unwrap()
+                .to_string(),
+            ZString::new(b"Alice")
+        );
+        assert_eq!(
+            person_obj
+                .get_property(&ZString::new(b"age"))
+                .unwrap()
+                .to_long(),
+            30
+        );
+
+        // 5. Verify we can look up methods through the ClassEntry
+        assert_eq!(person_class.get_method(&ZString::new(b"greet")), Some(2000));
+
+        // 6. Verify we can access class constants through the ClassEntry
+        assert_eq!(
+            person_class
+                .get_constant(&ZString::new(b"SPECIES"))
+                .unwrap()
+                .to_string(),
+            ZString::new(b"Human")
+        );
+    }
+
+    #[test]
+    fn test_multiple_objects_same_class() {
+        // Test: Multiple objects from the same class
+        // PHP equivalent:
+        //   class Counter { public $count; }
+        //   $c1 = new Counter(); $c1->count = 10;
+        //   $c2 = new Counter(); $c2->count = 20;
+
+        // Create class
+        let mut counter_class = ClassEntry::new(ZString::new(b"Counter"));
+        counter_class.add_property(ZString::new(b"count"), 3000);
+
+        // Create two objects
+        let class_handle = 5;
+        let mut obj1 = ZObject::new(class_handle);
+        let mut obj2 = ZObject::new(class_handle);
+
+        // Set different property values
+        obj1.set_property(ZString::new(b"count"), ZVal::long(10));
+        obj2.set_property(ZString::new(b"count"), ZVal::long(20));
+
+        // Verify objects have different handles
+        assert_ne!(obj1.handle(), obj2.handle());
+
+        // Verify objects have independent property values
+        assert_eq!(
+            obj1.get_property(&ZString::new(b"count"))
+                .unwrap()
+                .to_long(),
+            10
+        );
+        assert_eq!(
+            obj2.get_property(&ZString::new(b"count"))
+                .unwrap()
+                .to_long(),
+            20
+        );
+
+        // Both reference the same class
+        assert_eq!(obj1.class_entry(), class_handle);
+        assert_eq!(obj2.class_entry(), class_handle);
+    }
+
+    #[test]
+    fn test_inheritance_method_lookup() {
+        // Test: Method lookup through inheritance hierarchy
+        // PHP equivalent:
+        //   class Animal { public function eat() {} }
+        //   class Dog extends Animal { public function bark() {} }
+        //   $dog = new Dog();
+        //   // Dog has both eat() (inherited) and bark() (own)
+
+        // Create Animal class
+        let mut animal_class = ClassEntry::new(ZString::new(b"Animal"));
+        animal_class.add_method(ZString::new(b"eat"), 4000);
+        let animal_class = Arc::new(animal_class);
+
+        // Create Dog class that extends Animal
+        let mut dog_class = ClassEntry::new(ZString::new(b"Dog"));
+        dog_class.set_parent(animal_class.clone());
+        dog_class.add_method(ZString::new(b"bark"), 4001);
+
+        // Verify Dog has its own method
+        assert!(dog_class.has_method(&ZString::new(b"bark")));
+        assert_eq!(dog_class.get_method(&ZString::new(b"bark")), Some(4001));
+
+        // Verify parent has its method
+        assert!(animal_class.has_method(&ZString::new(b"eat")));
+        assert_eq!(animal_class.get_method(&ZString::new(b"eat")), Some(4000));
+
+        // Note: In a full implementation, Dog would inherit eat() from Animal
+        // through a recursive lookup in the parent chain. For now, we just
+        // verify the structure is correct.
+        assert_eq!(dog_class.parent().unwrap().name(), &ZString::new(b"Animal"));
+    }
+
+    #[test]
+    fn test_interface_implementation() {
+        // Test: Class implementing multiple interfaces
+        // PHP equivalent:
+        //   interface Drawable { public function draw(); }
+        //   interface Serializable { public function serialize(); }
+        //   class Shape implements Drawable, Serializable {
+        //       public function draw() {}
+        //       public function serialize() {}
+        //   }
+
+        // Create interfaces
+        let mut drawable_interface = ClassEntry::new(ZString::new(b"Drawable"));
+        drawable_interface.add_method(ZString::new(b"draw"), 5000);
+        let drawable_interface = Arc::new(drawable_interface);
+
+        let mut serializable_interface = ClassEntry::new(ZString::new(b"Serializable"));
+        serializable_interface.add_method(ZString::new(b"serialize"), 5001);
+        let serializable_interface = Arc::new(serializable_interface);
+
+        // Create Shape class implementing both interfaces
+        let mut shape_class = ClassEntry::new(ZString::new(b"Shape"));
+        shape_class.add_interface(drawable_interface.clone());
+        shape_class.add_interface(serializable_interface.clone());
+        shape_class.add_method(ZString::new(b"draw"), 5010);
+        shape_class.add_method(ZString::new(b"serialize"), 5011);
+
+        // Verify interfaces are registered
+        assert_eq!(shape_class.interfaces().len(), 2);
+        assert_eq!(
+            shape_class.interfaces()[0].name(),
+            &ZString::new(b"Drawable")
+        );
+        assert_eq!(
+            shape_class.interfaces()[1].name(),
+            &ZString::new(b"Serializable")
+        );
+
+        // Verify Shape implements the required methods
+        assert!(shape_class.has_method(&ZString::new(b"draw")));
+        assert!(shape_class.has_method(&ZString::new(b"serialize")));
+    }
+
+    #[test]
+    fn test_object_property_vs_class_property() {
+        // Test: Distinguish between class property declarations and object instance properties
+        // PHP equivalent:
+        //   class User { public $username; }
+        //   $user = new User();
+        //   $user->username = "alice";
+        //   $user->email = "alice@example.com"; // dynamic property
+
+        // Create User class with declared property
+        let mut user_class = ClassEntry::new(ZString::new(b"User"));
+        user_class.add_property(ZString::new(b"username"), 6000);
+
+        // Create object instance
+        let class_handle = 10;
+        let mut user_obj = ZObject::new(class_handle);
+
+        // Set declared property
+        let s_username = ZString::new(b"alice");
+        user_obj.set_property(
+            ZString::new(b"username"),
+            ZVal::string(Box::into_raw(Box::new(s_username)) as usize),
+        );
+
+        // Set dynamic property (not declared in class)
+        let s_email = ZString::new(b"alice@example.com");
+        user_obj.set_property(
+            ZString::new(b"email"),
+            ZVal::string(Box::into_raw(Box::new(s_email)) as usize),
+        );
+
+        // Verify both properties exist on the object
+        assert_eq!(user_obj.property_count(), 2);
+        assert!(user_obj.has_property(&ZString::new(b"username")));
+        assert!(user_obj.has_property(&ZString::new(b"email")));
+
+        // Verify class only knows about declared property
+        assert!(user_class.has_property(&ZString::new(b"username")));
+        assert!(!user_class.has_property(&ZString::new(b"email")));
+    }
+
+    #[test]
+    fn test_class_constant_access() {
+        // Test: Access class constants
+        // PHP equivalent:
+        //   class Math { const PI = 3.14159; const E = 2.71828; }
+        //   echo Math::PI;
+
+        let mut math_class = ClassEntry::new(ZString::new(b"Math"));
+        math_class.add_constant(ZString::new(b"PI"), ZVal::double(3.14159));
+        math_class.add_constant(ZString::new(b"E"), ZVal::double(2.71828));
+
+        // Verify constants exist
+        assert!(math_class.has_constant(&ZString::new(b"PI")));
+        assert!(math_class.has_constant(&ZString::new(b"E")));
+
+        // Verify constant values
+        let pi_val = math_class.get_constant(&ZString::new(b"PI")).unwrap();
+        assert_eq!(pi_val.as_double().unwrap(), 3.14159);
+
+        let e_val = math_class.get_constant(&ZString::new(b"E")).unwrap();
+        assert_eq!(e_val.as_double().unwrap(), 2.71828);
+
+        // Verify non-existent constant returns None
+        assert!(!math_class.has_constant(&ZString::new(b"TAU")));
+        assert!(math_class.get_constant(&ZString::new(b"TAU")).is_none());
+    }
+
+    #[test]
+    fn test_empty_class_empty_object() {
+        // Test: Empty class and object (like stdClass)
+        // PHP equivalent:
+        //   class stdClass {}
+        //   $obj = new stdClass();
+
+        let std_class = ClassEntry::new(ZString::new(b"stdClass"));
+
+        // Verify empty class
+        assert_eq!(std_class.name(), &ZString::new(b"stdClass"));
+        assert_eq!(std_class.method_names().len(), 0);
+        assert_eq!(std_class.property_names().len(), 0);
+        assert_eq!(std_class.constant_names().len(), 0);
+
+        // Create empty object
+        let obj = ZObject::new(15);
+
+        // Verify empty object
+        assert_eq!(obj.property_count(), 0);
+        assert!(obj.handle() > 0);
+    }
 }
