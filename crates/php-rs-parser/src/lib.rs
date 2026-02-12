@@ -4,5 +4,7 @@
 //! Equivalent to php-src/Zend/zend_language_parser.y
 
 mod ast;
+mod parser;
 
 pub use ast::*;
+pub use parser::{ParseError, Parser};

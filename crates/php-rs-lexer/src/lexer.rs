@@ -1672,7 +1672,88 @@ impl<'src> Lexer<'src> {
                 ))
             }
             '(' => {
-                self.consume();
+                // Check if this is a cast expression: (int), (string), (bool), etc.
+                // We need to lookahead to see if there's a type keyword followed by )
+                self.consume(); // consume '('
+
+                // Skip whitespace
+                let mut temp_pos = self.pos;
+                while temp_pos < self.source.len()
+                    && self.source[temp_pos..]
+                        .chars()
+                        .next()
+                        .map_or(false, |c| c.is_whitespace())
+                {
+                    temp_pos += 1;
+                }
+
+                // Try to read an identifier
+                let mut end_pos = temp_pos;
+                while end_pos < self.source.len() {
+                    if let Some(ch) = self.source[end_pos..].chars().next() {
+                        if ch.is_alphanumeric() || ch == '_' {
+                            end_pos += ch.len_utf8();
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                if end_pos > temp_pos {
+                    let identifier = &self.source[temp_pos..end_pos];
+
+                    // Skip whitespace after identifier
+                    let mut after_ident = end_pos;
+                    while after_ident < self.source.len()
+                        && self.source[after_ident..]
+                            .chars()
+                            .next()
+                            .map_or(false, |c| c.is_whitespace())
+                    {
+                        after_ident += 1;
+                    }
+
+                    // Check if followed by ')'
+                    if after_ident < self.source.len()
+                        && self.source[after_ident..].starts_with(')')
+                    {
+                        // Check if identifier is a cast type (case-insensitive)
+                        let cast_token = match identifier.to_lowercase().as_str() {
+                            "int" | "integer" => Some(Token::IntCast),
+                            "float" | "double" | "real" => Some(Token::DoubleCast),
+                            "string" | "binary" => Some(Token::StringCast),
+                            "bool" | "boolean" => Some(Token::BoolCast),
+                            "array" => Some(Token::ArrayCast),
+                            "object" => Some(Token::ObjectCast),
+                            "unset" => Some(Token::UnsetCast),
+                            _ => None,
+                        };
+
+                        if let Some(token) = cast_token {
+                            // Consume the rest of the cast expression
+                            self.pos = after_ident + 1; // +1 for the ')'
+
+                            // Update line and column tracking
+                            for ch in self.source[start_pos + 1..self.pos].chars() {
+                                if ch == '\n' {
+                                    self.line += 1;
+                                    self.column = 1;
+                                } else {
+                                    self.column += 1;
+                                }
+                            }
+
+                            return Some((
+                                token,
+                                Span::new(start_pos, self.pos, start_line, start_column),
+                            ));
+                        }
+                    }
+                }
+
+                // Not a cast expression, return regular LParen
                 Some((
                     Token::LParen,
                     Span::new(start_pos, self.pos, start_line, start_column),
@@ -1943,6 +2024,100 @@ mod tests {
         let (token, span) = lexer.next_token().expect("Should tokenize <?php");
         assert_eq!(token, Token::OpenTag);
         assert_eq!(span.extract(source), "<?php");
+    }
+
+    #[test]
+    fn test_cast_expressions() {
+        // Test: Cast expression tokens
+        let test_cases = vec![
+            (
+                "<?php (int)$x",
+                vec![Token::OpenTag, Token::IntCast, Token::Variable],
+            ),
+            (
+                "<?php (float)$x",
+                vec![Token::OpenTag, Token::DoubleCast, Token::Variable],
+            ),
+            (
+                "<?php (string)$x",
+                vec![Token::OpenTag, Token::StringCast, Token::Variable],
+            ),
+            (
+                "<?php (bool)$x",
+                vec![Token::OpenTag, Token::BoolCast, Token::Variable],
+            ),
+            (
+                "<?php (array)$x",
+                vec![Token::OpenTag, Token::ArrayCast, Token::Variable],
+            ),
+            (
+                "<?php (object)$x",
+                vec![Token::OpenTag, Token::ObjectCast, Token::Variable],
+            ),
+            (
+                "<?php (unset)$x",
+                vec![Token::OpenTag, Token::UnsetCast, Token::Variable],
+            ),
+            // Test all aliases
+            (
+                "<?php (integer)$x",
+                vec![Token::OpenTag, Token::IntCast, Token::Variable],
+            ),
+            (
+                "<?php (double)$x",
+                vec![Token::OpenTag, Token::DoubleCast, Token::Variable],
+            ),
+            (
+                "<?php (real)$x",
+                vec![Token::OpenTag, Token::DoubleCast, Token::Variable],
+            ),
+            (
+                "<?php (boolean)$x",
+                vec![Token::OpenTag, Token::BoolCast, Token::Variable],
+            ),
+            (
+                "<?php (binary)$x",
+                vec![Token::OpenTag, Token::StringCast, Token::Variable],
+            ),
+            // Test that regular parentheses still work
+            (
+                "<?php (1 + 2)",
+                vec![
+                    Token::OpenTag,
+                    Token::LParen,
+                    Token::LNumber,
+                    Token::Plus,
+                    Token::LNumber,
+                    Token::RParen,
+                ],
+            ),
+            // Test case-insensitivity
+            (
+                "<?php (INT)$x",
+                vec![Token::OpenTag, Token::IntCast, Token::Variable],
+            ),
+            (
+                "<?php (String)$x",
+                vec![Token::OpenTag, Token::StringCast, Token::Variable],
+            ),
+        ];
+
+        for (source, expected_tokens) in test_cases {
+            let mut lexer = Lexer::new(source);
+            for (idx, expected) in expected_tokens.iter().enumerate() {
+                let (token, _) = lexer.next_token().unwrap_or_else(|| {
+                    panic!(
+                        "Expected token {:?} at index {} for source: {}",
+                        expected, idx, source
+                    )
+                });
+                assert_eq!(
+                    token, *expected,
+                    "Mismatch at index {} for source: {}",
+                    idx, source
+                );
+            }
+        }
     }
 
     #[test]

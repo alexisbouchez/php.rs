@@ -157,13 +157,13 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 3.1.2  Test: AST nodes serialize/debug correctly
 
 ## 3.2 Expression parsing
-[ ] 3.2.1  Implement Pratt parser for expressions with correct precedence (45+ levels)
-[ ] 3.2.2  Test: arithmetic precedence (2 + 3 * 4 == 14)
-[ ] 3.2.3  Test: assignment right-associativity ($a = $b = 1)
-[ ] 3.2.4  Test: ternary associativity (left-to-right in PHP 7, deprecated nesting in 8)
-[ ] 3.2.5  Test: null coalesce right-associativity ($a ?? $b ?? $c)
-[ ] 3.2.6  Test: power operator right-associativity (2 ** 3 ** 2 == 512)
-[ ] 3.2.7  Test: all cast expressions ((int), (string), (array), (object), (bool), (float), (unset))
+[x] 3.2.1  Implement Pratt parser for expressions with correct precedence (45+ levels)
+[x] 3.2.2  Test: arithmetic precedence (2 + 3 * 4 == 14)
+[x] 3.2.3  Test: assignment right-associativity ($a = $b = 1)
+[x] 3.2.4  Test: ternary associativity (left-to-right in PHP 7, deprecated nesting in 8)
+[x] 3.2.5  Test: null coalesce right-associativity ($a ?? $b ?? $c)
+[x] 3.2.6  Test: power operator right-associativity (2 ** 3 ** 2 == 512)
+[x] 3.2.7  Test: all cast expressions ((int), (string), (array), (object), (bool), (float), (unset))
 
 ## 3.3 Statement parsing
 [ ] 3.3.1  Implement control flow: if/elseif/else, alternative syntax (if: ... endif;)
