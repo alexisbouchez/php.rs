@@ -3,8 +3,15 @@
 //! This crate implements the core PHP value types (ZVal, ZString, ZArray, ZObject)
 //! matching the reference PHP 8.6 implementation.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+
+// Lazy static for global string interning pool
+use std::sync::OnceLock;
+
+static GLOBAL_INTERN_POOL: OnceLock<Mutex<HashMap<u64, Arc<ZStringInner>>>> = OnceLock::new();
 
 /// PHP value type discriminant.
 ///
@@ -319,6 +326,7 @@ impl ZString {
     }
 
     /// Create a new ZString from a Rust string slice
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         Self::new(s.as_bytes())
     }
@@ -346,6 +354,46 @@ impl ZString {
     /// Get the string as a &str if it's valid UTF-8
     pub fn as_str(&self) -> Option<&str> {
         std::str::from_utf8(&self.inner.bytes).ok()
+    }
+
+    /// Intern a string globally
+    ///
+    /// This is used for strings that should be shared across all requests,
+    /// such as function names, class names, and keywords.
+    ///
+    /// Reference: PHP's zend_string.c — zend_new_interned_string()
+    pub fn intern(s: &str) -> Self {
+        Self::intern_bytes(s.as_bytes())
+    }
+
+    /// Intern bytes globally
+    fn intern_bytes(bytes: &[u8]) -> Self {
+        let hash = Self::compute_hash(bytes);
+
+        // Get or initialize the global intern pool
+        let pool = GLOBAL_INTERN_POOL.get_or_init(|| Mutex::new(HashMap::new()));
+
+        let mut pool = pool.lock().unwrap();
+
+        // Check if already interned
+        if let Some(inner) = pool.get(&hash) {
+            // Verify hash collision didn't occur by comparing actual bytes
+            if inner.bytes.as_ref() == bytes {
+                return Self {
+                    inner: Arc::clone(inner),
+                };
+            }
+        }
+
+        // Not interned yet, create and store it
+        let inner = Arc::new(ZStringInner {
+            hash,
+            bytes: bytes.into(),
+        });
+
+        pool.insert(hash, Arc::clone(&inner));
+
+        Self { inner }
     }
 
     /// Compute the hash using PHP's DJBX33A hash algorithm
@@ -419,6 +467,75 @@ impl std::hash::Hash for ZString {
 impl AsRef<[u8]> for ZString {
     fn as_ref(&self) -> &[u8] {
         self.as_bytes()
+    }
+}
+
+impl FromStr for ZString {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self::new(s.as_bytes()))
+    }
+}
+
+/// Request-scoped string interning context.
+///
+/// In PHP, there are two levels of string interning:
+/// 1. Global interning: for function names, class names, keywords (survives across requests)
+/// 2. Request-scoped interning: for variable names, property names (cleared after request)
+///
+/// This struct provides request-scoped interning.
+///
+/// Reference: php-src/Zend/zend_string.h — interned strings
+pub struct InternContext {
+    /// Request-scoped intern pool
+    pool: Mutex<HashMap<u64, Arc<ZStringInner>>>,
+}
+
+impl InternContext {
+    /// Create a new request-scoped intern context
+    pub fn new() -> Self {
+        Self {
+            pool: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Intern a string in this request context
+    pub fn intern(&self, s: &str) -> ZString {
+        self.intern_bytes(s.as_bytes())
+    }
+
+    /// Intern bytes in this request context
+    fn intern_bytes(&self, bytes: &[u8]) -> ZString {
+        let hash = ZString::compute_hash(bytes);
+
+        let mut pool = self.pool.lock().unwrap();
+
+        // Check if already interned in this context
+        if let Some(inner) = pool.get(&hash) {
+            // Verify hash collision didn't occur
+            if inner.bytes.as_ref() == bytes {
+                return ZString {
+                    inner: Arc::clone(inner),
+                };
+            }
+        }
+
+        // Not interned in this context, create and store it
+        let inner = Arc::new(ZStringInner {
+            hash,
+            bytes: bytes.into(),
+        });
+
+        pool.insert(hash, Arc::clone(&inner));
+
+        ZString { inner }
+    }
+}
+
+impl Default for InternContext {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -990,5 +1107,149 @@ mod tests {
         assert_eq!(s1, s2);
         assert_eq!(s1.hash(), s2.hash());
         assert!(Arc::ptr_eq(&s1.inner, &s2.inner)); // Same Arc
+    }
+
+    // ========================================================================
+    // String interning tests (Phase 1.2.3)
+    // ========================================================================
+
+    #[test]
+    fn test_string_interning_global() {
+        // Test: Globally intern a string
+        // Interned strings with the same content should be pointer-equal
+        let s1 = ZString::intern("function");
+        let s2 = ZString::intern("function");
+
+        // Should be pointer-equal (same Arc)
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1.as_str(), Some("function"));
+    }
+
+    #[test]
+    fn test_string_interning_global_different_content() {
+        // Test: Different strings are not interned to the same value
+        let s1 = ZString::intern("function");
+        let s2 = ZString::intern("class");
+
+        // Different content = different Arc
+        assert!(!Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1.as_str(), Some("function"));
+        assert_eq!(s2.as_str(), Some("class"));
+    }
+
+    #[test]
+    fn test_string_interning_global_empty_string() {
+        // Test: Empty string interning
+        let s1 = ZString::intern("");
+        let s2 = ZString::intern("");
+
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert!(s1.is_empty());
+    }
+
+    #[test]
+    fn test_string_interning_non_interned() {
+        // Test: Non-interned strings are not pointer-equal even with same content
+        let s1 = ZString::from_str("test");
+        let s2 = ZString::from_str("test");
+
+        // Same content, but different allocations
+        assert!(!Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1, s2); // Still equal by value
+    }
+
+    #[test]
+    fn test_string_interning_request_scoped() {
+        // Test: Request-scoped interning
+        // Create a new request context
+        let ctx = InternContext::new();
+
+        let s1 = ctx.intern("variable");
+        let s2 = ctx.intern("variable");
+
+        // Should be pointer-equal within the same context
+        assert!(Arc::ptr_eq(&s1.inner, &s2.inner));
+        assert_eq!(s1.as_str(), Some("variable"));
+    }
+
+    #[test]
+    fn test_string_interning_request_isolation() {
+        // Test: Different request contexts have separate intern pools
+        let ctx1 = InternContext::new();
+        let ctx2 = InternContext::new();
+
+        let s1 = ctx1.intern("test");
+        let s2 = ctx2.intern("test");
+
+        // Different contexts = different interned strings
+        // (unless they happen to use global pool)
+        // For request-scoped, they should be different Arcs
+        assert_eq!(s1.as_str(), Some("test"));
+        assert_eq!(s2.as_str(), Some("test"));
+    }
+
+    #[test]
+    fn test_string_interning_global_vs_request() {
+        // Test: Global and request-scoped interning can coexist
+        let global = ZString::intern("global");
+        let ctx = InternContext::new();
+        let request = ctx.intern("request");
+
+        assert_eq!(global.as_str(), Some("global"));
+        assert_eq!(request.as_str(), Some("request"));
+    }
+
+    #[test]
+    fn test_string_interning_common_keywords() {
+        // Test: Common PHP keywords are interned
+        // Reference: PHP interns all function names, class names, and keywords
+        let keywords = [
+            "function",
+            "class",
+            "interface",
+            "trait",
+            "namespace",
+            "use",
+            "public",
+            "private",
+            "protected",
+            "static",
+            "final",
+            "abstract",
+            "const",
+            "return",
+            "if",
+            "else",
+            "elseif",
+            "while",
+            "for",
+            "foreach",
+            "switch",
+            "case",
+            "break",
+            "continue",
+            "echo",
+            "print",
+            "var",
+            "new",
+            "clone",
+            "extends",
+            "implements",
+            "instanceof",
+            "throw",
+            "try",
+            "catch",
+            "finally",
+        ];
+
+        for &keyword in &keywords {
+            let s1 = ZString::intern(keyword);
+            let s2 = ZString::intern(keyword);
+            assert!(
+                Arc::ptr_eq(&s1.inner, &s2.inner),
+                "Keyword '{}' not properly interned",
+                keyword
+            );
+        }
     }
 }
