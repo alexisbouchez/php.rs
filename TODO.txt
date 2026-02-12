@@ -109,7 +109,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 2.1.3  Test: Token + Span roundtrip
 
 ## 2.2 Core scanning
-[ ] 2.2.1  Implement INITIAL state: scan <?php, <?=, <? (short_open_tag)
+[x] 2.2.1  Implement INITIAL state: scan <?php, <?=, <? (short_open_tag)
 [ ] 2.2.2  Test: inline HTML passthrough before <?php
 [ ] 2.2.3  Implement ST_IN_SCRIPTING: keywords, operators, identifiers
 [ ] 2.2.4  Test: all 70+ PHP keywords (abstract, class, function, match, enum, readonly, ...)
