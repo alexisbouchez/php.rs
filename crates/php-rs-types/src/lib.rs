@@ -215,6 +215,141 @@ impl ZVal {
             _ => None,
         }
     }
+
+    /// Convert this ZVal to a long (i64) using PHP type juggling rules.
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — convert_to_long()
+    ///
+    /// Conversion rules:
+    /// - Null → 0
+    /// - False → 0
+    /// - True → 1
+    /// - Long → identity
+    /// - Double → truncate to i64
+    /// - String → parse as integer (with leading whitespace skip, trailing text ignored)
+    /// - Array → 0 for empty, 1 for non-empty
+    /// - Object → 1 (with notice)
+    /// - Resource → resource ID (as int)
+    pub fn to_long(&self) -> i64 {
+        match self.type_tag {
+            ZValType::Null => 0,
+            ZValType::False => 0,
+            ZValType::True => 1,
+            ZValType::Long => self.value as i64,
+            ZValType::Double => {
+                // Truncate float to int
+                let d = f64::from_bits(self.value);
+                if d.is_nan() {
+                    0
+                } else if d >= i64::MAX as f64 {
+                    i64::MAX
+                } else if d <= i64::MIN as f64 {
+                    i64::MIN
+                } else {
+                    d as i64
+                }
+            }
+            ZValType::String => {
+                // SAFETY: We're assuming the pointer is valid for the lifetime of this operation
+                // In a real implementation, this would use proper reference counting
+                let ptr = self.value as usize;
+                if ptr == 0 {
+                    return 0;
+                }
+                // SAFETY: For now, this is unsafe. We'll fix this when we properly integrate ZString
+                unsafe {
+                    let zstring = &*(ptr as *const ZString);
+                    Self::string_to_long(zstring.as_bytes())
+                }
+            }
+            ZValType::Array => {
+                // TODO: Check if array is empty (0) or non-empty (1)
+                // For now, return 1 (placeholder)
+                1
+            }
+            ZValType::Object => {
+                // TODO: Object conversion (with notice)
+                // For now, return 1 (placeholder)
+                1
+            }
+            ZValType::Resource => {
+                // Resource ID is stored in the value
+                self.value as i64
+            }
+            ZValType::Reference => {
+                // TODO: Dereference and convert
+                // For now, return 0 (placeholder)
+                0
+            }
+        }
+    }
+
+    /// Helper: Convert string bytes to long using PHP's parsing rules
+    ///
+    /// Reference: php-src/Zend/zend_operators.c — zend_strtol()
+    ///
+    /// Rules:
+    /// - Leading whitespace is skipped
+    /// - Parse digits until non-digit found
+    /// - If no digits found, return 0 (with warning in real PHP)
+    /// - If digits followed by non-digits, return parsed value (with warning in real PHP)
+    fn string_to_long(bytes: &[u8]) -> i64 {
+        // Skip leading whitespace
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        if i >= bytes.len() {
+            return 0; // Empty or whitespace-only string
+        }
+
+        // Check for sign
+        let negative = if bytes[i] == b'-' {
+            i += 1;
+            true
+        } else if bytes[i] == b'+' {
+            i += 1;
+            false
+        } else {
+            false
+        };
+
+        // Parse digits
+        let mut result: i64 = 0;
+        let mut found_digit = false;
+
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            found_digit = true;
+            let digit = (bytes[i] - b'0') as i64;
+
+            // Check for overflow
+            if let Some(new_result) = result.checked_mul(10) {
+                if let Some(new_result) = new_result.checked_add(digit) {
+                    result = new_result;
+                } else {
+                    // Overflow - in PHP this would convert to float
+                    // For now, saturate at i64::MAX
+                    return if negative { i64::MIN } else { i64::MAX };
+                }
+            } else {
+                // Overflow
+                return if negative { i64::MIN } else { i64::MAX };
+            }
+
+            i += 1;
+        }
+
+        if !found_digit {
+            return 0; // No digits found (e.g., "abc")
+        }
+
+        if negative {
+            -result
+        } else {
+            result
+        }
+    }
 }
 
 impl fmt::Display for ZVal {
@@ -1251,5 +1386,78 @@ mod tests {
                 keyword
             );
         }
+    }
+
+    // ========================================================================
+    // Type coercion tests (Phase 1.3)
+    // ========================================================================
+    // Reference: php-src/Zend/zend_operators.c — convert_to_long(), convert_to_double(), etc.
+
+    #[test]
+    fn test_string_to_long_numeric_string() {
+        // Test: Numeric string "123" converts to 123
+        // Reference: php -r 'var_dump((int)"123");' outputs "int(123)"
+        let s = ZString::from_str("123");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 123);
+    }
+
+    #[test]
+    fn test_string_to_long_with_trailing_text() {
+        // Test: "12abc" converts to 12 with E_WARNING
+        // Reference: php -r 'var_dump((int)"12abc");' outputs:
+        //   "Warning: A non well formed numeric value encountered in ..."
+        //   "int(12)"
+        // For now, we'll just test the conversion result (warnings to be implemented later)
+        let s = ZString::from_str("12abc");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 12);
+    }
+
+    #[test]
+    fn test_string_to_long_non_numeric() {
+        // Test: "abc" converts to 0 with E_WARNING
+        // Reference: php -r 'var_dump((int)"abc");' outputs:
+        //   "Warning: A non-numeric value encountered in ..."
+        //   "int(0)"
+        let s = ZString::from_str("abc");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 0);
+    }
+
+    #[test]
+    fn test_string_to_long_empty_string() {
+        // Test: Empty string converts to 0
+        // Reference: php -r 'var_dump((int)"");' outputs "int(0)"
+        let s = ZString::from_str("");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 0);
+    }
+
+    #[test]
+    fn test_string_to_long_whitespace() {
+        // Test: Leading whitespace is skipped
+        // Reference: php -r 'var_dump((int)"  123");' outputs "int(123)"
+        let s = ZString::from_str("  123");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 123);
+    }
+
+    #[test]
+    fn test_string_to_long_negative() {
+        // Test: Negative numeric string
+        // Reference: php -r 'var_dump((int)"-456");' outputs "int(-456)"
+        let s = ZString::from_str("-456");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), -456);
+    }
+
+    #[test]
+    fn test_string_to_long_zero() {
+        // Test: "0" converts to 0
+        // Reference: php -r 'var_dump((int)"0");' outputs "int(0)"
+        let s = ZString::from_str("0");
+        let val = ZVal::string(Box::into_raw(Box::new(s)) as usize);
+        assert_eq!(val.to_long(), 0);
     }
 }

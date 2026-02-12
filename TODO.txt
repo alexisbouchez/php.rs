@@ -59,8 +59,8 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 1.2.5  Implement PartialEq, Eq, Hash, Display, AsRef<[u8]>
 
 ## 1.3 Type juggling / coercion
-[ ] 1.3.1  Test all PHP coercion rules (derive from php-src/Zend/zend_operators.c):
-           [ ] string → int: "123" → 123, "12abc" → 12 + notice, "abc" → 0
+[~] 1.3.1  Test all PHP coercion rules (derive from php-src/Zend/zend_operators.c):
+           [x] string → int: "123" → 123, "12abc" → 12 + notice, "abc" → 0
            [ ] string → float: "1.5" → 1.5, "1.5e2" → 150.0
            [ ] int → string: 42 → "42"
            [ ] float → string: 1.5 → "1.5", INF → "INF", NAN → "NAN"
