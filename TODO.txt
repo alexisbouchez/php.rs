@@ -1,0 +1,835 @@
+================================================================================
+TODO.txt — php.rs: Rewrite PHP 8.6 Interpreter in Rust (TDD)
+================================================================================
+
+STATUS LEGEND:
+  [ ] Not started
+  [~] In progress
+  [x] Done
+  [!] Blocked
+
+Each phase is meant to be completed fully (all tests green) before moving on.
+Within a phase, items are ordered by dependency. Work top-to-bottom.
+
+Reference: php-src/ (PHP 8.6.0-dev, Zend Engine 4.6.0-dev)
+Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
+
+################################################################################
+# PHASE 0: PROJECT SCAFFOLDING
+################################################################################
+
+[ ] 0.1  Initialize Cargo workspace at php.rs/ with workspace members
+[ ] 0.2  Create crate stubs:
+         [ ] crates/php-rs-types/
+         [ ] crates/php-rs-lexer/
+         [ ] crates/php-rs-parser/
+         [ ] crates/php-rs-compiler/
+         [ ] crates/php-rs-vm/
+         [ ] crates/php-rs-gc/
+         [ ] crates/php-rs-runtime/
+         [ ] crates/php-rs-ext-standard/
+         [ ] crates/php-rs-sapi-cli/
+[ ] 0.3  Set up CI (GitHub Actions): cargo test, cargo clippy, cargo fmt --check
+[ ] 0.4  Add benchmark harness (criterion) in crates/php-rs-vm/benches/
+[ ] 0.5  Write PHPT test runner scaffold:
+         [ ] Parse .phpt files (--TEST--, --FILE--, --EXPECT--, --EXPECTF--)
+         [ ] Execute php.rs CLI on --FILE-- section
+         [ ] Compare output to --EXPECT--/--EXPECTF--
+         [ ] Support --SKIPIF--, --INI--, --ENV--, --ARGS--, --CLEAN--
+[ ] 0.6  Verify scaffold: `cargo test` passes with zero tests, `cargo clippy` clean
+
+################################################################################
+# PHASE 1: TYPE SYSTEM (crates/php-rs-types)
+################################################################################
+# Reference: php-src/Zend/zend_types.h, zend_string.h, zend_hash.h
+# Tests: hand-written unit tests + edge cases from php-src/tests/lang/
+################################################################################
+
+## 1.1 ZVal — Core value container (16 bytes)
+[ ] 1.1.1  Define ZVal enum: Null, False, True, Long(i64), Double(f64), String, Array, Object, Resource, Reference
+[ ] 1.1.2  Test: size_of::<ZVal>() == 16
+[ ] 1.1.3  Implement Display for ZVal (PHP-compatible var_dump-style output)
+[ ] 1.1.4  Implement Clone, PartialEq, Debug
+
+## 1.2 ZString — Refcounted string with precomputed hash
+[ ] 1.2.1  Define ZString: Arc-based, stores len + hash + bytes
+[ ] 1.2.2  Test: empty string, ASCII, binary data (null bytes), UTF-8
+[ ] 1.2.3  Implement string interning pool (global + per-request)
+[ ] 1.2.4  Test: interned strings are pointer-equal
+[ ] 1.2.5  Implement PartialEq, Eq, Hash, Display, AsRef<[u8]>
+
+## 1.3 Type juggling / coercion
+[ ] 1.3.1  Test all PHP coercion rules (derive from php-src/Zend/zend_operators.c):
+           [ ] string → int: "123" → 123, "12abc" → 12 + notice, "abc" → 0
+           [ ] string → float: "1.5" → 1.5, "1.5e2" → 150.0
+           [ ] int → string: 42 → "42"
+           [ ] float → string: 1.5 → "1.5", INF → "INF", NAN → "NAN"
+           [ ] bool → int: true → 1, false → 0
+           [ ] null → string: "" , null → int: 0, null → float: 0.0, null → bool: false
+           [ ] array → bool: [] → false, [1] → true
+           [ ] string → bool: "" → false, "0" → false, anything else → true
+[ ] 1.3.2  Implement to_long(), to_double(), to_string(), to_bool() on ZVal
+[ ] 1.3.3  Test edge cases: PHP_INT_MAX overflow, very large floats, precision
+
+## 1.4 ZArray — Dual-mode hash table
+[ ] 1.4.1  Define packed mode (consecutive int keys 0..n, Vec<ZVal> backing)
+[ ] 1.4.2  Define hash mode (string/non-consecutive int keys, Robin Hood table)
+[ ] 1.4.3  Test: insert, get, delete, iteration order preserved
+[ ] 1.4.4  Test: packed → hash promotion when string key inserted
+[ ] 1.4.5  Test: next free integer key ($a[] = value)
+[ ] 1.4.6  Implement copy-on-write (CoW) semantics
+[ ] 1.4.7  Test: CoW — modifying a copy doesn't affect original
+[ ] 1.4.8  Test: nested arrays, recursive references
+[ ] 1.4.9  Implement count(), key exists, foreach iteration
+
+## 1.5 ZObject — Object representation
+[ ] 1.5.1  Define ZObject: class_entry ref, properties (ZArray), handle
+[ ] 1.5.2  Define ClassEntry: name, parent, interfaces, methods, properties, constants
+[ ] 1.5.3  Test: create object, set/get properties, method lookup
+
+## 1.6 ZResource — External resource handle
+[ ] 1.6.1  Define ZResource: type id, pointer, destructor
+[ ] 1.6.2  Test: create, access, destroy callback
+
+## 1.7 References
+[ ] 1.7.1  Define ZReference: refcount + wrapped ZVal
+[ ] 1.7.2  Test: assign by reference, modify through reference
+[ ] 1.7.3  Test: unset reference, reference to reference
+
+################################################################################
+# PHASE 2: LEXER (crates/php-rs-lexer)
+################################################################################
+# Reference: php-src/Zend/zend_language_scanner.l
+# Tests: tokenize known PHP snippets, compare token streams
+################################################################################
+
+## 2.1 Token definitions
+[ ] 2.1.1  Define Token enum matching all PHP tokens (T_VARIABLE, T_LNUMBER, T_STRING, etc.)
+[ ] 2.1.2  Define Span type (byte offset start..end, line, column)
+[ ] 2.1.3  Test: Token + Span roundtrip
+
+## 2.2 Core scanning
+[ ] 2.2.1  Implement INITIAL state: scan <?php, <?=, <? (short_open_tag)
+[ ] 2.2.2  Test: inline HTML passthrough before <?php
+[ ] 2.2.3  Implement ST_IN_SCRIPTING: keywords, operators, identifiers
+[ ] 2.2.4  Test: all 70+ PHP keywords (abstract, class, function, match, enum, readonly, ...)
+[ ] 2.2.5  Implement number literals: decimal, hex (0x), octal (0o/0), binary (0b), underscores (1_000)
+[ ] 2.2.6  Test: integer overflow to float, edge cases
+[ ] 2.2.7  Implement string literals:
+           [ ] Single-quoted: 'hello', escapes: \\, \'
+           [ ] Double-quoted: "hello $var", escapes: \n, \r, \t, \v, \e, \f, \\, \$, \", \x hex, \u{} unicode, \0 octal
+           [ ] Heredoc: <<<EOT ... EOT;
+           [ ] Nowdoc: <<<'EOT' ... EOT;
+[ ] 2.2.8  Test: string interpolation: "$var", "{$var}", "${var}", "$obj->prop", "$arr[key]"
+[ ] 2.2.9  Implement comments: //, #, /* */, /** */ (docblocks)
+[ ] 2.2.10 Implement operators: all PHP operators including <=>, ??=, ?->, #[
+[ ] 2.2.11 Test: edge cases — unterminated strings, nested comments, __halt_compiler
+
+## 2.3 Advanced scanning
+[ ] 2.3.1  Implement variable scanning in double-quoted strings (ST_DOUBLE_QUOTES state)
+[ ] 2.3.2  Implement heredoc/nowdoc body scanning (ST_HEREDOC, ST_NOWDOC states)
+[ ] 2.3.3  Implement backtick strings (`command`)
+[ ] 2.3.4  Test: multiline strings, heredoc with interpolation
+[ ] 2.3.5  Implement __halt_compiler() token handling
+[ ] 2.3.6  Test: full tokenization of real-world PHP files from php-src/ext/standard/tests/
+
+################################################################################
+# PHASE 3: PARSER (crates/php-rs-parser)
+################################################################################
+# Reference: php-src/Zend/zend_language_parser.y (Bison grammar)
+# Tests: parse PHP snippets → assert AST structure
+################################################################################
+
+## 3.1 AST node definitions
+[ ] 3.1.1  Define AST nodes for:
+           [ ] Statements: expression, echo, return, if/elseif/else, while, do-while,
+               for, foreach, switch, match, break, continue, declare, namespace, use,
+               try/catch/finally, throw, global, static, unset, class, interface, trait,
+               enum, function, const, goto/label, block
+           [ ] Expressions: literal, variable, assign, binary op, unary op, ternary,
+               null coalesce, function call, method call, static call, property access,
+               static property, array access, list(), array literal, new, clone,
+               instanceof, cast, yield, yield from, arrow fn, closure, match expr,
+               throw expr, named argument, spread, isset, empty, eval, include/require
+           [ ] Declarations: function params, return type, class members, property hooks,
+               constants, enum cases, attributes (#[...])
+           [ ] Types: named, nullable, union, intersection, DNF
+[ ] 3.1.2  Test: AST nodes serialize/debug correctly
+
+## 3.2 Expression parsing
+[ ] 3.2.1  Implement Pratt parser for expressions with correct precedence (45+ levels)
+[ ] 3.2.2  Test: arithmetic precedence (2 + 3 * 4 == 14)
+[ ] 3.2.3  Test: assignment right-associativity ($a = $b = 1)
+[ ] 3.2.4  Test: ternary associativity (left-to-right in PHP 7, deprecated nesting in 8)
+[ ] 3.2.5  Test: null coalesce right-associativity ($a ?? $b ?? $c)
+[ ] 3.2.6  Test: power operator right-associativity (2 ** 3 ** 2 == 512)
+[ ] 3.2.7  Test: all cast expressions ((int), (string), (array), (object), (bool), (float), (unset))
+
+## 3.3 Statement parsing
+[ ] 3.3.1  Implement control flow: if/elseif/else, alternative syntax (if: ... endif;)
+[ ] 3.3.2  Implement loops: while, do-while, for, foreach, alternative syntax
+[ ] 3.3.3  Implement switch/case/default + match expression
+[ ] 3.3.4  Implement try/catch/finally (multi-catch: catch (A | B))
+[ ] 3.3.5  Implement function declarations (named, closures, arrow functions, variadic, type hints)
+[ ] 3.3.6  Implement class declarations (abstract, final, readonly, extends, implements)
+[ ] 3.3.7  Implement interface, trait, enum declarations
+[ ] 3.3.8  Implement namespace, use, use function, use const
+[ ] 3.3.9  Implement attributes (#[Attr], #[Attr(args)])
+[ ] 3.3.10 Implement property hooks (get/set in PHP 8.4+)
+[ ] 3.3.11 Test: parse every file in php-src/tests/lang/*.phpt --FILE-- sections
+
+## 3.4 Error recovery
+[ ] 3.4.1  Implement parse error reporting with line/column
+[ ] 3.4.2  Test: meaningful error messages for common mistakes
+[ ] 3.4.3  Match PHP's exact error messages where possible
+
+################################################################################
+# PHASE 4: COMPILER (crates/php-rs-compiler)
+################################################################################
+# Reference: php-src/Zend/zend_compile.c (384 KB)
+# Tests: compile AST → assert opcode sequences
+################################################################################
+
+## 4.1 Opcode definitions
+[ ] 4.1.1  Define all 212 opcodes as enum (from php-src/Zend/zend_vm_opcodes.h):
+           ZEND_NOP(0) through ZEND_FRAMELESS_ICALL_3(211)
+[ ] 4.1.2  Define ZOp struct: opcode, op1, op2, result, operand types
+           (operand types: Const, TmpVar, Var, CV, Unused)
+[ ] 4.1.3  Define ZOpArray: opcodes vec, literals vec, vars vec, arg_info, try_catch_elements
+[ ] 4.1.4  Test: ZOp serialization/debug
+
+## 4.2 Expression compilation
+[ ] 4.2.1  Compile literals: int, float, string, bool, null → ZEND_QM_ASSIGN / constants
+[ ] 4.2.2  Compile binary ops: +, -, *, /, %, **, ., &, |, ^, <<, >>
+           → ZEND_ADD, ZEND_SUB, ZEND_MUL, ZEND_DIV, ZEND_MOD, ZEND_POW, ZEND_CONCAT, etc.
+[ ] 4.2.3  Compile comparison ops: ==, ===, !=, !==, <, <=, >, >=, <=>
+           → ZEND_IS_EQUAL, ZEND_IS_IDENTICAL, ZEND_IS_SMALLER, ZEND_SPACESHIP, etc.
+[ ] 4.2.4  Compile unary ops: -, +, ~, ! → ZEND_BW_NOT, ZEND_BOOL_NOT, ZEND_MUL(-1)
+[ ] 4.2.5  Compile variable read: $var → ZEND_FETCH with CV (compiled variable) slot
+[ ] 4.2.6  Compile assignment: $a = expr → ZEND_ASSIGN
+[ ] 4.2.7  Compile compound assignment: $a += expr → ZEND_ASSIGN_OP
+[ ] 4.2.8  Compile increment/decrement: $a++, ++$a → ZEND_POST_INC, ZEND_PRE_INC
+[ ] 4.2.9  Compile string concat: "a" . "b" → ZEND_CONCAT / ZEND_FAST_CONCAT
+[ ] 4.2.10 Compile array literal: [1, 'a' => 2] → ZEND_INIT_ARRAY + ZEND_ADD_ARRAY_ELEMENT
+[ ] 4.2.11 Test: compile expressions and verify opcode sequences match php -d opcache.opt_debug_level=0x10000
+
+## 4.3 Control flow compilation
+[ ] 4.3.1  Compile echo/print → ZEND_ECHO
+[ ] 4.3.2  Compile if/else → ZEND_JMPZ + ZEND_JMP
+[ ] 4.3.3  Compile while → ZEND_JMPZ (loop back with ZEND_JMP)
+[ ] 4.3.4  Compile do-while → ZEND_JMPNZ
+[ ] 4.3.5  Compile for → init + ZEND_JMPZ + body + increment + ZEND_JMP
+[ ] 4.3.6  Compile foreach → ZEND_FE_RESET_R + ZEND_FE_FETCH_R + ZEND_FE_FREE
+[ ] 4.3.7  Compile switch → ZEND_CASE + ZEND_JMPZ chain
+[ ] 4.3.8  Compile match → ZEND_MATCH + ZEND_MATCH_ERROR
+[ ] 4.3.9  Compile break/continue with depth → ZEND_JMP (+ ZEND_FE_FREE for foreach)
+[ ] 4.3.10 Compile return → ZEND_RETURN
+[ ] 4.3.11 Compile try/catch/finally → try_catch_element array + ZEND_CATCH
+[ ] 4.3.12 Compile throw → ZEND_THROW
+[ ] 4.3.13 Test: control flow opcodes against known PHP opcode dumps
+
+## 4.4 Function compilation
+[ ] 4.4.1  Compile function declaration → new ZOpArray + ZEND_DECLARE_FUNCTION
+[ ] 4.4.2  Compile function call → ZEND_INIT_FCALL + ZEND_SEND_VAL/VAR + ZEND_DO_FCALL
+[ ] 4.4.3  Compile return type + parameter type info → arg_info array
+[ ] 4.4.4  Compile closures → ZEND_DECLARE_LAMBDA_FUNCTION + use() variable binding
+[ ] 4.4.5  Compile arrow functions (fn($x) => $x + 1)
+[ ] 4.4.6  Compile variadic parameters (...$args) → ZEND_SEND_UNPACK
+[ ] 4.4.7  Compile named arguments → ZEND_SEND_VAL/VAR with name
+[ ] 4.4.8  Test: function call opcodes, argument passing modes (by-val, by-ref)
+
+## 4.5 Class compilation
+[ ] 4.5.1  Compile class declaration → ZEND_DECLARE_CLASS
+[ ] 4.5.2  Compile method definitions → ZOpArray per method
+[ ] 4.5.3  Compile property declarations with types and defaults
+[ ] 4.5.4  Compile constructor, destructor
+[ ] 4.5.5  Compile static methods and properties
+[ ] 4.5.6  Compile new → ZEND_NEW + ZEND_DO_FCALL (constructor)
+[ ] 4.5.7  Compile property access → ZEND_FETCH_OBJ_R/W
+[ ] 4.5.8  Compile method call → ZEND_INIT_METHOD_CALL + ZEND_DO_FCALL
+[ ] 4.5.9  Compile static call → ZEND_INIT_STATIC_METHOD_CALL
+[ ] 4.5.10 Compile class constants → ZEND_FETCH_CLASS_CONSTANT
+[ ] 4.5.11 Compile inheritance, interfaces, traits
+[ ] 4.5.12 Compile abstract, final, readonly modifiers
+[ ] 4.5.13 Compile enums (backed and unit)
+[ ] 4.5.14 Test: class compilation against php-src/tests/classes/*.phpt
+
+## 4.6 Optimization passes (basic)
+[ ] 4.6.1  Constant folding: 2 + 3 → 5 at compile time
+[ ] 4.6.2  Dead code elimination after unconditional return/throw
+[ ] 4.6.3  Test: optimized opcodes are semantically equivalent
+
+################################################################################
+# PHASE 5: VIRTUAL MACHINE (crates/php-rs-vm)
+################################################################################
+# Reference: php-src/Zend/zend_vm_def.h (handler definitions)
+#            php-src/Zend/zend_execute.c (executor)
+# Tests: execute opcode arrays → assert output/return values
+################################################################################
+
+## 5.1 Execution frame
+[ ] 5.1.1  Define Frame (execute_data equivalent):
+           current_opline, call_stack, return_value, func_ref, symbol_table,
+           compiled_variables (CV) array, temporary variables array
+[ ] 5.1.2  Implement call stack: push/pop frames for function calls
+[ ] 5.1.3  Test: frame creation, variable slot access
+
+## 5.2 VM dispatch loop
+[ ] 5.2.1  Implement main dispatch loop (match on opcode)
+[ ] 5.2.2  Implement operand fetch: read Const, TmpVar, Var, CV operands
+[ ] 5.2.3  Implement result store: write to TmpVar, Var, CV slots
+[ ] 5.2.4  Test: NOP execution, simple linear opcode sequence
+
+## 5.3 Arithmetic & comparison handlers
+[ ] 5.3.1  ZEND_ADD: int+int, float+float, int+float, string+int (coercion), array+array
+[ ] 5.3.2  ZEND_SUB, ZEND_MUL, ZEND_DIV, ZEND_MOD, ZEND_POW
+[ ] 5.3.3  ZEND_CONCAT, ZEND_FAST_CONCAT
+[ ] 5.3.4  ZEND_BW_OR, ZEND_BW_AND, ZEND_BW_XOR, ZEND_BW_NOT, ZEND_SL, ZEND_SR
+[ ] 5.3.5  ZEND_IS_EQUAL, ZEND_IS_NOT_EQUAL (loose comparison: == / !=)
+[ ] 5.3.6  ZEND_IS_IDENTICAL, ZEND_IS_NOT_IDENTICAL (strict: === / !==)
+[ ] 5.3.7  ZEND_IS_SMALLER, ZEND_IS_SMALLER_OR_EQUAL
+[ ] 5.3.8  ZEND_SPACESHIP (<=>)
+[ ] 5.3.9  ZEND_BOOL_NOT, ZEND_BOOL_XOR
+[ ] 5.3.10 Test each handler with all operand type combinations
+           Reference: php-src/Zend/tests/operators/
+
+## 5.4 Variable handlers
+[ ] 5.4.1  ZEND_ASSIGN: simple variable assignment
+[ ] 5.4.2  ZEND_ASSIGN_REF: reference assignment
+[ ] 5.4.3  ZEND_ASSIGN_DIM: $a[$key] = $val
+[ ] 5.4.4  ZEND_ASSIGN_OBJ: $obj->prop = $val
+[ ] 5.4.5  ZEND_ASSIGN_OP: +=, -=, .=, etc.
+[ ] 5.4.6  ZEND_PRE_INC, ZEND_PRE_DEC, ZEND_POST_INC, ZEND_POST_DEC
+[ ] 5.4.7  ZEND_FETCH_DIM_R/W/RW/IS/UNSET: array element access
+[ ] 5.4.8  ZEND_FETCH_OBJ_R/W/RW/IS/UNSET: object property access
+[ ] 5.4.9  ZEND_ISSET_ISEMPTY_VAR, ZEND_ISSET_ISEMPTY_DIM_OBJ
+[ ] 5.4.10 ZEND_UNSET_VAR, ZEND_UNSET_DIM, ZEND_UNSET_OBJ
+[ ] 5.4.11 ZEND_CHECK_VAR (undefined variable notice)
+[ ] 5.4.12 Test: all variable access patterns from php-src/tests/lang/
+
+## 5.5 Control flow handlers
+[ ] 5.5.1  ZEND_JMP: unconditional jump
+[ ] 5.5.2  ZEND_JMPZ, ZEND_JMPNZ: conditional jump
+[ ] 5.5.3  ZEND_JMPZ_EX, ZEND_JMPNZ_EX: jump + assign boolean result (&&, ||)
+[ ] 5.5.4  ZEND_JMPZNZ: ternary dispatch
+[ ] 5.5.5  ZEND_CASE: switch case comparison
+[ ] 5.5.6  ZEND_MATCH: match expression
+[ ] 5.5.7  ZEND_JMP_SET: short-circuit ternary ($a ?: $b)
+[ ] 5.5.8  ZEND_COALESCE: null coalesce ($a ?? $b)
+[ ] 5.5.9  ZEND_JMP_NULL: nullsafe operator ($a?->b)
+[ ] 5.5.10 ZEND_FE_RESET_R/RW + ZEND_FE_FETCH_R/RW + ZEND_FE_FREE: foreach
+[ ] 5.5.11 Test: all control flow with php-src/tests/lang/
+
+## 5.6 Function call handlers
+[ ] 5.6.1  ZEND_INIT_FCALL: resolve and prepare named function call
+[ ] 5.6.2  ZEND_INIT_FCALL_BY_NAME: late-binding function call
+[ ] 5.6.3  ZEND_INIT_DYNAMIC_CALL: $func() variable function call
+[ ] 5.6.4  ZEND_INIT_METHOD_CALL: $obj->method()
+[ ] 5.6.5  ZEND_INIT_STATIC_METHOD_CALL: Class::method()
+[ ] 5.6.6  ZEND_SEND_VAL, ZEND_SEND_VAR, ZEND_SEND_REF: argument passing
+[ ] 5.6.7  ZEND_SEND_VAR_EX: by-val or by-ref depending on callee
+[ ] 5.6.8  ZEND_SEND_UNPACK: ...$args spread
+[ ] 5.6.9  ZEND_DO_FCALL, ZEND_DO_ICALL (internal), ZEND_DO_UCALL (user): execute call
+[ ] 5.6.10 ZEND_RETURN, ZEND_RETURN_BY_REF
+[ ] 5.6.11 ZEND_VERIFY_RETURN_TYPE: runtime return type check
+[ ] 5.6.12 Test: function calls with php-src/tests/func/*.phpt
+
+## 5.7 I/O handlers
+[ ] 5.7.1  ZEND_ECHO: output value
+[ ] 5.7.2  Test: echo with different types, output buffering integration
+
+## 5.8 Exception handlers
+[ ] 5.8.1  ZEND_THROW: throw exception
+[ ] 5.8.2  ZEND_CATCH: catch block handler
+[ ] 5.8.3  ZEND_HANDLE_EXCEPTION: unwind stack to nearest catch/finally
+[ ] 5.8.4  ZEND_DISCARD_EXCEPTION: finally block completion
+[ ] 5.8.5  ZEND_FAST_CALL, ZEND_FAST_RET: finally block enter/exit
+[ ] 5.8.6  Test: exception handling, nested try/catch, finally
+
+## 5.9 Type & cast handlers
+[ ] 5.9.1  ZEND_CAST: (int), (string), (float), (bool), (array), (object)
+[ ] 5.9.2  ZEND_TYPE_CHECK: is_int, is_string, etc.
+[ ] 5.9.3  ZEND_INSTANCEOF: instanceof operator
+[ ] 5.9.4  ZEND_STRLEN: strlen() dedicated opcode
+[ ] 5.9.5  ZEND_COUNT: count() dedicated opcode
+[ ] 5.9.6  Test: type operations from php-src/tests/lang/type_hints/
+
+## 5.10 Class & object handlers
+[ ] 5.10.1  ZEND_NEW: object instantiation
+[ ] 5.10.2  ZEND_CLONE: clone operator
+[ ] 5.10.3  ZEND_DECLARE_CLASS: register class in class table
+[ ] 5.10.4  ZEND_DECLARE_FUNCTION: register function in function table
+[ ] 5.10.5  ZEND_FETCH_CLASS: resolve class name
+[ ] 5.10.6  ZEND_FETCH_CLASS_CONSTANT: Class::CONST
+[ ] 5.10.7  ZEND_FETCH_STATIC_PROP_R/W/RW/IS/UNSET
+[ ] 5.10.8  Test: OOP with php-src/tests/classes/*.phpt (291 tests)
+
+## 5.11 Generator & Fiber handlers
+[ ] 5.11.1  ZEND_GENERATOR_CREATE: create generator from function
+[ ] 5.11.2  ZEND_YIELD: yield value
+[ ] 5.11.3  ZEND_YIELD_FROM: yield from iterable
+[ ] 5.11.4  ZEND_GENERATOR_RETURN: return from generator
+[ ] 5.11.5  Implement Fiber support (ZEND_SWITCH_FIBER, stack switching)
+[ ] 5.11.6  Test: generators and fibers
+
+## 5.12 Include & eval handlers
+[ ] 5.12.1  ZEND_INCLUDE_OR_EVAL: include, include_once, require, require_once, eval()
+[ ] 5.12.2  Implement file resolution and compilation caching
+[ ] 5.12.3  Test: include, require, once semantics, eval
+
+################################################################################
+# PHASE 6: GARBAGE COLLECTOR (crates/php-rs-gc)
+################################################################################
+# Reference: php-src/Zend/zend_gc.c, zend_alloc.c
+################################################################################
+
+[ ] 6.1  Implement reference counting for ZVal (increment/decrement)
+[ ] 6.2  Implement request-scoped arena allocator (bulk free at request end)
+[ ] 6.3  Implement cycle detection (mark-and-sweep for circular references)
+         Reference: php-src/Zend/zend_gc.c — purple, grey, white, black coloring
+[ ] 6.4  Test: simple refcount lifecycle
+[ ] 6.5  Test: circular reference detection ($a = []; $a[0] = &$a;)
+[ ] 6.6  Test: memory cleanup at request end
+[ ] 6.7  Benchmark: GC pause times with large object graphs
+
+################################################################################
+# PHASE 7: RUNTIME SERVICES (crates/php-rs-runtime)
+################################################################################
+# Reference: php-src/main/
+################################################################################
+
+## 7.1 Error handling
+[ ] 7.1.1  Implement error levels: E_ERROR, E_WARNING, E_NOTICE, E_PARSE, E_DEPRECATED, etc.
+[ ] 7.1.2  Implement error_reporting() INI directive
+[ ] 7.1.3  Implement set_error_handler(), set_exception_handler()
+[ ] 7.1.4  Implement @ error suppression operator (ZEND_BEGIN_SILENCE / ZEND_END_SILENCE)
+[ ] 7.1.5  Test: error levels, custom handlers, @ operator
+
+## 7.2 INI system
+[ ] 7.2.1  Parse php.ini format (key = value, sections, constants, expressions)
+[ ] 7.2.2  Implement ini_get(), ini_set(), ini_restore()
+[ ] 7.2.3  Implement INI_SYSTEM, INI_PERDIR, INI_USER, INI_ALL permission levels
+[ ] 7.2.4  Register core INI directives (error_reporting, display_errors, memory_limit, etc.)
+[ ] 7.2.5  Test: INI parsing and runtime modification
+
+## 7.3 Output system
+[ ] 7.3.1  Implement output buffering (ob_start, ob_end_flush, ob_get_contents, etc.)
+[ ] 7.3.2  Implement nested output buffers
+[ ] 7.3.3  Implement implicit_flush
+[ ] 7.3.4  Test: output buffering stacking, callback functions
+
+## 7.4 Stream system
+[ ] 7.4.1  Define StreamWrapper trait: open, read, write, seek, close, stat
+[ ] 7.4.2  Implement file:// wrapper (local filesystem)
+[ ] 7.4.3  Implement php:// wrappers: stdin, stdout, stderr, input, output, memory, temp, filter
+[ ] 7.4.4  Implement stream context (stream_context_create)
+[ ] 7.4.5  Test: file I/O through stream API
+
+## 7.5 Superglobals
+[ ] 7.5.1  Implement $_SERVER, $_ENV, $_GET, $_POST, $_COOKIE, $_FILES, $_REQUEST, $_SESSION
+[ ] 7.5.2  Populate from SAPI request context
+[ ] 7.5.3  Implement variables_order INI directive
+[ ] 7.5.4  Test: superglobal population and access
+
+## 7.6 Autoloading
+[ ] 7.6.1  Implement spl_autoload_register / spl_autoload_unregister
+[ ] 7.6.2  Implement autoload queue execution on class-not-found
+[ ] 7.6.3  Test: autoloading with real file includes
+
+################################################################################
+# PHASE 8: STANDARD EXTENSION (crates/php-rs-ext-standard)
+################################################################################
+# Reference: php-src/ext/standard/ (~57,551 lines, 551 functions)
+# Tests: php-src/ext/standard/tests/ (3,833 .phpt files)
+# Strategy: implement in batches by category, most-used functions first
+################################################################################
+
+## 8.1 String functions (batch 1 — most critical)
+[ ] 8.1.1  strlen, substr, strpos, strrpos, strstr, str_contains, str_starts_with, str_ends_with
+[ ] 8.1.2  str_replace, str_ireplace, substr_replace, str_repeat, str_pad
+[ ] 8.1.3  strtolower, strtoupper, ucfirst, lcfirst, ucwords
+[ ] 8.1.4  trim, ltrim, rtrim
+[ ] 8.1.5  explode, implode (join)
+[ ] 8.1.6  sprintf, printf, fprintf, vsprintf, vprintf
+[ ] 8.1.7  number_format, money_format
+[ ] 8.1.8  nl2br, wordwrap, chunk_split
+[ ] 8.1.9  htmlspecialchars, htmlentities, html_entity_decode, htmlspecialchars_decode
+[ ] 8.1.10 urlencode, urldecode, rawurlencode, rawurldecode
+[ ] 8.1.11 base64_encode, base64_decode
+[ ] 8.1.12 md5, sha1 (thin wrappers over ext/hash)
+[ ] 8.1.13 crc32, crypt
+[ ] 8.1.14 str_rot13, str_shuffle, str_word_count
+[ ] 8.1.15 ord, chr, str_split, count_chars
+[ ] 8.1.16 quoted_printable_encode, quoted_printable_decode
+[ ] 8.1.17 addslashes, stripslashes, addcslashes, stripcslashes
+[ ] 8.1.18 Test: all string functions with php-src/ext/standard/tests/strings/
+
+## 8.2 Array functions (batch 2 — most critical)
+[ ] 8.2.1  count, sizeof
+[ ] 8.2.2  array_push, array_pop, array_shift, array_unshift
+[ ] 8.2.3  array_merge, array_merge_recursive, array_replace, array_replace_recursive
+[ ] 8.2.4  array_keys, array_values, array_combine
+[ ] 8.2.5  array_search, in_array, array_key_exists
+[ ] 8.2.6  array_map, array_filter, array_walk, array_walk_recursive
+[ ] 8.2.7  array_reduce, array_column
+[ ] 8.2.8  array_slice, array_splice, array_chunk
+[ ] 8.2.9  array_unique, array_flip, array_reverse, array_pad
+[ ] 8.2.10 sort, rsort, asort, arsort, ksort, krsort, usort, uasort, uksort
+[ ] 8.2.11 array_multisort
+[ ] 8.2.12 array_diff, array_intersect (+ assoc/key variants)
+[ ] 8.2.13 array_fill, array_fill_keys, range
+[ ] 8.2.14 compact, extract
+[ ] 8.2.15 list() / array destructuring (parser + compiler level)
+[ ] 8.2.16 Test: all array functions with php-src/ext/standard/tests/array/
+
+## 8.3 Variable functions
+[ ] 8.3.1  var_dump, print_r, var_export
+[ ] 8.3.2  gettype, settype, get_debug_type
+[ ] 8.3.3  is_int, is_float, is_string, is_bool, is_null, is_array, is_object, is_numeric, is_callable
+[ ] 8.3.4  intval, floatval, strval, boolval
+[ ] 8.3.5  isset, unset, empty (these are language constructs, compiled to opcodes)
+[ ] 8.3.6  serialize, unserialize
+[ ] 8.3.7  Test: variable functions
+
+## 8.4 Math functions
+[ ] 8.4.1  abs, ceil, floor, round, fmod, intdiv
+[ ] 8.4.2  max, min
+[ ] 8.4.3  pow, sqrt, log, log2, log10, exp
+[ ] 8.4.4  sin, cos, tan, asin, acos, atan, atan2
+[ ] 8.4.5  pi, M_PI, M_E (math constants)
+[ ] 8.4.6  rand, mt_rand, random_int, random_bytes
+[ ] 8.4.7  base_convert, bindec, octdec, hexdec, decoct, dechex, decbin
+[ ] 8.4.8  Test: math functions with edge cases (INF, NAN, overflow)
+
+## 8.5 File functions
+[ ] 8.5.1  fopen, fclose, fread, fwrite, fgets, fgetc, feof, fseek, ftell, rewind, fflush
+[ ] 8.5.2  file_get_contents, file_put_contents
+[ ] 8.5.3  file, readfile, fpassthru
+[ ] 8.5.4  flock, ftruncate
+[ ] 8.5.5  file_exists, is_file, is_dir, is_readable, is_writable, is_executable
+[ ] 8.5.6  stat, lstat, fileatime, filemtime, filesize, filetype, fileperms
+[ ] 8.5.7  mkdir, rmdir, rename, unlink, copy, symlink, link, readlink
+[ ] 8.5.8  glob, scandir, opendir, readdir, closedir
+[ ] 8.5.9  tempnam, sys_get_temp_dir, tmpfile
+[ ] 8.5.10 dirname, basename, pathinfo, realpath
+[ ] 8.5.11 Test: file functions with php-src/ext/standard/tests/file/
+
+## 8.6 Misc standard functions
+[ ] 8.6.1  define, constant, defined
+[ ] 8.6.2  function_exists, class_exists, interface_exists, method_exists, property_exists
+[ ] 8.6.3  get_class, get_parent_class, is_a, is_subclass_of
+[ ] 8.6.4  call_user_func, call_user_func_array
+[ ] 8.6.5  header, header_remove, headers_sent, http_response_code
+[ ] 8.6.6  sleep, usleep, time_nanosleep, time_sleep_until
+[ ] 8.6.7  microtime, hrtime
+[ ] 8.6.8  getenv, putenv
+[ ] 8.6.9  exit, die
+[ ] 8.6.10 register_shutdown_function
+[ ] 8.6.11 set_time_limit, ignore_user_abort
+[ ] 8.6.12 phpversion, phpinfo, php_uname, php_sapi_name
+[ ] 8.6.13 Test: misc functions
+
+## 8.7 Regex via ext-standard wrappers
+[ ] 8.7.1  preg_match, preg_match_all (delegates to ext-pcre)
+[ ] 8.7.2  preg_replace, preg_replace_callback
+[ ] 8.7.3  preg_split, preg_quote
+[ ] 8.7.4  Test: regex functions
+
+################################################################################
+# PHASE 9: ESSENTIAL EXTENSIONS (one crate each)
+################################################################################
+
+## 9.1 ext/json (crates/php-rs-ext-json)
+# Reference: php-src/ext/json/ — json_encoder.c, json_parser.y, json_scanner.re
+[ ] 9.1.1  json_encode(): all types, options (JSON_PRETTY_PRINT, JSON_UNESCAPED_UNICODE, etc.)
+[ ] 9.1.2  json_decode(): object/assoc modes, depth limit
+[ ] 9.1.3  json_last_error(), json_last_error_msg()
+[ ] 9.1.4  JsonSerializable interface
+[ ] 9.1.5  Test: php-src/ext/json/tests/
+
+## 9.2 ext/pcre (crates/php-rs-ext-pcre)
+# Use Rust regex crate or PCRE2 bindings
+[ ] 9.2.1  Integrate PCRE2 (via pcre2 crate) or implement PHP regex flavor
+[ ] 9.2.2  preg_match, preg_match_all
+[ ] 9.2.3  preg_replace, preg_replace_callback, preg_replace_callback_array
+[ ] 9.2.4  preg_split, preg_quote, preg_grep
+[ ] 9.2.5  preg_last_error, preg_last_error_msg
+[ ] 9.2.6  Named captures, backreferences, modifiers (i, m, s, x, u)
+[ ] 9.2.7  Test: php-src/ext/pcre/tests/
+
+## 9.3 ext/date (crates/php-rs-ext-date)
+# Reference: php-src/ext/date/ — uses bundled timelib
+[ ] 9.3.1  time(), microtime(), hrtime()
+[ ] 9.3.2  date(), gmdate(), strftime()
+[ ] 9.3.3  strtotime() (natural language date parsing)
+[ ] 9.3.4  mktime(), gmmktime()
+[ ] 9.3.5  DateTime class, DateTimeImmutable, DateTimeZone, DateInterval, DatePeriod
+[ ] 9.3.6  Timezone database integration
+[ ] 9.3.7  Test: php-src/ext/date/tests/
+
+## 9.4 ext/spl (crates/php-rs-ext-spl)
+# Reference: php-src/ext/spl/ — Standard PHP Library
+[ ] 9.4.1  Iterators: ArrayIterator, DirectoryIterator, RecursiveIterator, FilterIterator, etc.
+[ ] 9.4.2  Data structures: SplStack, SplQueue, SplPriorityQueue, SplFixedArray, SplDoublyLinkedList
+[ ] 9.4.3  SplFileObject, SplFileInfo
+[ ] 9.4.4  SplAutoloader: spl_autoload_register/unregister
+[ ] 9.4.5  Exceptions: LogicException, RuntimeException, InvalidArgumentException, etc.
+[ ] 9.4.6  Countable, Iterator, IteratorAggregate, ArrayAccess, Serializable interfaces
+[ ] 9.4.7  Test: php-src/ext/spl/tests/
+
+## 9.5 ext/hash (crates/php-rs-ext-hash)
+[ ] 9.5.1  hash(): md5, sha1, sha256, sha512, etc.
+[ ] 9.5.2  hash_hmac(), hash_file(), hash_init/update/final (streaming)
+[ ] 9.5.3  hash_algos(), hash_equals(), hash_pbkdf2()
+[ ] 9.5.4  Test: php-src/ext/hash/tests/
+
+## 9.6 ext/filter (crates/php-rs-ext-filter)
+[ ] 9.6.1  filter_var(), filter_input()
+[ ] 9.6.2  FILTER_VALIDATE_* (email, url, ip, int, float, etc.)
+[ ] 9.6.3  FILTER_SANITIZE_* (string, email, url, number_int, etc.)
+[ ] 9.6.4  Test: php-src/ext/filter/tests/
+
+## 9.7 ext/mbstring (crates/php-rs-ext-mbstring)
+[ ] 9.7.1  mb_strlen, mb_substr, mb_strpos, mb_strtolower, mb_strtoupper
+[ ] 9.7.2  mb_detect_encoding, mb_convert_encoding
+[ ] 9.7.3  mb_internal_encoding
+[ ] 9.7.4  Test: php-src/ext/mbstring/tests/
+
+## 9.8 ext/ctype (crates/php-rs-ext-ctype)
+[ ] 9.8.1  ctype_alpha, ctype_digit, ctype_alnum, ctype_space, etc.
+[ ] 9.8.2  Test: php-src/ext/ctype/tests/
+
+## 9.9 ext/tokenizer (crates/php-rs-ext-tokenizer)
+[ ] 9.9.1  token_get_all(), token_name(), PhpToken class
+[ ] 9.9.2  Test: php-src/ext/tokenizer/tests/
+
+## 9.10 ext/reflection (crates/php-rs-ext-reflection)
+[ ] 9.10.1  ReflectionClass, ReflectionMethod, ReflectionFunction, ReflectionProperty
+[ ] 9.10.2  ReflectionParameter, ReflectionType, ReflectionAttribute
+[ ] 9.10.3  ReflectionEnum, ReflectionEnumCase
+[ ] 9.10.4  Test: php-src/ext/reflection/tests/
+
+## 9.11 ext/dom (crates/php-rs-ext-dom)
+[ ] 9.11.1  DOMDocument, DOMElement, DOMNode, DOMNodeList
+[ ] 9.11.2  DOM manipulation: createElement, appendChild, removeChild, etc.
+[ ] 9.11.3  XPath queries (DOMXPath)
+[ ] 9.11.4  HTML5 parser integration (lexbor equivalent)
+[ ] 9.11.5  Test: php-src/ext/dom/tests/
+
+## 9.12 ext/xml / ext/simplexml / ext/xmlreader / ext/xmlwriter
+[ ] 9.12.1  SimpleXMLElement, simplexml_load_string, simplexml_load_file
+[ ] 9.12.2  XMLReader, XMLWriter
+[ ] 9.12.3  xml_parse, xml_parser_create (expat-style SAX)
+[ ] 9.12.4  Test: php-src/ext/simplexml/tests/, ext/xml/tests/
+
+## 9.13 ext/pdo + ext/pdo_sqlite (crates/php-rs-ext-pdo, php-rs-ext-pdo-sqlite)
+[ ] 9.13.1  PDO class: connect, prepare, execute, fetch
+[ ] 9.13.2  PDOStatement: bindParam, bindValue, fetch modes
+[ ] 9.13.3  PDO transactions: beginTransaction, commit, rollBack
+[ ] 9.13.4  PDO SQLite driver
+[ ] 9.13.5  Test: php-src/ext/pdo/tests/, ext/pdo_sqlite/tests/
+
+## 9.14 ext/session (crates/php-rs-ext-session)
+[ ] 9.14.1  session_start, session_destroy, session_regenerate_id
+[ ] 9.14.2  $_SESSION superglobal integration
+[ ] 9.14.3  SessionHandlerInterface
+[ ] 9.14.4  File-based session storage
+[ ] 9.14.5  Test: php-src/ext/session/tests/
+
+## 9.15 ext/curl (crates/php-rs-ext-curl)
+[ ] 9.15.1  curl_init, curl_setopt, curl_exec, curl_close
+[ ] 9.15.2  CurlHandle class (PHP 8.0+)
+[ ] 9.15.3  curl_multi_*
+[ ] 9.15.4  Test: php-src/ext/curl/tests/
+
+## 9.16 ext/openssl (crates/php-rs-ext-openssl)
+[ ] 9.16.1  openssl_encrypt, openssl_decrypt
+[ ] 9.16.2  openssl_sign, openssl_verify
+[ ] 9.16.3  openssl_pkey_new, openssl_pkey_get_public/private
+[ ] 9.16.4  Test: php-src/ext/openssl/tests/
+
+## 9.17 ext/sodium (crates/php-rs-ext-sodium)
+[ ] 9.17.1  sodium_crypto_secretbox, sodium_crypto_box
+[ ] 9.17.2  sodium_crypto_sign, sodium_crypto_aead_*
+[ ] 9.17.3  Test: php-src/ext/sodium/tests/
+
+## 9.18 ext/random (crates/php-rs-ext-random)
+[ ] 9.18.1  Random\Engine interface, Random\Randomizer
+[ ] 9.18.2  Mt19937, PcgOneseq128XslRr64, Xoshiro256StarStar, Secure engines
+[ ] 9.18.3  Test: php-src/ext/random/tests/
+
+## 9.19 ext/intl (crates/php-rs-ext-intl)
+[ ] 9.19.1  NumberFormatter, DateFormatter
+[ ] 9.19.2  Collator, Normalizer, Transliterator
+[ ] 9.19.3  IntlCalendar, IntlTimeZone
+[ ] 9.19.4  Test: php-src/ext/intl/tests/
+
+## 9.20 ext/opcache (crates/php-rs-ext-opcache)
+[ ] 9.20.1  Opcode caching in shared memory (or Rust equivalent: mmap + serde)
+[ ] 9.20.2  JIT compilation (cranelift or LLVM backend)
+[ ] 9.20.3  Optimization passes
+[ ] 9.20.4  Test: php-src/ext/opcache/tests/
+
+## 9.21 Remaining extensions (lower priority, implement as needed)
+[ ] ext/bcmath — arbitrary precision math
+[ ] ext/bz2 — bzip2 compression
+[ ] ext/calendar — calendar conversion functions
+[ ] ext/dba — database abstraction (dbm-style)
+[ ] ext/enchant — spell checking
+[ ] ext/exif — image metadata
+[ ] ext/ffi — Foreign Function Interface
+[ ] ext/fileinfo — file type detection (libmagic)
+[ ] ext/ftp — FTP client
+[ ] ext/gd — image manipulation
+[ ] ext/gettext — i18n message translation
+[ ] ext/gmp — GNU Multiple Precision
+[ ] ext/iconv — character set conversion
+[ ] ext/ldap — LDAP directory access
+[ ] ext/mysqli — MySQL improved
+[ ] ext/mysqlnd — MySQL native driver
+[ ] ext/odbc — ODBC database
+[ ] ext/pcntl — process control
+[ ] ext/pdo_mysql — PDO MySQL driver
+[ ] ext/pdo_pgsql — PDO PostgreSQL driver
+[ ] ext/phar — PHP Archive
+[ ] ext/posix — POSIX functions
+[ ] ext/readline — interactive shell
+[ ] ext/shmop — shared memory
+[ ] ext/snmp — SNMP protocol
+[ ] ext/soap — SOAP web services
+[ ] ext/sockets — low-level socket API
+[ ] ext/sqlite3 — SQLite3 direct API
+[ ] ext/sysvmsg, ext/sysvsem, ext/sysvshm — System V IPC
+[ ] ext/tidy — HTML tidy
+[ ] ext/xsl — XSL transformations
+[ ] ext/zip — ZIP archive
+[ ] ext/zlib — zlib compression
+
+################################################################################
+# PHASE 10: CLI SAPI (crates/php-rs-sapi-cli)
+################################################################################
+# Reference: php-src/sapi/cli/php_cli.c
+################################################################################
+
+[ ] 10.1  Implement CLI argument parsing: php [options] [-f] file [--] [args]
+[ ] 10.2  Implement -r (run code), -a (interactive), -l (lint), -w (strip), -s (syntax highlight)
+[ ] 10.3  Implement -d (INI override), -c (config file), -n (no config)
+[ ] 10.4  Implement -v (version), -m (modules), -i (phpinfo)
+[ ] 10.5  Implement stdin reading (php < script.php, echo "code" | php)
+[ ] 10.6  Implement process exit code semantics
+[ ] 10.7  Wire up: parse args → load INI → init extensions → compile file → execute → shutdown
+[ ] 10.8  Test: CLI with php-src/tests/basic/*.phpt
+
+## Milestone: "Hello World" end-to-end
+[ ] 10.9  php.rs -r 'echo "Hello, World!\n";' outputs "Hello, World!\n"
+[ ] 10.10 php.rs test.php (with test.php containing echo + variables + arithmetic)
+
+################################################################################
+# PHASE 11: BUILT-IN WEB SERVER
+################################################################################
+# Reference: php-src/sapi/cli/php_cli_server.c (~86 KB)
+################################################################################
+
+[ ] 11.1  Implement built-in HTTP server (php -S localhost:8080)
+[ ] 11.2  Implement document root serving (-t docroot)
+[ ] 11.3  Implement router script support (php -S localhost:8080 router.php)
+[ ] 11.4  Implement $_SERVER population from HTTP request
+[ ] 11.5  Test: serve a simple PHP page, form submission, file upload
+
+################################################################################
+# PHASE 12: FPM SAPI (crates/php-rs-sapi-fpm)
+################################################################################
+# Reference: php-src/sapi/fpm/ (32 C files)
+################################################################################
+
+[ ] 12.1  Implement FastCGI protocol (request parsing, response framing)
+[ ] 12.2  Implement master process (signal handling, config loading)
+[ ] 12.3  Implement worker pool management (spawn, retire, max_children)
+[ ] 12.4  Implement pm modes: static, dynamic, ondemand
+[ ] 12.5  Implement pool configuration (listen, user, group, pm.*)
+[ ] 12.6  Implement slow log, access log
+[ ] 12.7  Implement status page (/status, /ping)
+[ ] 12.8  Implement graceful reload (SIGUSR2)
+[ ] 12.9  Test: FPM behind nginx, concurrent request handling
+
+################################################################################
+# PHASE 13: EMBED SAPI (crates/php-rs-sapi-embed)
+################################################################################
+# Reference: php-src/sapi/embed/
+################################################################################
+
+[ ] 13.1  Implement embeddable library interface (php_embed_init, php_embed_shutdown)
+[ ] 13.2  Implement eval_string, execute_file from host application
+[ ] 13.3  Implement value exchange between Rust host and PHP runtime
+[ ] 13.4  Test: embed in a Rust application, call PHP functions from Rust
+
+################################################################################
+# PHASE 14: COMPATIBILITY TEST SUITE
+################################################################################
+# Systematic PHPT test pass against php-src test suite
+################################################################################
+
+[ ] 14.1  Run php-src/tests/lang/ (228 tests) — language constructs
+[ ] 14.2  Run php-src/tests/classes/ (291 tests) — OOP
+[ ] 14.3  Run php-src/tests/basic/ (115 tests) — basics
+[ ] 14.4  Run php-src/tests/func/ (16 tests) — functions
+[ ] 14.5  Run php-src/tests/output/ (94 tests) — output handling
+[ ] 14.6  Run php-src/tests/strings/ (11 tests) — string operations
+[ ] 14.7  Run php-src/tests/security/ (54 tests) — security
+[ ] 14.8  Run php-src/ext/standard/tests/ (3,833 tests) — standard library
+[ ] 14.9  Run php-src/ext/json/tests/
+[ ] 14.10 Run php-src/ext/pcre/tests/
+[ ] 14.11 Run php-src/ext/date/tests/
+[ ] 14.12 Run php-src/ext/spl/tests/
+[ ] 14.13 Track pass rate: target 100% for phases 14.1–14.8 before declaring "beta"
+[ ] 14.14 Set up CI dashboard showing pass rates per test directory
+
+################################################################################
+# PHASE 15: PERFORMANCE
+################################################################################
+
+[ ] 15.1  Benchmark suite: fibonacci, array sorting, string manipulation, class instantiation
+[ ] 15.2  Profile VM dispatch loop — optimize hot paths
+[ ] 15.3  Optimize ZArray: packed mode fast path, small-array optimization
+[ ] 15.4  Optimize string interning: lock-free concurrent pool
+[ ] 15.5  Implement opcode caching (serialize/deserialize compiled opcodes)
+[ ] 15.6  Explore JIT: cranelift backend for hot functions
+[ ] 15.7  Target: match or beat PHP 8.6 on standard benchmarks
+
+################################################################################
+# PHASE 16: PRODUCTION HARDENING
+################################################################################
+
+[ ] 16.1  Memory limit enforcement (memory_limit INI)
+[ ] 16.2  Execution time limit (max_execution_time INI)
+[ ] 16.3  Open basedir restriction (open_basedir INI)
+[ ] 16.4  Disable functions (disable_functions INI)
+[ ] 16.5  Upload handling (file_uploads, upload_max_filesize, post_max_size)
+[ ] 16.6  Signal handling (SIGTERM, SIGINT graceful shutdown)
+[ ] 16.7  Fuzz testing: lexer, parser, VM with arbitrary PHP input
+[ ] 16.8  Address sanitizer / Miri testing for unsafe blocks
+[ ] 16.9  Documentation: man page, --help output matching PHP
+
+################################################################################
+# TOTALS (approximate)
+################################################################################
+#
+# Core engine:    ~300 tasks (types, lexer, parser, compiler, VM, GC, runtime)
+# Standard ext:   ~100 tasks (551 functions in ~17 categories)
+# Other exts:     ~80 tasks (20 extensions with high priority)
+# SAPIs:          ~25 tasks (CLI, built-in server, FPM, embed)
+# Testing:        ~15 tasks (PHPT compatibility)
+# Performance:    ~10 tasks (benchmarks, optimization, JIT)
+# Hardening:      ~10 tasks (security, limits, fuzzing)
+#
+# TOTAL: ~540 tasks
+#
+# Estimated reference code to reimplement:
+#   Zend Engine:      ~78,500 lines of C
+#   ext/standard:     ~57,500 lines of C
+#   Other extensions: ~298,000 lines of C
+#   SAPIs:            ~15,000 lines of C
+#   Main layer:       ~19,500 lines of C
+#   TOTAL:            ~468,500 lines of C → estimated ~200,000–300,000 lines of Rust
+#
+################################################################################
