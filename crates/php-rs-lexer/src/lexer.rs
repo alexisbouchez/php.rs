@@ -133,7 +133,7 @@ impl<'src> Lexer<'src> {
             // Check that after <?php we have whitespace, newline, or EOF
             // This prevents matching "<?phps" or "<?phpinfo" etc.
             let after = self.peek_str(6);
-            if after.len() == 5 || after.chars().nth(5).map_or(true, |ch| ch.is_whitespace()) {
+            if after.len() == 5 || after.chars().nth(5).is_none_or(|ch| ch.is_whitespace()) {
                 self.consume_bytes(5);
                 self.state = State::InScripting;
                 let span = Span::new(start_pos, self.pos, start_line, start_column);
@@ -171,8 +171,426 @@ impl<'src> Lexer<'src> {
 
     /// Scan in ST_IN_SCRIPTING state - inside PHP code
     fn scan_scripting(&mut self) -> Option<(Token, Span)> {
-        // Placeholder for now - will implement in next tasks
-        None
+        // Skip whitespace
+        while let Some(ch) = self.peek() {
+            if ch.is_whitespace() {
+                self.consume();
+            } else {
+                break;
+            }
+        }
+
+        if self.is_eof() {
+            return None;
+        }
+
+        let start_pos = self.pos;
+        let start_line = self.line;
+        let start_column = self.column;
+
+        // Try to match multi-character operators first (longest match wins)
+        // Three-character operators
+        if self.peek_str(3) == "===" {
+            self.consume_bytes(3);
+            return Some((
+                Token::IsIdentical,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(3) == "!==" {
+            self.consume_bytes(3);
+            return Some((
+                Token::IsNotIdentical,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(3) == "<=>" {
+            self.consume_bytes(3);
+            return Some((
+                Token::Spaceship,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(3) == "<<=" {
+            self.consume_bytes(3);
+            return Some((
+                Token::SlEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(3) == ">>=" {
+            self.consume_bytes(3);
+            return Some((
+                Token::SrEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(3) == "**=" {
+            self.consume_bytes(3);
+            return Some((
+                Token::PowEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(3) == "..." {
+            self.consume_bytes(3);
+            return Some((
+                Token::Ellipsis,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(3) == "??=" {
+            self.consume_bytes(3);
+            return Some((
+                Token::CoalesceEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(3) == "?->" {
+            self.consume_bytes(3);
+            return Some((
+                Token::NullsafeObjectOperator,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+
+        // Two-character operators
+        if self.peek_str(2) == "==" {
+            self.consume_bytes(2);
+            return Some((
+                Token::IsEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "!=" || self.peek_str(2) == "<>" {
+            self.consume_bytes(2);
+            return Some((
+                Token::IsNotEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "<=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::IsSmallerOrEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == ">=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::IsGreaterOrEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "<<" {
+            self.consume_bytes(2);
+            return Some((
+                Token::Sl,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == ">>" {
+            self.consume_bytes(2);
+            return Some((
+                Token::Sr,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "++" {
+            self.consume_bytes(2);
+            return Some((
+                Token::Inc,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "--" {
+            self.consume_bytes(2);
+            return Some((
+                Token::Dec,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "+=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::PlusEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "-=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::MinusEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "*=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::MulEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "/=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::DivEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == ".=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::ConcatEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "%=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::ModEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "&=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::AndEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "|=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::OrEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "^=" {
+            self.consume_bytes(2);
+            return Some((
+                Token::XorEqual,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "&&" {
+            self.consume_bytes(2);
+            return Some((
+                Token::BooleanAnd,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "||" {
+            self.consume_bytes(2);
+            return Some((
+                Token::BooleanOr,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "**" {
+            self.consume_bytes(2);
+            return Some((
+                Token::Pow,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "??" {
+            self.consume_bytes(2);
+            return Some((
+                Token::Coalesce,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "->" {
+            self.consume_bytes(2);
+            return Some((
+                Token::ObjectOperator,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "=>" {
+            self.consume_bytes(2);
+            return Some((
+                Token::DoubleArrow,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "::" {
+            self.consume_bytes(2);
+            return Some((
+                Token::PaamayimNekudotayim,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+        if self.peek_str(2) == "#[" {
+            self.consume_bytes(2);
+            return Some((
+                Token::Attribute,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
+
+        // Single-character operators and punctuation
+        let ch = self.peek()?;
+        match ch {
+            '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '&' | '|' | '^' | '~' | '('
+            | ')' | '{' | '}' | '[' | ']' | ';' | ',' | '.' | ':' | '?' | '@' | '#' | '\\' => {
+                self.consume();
+                let span = Span::new(start_pos, self.pos, start_line, start_column);
+                // For now, return these as String tokens (will be refined later)
+                // Actually, we should return BadCharacter for unrecognized single chars
+                // But for basic arithmetic/logic, these are valid
+                // For simplicity in this implementation, we'll just consume them
+                // The parser will handle the semantic meaning
+                Some((Token::BadCharacter, span))
+            }
+            '$' => {
+                // Variable
+                self.consume(); // consume '$'
+
+                // Variable name must start with letter or underscore
+                if let Some(first) = self.peek() {
+                    if first.is_alphabetic() || first == '_' {
+                        self.consume();
+                        // Continue consuming alphanumeric or underscore
+                        while let Some(ch) = self.peek() {
+                            if ch.is_alphanumeric() || ch == '_' {
+                                self.consume();
+                            } else {
+                                break;
+                            }
+                        }
+                        return Some((
+                            Token::Variable,
+                            Span::new(start_pos, self.pos, start_line, start_column),
+                        ));
+                    }
+                }
+
+                // If we get here, it's just a '$' with no valid identifier
+                Some((
+                    Token::BadCharacter,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+            _ if ch.is_alphabetic() || ch == '_' => {
+                // Identifier or keyword
+                self.consume();
+                while let Some(ch) = self.peek() {
+                    if ch.is_alphanumeric() || ch == '_' {
+                        self.consume();
+                    } else {
+                        break;
+                    }
+                }
+
+                let span = Span::new(start_pos, self.pos, start_line, start_column);
+                let text = span.extract(self.source);
+
+                // Check if it's a keyword (case-insensitive in PHP)
+                let token = match text.to_lowercase().as_str() {
+                    "abstract" => Token::Abstract,
+                    "and" => Token::LogicalAnd,
+                    "array" => Token::Array,
+                    "as" => Token::As,
+                    "break" => Token::Break,
+                    "callable" => Token::Callable,
+                    "case" => Token::Case,
+                    "catch" => Token::Catch,
+                    "class" => Token::Class,
+                    "clone" => Token::Clone,
+                    "const" => Token::Const,
+                    "continue" => Token::Continue,
+                    "declare" => Token::Declare,
+                    "default" => Token::Default,
+                    "die" => Token::Exit,
+                    "do" => Token::Do,
+                    "echo" => Token::Echo,
+                    "else" => Token::Else,
+                    "elseif" => Token::Elseif,
+                    "empty" => Token::Empty,
+                    "enddeclare" => Token::Enddeclare,
+                    "endfor" => Token::Endfor,
+                    "endforeach" => Token::Endforeach,
+                    "endif" => Token::Endif,
+                    "endswitch" => Token::Endswitch,
+                    "endwhile" => Token::Endwhile,
+                    "enum" => Token::Enum,
+                    "eval" => Token::Eval,
+                    "exit" => Token::Exit,
+                    "extends" => Token::Extends,
+                    "final" => Token::Final,
+                    "finally" => Token::Finally,
+                    "fn" => Token::Fn,
+                    "for" => Token::For,
+                    "foreach" => Token::Foreach,
+                    "function" => Token::Function,
+                    "global" => Token::Global,
+                    "goto" => Token::Goto,
+                    "if" => Token::If,
+                    "implements" => Token::Implements,
+                    "include" => Token::Include,
+                    "include_once" => Token::IncludeOnce,
+                    "instanceof" => Token::Instanceof,
+                    "insteadof" => Token::Insteadof,
+                    "interface" => Token::Interface,
+                    "isset" => Token::Isset,
+                    "list" => Token::List,
+                    "match" => Token::Match,
+                    "namespace" => Token::Namespace,
+                    "new" => Token::New,
+                    "or" => Token::LogicalOr,
+                    "print" => Token::Print,
+                    "private" => Token::Private,
+                    "protected" => Token::Protected,
+                    "public" => Token::Public,
+                    "readonly" => Token::Readonly,
+                    "require" => Token::Require,
+                    "require_once" => Token::RequireOnce,
+                    "return" => Token::Return,
+                    "static" => Token::Static,
+                    "switch" => Token::Switch,
+                    "throw" => Token::Throw,
+                    "trait" => Token::Trait,
+                    "try" => Token::Try,
+                    "unset" => Token::Unset,
+                    "use" => Token::Use,
+                    "var" => Token::Var,
+                    "while" => Token::While,
+                    "xor" => Token::LogicalXor,
+                    "yield" => Token::Yield,
+                    // Magic constants (case-insensitive)
+                    "__class__" => Token::ClassC,
+                    "__dir__" => Token::Dir,
+                    "__file__" => Token::File,
+                    "__function__" => Token::FuncC,
+                    "__line__" => Token::Line,
+                    "__method__" => Token::MethodC,
+                    "__namespace__" => Token::NsC,
+                    "__trait__" => Token::TraitC,
+                    "__property__" => Token::PropertyC,
+                    // Check for "yield from" (two keywords)
+                    "from" if self.peek_str(0).is_empty() => {
+                        // This is tricky - we need to look back to see if previous token was yield
+                        // For now, just treat "from" as an identifier
+                        // The parser will handle "yield from" as two tokens
+                        Token::String
+                    }
+                    _ => Token::String, // Regular identifier
+                };
+
+                Some((token, span))
+            }
+            _ => {
+                // Unknown character
+                self.consume();
+                Some((
+                    Token::BadCharacter,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ))
+            }
+        }
     }
 }
 
@@ -581,5 +999,657 @@ mod tests {
         assert_eq!(last.0, Token::OpenTag);
         assert_eq!(last.1, 3); // line 3
         assert_eq!(last.2, 1); // column 1
+    }
+
+    // ======================================================================
+    // Task 2.2.3: Test ST_IN_SCRIPTING state - keywords, operators, identifiers
+    // ======================================================================
+
+    #[test]
+    fn test_scripting_basic_keywords() {
+        // Test: Basic PHP keywords are recognized
+        let source = "<?php if else while for foreach";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.extract(source).to_string()));
+        }
+
+        assert_eq!(tokens[0].0, Token::OpenTag);
+        assert_eq!(tokens[1].0, Token::If);
+        assert_eq!(tokens[2].0, Token::Else);
+        assert_eq!(tokens[3].0, Token::While);
+        assert_eq!(tokens[4].0, Token::For);
+        assert_eq!(tokens[5].0, Token::Foreach);
+    }
+
+    #[test]
+    fn test_scripting_keywords_case_insensitive() {
+        // Test: PHP keywords are case-insensitive
+        let test_cases = vec![
+            ("<?php IF", Token::If),
+            ("<?php If", Token::If),
+            ("<?php if", Token::If),
+            ("<?php FUNCTION", Token::Function),
+            ("<?php Function", Token::Function),
+            ("<?php function", Token::Function),
+            ("<?php CLASS", Token::Class),
+            ("<?php Class", Token::Class),
+            ("<?php class", Token::Class),
+        ];
+
+        for (source, expected_token) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, expected_token, "Failed for source: {}", source);
+        }
+    }
+
+    #[test]
+    fn test_scripting_all_control_flow_keywords() {
+        // Test: All control flow keywords
+        let keywords = vec![
+            ("if", Token::If),
+            ("else", Token::Else),
+            ("elseif", Token::Elseif),
+            ("endif", Token::Endif),
+            ("while", Token::While),
+            ("endwhile", Token::Endwhile),
+            ("do", Token::Do),
+            ("for", Token::For),
+            ("endfor", Token::Endfor),
+            ("foreach", Token::Foreach),
+            ("endforeach", Token::Endforeach),
+            ("switch", Token::Switch),
+            ("endswitch", Token::Endswitch),
+            ("case", Token::Case),
+            ("default", Token::Default),
+            ("match", Token::Match),
+            ("break", Token::Break),
+            ("continue", Token::Continue),
+            ("goto", Token::Goto),
+        ];
+
+        for (keyword, expected_token) in keywords {
+            let source = format!("<?php {}", keyword);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", keyword));
+            assert_eq!(token, expected_token);
+            assert_eq!(span.extract(&source), keyword);
+        }
+    }
+
+    #[test]
+    fn test_scripting_all_declaration_keywords() {
+        // Test: All declaration keywords
+        let keywords = vec![
+            ("function", Token::Function),
+            ("fn", Token::Fn),
+            ("class", Token::Class),
+            ("interface", Token::Interface),
+            ("trait", Token::Trait),
+            ("enum", Token::Enum),
+            ("extends", Token::Extends),
+            ("implements", Token::Implements),
+            ("namespace", Token::Namespace),
+            ("use", Token::Use),
+            ("const", Token::Const),
+        ];
+
+        for (keyword, expected_token) in keywords {
+            let source = format!("<?php {}", keyword);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", keyword));
+            assert_eq!(token, expected_token);
+        }
+    }
+
+    #[test]
+    fn test_scripting_all_visibility_keywords() {
+        // Test: All visibility and modifier keywords
+        let keywords = vec![
+            ("public", Token::Public),
+            ("protected", Token::Protected),
+            ("private", Token::Private),
+            ("static", Token::Static),
+            ("final", Token::Final),
+            ("abstract", Token::Abstract),
+            ("readonly", Token::Readonly),
+            ("var", Token::Var),
+        ];
+
+        for (keyword, expected_token) in keywords {
+            let source = format!("<?php {}", keyword);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", keyword));
+            assert_eq!(token, expected_token);
+        }
+    }
+
+    #[test]
+    fn test_scripting_exception_keywords() {
+        // Test: Exception handling keywords
+        let keywords = vec![
+            ("try", Token::Try),
+            ("catch", Token::Catch),
+            ("finally", Token::Finally),
+            ("throw", Token::Throw),
+        ];
+
+        for (keyword, expected_token) in keywords {
+            let source = format!("<?php {}", keyword);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", keyword));
+            assert_eq!(token, expected_token);
+        }
+    }
+
+    #[test]
+    fn test_scripting_other_keywords() {
+        // Test: Other keywords (echo, return, new, etc.)
+        let keywords = vec![
+            ("echo", Token::Echo),
+            ("print", Token::Print),
+            ("return", Token::Return),
+            ("yield", Token::Yield),
+            ("new", Token::New),
+            ("clone", Token::Clone),
+            ("instanceof", Token::Instanceof),
+            ("include", Token::Include),
+            ("include_once", Token::IncludeOnce),
+            ("require", Token::Require),
+            ("require_once", Token::RequireOnce),
+            ("eval", Token::Eval),
+            ("isset", Token::Isset),
+            ("empty", Token::Empty),
+            ("unset", Token::Unset),
+            ("exit", Token::Exit),
+            ("die", Token::Exit), // die is alias for exit
+            ("list", Token::List),
+            ("array", Token::Array),
+            ("callable", Token::Callable),
+            ("declare", Token::Declare),
+            ("enddeclare", Token::Enddeclare),
+            ("global", Token::Global),
+            ("insteadof", Token::Insteadof),
+            ("as", Token::As),
+        ];
+
+        for (keyword, expected_token) in keywords {
+            let source = format!("<?php {}", keyword);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", keyword));
+            assert_eq!(token, expected_token, "Failed for keyword: {}", keyword);
+        }
+    }
+
+    #[test]
+    fn test_scripting_logical_keyword_operators() {
+        // Test: Logical operators that are keywords (and, or, xor)
+        let keywords = vec![
+            ("and", Token::LogicalAnd),
+            ("or", Token::LogicalOr),
+            ("xor", Token::LogicalXor),
+        ];
+
+        for (keyword, expected_token) in keywords {
+            let source = format!("<?php {}", keyword);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", keyword));
+            assert_eq!(token, expected_token);
+        }
+    }
+
+    #[test]
+    fn test_scripting_magic_constants() {
+        // Test: Magic constants are recognized (case-insensitive)
+        let constants = vec![
+            ("__LINE__", Token::Line),
+            ("__line__", Token::Line),
+            ("__FILE__", Token::File),
+            ("__file__", Token::File),
+            ("__DIR__", Token::Dir),
+            ("__CLASS__", Token::ClassC),
+            ("__TRAIT__", Token::TraitC),
+            ("__METHOD__", Token::MethodC),
+            ("__FUNCTION__", Token::FuncC),
+            ("__NAMESPACE__", Token::NsC),
+            ("__PROPERTY__", Token::PropertyC),
+        ];
+
+        for (constant, expected_token) in constants {
+            let source = format!("<?php {}", constant);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, _) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", constant));
+            assert_eq!(token, expected_token, "Failed for constant: {}", constant);
+        }
+    }
+
+    #[test]
+    fn test_scripting_identifiers() {
+        // Test: Regular identifiers are recognized
+        let identifiers = vec![
+            "myVariable",
+            "MyClass",
+            "_private",
+            "test123",
+            "camelCase",
+            "snake_case",
+            "UPPER_CASE",
+            "x",
+            "_",
+            "__construct",
+            "é", // Unicode identifier
+        ];
+
+        for identifier in identifiers {
+            let source = format!("<?php {}", identifier);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", identifier));
+            assert_eq!(
+                token,
+                Token::String,
+                "Failed for identifier: {}",
+                identifier
+            );
+            assert_eq!(span.extract(&source), identifier);
+        }
+    }
+
+    #[test]
+    fn test_scripting_variables() {
+        // Test: Variables (starting with $) are recognized
+        let variables = vec!["$var", "$myVar", "$_private", "$var123", "$x", "$_"];
+
+        for variable in variables {
+            let source = format!("<?php {}", variable);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", variable));
+            assert_eq!(token, Token::Variable, "Failed for variable: {}", variable);
+            assert_eq!(span.extract(&source), variable);
+        }
+    }
+
+    #[test]
+    fn test_scripting_comparison_operators() {
+        // Test: Comparison operators
+        let operators = vec![
+            ("==", Token::IsEqual),
+            ("!=", Token::IsNotEqual),
+            ("<>", Token::IsNotEqual), // <> is alias for !=
+            ("===", Token::IsIdentical),
+            ("!==", Token::IsNotIdentical),
+            ("<=", Token::IsSmallerOrEqual),
+            (">=", Token::IsGreaterOrEqual),
+            ("<=>", Token::Spaceship),
+        ];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_arithmetic_compound_assignment() {
+        // Test: Compound assignment operators
+        let operators = vec![
+            ("+=", Token::PlusEqual),
+            ("-=", Token::MinusEqual),
+            ("*=", Token::MulEqual),
+            ("/=", Token::DivEqual),
+            ("%=", Token::ModEqual),
+            (".=", Token::ConcatEqual),
+            ("**=", Token::PowEqual),
+        ];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_bitwise_compound_assignment() {
+        // Test: Bitwise compound assignment operators
+        let operators = vec![
+            ("&=", Token::AndEqual),
+            ("|=", Token::OrEqual),
+            ("^=", Token::XorEqual),
+            ("<<=", Token::SlEqual),
+            (">>=", Token::SrEqual),
+        ];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_logical_operators() {
+        // Test: Logical operators (symbolic)
+        let operators = vec![("&&", Token::BooleanAnd), ("||", Token::BooleanOr)];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_bitwise_shift_operators() {
+        // Test: Bitwise shift operators
+        let operators = vec![("<<", Token::Sl), (">>", Token::Sr)];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_increment_decrement() {
+        // Test: Increment and decrement operators
+        let operators = vec![("++", Token::Inc), ("--", Token::Dec)];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_power_operator() {
+        // Test: Power operator
+        let source = "<?php **";
+        let mut lexer = Lexer::new(source);
+        lexer.next_token(); // Skip <?php
+        let (token, span) = lexer.next_token().expect("Should tokenize **");
+        assert_eq!(token, Token::Pow);
+        assert_eq!(span.extract(source), "**");
+    }
+
+    #[test]
+    fn test_scripting_null_coalesce() {
+        // Test: Null coalesce operator
+        let operators = vec![("??", Token::Coalesce), ("??=", Token::CoalesceEqual)];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_object_operators() {
+        // Test: Object access operators
+        let operators = vec![
+            ("->", Token::ObjectOperator),
+            ("?->", Token::NullsafeObjectOperator),
+            ("::", Token::PaamayimNekudotayim),
+        ];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_arrow_operators() {
+        // Test: Arrow operators
+        let operators = vec![("=>", Token::DoubleArrow)];
+
+        for (op, expected_token) in operators {
+            let source = format!("<?php {}", op);
+            let mut lexer = Lexer::new(&source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", op));
+            assert_eq!(token, expected_token, "Failed for operator: {}", op);
+            assert_eq!(span.extract(&source), op);
+        }
+    }
+
+    #[test]
+    fn test_scripting_ellipsis() {
+        // Test: Ellipsis/spread operator
+        let source = "<?php ...";
+        let mut lexer = Lexer::new(source);
+        lexer.next_token(); // Skip <?php
+        let (token, span) = lexer.next_token().expect("Should tokenize ...");
+        assert_eq!(token, Token::Ellipsis);
+        assert_eq!(span.extract(source), "...");
+    }
+
+    #[test]
+    fn test_scripting_attribute_syntax() {
+        // Test: Attribute syntax #[
+        let source = "<?php #[";
+        let mut lexer = Lexer::new(source);
+        lexer.next_token(); // Skip <?php
+        let (token, span) = lexer.next_token().expect("Should tokenize #[");
+        assert_eq!(token, Token::Attribute);
+        assert_eq!(span.extract(source), "#[");
+    }
+
+    #[test]
+    fn test_scripting_whitespace_handling() {
+        // Test: Whitespace is skipped in scripting mode
+        let source = "<?php   if    else     while";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, _)) = lexer.next_token() {
+            tokens.push(token);
+        }
+
+        // Should only get: OpenTag, If, Else, While (no whitespace tokens)
+        assert_eq!(
+            tokens,
+            vec![Token::OpenTag, Token::If, Token::Else, Token::While]
+        );
+    }
+
+    #[test]
+    fn test_scripting_multiline_code() {
+        // Test: Code spanning multiple lines
+        let source = "<?php\nfunction\ntest\n(\n)";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, _)) = lexer.next_token() {
+            tokens.push(token);
+        }
+
+        // OpenTag, Function, String (test)
+        assert_eq!(tokens[0], Token::OpenTag);
+        assert_eq!(tokens[1], Token::Function);
+        assert_eq!(tokens[2], Token::String);
+    }
+
+    #[test]
+    fn test_scripting_mixed_tokens() {
+        // Test: Mix of keywords, identifiers, operators, variables
+        let source = "<?php function test($var) { return $var + 1; }";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token.clone(), span.extract(source).to_string()));
+        }
+
+        // Debug: print all tokens
+        // for (i, (token, text)) in tokens.iter().enumerate() {
+        //     println!("{}: {:?} = {:?}", i, token, text);
+        // }
+
+        // Find key tokens (skip BadCharacter tokens for punctuation)
+        let mut idx = 0;
+
+        // Token 0: <?php
+        assert_eq!(tokens[idx].0, Token::OpenTag);
+        idx += 1;
+
+        // Token 1: function
+        assert_eq!(tokens[idx].0, Token::Function);
+        idx += 1;
+
+        // Token 2: test
+        assert_eq!(tokens[idx].0, Token::String);
+        assert_eq!(tokens[idx].1, "test");
+        idx += 1;
+
+        // Skip BadCharacter for (
+        if tokens[idx].0 == Token::BadCharacter {
+            idx += 1;
+        }
+
+        // Variable $var
+        assert_eq!(tokens[idx].0, Token::Variable);
+        assert_eq!(tokens[idx].1, "$var");
+        idx += 1;
+
+        // Skip BadCharacter for )
+        if tokens[idx].0 == Token::BadCharacter {
+            idx += 1;
+        }
+
+        // Skip BadCharacter for {
+        if tokens[idx].0 == Token::BadCharacter {
+            idx += 1;
+        }
+
+        // return keyword
+        assert_eq!(tokens[idx].0, Token::Return);
+        idx += 1;
+
+        // Variable $var
+        assert_eq!(tokens[idx].0, Token::Variable);
+        assert_eq!(tokens[idx].1, "$var");
+    }
+
+    #[test]
+    fn test_scripting_operator_precedence_tokenization() {
+        // Test: Operators are tokenized correctly even when adjacent
+        let source = "<?php $a++--";
+        let mut lexer = Lexer::new(source);
+
+        let mut tokens = Vec::new();
+        while let Some((token, span)) = lexer.next_token() {
+            tokens.push((token, span.extract(source).to_string()));
+        }
+
+        assert_eq!(tokens[0].0, Token::OpenTag);
+        assert_eq!(tokens[1].0, Token::Variable);
+        assert_eq!(tokens[1].1, "$a");
+        assert_eq!(tokens[2].0, Token::Inc);
+        assert_eq!(tokens[2].1, "++");
+        assert_eq!(tokens[3].0, Token::Dec);
+        assert_eq!(tokens[3].1, "--");
+    }
+
+    #[test]
+    fn test_scripting_longest_match_wins() {
+        // Test: Longest operator match wins (e.g., === not ==)
+        let test_cases = vec![
+            ("<?php ===", Token::IsIdentical, "==="),
+            ("<?php !==", Token::IsNotIdentical, "!=="),
+            ("<?php <=>", Token::Spaceship, "<=>"),
+            ("<?php **=", Token::PowEqual, "**="),
+            ("<?php ??=", Token::CoalesceEqual, "??="),
+            ("<?php ?->", Token::NullsafeObjectOperator, "?->"),
+        ];
+
+        for (source, expected_token, expected_text) in test_cases {
+            let mut lexer = Lexer::new(source);
+            lexer.next_token(); // Skip <?php
+            let (token, span) = lexer
+                .next_token()
+                .expect(&format!("Should tokenize: {}", source));
+            assert_eq!(token, expected_token, "Failed for source: {}", source);
+            assert_eq!(span.extract(source), expected_text);
+        }
     }
 }
