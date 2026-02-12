@@ -8,6 +8,5 @@ mod tests {
     #[test]
     fn test_placeholder() {
         // Placeholder test to ensure the crate compiles
-        assert!(true);
     }
 }
