@@ -697,6 +697,15 @@ impl PhpArray {
         }
     }
 
+    /// Build a PhpArray from a string→string map (e.g. $_GET, $_ENV).
+    pub fn from_string_map(map: &HashMap<String, String>) -> Self {
+        let mut arr = Self::new();
+        for (k, v) in map {
+            arr.set_string(k.clone(), Value::String(v.clone()));
+        }
+        arr
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }

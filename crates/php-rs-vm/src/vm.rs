@@ -189,7 +189,14 @@ impl Vm {
     }
 
     /// Execute a compiled op_array and return the output.
-    pub fn execute(&mut self, op_array: &ZOpArray) -> VmResult<String> {
+    ///
+    /// If `superglobals` is provided, CVs whose names match keys in the map are
+    /// initialized with those values (e.g. `$_GET`, `$_SERVER`) before execution.
+    pub fn execute(
+        &mut self,
+        op_array: &ZOpArray,
+        superglobals: Option<&HashMap<String, Value>>,
+    ) -> VmResult<String> {
         // Store the main op_array
         self.op_arrays.clear();
         self.op_arrays.push(op_array.clone());
@@ -203,6 +210,15 @@ impl Vm {
         // Create the main frame
         let mut frame = Frame::new(op_array);
         frame.op_array_idx = 0;
+
+        // Pre-fill superglobal CVs so $_GET, $_SERVER, etc. are available
+        if let Some(sg) = superglobals {
+            for (name, value) in sg {
+                if let Some(idx) = op_array.vars.iter().position(|v| v == name) {
+                    frame.cvs[idx] = value.clone();
+                }
+            }
+        }
 
         self.call_stack.push(frame);
 
@@ -4466,7 +4482,7 @@ mod tests {
             panic!("Compilation failed for:\n{}\nError: {:?}", source, e);
         });
         let mut vm = Vm::new();
-        vm.execute(&op_array).unwrap_or_else(|e| {
+        vm.execute(&op_array, None).unwrap_or_else(|e| {
             panic!(
                 "Execution failed for:\n{}\nError: {:?}\nOpcodes:\n{}",
                 source,
@@ -4969,7 +4985,7 @@ try {
     fn test_vm_uncaught_exception() {
         let op_array = php_rs_compiler::compile("<?php throw 42;").unwrap();
         let mut vm = Vm::new();
-        let result = vm.execute(&op_array);
+        let result = vm.execute(&op_array, None);
         assert!(result.is_err());
     }
 
@@ -5177,7 +5193,7 @@ echo $x;
     fn test_vm_require_missing_file() {
         let op_array = compile("<?php require '/nonexistent/file.php';").unwrap();
         let mut vm = Vm::new();
-        let result = vm.execute(&op_array);
+        let result = vm.execute(&op_array, None);
         assert!(result.is_err());
     }
 
@@ -5607,7 +5623,7 @@ echo get_class($g);
             }
         }
         let mut vm = Vm::new();
-        let output = vm.execute(&op_array).unwrap();
+        let output = vm.execute(&op_array, None).unwrap();
         assert_eq!(output, "Generator");
     }
 

@@ -26,7 +26,9 @@ use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process;
 
-use php_rs_runtime::IniSystem;
+use php_rs_runtime::{IniSystem, Superglobals};
+use php_rs_vm::{PhpArray, Value};
+use std::collections::HashMap;
 
 mod server;
 
@@ -336,8 +338,59 @@ fn print_phpinfo() {
 
 // ── Compilation & execution ─────────────────────────────────────────────────
 
+/// Build VM superglobal bindings from runtime Superglobals and CLI argv.
+/// $_SERVER gets argc (int) and argv (array of strings) set from the given argv slice.
+/// Keys use the compiler's CV names (variable name without leading $: _GET, _SERVER, etc.).
+fn superglobals_for_vm(sg: &Superglobals, argv: &[String]) -> HashMap<String, Value> {
+    let mut map = HashMap::new();
+
+    // CV names match parser output (leading $ stripped): _GET, _SERVER, etc.
+    map.insert(
+        "_GET".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.get)),
+    );
+    map.insert(
+        "_POST".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.post)),
+    );
+    map.insert(
+        "_ENV".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.env)),
+    );
+    map.insert(
+        "_COOKIE".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.cookie)),
+    );
+    map.insert(
+        "_FILES".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.files)),
+    );
+    map.insert(
+        "_REQUEST".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.request)),
+    );
+    map.insert(
+        "_SESSION".to_string(),
+        Value::Array(PhpArray::from_string_map(&sg.session)),
+    );
+
+    // $_SERVER: string map + argc (int) and argv (array of strings)
+    let mut server = PhpArray::from_string_map(&sg.server);
+    server.set_string("argc".to_string(), Value::Long(argv.len() as i64));
+    let mut argv_arr = PhpArray::new();
+    for arg in argv {
+        argv_arr.push(Value::String(arg.clone()));
+    }
+    server.set_string("argv".to_string(), Value::Array(argv_arr));
+    map.insert("_SERVER".to_string(), Value::Array(server));
+
+    map
+}
+
 /// Compile and execute PHP source code, returning the exit code.
-fn execute_php(source: &str, ini: &IniSystem) -> i32 {
+/// `script_path` is the script name (e.g. "test.php" or "-" for stdin/-r).
+/// `argv` is the full argument list for this run (script path + script args), used for $_SERVER['argv'] and argc.
+fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]) -> i32 {
     let _ = ini; // Will be used when VM integrates INI
 
     // Compile
@@ -349,9 +402,16 @@ fn execute_php(source: &str, ini: &IniSystem) -> i32 {
         }
     };
 
+    // Build superglobals for this request
+    let mut sg = Superglobals::new();
+    sg.populate_env();
+    sg.populate_server_cli(script_path, argv);
+    sg.build_request("GP");
+    let sg_map = superglobals_for_vm(&sg, argv);
+
     // Execute
     let mut vm = php_rs_vm::Vm::new();
-    match vm.execute(&op_array) {
+    match vm.execute(&op_array, Some(&sg_map)) {
         Ok(output) => {
             print!("{}", output);
             0
@@ -359,6 +419,36 @@ fn execute_php(source: &str, ini: &IniSystem) -> i32 {
         Err(e) => {
             eprintln!("Fatal error: {:?}", e);
             255
+        }
+    }
+}
+
+/// Execute PHP and return (exit_code, stdout). Used by tests to assert on output.
+fn execute_php_capture(
+    source: &str,
+    ini: &IniSystem,
+    script_path: &str,
+    argv: &[String],
+) -> (i32, String) {
+    let _ = ini;
+    let op_array = match php_rs_compiler::compile(source) {
+        Ok(oa) => oa,
+        Err(e) => {
+            eprintln!("{}", e);
+            return (255, String::new());
+        }
+    };
+    let mut sg = Superglobals::new();
+    sg.populate_env();
+    sg.populate_server_cli(script_path, argv);
+    sg.build_request("GP");
+    let sg_map = superglobals_for_vm(&sg, argv);
+    let mut vm = php_rs_vm::Vm::new();
+    match vm.execute(&op_array, Some(&sg_map)) {
+        Ok(output) => (0, output),
+        Err(e) => {
+            eprintln!("Fatal error: {:?}", e);
+            (255, String::new())
         }
     }
 }
@@ -461,7 +551,7 @@ fn run_interactive() -> i32 {
                 };
 
                 let mut vm = php_rs_vm::Vm::new();
-                match vm.execute(&op_array) {
+                match vm.execute(&op_array, None) {
                     Ok(output) => {
                         if !output.is_empty() {
                             print!("{}", output);
@@ -618,10 +708,18 @@ fn main() {
         CliMode::RunCode(code) => {
             // -r wraps in <?php automatically
             let source = format!("<?php {}", code);
-            execute_php(&source, &ini)
+            let argv: Vec<String> = std::iter::once("-".to_string())
+                .chain(opts.script_args.clone())
+                .collect();
+            execute_php(&source, &ini, "-", &argv)
         }
         CliMode::RunFile(path) => match read_file(&path) {
-            Ok(source) => execute_php(&source, &ini),
+            Ok(source) => {
+                let argv: Vec<String> = std::iter::once(path.clone())
+                    .chain(opts.script_args.clone())
+                    .collect();
+                execute_php(&source, &ini, &path, &argv)
+            }
             Err(code) => code,
         },
         CliMode::Lint(path) => match read_file(&path) {
@@ -643,7 +741,7 @@ fn main() {
             Err(code) => code,
         },
         CliMode::Stdin => match read_stdin() {
-            Ok(source) => execute_php(&source, &ini),
+            Ok(source) => execute_php(&source, &ini, "-", &["-".to_string()]),
             Err(code) => code,
         },
     };
@@ -794,27 +892,46 @@ mod tests {
 
     // ── End-to-end execution tests ──
 
+    fn default_argv() -> Vec<String> {
+        vec!["-".to_string()]
+    }
+
     #[test]
     fn test_execute_hello_world() {
-        let code = execute_php("<?php echo \"Hello, World!\n\";", &IniSystem::new());
+        let code = execute_php(
+            "<?php echo \"Hello, World!\n\";",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
         assert_eq!(code, 0);
     }
 
     #[test]
     fn test_execute_echo_number() {
-        let code = execute_php("<?php echo 42;", &IniSystem::new());
+        let code = execute_php("<?php echo 42;", &IniSystem::new(), "-", &default_argv());
         assert_eq!(code, 0);
     }
 
     #[test]
     fn test_execute_variable_assignment() {
-        let code = execute_php("<?php $x = 10; echo $x;", &IniSystem::new());
+        let code = execute_php(
+            "<?php $x = 10; echo $x;",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
         assert_eq!(code, 0);
     }
 
     #[test]
     fn test_execute_arithmetic() {
-        let code = execute_php("<?php echo 2 + 3 * 4;", &IniSystem::new());
+        let code = execute_php(
+            "<?php echo 2 + 3 * 4;",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
         assert_eq!(code, 0);
     }
 
@@ -823,6 +940,8 @@ mod tests {
         let code = execute_php(
             "<?php echo \"Hello\" . \" \" . \"World\";",
             &IniSystem::new(),
+            "-",
+            &default_argv(),
         );
         assert_eq!(code, 0);
     }
@@ -832,6 +951,8 @@ mod tests {
         let code = execute_php(
             "<?php $x = 5; if ($x > 3) { echo \"yes\"; } else { echo \"no\"; }",
             &IniSystem::new(),
+            "-",
+            &default_argv(),
         );
         assert_eq!(code, 0);
     }
@@ -841,6 +962,8 @@ mod tests {
         let code = execute_php(
             "<?php $i = 0; while ($i < 5) { echo $i; $i = $i + 1; }",
             &IniSystem::new(),
+            "-",
+            &default_argv(),
         );
         assert_eq!(code, 0);
     }
@@ -850,13 +973,15 @@ mod tests {
         let code = execute_php(
             "<?php function add($a, $b) { return $a + $b; } echo add(3, 4);",
             &IniSystem::new(),
+            "-",
+            &default_argv(),
         );
         assert_eq!(code, 0);
     }
 
     #[test]
     fn test_execute_parse_error() {
-        let code = execute_php("<?php echo (;", &IniSystem::new());
+        let code = execute_php("<?php echo (;", &IniSystem::new(), "-", &default_argv());
         assert_eq!(code, 255);
     }
 
@@ -864,8 +989,78 @@ mod tests {
     fn test_execute_r_flag_wrapping() {
         // -r wraps in <?php, so code shouldn't include it
         let source = format!("<?php {}", "echo 42;");
-        let code = execute_php(&source, &IniSystem::new());
+        let code = execute_php(&source, &IniSystem::new(), "-", &default_argv());
         assert_eq!(code, 0);
+    }
+
+    // ── Superglobal tests ──
+
+    #[test]
+    fn test_superglobal_server_argc_argv() {
+        // argv = ["-", "a", "b"] => argc = 3, argv[0] = "-", argv[1] = "a", argv[2] = "b"
+        let argv = vec!["-".to_string(), "a".to_string(), "b".to_string()];
+        let (code, out) = execute_php_capture(
+            "<?php echo $_SERVER['argc'];",
+            &IniSystem::new(),
+            "-",
+            &argv,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "3");
+    }
+
+    #[test]
+    fn test_superglobal_server_argv_array() {
+        let argv = vec!["script.php".to_string(), "one".to_string(), "two".to_string()];
+        let (code, out) = execute_php_capture(
+            "<?php $a = $_SERVER['argv']; echo $a[0].','.$a[1].','.$a[2];",
+            &IniSystem::new(),
+            "script.php",
+            &argv,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "script.php,one,two");
+    }
+
+    #[test]
+    fn test_superglobal_server_script_filename() {
+        let argv = vec!["/path/to/script.php".to_string()];
+        let (code, out) = execute_php_capture(
+            "<?php echo $_SERVER['SCRIPT_FILENAME'];",
+            &IniSystem::new(),
+            "/path/to/script.php",
+            &argv,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "/path/to/script.php");
+    }
+
+    #[test]
+    fn test_superglobal_get_empty_then_assign() {
+        // $_GET is pre-filled (empty for CLI); script can read and assign
+        let (code, out) = execute_php_capture(
+            "<?php $_GET['x'] = 'y'; echo $_GET['x'];",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "y");
+    }
+
+    #[test]
+    fn test_superglobal_env_available() {
+        // $_ENV is populated from process environment
+        std::env::set_var("PHP_RS_SUPERGLOBAL_TEST", "env_ok");
+        let (code, out) = execute_php_capture(
+            "<?php echo isset($_ENV['PHP_RS_SUPERGLOBAL_TEST']) ? $_ENV['PHP_RS_SUPERGLOBAL_TEST'] : 'missing';",
+            &IniSystem::new(),
+            "-",
+            &default_argv(),
+        );
+        std::env::remove_var("PHP_RS_SUPERGLOBAL_TEST");
+        assert_eq!(code, 0);
+        assert_eq!(out.trim(), "env_ok");
     }
 
     #[test]

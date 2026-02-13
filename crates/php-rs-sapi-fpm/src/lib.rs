@@ -555,7 +555,7 @@ fn execute_php_fcgi(
     };
 
     let mut vm = php_rs_vm::Vm::new();
-    match vm.execute(&op_array) {
+    match vm.execute(&op_array, None) {
         Ok(output) => (0, output, String::new()),
         Err(e) => (1, String::new(), format!("{:?}", e)),
     }

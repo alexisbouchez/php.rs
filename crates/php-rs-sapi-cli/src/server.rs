@@ -256,7 +256,7 @@ fn execute_php_request(
         HashMap::new()
     };
 
-    match vm.execute(&op_array) {
+    match vm.execute(&op_array, None) {
         Ok(output) => Ok((200, "text/html; charset=UTF-8".into(), output.into_bytes())),
         Err(e) => Err(format!("{:?}", e)),
     }

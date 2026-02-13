@@ -248,7 +248,7 @@ impl PhpEmbed {
             php_rs_compiler::compile(source).map_err(|e| EmbedError::ParseError(e.to_string()))?;
 
         let mut vm = php_rs_vm::Vm::new();
-        vm.execute(&op_array)
+        vm.execute(&op_array, None)
             .map_err(|e| EmbedError::RuntimeError(format!("{:?}", e)))
     }
 }
