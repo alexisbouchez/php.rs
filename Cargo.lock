@@ -274,7 +274,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "php-rs-ext-ctype"
+version = "0.1.0"
+
+[[package]]
+name = "php-rs-ext-date"
+version = "0.1.0"
+
+[[package]]
+name = "php-rs-ext-filter"
+version = "0.1.0"
+
+[[package]]
+name = "php-rs-ext-hash"
+version = "0.1.0"
+
+[[package]]
+name = "php-rs-ext-json"
+version = "0.1.0"
+
+[[package]]
+name = "php-rs-ext-mbstring"
+version = "0.1.0"
+
+[[package]]
+name = "php-rs-ext-pcre"
+version = "0.1.0"
+dependencies = [
+ "regex",
+]
+
+[[package]]
+name = "php-rs-ext-spl"
+version = "0.1.0"
+
+[[package]]
 name = "php-rs-ext-standard"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "php-rs-ext-tokenizer"
 version = "0.1.0"
 
 [[package]]
@@ -299,6 +341,11 @@ version = "0.1.0"
 [[package]]
 name = "php-rs-sapi-cli"
 version = "0.1.0"
+dependencies = [
+ "php-rs-compiler",
+ "php-rs-runtime",
+ "php-rs-vm",
+]
 
 [[package]]
 name = "php-rs-types"

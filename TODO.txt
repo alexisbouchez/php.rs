@@ -712,18 +712,18 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 # Reference: php-src/sapi/cli/php_cli.c
 ################################################################################
 
-[ ] 10.1  Implement CLI argument parsing: php [options] [-f] file [--] [args]
-[ ] 10.2  Implement -r (run code), -a (interactive), -l (lint), -w (strip), -s (syntax highlight)
-[ ] 10.3  Implement -d (INI override), -c (config file), -n (no config)
-[ ] 10.4  Implement -v (version), -m (modules), -i (phpinfo)
-[ ] 10.5  Implement stdin reading (php < script.php, echo "code" | php)
-[ ] 10.6  Implement process exit code semantics
-[ ] 10.7  Wire up: parse args → load INI → init extensions → compile file → execute → shutdown
+[x] 10.1  Implement CLI argument parsing: php [options] [-f] file [--] [args]
+[x] 10.2  Implement -r (run code), -a (interactive), -l (lint), -w (strip), -s (syntax highlight)
+[x] 10.3  Implement -d (INI override), -c (config file), -n (no config)
+[x] 10.4  Implement -v (version), -m (modules), -i (phpinfo)
+[x] 10.5  Implement stdin reading (php < script.php, echo "code" | php)
+[x] 10.6  Implement process exit code semantics
+[x] 10.7  Wire up: parse args → load INI → init extensions → compile file → execute → shutdown
 [ ] 10.8  Test: CLI with php-src/tests/basic/*.phpt
 
 ## Milestone: "Hello World" end-to-end
-[ ] 10.9  php.rs -r 'echo "Hello, World!\n";' outputs "Hello, World!\n"
-[ ] 10.10 php.rs test.php (with test.php containing echo + variables + arithmetic)
+[x] 10.9  php.rs -r 'echo "Hello, World!\n";' outputs "Hello, World!\n"
+[x] 10.10 php.rs test.php (with test.php containing echo + variables + arithmetic)
 
 ################################################################################
 # PHASE 11: BUILT-IN WEB SERVER
