@@ -851,6 +851,85 @@ impl PhpArray {
     pub fn entries(&self) -> &[(ArrayKey, Value)] {
         &self.entries
     }
+
+    /// Remove and return the last entry's value (like array_pop).
+    pub fn pop(&mut self) -> Value {
+        match self.entries.pop() {
+            Some((_, v)) => v,
+            None => Value::Null,
+        }
+    }
+
+    /// Remove and return the first entry's value, reindexing integer keys (like array_shift).
+    pub fn shift(&mut self) -> Value {
+        if self.entries.is_empty() {
+            return Value::Null;
+        }
+        let (_, val) = self.entries.remove(0);
+        // Reindex integer keys starting from 0
+        let mut next = 0i64;
+        for entry in &mut self.entries {
+            if let ArrayKey::Int(_) = entry.0 {
+                entry.0 = ArrayKey::Int(next);
+                next += 1;
+            }
+        }
+        self.next_int_key = next;
+        val
+    }
+
+    /// Prepend a value at the beginning, reindexing integer keys (like array_unshift).
+    pub fn unshift(&mut self, value: Value) {
+        self.entries.insert(0, (ArrayKey::Int(0), value));
+        // Reindex integer keys
+        let mut next = 0i64;
+        for entry in &mut self.entries {
+            if let ArrayKey::Int(_) = entry.0 {
+                entry.0 = ArrayKey::Int(next);
+                next += 1;
+            }
+        }
+        self.next_int_key = next;
+    }
+
+    /// Return the first key, or Null if empty (like array_key_first).
+    pub fn key_first(&self) -> Value {
+        match self.entries.first() {
+            Some((ArrayKey::Int(n), _)) => Value::Long(*n),
+            Some((ArrayKey::String(s), _)) => Value::String(s.clone()),
+            None => Value::Null,
+        }
+    }
+
+    /// Return the last key, or Null if empty (like array_key_last).
+    pub fn key_last(&self) -> Value {
+        match self.entries.last() {
+            Some((ArrayKey::Int(n), _)) => Value::Long(*n),
+            Some((ArrayKey::String(s), _)) => Value::String(s.clone()),
+            None => Value::Null,
+        }
+    }
+
+    /// Return the current value (first entry) like current().
+    pub fn current(&self) -> Value {
+        match self.entries.first() {
+            Some((_, v)) => v.clone(),
+            None => Value::Bool(false),
+        }
+    }
+
+    /// Check if the array is a list (sequential integer keys 0..n).
+    pub fn is_list(&self) -> bool {
+        self.entries
+            .iter()
+            .enumerate()
+            .all(|(i, (k, _))| matches!(k, ArrayKey::Int(n) if *n == i as i64))
+    }
+
+    /// Get mutable entries.
+    pub fn entries_mut(&mut self) -> &mut Vec<(ArrayKey, Value)> {
+        &mut self.entries
+    }
 }
 
 impl Default for PhpArray {

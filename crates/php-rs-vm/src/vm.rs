@@ -3297,7 +3297,6 @@ impl Vm {
                 };
                 Ok(Some(Value::Long(count as i64)))
             }
-            "array_pop" => Ok(Some(Value::Null)),
             "array_key_exists" => {
                 let key = args.first().cloned().unwrap_or(Value::Null);
                 let arr = args.get(1).cloned().unwrap_or(Value::Null);
@@ -3547,12 +3546,6 @@ impl Vm {
                 }
                 Ok(Some(Value::Array(result)))
             }
-            "array_map" => {
-                // array_map(null, $array) = identity
-                // We can't execute closures yet, so just handle null case
-                let arr = args.get(1).cloned().unwrap_or(Value::Null);
-                Ok(Some(arr))
-            }
             "array_slice" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
                 let offset = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
@@ -3725,15 +3718,6 @@ impl Vm {
                 };
                 Ok(Some(Value::String(result)))
             }
-            "number_format" => {
-                let num = args.first().cloned().unwrap_or(Value::Null).to_double();
-                let decimals = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
-                Ok(Some(Value::String(format!(
-                    "{:.prec$}",
-                    num,
-                    prec = decimals as usize
-                ))))
-            }
             "isset" => {
                 // Shouldn't normally reach here (ISSET is usually compiled as opcode)
                 let v = args.first().cloned().unwrap_or(Value::Null);
@@ -3792,6 +3776,14 @@ impl Vm {
             "json_last_error_msg" => Ok(Some(Value::String(
                 php_rs_ext_json::json_last_error_msg().to_string(),
             ))),
+            "json_validate" => {
+                let json_str = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let depth = args.get(1).cloned().unwrap_or(Value::Long(512)).to_long() as usize;
+                // json_validate returns true if the string is valid JSON
+                let valid = php_rs_ext_json::json_decode(&json_str, false, depth).is_some()
+                    && php_rs_ext_json::json_last_error() == php_rs_ext_json::JsonError::None;
+                Ok(Some(Value::Bool(valid)))
+            }
             // ── Phase 8 additions ──
             "quoted_printable_encode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -4067,6 +4059,60 @@ impl Vm {
                 }
                 Ok(Some(Value::String(result)))
             }
+            "preg_filter" => {
+                // preg_filter is like preg_replace but returns NULL for non-matching subjects
+                // when subject is a string, or omits non-matching entries when subject is an array
+                let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let rep = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let subj = args.get(2).cloned().unwrap_or(Value::Null);
+                match parse_php_regex(&pat) {
+                    Some((re, flags)) => match regex::Regex::new(&apply_regex_flags(&re, &flags)) {
+                        Ok(r) => {
+                            let rr = rep
+                                .replace("\\1", "$1")
+                                .replace("\\2", "$2")
+                                .replace("\\3", "$3");
+                            match subj {
+                                Value::Array(ref arr) => {
+                                    let mut result = PhpArray::new();
+                                    for (key, val) in arr.entries() {
+                                        let s = val.to_php_string();
+                                        if r.is_match(&s) {
+                                            let replaced = r.replace_all(&s, rr.as_str()).to_string();
+                                            match key {
+                                                ArrayKey::Int(i) => result.set_int(*i, Value::String(replaced)),
+                                                ArrayKey::String(k) => result.set_string(k.clone(), Value::String(replaced)),
+                                            }
+                                        }
+                                    }
+                                    Ok(Some(Value::Array(result)))
+                                }
+                                _ => {
+                                    let s = subj.to_php_string();
+                                    if r.is_match(&s) {
+                                        Ok(Some(Value::String(
+                                            r.replace_all(&s, rr.as_str()).to_string(),
+                                        )))
+                                    } else {
+                                        Ok(Some(Value::Null))
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => Ok(Some(Value::Null)),
+                    },
+                    None => Ok(Some(Value::Null)),
+                }
+            }
+            "preg_replace_callback_array" => {
+                // preg_replace_callback_array(array $pattern_callbacks, string $subject, ...)
+                // Stub: return subject unchanged (full callback execution requires VM re-entry)
+                let subject = args.get(1).cloned().unwrap_or(Value::Null);
+                match subject {
+                    Value::String(_) => Ok(Some(subject)),
+                    _ => Ok(Some(Value::String(subject.to_php_string()))),
+                }
+            }
             "md5" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(
@@ -4321,6 +4367,1489 @@ impl Vm {
                 match std::fs::canonicalize(&p) {
                     Ok(rp) => Ok(Some(Value::String(rp.to_string_lossy().to_string()))),
                     Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // TIER 2: Math functions
+            // ══════════════════════════════════════════════════════════════
+            "pow" => {
+                let base = args.first().cloned().unwrap_or(Value::Null);
+                let exp = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(Some(base.pow(&exp)))
+            }
+            "sqrt" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.sqrt())))
+            }
+            "log" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                let base = args.get(1).map(|v| v.to_double());
+                let result = match base {
+                    Some(b) => n.log(b),
+                    None => n.ln(),
+                };
+                Ok(Some(Value::Double(result)))
+            }
+            "log10" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.log10())))
+            }
+            "log2" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.log2())))
+            }
+            "fmod" => {
+                let x = args.first().cloned().unwrap_or(Value::Null).to_double();
+                let y = args.get(1).cloned().unwrap_or(Value::Long(1)).to_double();
+                Ok(Some(Value::Double(x % y)))
+            }
+            "intdiv" => {
+                let a = args.first().cloned().unwrap_or(Value::Null).to_long();
+                let b = args.get(1).cloned().unwrap_or(Value::Long(1)).to_long();
+                if b == 0 {
+                    Err(VmError::FatalError("Division by zero".to_string()))
+                } else {
+                    Ok(Some(Value::Long(a / b)))
+                }
+            }
+            "pi" => Ok(Some(Value::Double(std::f64::consts::PI))),
+            "sin" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.sin())))
+            }
+            "cos" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.cos())))
+            }
+            "tan" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.tan())))
+            }
+            "asin" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.asin())))
+            }
+            "acos" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.acos())))
+            }
+            "atan" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.atan())))
+            }
+            "atan2" => {
+                let y = args.first().cloned().unwrap_or(Value::Null).to_double();
+                let x = args.get(1).cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(y.atan2(x))))
+            }
+            "exp" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.exp())))
+            }
+            "base_convert" => {
+                let number = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let from_base = args.get(1).cloned().unwrap_or(Value::Long(10)).to_long() as u32;
+                let to_base = args.get(2).cloned().unwrap_or(Value::Long(10)).to_long() as u32;
+                match php_rs_ext_standard::math::php_base_convert(&number, from_base, to_base) {
+                    Some(s) => Ok(Some(Value::String(s))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "bindec" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Long(php_rs_ext_standard::math::php_bindec(&s))))
+            }
+            "octdec" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Long(php_rs_ext_standard::math::php_octdec(&s))))
+            }
+            "hexdec" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Long(php_rs_ext_standard::math::php_hexdec(&s))))
+            }
+            "decoct" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_long();
+                Ok(Some(Value::String(php_rs_ext_standard::math::php_decoct(n))))
+            }
+            "dechex" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_long();
+                Ok(Some(Value::String(php_rs_ext_standard::math::php_dechex(n))))
+            }
+            "decbin" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_long();
+                Ok(Some(Value::String(php_rs_ext_standard::math::php_decbin(n))))
+            }
+            "rand" | "mt_rand" => {
+                let min = args.first().cloned().unwrap_or(Value::Long(0)).to_long();
+                let max = args.get(1).cloned().unwrap_or(Value::Long(i32::MAX as i64)).to_long();
+                Ok(Some(Value::Long(php_rs_ext_standard::math::php_rand(min, max))))
+            }
+            "random_int" => {
+                let min = args.first().cloned().unwrap_or(Value::Long(0)).to_long();
+                let max = args.get(1).cloned().unwrap_or(Value::Long(i64::MAX)).to_long();
+                Ok(Some(Value::Long(php_rs_ext_standard::math::php_rand(min, max))))
+            }
+            "getrandmax" | "mt_getrandmax" => Ok(Some(Value::Long(i32::MAX as i64))),
+            "is_nan" => {
+                let v = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Bool(v.is_nan())))
+            }
+            "is_infinite" => {
+                let v = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Bool(v.is_infinite())))
+            }
+            "is_finite" => {
+                let v = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Bool(v.is_finite())))
+            }
+            "hypot" => {
+                let x = args.first().cloned().unwrap_or(Value::Null).to_double();
+                let y = args.get(1).cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(x.hypot(y))))
+            }
+            "sinh" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.sinh())))
+            }
+            "cosh" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.cosh())))
+            }
+            "tanh" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.tanh())))
+            }
+            "deg2rad" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.to_radians())))
+            }
+            "rad2deg" => {
+                let n = args.first().cloned().unwrap_or(Value::Null).to_double();
+                Ok(Some(Value::Double(n.to_degrees())))
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // TIER 2: String functions
+            // ══════════════════════════════════════════════════════════════
+            "strrpos" => {
+                let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let needle = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let offset = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+                match php_rs_ext_standard::strings::php_strrpos(&haystack, &needle, offset) {
+                    Some(pos) => Ok(Some(Value::Long(pos as i64))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "strstr" | "strchr" => {
+                let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let needle = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let before = args.get(2).is_some_and(|v| v.to_bool());
+                match php_rs_ext_standard::strings::php_strstr(&haystack, &needle, before) {
+                    Some(s) => Ok(Some(Value::String(s))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "stristr" => {
+                let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let needle = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let before = args.get(2).is_some_and(|v| v.to_bool());
+                let hay_lower = haystack.to_lowercase();
+                let needle_lower = needle.to_lowercase();
+                match hay_lower.find(&needle_lower) {
+                    Some(pos) => {
+                        if before {
+                            Ok(Some(Value::String(haystack[..pos].to_string())))
+                        } else {
+                            Ok(Some(Value::String(haystack[pos..].to_string())))
+                        }
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "stripos" => {
+                let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let needle = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let offset = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let hay_lower = haystack.to_lowercase();
+                let needle_lower = needle.to_lowercase();
+                match hay_lower[offset..].find(&needle_lower) {
+                    Some(pos) => Ok(Some(Value::Long((pos + offset) as i64))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "strripos" => {
+                let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let needle = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let offset = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+                let hay_lower = haystack.to_lowercase();
+                let needle_lower = needle.to_lowercase();
+                let start = if offset < 0 {
+                    (haystack.len() as i64 + offset).max(0) as usize
+                } else {
+                    offset as usize
+                };
+                let end = if offset < 0 {
+                    haystack.len() - ((-offset) as usize).min(haystack.len())
+                } else {
+                    haystack.len()
+                };
+                if start <= end && start <= hay_lower.len() {
+                    match hay_lower[start..end.min(hay_lower.len())].rfind(&needle_lower) {
+                        Some(pos) => Ok(Some(Value::Long((pos + start) as i64))),
+                        None => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "substr_count" => {
+                let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let needle = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                if needle.is_empty() {
+                    return Ok(Some(Value::Long(0)));
+                }
+                Ok(Some(Value::Long(haystack.matches(&needle).count() as i64)))
+            }
+            "substr_replace" => {
+                let string = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let replacement = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let start = args.get(2).cloned().unwrap_or(Value::Long(0)).to_long();
+                let length = args.get(3).map(|v| v.to_long());
+                let slen = string.len() as i64;
+                let start_idx = if start < 0 { (slen + start).max(0) as usize } else { start.min(slen) as usize };
+                let end_idx = match length {
+                    Some(l) if l < 0 => (slen + l).max(0) as usize,
+                    Some(l) => (start_idx + l as usize).min(string.len()),
+                    None => string.len(),
+                };
+                let mut result = String::new();
+                result.push_str(&string[..start_idx]);
+                result.push_str(&replacement);
+                if end_idx < string.len() {
+                    result.push_str(&string[end_idx..]);
+                }
+                Ok(Some(Value::String(result)))
+            }
+            "str_ireplace" => {
+                let search = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let replace = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let subject = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
+                if search.is_empty() {
+                    return Ok(Some(Value::String(subject)));
+                }
+                // Case-insensitive replace
+                let mut result = String::new();
+                let lower_subject = subject.to_lowercase();
+                let lower_search = search.to_lowercase();
+                let mut pos = 0;
+                while let Some(found) = lower_subject[pos..].find(&lower_search) {
+                    result.push_str(&subject[pos..pos + found]);
+                    result.push_str(&replace);
+                    pos += found + search.len();
+                }
+                result.push_str(&subject[pos..]);
+                Ok(Some(Value::String(result)))
+            }
+            "nl2br" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let is_xhtml = !args.get(1).is_some_and(|v| !v.to_bool());
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_nl2br(&s, is_xhtml),
+                )))
+            }
+            "wordwrap" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let width = args.get(1).cloned().unwrap_or(Value::Long(75)).to_long() as usize;
+                let brk = args.get(2).cloned().unwrap_or(Value::String("\n".to_string())).to_php_string();
+                let cut = args.get(3).is_some_and(|v| v.to_bool());
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_wordwrap(&s, width, &brk, cut),
+                )))
+            }
+            "chunk_split" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let chunklen = args.get(1).cloned().unwrap_or(Value::Long(76)).to_long() as usize;
+                let end = args.get(2).cloned().unwrap_or(Value::String("\r\n".to_string())).to_php_string();
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_chunk_split(&s, chunklen, &end),
+                )))
+            }
+            "hex2bin" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let mut result = Vec::new();
+                let bytes = s.as_bytes();
+                let mut i = 0;
+                while i + 1 < bytes.len() {
+                    let hi = match bytes[i] {
+                        b'0'..=b'9' => bytes[i] - b'0',
+                        b'a'..=b'f' => bytes[i] - b'a' + 10,
+                        b'A'..=b'F' => bytes[i] - b'A' + 10,
+                        _ => return Ok(Some(Value::Bool(false))),
+                    };
+                    let lo = match bytes[i + 1] {
+                        b'0'..=b'9' => bytes[i + 1] - b'0',
+                        b'a'..=b'f' => bytes[i + 1] - b'a' + 10,
+                        b'A'..=b'F' => bytes[i + 1] - b'A' + 10,
+                        _ => return Ok(Some(Value::Bool(false))),
+                    };
+                    result.push((hi << 4) | lo);
+                    i += 2;
+                }
+                Ok(Some(Value::String(String::from_utf8_lossy(&result).to_string())))
+            }
+            "bin2hex" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let hex: String = s.bytes().map(|b| format!("{:02x}", b)).collect();
+                Ok(Some(Value::String(hex)))
+            }
+            "str_split" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let length = args.get(1).cloned().unwrap_or(Value::Long(1)).to_long().max(1) as usize;
+                let parts = php_rs_ext_standard::strings::php_str_split(&s, length);
+                let mut arr = PhpArray::new();
+                for part in parts {
+                    arr.push(Value::String(part));
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "str_word_count" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let format = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
+                match format {
+                    0 => Ok(Some(Value::Long(php_rs_ext_standard::strings::php_str_word_count(&s) as i64))),
+                    1 => {
+                        let mut arr = PhpArray::new();
+                        for word in s.split_whitespace() {
+                            arr.push(Value::String(word.to_string()));
+                        }
+                        Ok(Some(Value::Array(arr)))
+                    }
+                    2 => {
+                        let mut arr = PhpArray::new();
+                        let mut pos = 0;
+                        for part in s.split_whitespace() {
+                            if let Some(idx) = s[pos..].find(part) {
+                                arr.set_int((pos + idx) as i64, Value::String(part.to_string()));
+                                pos += idx + part.len();
+                            }
+                        }
+                        Ok(Some(Value::Array(arr)))
+                    }
+                    _ => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "printf" => {
+                // printf = echo sprintf(...)
+                let fmt_args: Vec<Value> = args.to_vec();
+                let result = self.call_builtin("sprintf", &fmt_args)?;
+                if let Some(Value::String(s)) = result {
+                    let len = s.len();
+                    self.output.push_str(&s);
+                    Ok(Some(Value::Long(len as i64)))
+                } else {
+                    Ok(Some(Value::Long(0)))
+                }
+            }
+            "strtok" => {
+                // Simplified: just split on first char of delimiter and return first token
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let delim = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                if delim.is_empty() {
+                    return Ok(Some(Value::String(s)));
+                }
+                match s.find(|c: char| delim.contains(c)) {
+                    Some(pos) => Ok(Some(Value::String(s[..pos].to_string()))),
+                    None => Ok(Some(Value::String(s))),
+                }
+            }
+            "str_getcsv" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let sep = args.get(1).cloned().unwrap_or(Value::String(",".to_string())).to_php_string();
+                let sep_char = sep.chars().next().unwrap_or(',');
+                let mut arr = PhpArray::new();
+                // Simple CSV split (doesn't handle quotes fully)
+                for field in s.split(sep_char) {
+                    let trimmed = field.trim_matches('"');
+                    arr.push(Value::String(trimmed.to_string()));
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "strrev" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(s.chars().rev().collect())))
+            }
+            "str_shuffle" => {
+                // Simple shuffle using available random
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let mut chars: Vec<char> = s.chars().collect();
+                let len = chars.len();
+                for i in (1..len).rev() {
+                    let j = php_rs_ext_standard::math::php_rand(0, i as i64) as usize;
+                    chars.swap(i, j);
+                }
+                Ok(Some(Value::String(chars.into_iter().collect())))
+            }
+            "similar_text" => {
+                let s1 = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let s2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                // Simple matching character count
+                let mut count = 0;
+                let b1 = s1.as_bytes();
+                let b2 = s2.as_bytes();
+                let min_len = b1.len().min(b2.len());
+                for i in 0..min_len {
+                    if b1[i] == b2[i] { count += 1; }
+                }
+                Ok(Some(Value::Long(count)))
+            }
+            "soundex" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let s = s.to_uppercase();
+                if s.is_empty() {
+                    return Ok(Some(Value::String("0000".to_string())));
+                }
+                let first = s.chars().next().unwrap();
+                let mut code = String::new();
+                code.push(first);
+                let encode = |c: char| match c {
+                    'B'|'F'|'P'|'V' => '1',
+                    'C'|'G'|'J'|'K'|'Q'|'S'|'X'|'Z' => '2',
+                    'D'|'T' => '3',
+                    'L' => '4',
+                    'M'|'N' => '5',
+                    'R' => '6',
+                    _ => '0',
+                };
+                let mut last = encode(first);
+                for c in s.chars().skip(1) {
+                    let coded = encode(c);
+                    if coded != '0' && coded != last {
+                        code.push(coded);
+                        if code.len() == 4 { break; }
+                    }
+                    last = coded;
+                }
+                while code.len() < 4 { code.push('0'); }
+                Ok(Some(Value::String(code)))
+            }
+            "metaphone" => {
+                // Very basic metaphone - just return first letters
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let s = s.to_uppercase();
+                let result: String = s.chars().filter(|c| c.is_ascii_alphabetic()).take(6).collect();
+                Ok(Some(Value::String(result)))
+            }
+            "levenshtein" => {
+                let s1 = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let s2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let b1 = s1.as_bytes();
+                let b2 = s2.as_bytes();
+                let m = b1.len();
+                let n = b2.len();
+                let mut d = vec![vec![0usize; n + 1]; m + 1];
+                for i in 0..=m { d[i][0] = i; }
+                for j in 0..=n { d[0][j] = j; }
+                for i in 1..=m {
+                    for j in 1..=n {
+                        let cost = if b1[i-1] == b2[j-1] { 0 } else { 1 };
+                        d[i][j] = (d[i-1][j] + 1).min(d[i][j-1] + 1).min(d[i-1][j-1] + cost);
+                    }
+                }
+                Ok(Some(Value::Long(d[m][n] as i64)))
+            }
+            "substr_compare" => {
+                let main_str = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let str2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let offset = args.get(2).cloned().unwrap_or(Value::Long(0)).to_long();
+                let length = args.get(3).map(|v| v.to_long() as usize);
+                let case_insensitive = args.get(4).is_some_and(|v| v.to_bool());
+                let slen = main_str.len() as i64;
+                let start = if offset < 0 { (slen + offset).max(0) as usize } else { offset as usize };
+                if start > main_str.len() {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                let sub = match length {
+                    Some(l) => &main_str[start..(start + l).min(main_str.len())],
+                    None => &main_str[start..],
+                };
+                let cmp_str = match length {
+                    Some(l) => &str2[..l.min(str2.len())],
+                    None => &str2,
+                };
+                if case_insensitive {
+                    Ok(Some(Value::Long(sub.to_lowercase().cmp(&cmp_str.to_lowercase()) as i64)))
+                } else {
+                    Ok(Some(Value::Long(sub.cmp(cmp_str) as i64)))
+                }
+            }
+            "strcmp" => {
+                let s1 = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let s2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Long(s1.cmp(&s2) as i64)))
+            }
+            "strncmp" => {
+                let s1 = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let s2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let n = args.get(2).cloned().unwrap_or(Value::Long(0)).to_long() as usize;
+                let a = &s1[..n.min(s1.len())];
+                let b = &s2[..n.min(s2.len())];
+                Ok(Some(Value::Long(a.cmp(b) as i64)))
+            }
+            "strcasecmp" => {
+                let s1 = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                let s2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                Ok(Some(Value::Long(s1.cmp(&s2) as i64)))
+            }
+            "strncasecmp" => {
+                let s1 = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                let s2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                let n = args.get(2).cloned().unwrap_or(Value::Long(0)).to_long() as usize;
+                let a = &s1[..n.min(s1.len())];
+                let b = &s2[..n.min(s2.len())];
+                Ok(Some(Value::Long(a.cmp(b) as i64)))
+            }
+            "number_format" => {
+                let num = args.first().cloned().unwrap_or(Value::Null).to_double();
+                let decimals = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long() as usize;
+                let dec_point = args.get(2).cloned().unwrap_or(Value::String(".".to_string())).to_php_string();
+                let thousands = args.get(3).cloned().unwrap_or(Value::String(",".to_string())).to_php_string();
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_number_format(num, decimals, &dec_point, &thousands),
+                )))
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // TIER 2: zend_core functions
+            // ══════════════════════════════════════════════════════════════
+            "define" => {
+                let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let value = args.get(1).cloned().unwrap_or(Value::Null);
+                self.constants.insert(name, value);
+                Ok(Some(Value::Bool(true)))
+            }
+            "defined" => {
+                let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(self.constants.contains_key(&name))))
+            }
+            "constant" => {
+                let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                match self.constants.get(&name) {
+                    Some(v) => Ok(Some(v.clone())),
+                    None => Err(VmError::FatalError(format!("Undefined constant \"{}\"", name))),
+                }
+            }
+            "func_get_args" => {
+                let mut arr = PhpArray::new();
+                if let Some(frame) = self.call_stack.last() {
+                    for arg in &frame.args {
+                        arr.push(arg.clone());
+                    }
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "func_get_arg" => {
+                let idx = args.first().cloned().unwrap_or(Value::Long(0)).to_long() as usize;
+                if let Some(frame) = self.call_stack.last() {
+                    match frame.args.get(idx) {
+                        Some(v) => Ok(Some(v.clone())),
+                        None => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "func_num_args" => {
+                if let Some(frame) = self.call_stack.last() {
+                    Ok(Some(Value::Long(frame.args.len() as i64)))
+                } else {
+                    Ok(Some(Value::Long(-1)))
+                }
+            }
+            "get_called_class" => {
+                // Return the current class context if available
+                Ok(Some(Value::Bool(false)))
+            }
+            "get_class_methods" => {
+                let class_name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let mut arr = PhpArray::new();
+                if let Some(class) = self.classes.get(&class_name) {
+                    for name in class.methods.keys() {
+                        arr.push(Value::String(name.clone()));
+                    }
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "get_class_vars" => {
+                let class_name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let mut arr = PhpArray::new();
+                if let Some(class) = self.classes.get(&class_name) {
+                    for (name, val) in &class.default_properties {
+                        arr.set_string(name.clone(), val.clone());
+                    }
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "get_object_vars" => {
+                let obj = args.first().cloned().unwrap_or(Value::Null);
+                let mut arr = PhpArray::new();
+                if let Value::Object(ref o) = obj {
+                    for (name, val) in &o.properties {
+                        arr.set_string(name.clone(), val.clone());
+                    }
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "interface_exists" => {
+                let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                // Check if it exists as a class with is_interface flag (simplified)
+                Ok(Some(Value::Bool(self.classes.contains_key(&name))))
+            }
+            "class_alias" => {
+                let original = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let alias = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                if let Some(class) = self.classes.get(&original).cloned() {
+                    self.classes.insert(alias, class);
+                    Ok(Some(Value::Bool(true)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "extension_loaded" => {
+                let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let loaded = matches!(name.as_str(),
+                    "standard" | "Core" | "json" | "pcre" | "date" | "ctype" | "mbstring" | "SPL"
+                );
+                Ok(Some(Value::Bool(loaded)))
+            }
+            "get_defined_vars" => {
+                let mut arr = PhpArray::new();
+                if let Some(frame) = self.call_stack.last() {
+                    // Get CV names from the current op_array
+                    let oa_idx = frame.op_array_idx;
+                    if oa_idx < self.op_arrays.len() {
+                        let vars = &self.op_arrays[oa_idx].vars;
+                        for (i, vname) in vars.iter().enumerate() {
+                            if i < frame.cvs.len() {
+                                arr.set_string(vname.clone(), frame.cvs[i].clone());
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "get_defined_functions" => {
+                let internal = PhpArray::new();
+                let mut user = PhpArray::new();
+                for name in self.functions.keys() {
+                    user.push(Value::String(name.clone()));
+                }
+                let mut result = PhpArray::new();
+                result.set_string("internal".to_string(), Value::Array(internal));
+                result.set_string("user".to_string(), Value::Array(user));
+                Ok(Some(Value::Array(result)))
+            }
+            "get_defined_constants" => {
+                let mut arr = PhpArray::new();
+                for (name, val) in &self.constants {
+                    arr.set_string(name.clone(), val.clone());
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "error_reporting" => {
+                // Stub: return E_ALL (32767) and ignore setting
+                let _level = args.first().map(|v| v.to_long());
+                Ok(Some(Value::Long(32767)))
+            }
+            "trigger_error" | "user_error" => {
+                let msg = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let level = args.get(1).cloned().unwrap_or(Value::Long(256)).to_long(); // E_USER_ERROR = 256
+                if level == 256 {
+                    return Err(VmError::FatalError(msg));
+                }
+                // E_USER_WARNING(512), E_USER_NOTICE(1024) — just print
+                self.output.push_str(&format!("\nWarning: {} in Unknown on line 0\n", msg));
+                Ok(Some(Value::Bool(true)))
+            }
+            "set_error_handler" => {
+                // Stub: accept but ignore error handler
+                Ok(Some(Value::Null))
+            }
+            "restore_error_handler" => Ok(Some(Value::Bool(true))),
+            "set_exception_handler" => Ok(Some(Value::Null)),
+            "restore_exception_handler" => Ok(Some(Value::Bool(true))),
+
+            // ══════════════════════════════════════════════════════════════
+            // TIER 2: Array functions
+            // ══════════════════════════════════════════════════════════════
+            "array_filter" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                // Without callback: filter falsy values
+                if let Value::Array(ref a) = arr {
+                    let mut result = PhpArray::new();
+                    for (key, val) in a.entries() {
+                        if val.to_bool() {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "array_search" => {
+                let needle = args.first().cloned().unwrap_or(Value::Null);
+                let haystack = args.get(1).cloned().unwrap_or(Value::Null);
+                let strict = args.get(2).is_some_and(|v| v.to_bool());
+                if let Value::Array(ref a) = haystack {
+                    for (key, val) in a.entries() {
+                        let found = if strict { needle.strict_eq(val) } else { needle.loose_eq(val) };
+                        if found {
+                            return Ok(Some(match key {
+                                ArrayKey::Int(n) => Value::Long(*n),
+                                ArrayKey::String(s) => Value::String(s.clone()),
+                            }));
+                        }
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "array_shift" => {
+                // We can't mutate the original, but we return the first value
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    if let Some((_, v)) = a.entries().first() {
+                        Ok(Some(v.clone()))
+                    } else {
+                        Ok(Some(Value::Null))
+                    }
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "array_unshift" => {
+                // Can't mutate; return new count
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let count = if let Value::Array(ref a) = arr {
+                    a.len() + args.len() - 1
+                } else { 0 };
+                Ok(Some(Value::Long(count as i64)))
+            }
+            "array_splice" => {
+                // Return the extracted portion
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let offset = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
+                let length = args.get(2).map(|v| v.to_long());
+                if let Value::Array(ref a) = arr {
+                    let entries = a.entries();
+                    let len = entries.len() as i64;
+                    let start = if offset < 0 { (len + offset).max(0) as usize } else { offset as usize };
+                    let end = match length {
+                        Some(l) if l < 0 => (len + l).max(0) as usize,
+                        Some(l) => (start + l as usize).min(entries.len()),
+                        None => entries.len(),
+                    };
+                    let mut result = PhpArray::new();
+                    for (_, val) in &entries[start..end] {
+                        result.push(val.clone());
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "array_combine" => {
+                let keys = args.first().cloned().unwrap_or(Value::Null);
+                let values = args.get(1).cloned().unwrap_or(Value::Null);
+                if let (Value::Array(ref k), Value::Array(ref v)) = (&keys, &values) {
+                    if k.len() != v.len() {
+                        return Ok(Some(Value::Bool(false)));
+                    }
+                    let mut result = PhpArray::new();
+                    for (kentry, ventry) in k.entries().iter().zip(v.entries().iter()) {
+                        result.set(&kentry.1, ventry.1.clone());
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "array_column" => {
+                let input = args.first().cloned().unwrap_or(Value::Null);
+                let column_key = args.get(1).cloned().unwrap_or(Value::Null);
+                let index_key = args.get(2).cloned();
+                if let Value::Array(ref a) = input {
+                    let mut result = PhpArray::new();
+                    for (_, row) in a.entries() {
+                        if let Value::Array(ref row_arr) = row {
+                            let val = if column_key.is_null() {
+                                row.clone()
+                            } else {
+                                row_arr.get(&column_key).cloned().unwrap_or(Value::Null)
+                            };
+                            match &index_key {
+                                Some(ik) if !ik.is_null() => {
+                                    if let Some(idx) = row_arr.get(ik) {
+                                        result.set(idx, val);
+                                    } else {
+                                        result.push(val);
+                                    }
+                                }
+                                _ => result.push(val),
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "array_chunk" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let size = args.get(1).cloned().unwrap_or(Value::Long(1)).to_long().max(1) as usize;
+                let preserve_keys = args.get(2).is_some_and(|v| v.to_bool());
+                if let Value::Array(ref a) = arr {
+                    let mut result = PhpArray::new();
+                    let entries = a.entries();
+                    for chunk in entries.chunks(size) {
+                        let mut sub = PhpArray::new();
+                        for (key, val) in chunk {
+                            if preserve_keys {
+                                match key {
+                                    ArrayKey::Int(n) => sub.set_int(*n, val.clone()),
+                                    ArrayKey::String(s) => sub.set_string(s.clone(), val.clone()),
+                                }
+                            } else {
+                                sub.push(val.clone());
+                            }
+                        }
+                        result.push(Value::Array(sub));
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "array_fill" => {
+                let start = args.first().cloned().unwrap_or(Value::Long(0)).to_long();
+                let num = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long().max(0);
+                let value = args.get(2).cloned().unwrap_or(Value::Null);
+                let mut arr = PhpArray::new();
+                for i in 0..num {
+                    arr.set_int(start + i, value.clone());
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "array_fill_keys" => {
+                let keys = args.first().cloned().unwrap_or(Value::Null);
+                let value = args.get(1).cloned().unwrap_or(Value::Null);
+                let mut arr = PhpArray::new();
+                if let Value::Array(ref k) = keys {
+                    for (_, key_val) in k.entries() {
+                        arr.set(key_val, value.clone());
+                    }
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "array_intersect" => {
+                let arr1 = args.first().cloned().unwrap_or(Value::Null);
+                let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
+                if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+                    let mut result = PhpArray::new();
+                    for (key, val) in a1.entries() {
+                        if a2.entries().iter().any(|(_, v)| val.loose_eq(v)) {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "array_intersect_key" => {
+                let arr1 = args.first().cloned().unwrap_or(Value::Null);
+                let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
+                if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+                    let mut result = PhpArray::new();
+                    for (key, val) in a1.entries() {
+                        if a2.entries().iter().any(|(k, _)| k == key) {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "array_diff" => {
+                let arr1 = args.first().cloned().unwrap_or(Value::Null);
+                let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
+                if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+                    let mut result = PhpArray::new();
+                    for (key, val) in a1.entries() {
+                        if !a2.entries().iter().any(|(_, v)| val.loose_eq(v)) {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "array_diff_key" => {
+                let arr1 = args.first().cloned().unwrap_or(Value::Null);
+                let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
+                if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+                    let mut result = PhpArray::new();
+                    for (key, val) in a1.entries() {
+                        if !a2.entries().iter().any(|(k, _)| k == key) {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "array_diff_assoc" => {
+                let arr1 = args.first().cloned().unwrap_or(Value::Null);
+                let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
+                if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+                    let mut result = PhpArray::new();
+                    for (key, val) in a1.entries() {
+                        let found = a2.entries().iter().any(|(k, v)| k == key && val.loose_eq(v));
+                        if !found {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "array_pad" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let size = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
+                let value = args.get(2).cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    let mut result = PhpArray::new();
+                    let abs_size = size.unsigned_abs() as usize;
+                    if abs_size <= a.len() {
+                        // Already big enough, just copy
+                        for (_, val) in a.entries() {
+                            result.push(val.clone());
+                        }
+                    } else if size > 0 {
+                        // Pad right
+                        for (_, val) in a.entries() {
+                            result.push(val.clone());
+                        }
+                        for _ in 0..(abs_size - a.len()) {
+                            result.push(value.clone());
+                        }
+                    } else {
+                        // Pad left
+                        for _ in 0..(abs_size - a.len()) {
+                            result.push(value.clone());
+                        }
+                        for (_, val) in a.entries() {
+                            result.push(val.clone());
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "array_rand" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let num = args.get(1).cloned().unwrap_or(Value::Long(1)).to_long().max(1);
+                if let Value::Array(ref a) = arr {
+                    if a.is_empty() {
+                        return Ok(Some(Value::Null));
+                    }
+                    if num == 1 {
+                        let idx = php_rs_ext_standard::math::php_rand(0, a.len() as i64 - 1) as usize;
+                        let (key, _) = &a.entries()[idx];
+                        Ok(Some(match key {
+                            ArrayKey::Int(n) => Value::Long(*n),
+                            ArrayKey::String(s) => Value::String(s.clone()),
+                        }))
+                    } else {
+                        let mut result = PhpArray::new();
+                        let mut indices: Vec<usize> = (0..a.len()).collect();
+                        // Simple shuffle
+                        for i in (1..indices.len()).rev() {
+                            let j = php_rs_ext_standard::math::php_rand(0, i as i64) as usize;
+                            indices.swap(i, j);
+                        }
+                        for &idx in indices.iter().take(num as usize) {
+                            let (key, _) = &a.entries()[idx];
+                            result.push(match key {
+                                ArrayKey::Int(n) => Value::Long(*n),
+                                ArrayKey::String(s) => Value::String(s.clone()),
+                            });
+                        }
+                        Ok(Some(Value::Array(result)))
+                    }
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "array_reduce" => {
+                // Without callback support, just return the initial value
+                let initial = args.get(2).cloned().unwrap_or(Value::Null);
+                Ok(Some(initial))
+            }
+            "array_replace" => {
+                let mut result = PhpArray::new();
+                // Start with the first array
+                if let Some(Value::Array(ref a)) = args.first() {
+                    for (key, val) in a.entries() {
+                        match key {
+                            ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                            ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                        }
+                    }
+                }
+                // Override with subsequent arrays
+                for arg in args.iter().skip(1) {
+                    if let Value::Array(ref a) = arg {
+                        for (key, val) in a.entries() {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
+            "array_key_first" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    Ok(Some(a.key_first()))
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "array_key_last" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    Ok(Some(a.key_last()))
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "key_exists" => {
+                // Alias for array_key_exists
+                let key = args.first().cloned().unwrap_or(Value::Null);
+                let arr = args.get(1).cloned().unwrap_or(Value::Null);
+                let exists = if let Value::Array(ref a) = arr {
+                    a.get(&key).is_some()
+                } else {
+                    false
+                };
+                Ok(Some(Value::Bool(exists)))
+            }
+            "array_walk" => {
+                // Without callback support, just return true
+                Ok(Some(Value::Bool(true)))
+            }
+            "compact" => {
+                // Can't access CVs from call_builtin easily; return empty array
+                Ok(Some(Value::Array(PhpArray::new())))
+            }
+            "extract" => {
+                // Can't modify CVs from call_builtin; return 0
+                Ok(Some(Value::Long(0)))
+            }
+            "list" => {
+                // list() is handled by compiler; shouldn't reach here
+                Ok(Some(Value::Null))
+            }
+            "array_multisort" => {
+                // Sorting stub — return true
+                Ok(Some(Value::Bool(true)))
+            }
+            "usort" | "uasort" | "uksort" => {
+                // Can't invoke callbacks from call_builtin; return true
+                Ok(Some(Value::Bool(true)))
+            }
+            "array_is_list" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    Ok(Some(Value::Bool(a.is_list())))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "array_map" => {
+                // With null callback: identity. Otherwise, stub returns input.
+                let arr = args.get(1).cloned().unwrap_or(Value::Null);
+                Ok(Some(arr))
+            }
+            "current" | "pos" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    Ok(Some(a.current()))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "end" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    match a.entries().last() {
+                        Some((_, v)) => Ok(Some(v.clone())),
+                        None => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "reset" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    match a.entries().first() {
+                        Some((_, v)) => Ok(Some(v.clone())),
+                        None => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // TIER 2: File system functions
+            // ══════════════════════════════════════════════════════════════
+            "file" => {
+                let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&f)?;
+                match std::fs::read_to_string(&f) {
+                    Ok(content) => {
+                        let mut arr = PhpArray::new();
+                        for line in content.lines() {
+                            arr.push(Value::String(format!("{}\n", line)));
+                        }
+                        Ok(Some(Value::Array(arr)))
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "mkdir" => {
+                let path = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&path)?;
+                let _mode = args.get(1).cloned().unwrap_or(Value::Long(0o777));
+                let recursive = args.get(2).is_some_and(|v| v.to_bool());
+                let result = if recursive {
+                    std::fs::create_dir_all(&path)
+                } else {
+                    std::fs::create_dir(&path)
+                };
+                Ok(Some(Value::Bool(result.is_ok())))
+            }
+            "rmdir" => {
+                let path = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&path)?;
+                Ok(Some(Value::Bool(std::fs::remove_dir(&path).is_ok())))
+            }
+            "unlink" => {
+                let path = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&path)?;
+                Ok(Some(Value::Bool(std::fs::remove_file(&path).is_ok())))
+            }
+            "rename" => {
+                let from = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let to = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&from)?;
+                self.check_open_basedir(&to)?;
+                Ok(Some(Value::Bool(std::fs::rename(&from, &to).is_ok())))
+            }
+            "copy" => {
+                let from = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let to = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&from)?;
+                self.check_open_basedir(&to)?;
+                Ok(Some(Value::Bool(std::fs::copy(&from, &to).is_ok())))
+            }
+            "tempnam" => {
+                let dir = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let prefix = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                match php_rs_ext_standard::file::php_tempnam(&dir, &prefix) {
+                    Ok(p) => Ok(Some(Value::String(p))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "sys_get_temp_dir" => {
+                Ok(Some(Value::String(php_rs_ext_standard::file::php_sys_get_temp_dir())))
+            }
+            "filesize" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
+                match std::fs::metadata(&p) {
+                    Ok(m) => Ok(Some(Value::Long(m.len() as i64))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "filetype" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
+                match std::fs::metadata(&p) {
+                    Ok(m) => {
+                        let t = if m.is_file() { "file" } else if m.is_dir() { "dir" } else { "unknown" };
+                        Ok(Some(Value::String(t.to_string())))
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "filemtime" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
+                match php_rs_ext_standard::file::php_filemtime(&p) {
+                    Ok(t) => Ok(Some(Value::Long(t as i64))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "fileatime" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
+                match std::fs::metadata(&p) {
+                    Ok(m) => {
+                        let t = m.accessed()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        Ok(Some(Value::Long(t)))
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "filectime" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
+                match std::fs::metadata(&p) {
+                    Ok(m) => {
+                        let t = m.created()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        Ok(Some(Value::Long(t)))
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "is_readable" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
+                Ok(Some(Value::Bool(std::fs::File::open(&p).is_ok())))
+            }
+            "is_writable" | "is_writeable" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
+                Ok(Some(Value::Bool(
+                    std::fs::OpenOptions::new().write(true).open(&p).is_ok()
+                )))
+            }
+            "is_executable" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let exec = std::fs::metadata(&p)
+                        .map(|m| m.permissions().mode() & 0o111 != 0)
+                        .unwrap_or(false);
+                    Ok(Some(Value::Bool(exec)))
+                }
+                #[cfg(not(unix))]
+                {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "pathinfo" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let option = args.get(1).map(|v| v.to_long());
+                let info = php_rs_ext_standard::file::php_pathinfo(&p);
+                match option {
+                    Some(1) => Ok(Some(Value::String(info.dirname))),   // PATHINFO_DIRNAME
+                    Some(2) => Ok(Some(Value::String(info.basename))),  // PATHINFO_BASENAME
+                    Some(4) => Ok(Some(Value::String(info.extension))), // PATHINFO_EXTENSION
+                    Some(8) => Ok(Some(Value::String(info.filename))),  // PATHINFO_FILENAME
+                    _ => {
+                        let mut arr = PhpArray::new();
+                        arr.set_string("dirname".to_string(), Value::String(info.dirname));
+                        arr.set_string("basename".to_string(), Value::String(info.basename));
+                        arr.set_string("extension".to_string(), Value::String(info.extension));
+                        arr.set_string("filename".to_string(), Value::String(info.filename));
+                        Ok(Some(Value::Array(arr)))
+                    }
+                }
+            }
+            "getcwd" => {
+                match std::env::current_dir() {
+                    Ok(p) => Ok(Some(Value::String(p.to_string_lossy().to_string()))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "chdir" => {
+                let path = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(std::env::set_current_dir(&path).is_ok())))
+            }
+            "chmod" => {
+                let _path = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let _mode = args.get(1).cloned().unwrap_or(Value::Long(0o755)).to_long();
+                // chmod requires platform-specific code; stub for now
+                Ok(Some(Value::Bool(true)))
+            }
+            "scandir" => {
+                let dir = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&dir)?;
+                match php_rs_ext_standard::file::php_scandir(&dir) {
+                    Ok(entries) => {
+                        let mut arr = PhpArray::new();
+                        for entry in entries {
+                            arr.push(Value::String(entry));
+                        }
+                        Ok(Some(Value::Array(arr)))
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "glob" => {
+                // Basic glob using std::fs::read_dir with pattern matching
+                let pattern = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let mut arr = PhpArray::new();
+                // Extract directory part
+                let dir = std::path::Path::new(&pattern).parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| ".".to_string());
+                let file_pattern = std::path::Path::new(&pattern).file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if let Ok(entries) = std::fs::read_dir(&dir) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        // Simple wildcard matching: * matches anything
+                        if file_pattern.contains('*') {
+                            let parts: Vec<&str> = file_pattern.split('*').collect();
+                            let matches = if parts.len() == 2 {
+                                name.starts_with(parts[0]) && name.ends_with(parts[1])
+                            } else {
+                                true
+                            };
+                            if matches {
+                                let full = if dir == "." {
+                                    name
+                                } else {
+                                    format!("{}/{}", dir, name)
+                                };
+                                arr.push(Value::String(full));
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "is_link" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(std::fs::symlink_metadata(&p)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false))))
+            }
+            "touch" => {
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                // Create file if doesn't exist, otherwise just return true
+                if !std::path::Path::new(&p).exists() {
+                    let _ = std::fs::File::create(&p);
+                }
+                Ok(Some(Value::Bool(true)))
+            }
+
+            // ══════════════════════════════════════════════════════════════
+            // TIER 2: Type/value functions
+            // ══════════════════════════════════════════════════════════════
+            "is_numeric_string" | "ctype_digit" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(s.chars().all(|c| c.is_ascii_digit()))))
+            }
+            "ctype_alpha" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_alphabetic()))))
+            }
+            "ctype_alnum" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))))
+            }
+            "ctype_lower" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase()))))
+            }
+            "ctype_upper" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase()))))
+            }
+            "ctype_space" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_whitespace()))))
+            }
+            "ctype_punct" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_punctuation()))))
+            }
+            "ctype_xdigit" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()))))
+            }
+            "array_pop" => {
+                // Can't mutate the original, return last element
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    match a.entries().last() {
+                        Some((_, v)) => Ok(Some(v.clone())),
+                        None => Ok(Some(Value::Null)),
+                    }
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "array_intersect_assoc" => {
+                let arr1 = args.first().cloned().unwrap_or(Value::Null);
+                let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
+                if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+                    let mut result = PhpArray::new();
+                    for (key, val) in a1.entries() {
+                        let found = a2.entries().iter().any(|(k, v)| k == key && val.loose_eq(v));
+                        if found {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
                 }
             }
             _ => Ok(None),
