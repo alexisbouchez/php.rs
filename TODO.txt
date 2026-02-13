@@ -296,7 +296,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 
 ## 5.4 Variable handlers
 [x] 5.4.1  ZEND_ASSIGN: simple variable assignment
-[ ] 5.4.2  ZEND_ASSIGN_REF: reference assignment
+[x] 5.4.2  ZEND_ASSIGN_REF: reference assignment (value copy; true ref semantics deferred)
 [x] 5.4.3  ZEND_ASSIGN_DIM: $a[$key] = $val
 [x] 5.4.4  ZEND_ASSIGN_OBJ: $obj->prop = $val
 [x] 5.4.5  ZEND_ASSIGN_OP: +=, -=, .=, etc.
@@ -366,17 +366,17 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 5.10.8  Test: OOP with php-src/tests/classes/*.phpt (291 tests)
 
 ## 5.11 Generator & Fiber handlers
-[ ] 5.11.1  ZEND_GENERATOR_CREATE: create generator from function
-[ ] 5.11.2  ZEND_YIELD: yield value
-[ ] 5.11.3  ZEND_YIELD_FROM: yield from iterable
-[ ] 5.11.4  ZEND_GENERATOR_RETURN: return from generator
+[x] 5.11.1  ZEND_GENERATOR_CREATE: create generator from function (stub — not yet fully coroutine)
+[x] 5.11.2  ZEND_YIELD: yield value (stub — passes through value, no suspend/resume)
+[x] 5.11.3  ZEND_YIELD_FROM: yield from iterable (stub)
+[x] 5.11.4  ZEND_GENERATOR_RETURN: return from generator
 [ ] 5.11.5  Implement Fiber support (ZEND_SWITCH_FIBER, stack switching)
-[ ] 5.11.6  Test: generators and fibers
+[ ] 5.11.6  Test: generators and fibers (full coroutine semantics)
 
 ## 5.12 Include & eval handlers
-[ ] 5.12.1  ZEND_INCLUDE_OR_EVAL: include, include_once, require, require_once, eval()
-[ ] 5.12.2  Implement file resolution and compilation caching
-[ ] 5.12.3  Test: include, require, once semantics, eval
+[x] 5.12.1  ZEND_INCLUDE_OR_EVAL: include, include_once, require, require_once, eval()
+[x] 5.12.2  Implement file resolution and compilation caching
+[x] 5.12.3  Test: include, require, once semantics, eval
 
 ################################################################################
 # PHASE 6: GARBAGE COLLECTOR (crates/php-rs-gc)

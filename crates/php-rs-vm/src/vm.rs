@@ -2,7 +2,7 @@
 //!
 //! Equivalent to php-src/Zend/zend_execute.c and zend_vm_def.h.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use php_rs_compiler::op::{OperandType, ZOp};
 use php_rs_compiler::op_array::{Literal, ZOpArray};
@@ -134,6 +134,8 @@ pub struct Vm {
     next_object_id: u64,
     /// Current exception being handled (for catch/handle_exception).
     current_exception: Option<Value>,
+    /// Set of already-included files (for include_once/require_once).
+    included_files: HashSet<String>,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -160,6 +162,7 @@ impl Vm {
             classes: HashMap::new(),
             next_object_id: 1,
             current_exception: None,
+            included_files: HashSet::new(),
         }
     }
 
@@ -333,6 +336,16 @@ impl Vm {
                 let val = self.read_operand(op, 2, oa_idx)?;
                 self.write_cv(op, oa_idx, val.clone())?;
                 // If result is used, store the assigned value
+                if op.result_type != OperandType::Unused {
+                    self.write_result(op, oa_idx, val)?;
+                }
+                Ok(DispatchSignal::Next)
+            }
+            ZOpcode::AssignRef => {
+                // Reference assignment: $a = &$b
+                // For now, just copy the value (true reference semantics need Rc<RefCell>)
+                let val = self.read_operand(op, 2, oa_idx)?;
+                self.write_cv(op, oa_idx, val.clone())?;
                 if op.result_type != OperandType::Unused {
                     self.write_result(op, oa_idx, val)?;
                 }
@@ -1047,6 +1060,31 @@ impl Vm {
                 Ok(DispatchSignal::Next)
             }
 
+            // =====================================================================
+            // Include / Eval
+            // =====================================================================
+            ZOpcode::IncludeOrEval => self.handle_include_or_eval(op, oa_idx),
+
+            // =====================================================================
+            // Generators (stub — yield pauses execution)
+            // =====================================================================
+            ZOpcode::GeneratorCreate => {
+                // For now, NOP — generator object creation not yet fully supported
+                Ok(DispatchSignal::Next)
+            }
+            ZOpcode::Yield => {
+                // Yield value from generator — stub: just return the value
+                let val = self.read_operand(op, 1, oa_idx)?;
+                self.write_result(op, oa_idx, val)?;
+                Ok(DispatchSignal::Next)
+            }
+            ZOpcode::YieldFrom => {
+                // Yield from iterable — stub
+                let val = self.read_operand(op, 1, oa_idx)?;
+                self.write_result(op, oa_idx, val)?;
+                Ok(DispatchSignal::Next)
+            }
+
             // Anything else: NOP for now
             _ => Ok(DispatchSignal::Next),
         }
@@ -1307,6 +1345,85 @@ impl Vm {
 
         self.write_result(op, oa_idx, val)?;
         Ok(())
+    }
+
+    /// Handle INCLUDE_OR_EVAL — include/require/eval.
+    fn handle_include_or_eval(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<DispatchSignal> {
+        let operand = self.read_operand(op, 1, oa_idx)?;
+        let mode = op.extended_value;
+        // mode: 0=eval, 1=include, 2=include_once, 3=require, 4=require_once
+
+        let source = match mode {
+            0 => {
+                // eval(): operand is the code string
+                let code = operand.to_php_string();
+                if code.starts_with("<?php") || code.starts_with("<?") {
+                    code
+                } else {
+                    format!("<?php {}", code)
+                }
+            }
+            1 | 2 | 3 | 4 => {
+                let path = operand.to_php_string();
+
+                // For once variants, check if already included
+                if (mode == 2 || mode == 4) && self.included_files.contains(&path) {
+                    self.write_result(op, oa_idx, Value::Bool(true))?;
+                    return Ok(DispatchSignal::Next);
+                }
+
+                match std::fs::read_to_string(&path) {
+                    Ok(contents) => {
+                        self.included_files.insert(path);
+                        contents
+                    }
+                    Err(_) => {
+                        if mode == 3 || mode == 4 {
+                            return Err(VmError::FatalError(format!(
+                                "require(): Failed opening required '{}'",
+                                path
+                            )));
+                        }
+                        self.write_result(op, oa_idx, Value::Bool(false))?;
+                        return Ok(DispatchSignal::Next);
+                    }
+                }
+            }
+            _ => {
+                return Err(VmError::InternalError(format!(
+                    "Unknown include/eval mode: {}",
+                    mode
+                )));
+            }
+        };
+
+        // Compile and execute the source
+        match php_rs_compiler::compile(&source) {
+            Ok(included_oa) => {
+                let base_idx = self.op_arrays.len();
+                self.op_arrays.push(included_oa.clone());
+                self.register_dynamic_func_defs(base_idx);
+
+                // Advance caller's IP past the IncludeOrEval
+                self.call_stack.last_mut().unwrap().ip += 1;
+
+                let mut new_frame = Frame::new(&included_oa);
+                new_frame.op_array_idx = base_idx;
+                if op.result_type != OperandType::Unused {
+                    new_frame.return_dest = Some((op.result_type, op.result.val));
+                }
+
+                self.call_stack.push(new_frame);
+                Ok(DispatchSignal::CallPushed)
+            }
+            Err(_) => {
+                if mode == 0 {
+                    return Err(VmError::FatalError("eval(): syntax error".to_string()));
+                }
+                self.write_result(op, oa_idx, Value::Bool(false))?;
+                Ok(DispatchSignal::Next)
+            }
+        }
     }
 
     /// Handle DO_FCALL — execute a function call.
@@ -3060,5 +3177,72 @@ echo MathHelper::double(21);
 "#,
         );
         assert_eq!(output, "42");
+    }
+
+    // =========================================================================
+    // 5.12 Include & eval
+    // =========================================================================
+
+    #[test]
+    fn test_vm_eval_basic() {
+        let output = run_php(
+            r#"<?php
+eval('echo "hello from eval";');
+"#,
+        );
+        assert_eq!(output, "hello from eval");
+    }
+
+    #[test]
+    fn test_vm_eval_expression() {
+        let output = run_php(
+            r#"<?php
+$x = eval('return 2 + 3;');
+echo $x;
+"#,
+        );
+        assert_eq!(output, "5");
+    }
+
+    #[test]
+    fn test_vm_include_file() {
+        // Create a temp file to include
+        let dir = std::env::temp_dir();
+        let path = dir.join("php_rs_test_include.php");
+        std::fs::write(&path, "<?php echo \"included\";").unwrap();
+
+        let source = format!(
+            "<?php include '{}';",
+            path.to_str().unwrap().replace('\\', "\\\\")
+        );
+        let output = run_php(&source);
+        assert_eq!(output, "included");
+
+        // Clean up
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_vm_require_missing_file() {
+        let op_array = compile("<?php require '/nonexistent/file.php';").unwrap();
+        let mut vm = Vm::new();
+        let result = vm.execute(&op_array);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_vm_include_once_dedup() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("php_rs_test_include_once.php");
+        std::fs::write(&path, "<?php echo \"X\";").unwrap();
+
+        let source = format!(
+            "<?php\ninclude_once '{0}';\ninclude_once '{0}';",
+            path.to_str().unwrap().replace('\\', "\\\\")
+        );
+        let output = run_php(&source);
+        assert_eq!(output, "X"); // Only once
+
+        let _ = std::fs::remove_file(&path);
     }
 }
