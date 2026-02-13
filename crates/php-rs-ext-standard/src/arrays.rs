@@ -578,6 +578,125 @@ pub fn php_range(start: i64, end: i64, step: i64) -> PhpArray {
     arr
 }
 
+// ── 8.2.11: Multisort ─────────────────────────────────────────────────────────
+
+/// array_multisort() — Sort multiple arrays or multi-dimensional arrays.
+///
+/// Sorts the first array and rearranges all subsequent arrays to match.
+/// Returns true on success.
+pub fn php_array_multisort(arrays: &mut [&mut PhpArray]) -> bool {
+    if arrays.is_empty() {
+        return false;
+    }
+
+    let len = arrays[0].len();
+    // All arrays must have the same length
+    for arr in arrays.iter() {
+        if arr.len() != len {
+            return false;
+        }
+    }
+
+    if len == 0 {
+        return true;
+    }
+
+    // Create index array and sort by first array's values
+    let mut indices: Vec<usize> = (0..len).collect();
+    let first = &arrays[0].entries;
+    indices.sort_by(|&a, &b| {
+        first[a]
+            .1
+            .as_str()
+            .partial_cmp(&first[b].1.as_str())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Reorder all arrays according to sorted indices
+    for arr in arrays.iter_mut() {
+        let old_entries = arr.entries.clone();
+        for (new_idx, &old_idx) in indices.iter().enumerate() {
+            arr.entries[new_idx] = old_entries[old_idx].clone();
+            arr.entries[new_idx].0 = ArrayKey::Int(new_idx as i64);
+        }
+        arr.next_int_key = len as i64;
+    }
+
+    true
+}
+
+// ── 8.2.14: compact / extract ─────────────────────────────────────────────────
+
+/// compact() — Create an array from variables and their values.
+///
+/// Takes variable names and a lookup function, returns an associative array.
+pub fn php_compact(var_names: &[&str], lookup: impl Fn(&str) -> Option<ArrayValue>) -> PhpArray {
+    let mut result = PhpArray::new();
+    for &name in var_names {
+        if let Some(value) = lookup(name) {
+            result.set(ArrayKey::Str(name.to_string()), value);
+        }
+    }
+    result
+}
+
+/// extract() — Import variables into the current symbol table from an array.
+///
+/// Returns the number of variables imported. The caller provides a callback
+/// to set variables in the current scope.
+pub fn php_extract(arr: &PhpArray, mut setter: impl FnMut(&str, &ArrayValue)) -> usize {
+    let mut count = 0;
+    for (key, value) in &arr.entries {
+        if let ArrayKey::Str(name) = key {
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+            {
+                setter(name, value);
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+// ── 8.2.15: array_pad ────────────────────────────────────────────────────────
+
+/// array_pad() — Pad array to the specified length with a value.
+pub fn php_array_pad(arr: &PhpArray, size: i64, value: ArrayValue) -> PhpArray {
+    let current_len = arr.len() as i64;
+    let abs_size = size.unsigned_abs() as i64;
+
+    if abs_size <= current_len {
+        return arr.clone();
+    }
+
+    let pad_count = (abs_size - current_len) as usize;
+    let mut result = PhpArray::new();
+
+    if size < 0 {
+        // Pad at the beginning
+        for _ in 0..pad_count {
+            result.push(value.clone());
+        }
+        for (_, v) in &arr.entries {
+            result.push(v.clone());
+        }
+    } else {
+        // Pad at the end
+        for (_, v) in &arr.entries {
+            result.push(v.clone());
+        }
+        for _ in 0..pad_count {
+            result.push(value.clone());
+        }
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,6 +935,67 @@ mod tests {
         assert_eq!(arr.len(), 3);
         assert_eq!(arr.get(&ArrayKey::Int(5)), Some(&str("x")));
         assert_eq!(arr.get(&ArrayKey::Int(7)), Some(&str("x")));
+    }
+
+    #[test]
+    fn test_array_multisort() {
+        let mut a = PhpArray::from_values(vec![int(3), int(1), int(2)]);
+        let mut b = PhpArray::from_values(vec![str("c"), str("a"), str("b")]);
+        assert!(php_array_multisort(&mut [&mut a, &mut b]));
+        assert_eq!(a.get(&ArrayKey::Int(0)), Some(&int(1)));
+        assert_eq!(a.get(&ArrayKey::Int(2)), Some(&int(3)));
+        assert_eq!(b.get(&ArrayKey::Int(0)), Some(&str("a")));
+        assert_eq!(b.get(&ArrayKey::Int(2)), Some(&str("c")));
+    }
+
+    #[test]
+    fn test_compact() {
+        let result = php_compact(&["name", "age", "missing"], |var| match var {
+            "name" => Some(str("PHP")),
+            "age" => Some(int(30)),
+            _ => None,
+        });
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result.get(&ArrayKey::Str("name".to_string())),
+            Some(&str("PHP"))
+        );
+        assert_eq!(
+            result.get(&ArrayKey::Str("age".to_string())),
+            Some(&int(30))
+        );
+    }
+
+    #[test]
+    fn test_extract() {
+        let mut arr = PhpArray::new();
+        arr.set(ArrayKey::Str("name".to_string()), str("PHP"));
+        arr.set(ArrayKey::Str("version".to_string()), int(8));
+        arr.set(ArrayKey::Int(0), str("ignored")); // Non-string keys are ignored
+
+        let mut vars = std::collections::HashMap::new();
+        let count = php_extract(&arr, |name, value| {
+            vars.insert(name.to_string(), value.clone());
+        });
+        assert_eq!(count, 2);
+        assert_eq!(vars.get("name"), Some(&str("PHP")));
+        assert_eq!(vars.get("version"), Some(&int(8)));
+    }
+
+    #[test]
+    fn test_array_pad() {
+        let arr = PhpArray::from_values(vec![int(1), int(2), int(3)]);
+        let padded = php_array_pad(&arr, 5, int(0));
+        assert_eq!(padded.len(), 5);
+        assert_eq!(padded.get(&ArrayKey::Int(3)), Some(&int(0)));
+
+        let padded = php_array_pad(&arr, -5, int(0));
+        assert_eq!(padded.len(), 5);
+        assert_eq!(padded.get(&ArrayKey::Int(0)), Some(&int(0)));
+
+        // No padding needed
+        let padded = php_array_pad(&arr, 2, int(0));
+        assert_eq!(padded.len(), 3);
     }
 
     #[test]

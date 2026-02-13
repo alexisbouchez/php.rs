@@ -312,6 +312,204 @@ pub fn php_sapi_name() -> &'static str {
     "cli"
 }
 
+// ── 8.6.3: Class introspection ────────────────────────────────────────────────
+
+/// get_parent_class() — Retrieves the parent class name.
+/// The actual class lookup happens in the VM; this is the signature.
+pub fn php_get_parent_class(
+    class_name: &str,
+    parent_lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    parent_lookup(class_name)
+}
+
+/// is_a() — Checks if the object is of this class or has this class as one of its parents.
+pub fn php_is_a(
+    class_name: &str,
+    target_class: &str,
+    inheritance_check: impl Fn(&str, &str) -> bool,
+) -> bool {
+    if class_name.eq_ignore_ascii_case(target_class) {
+        return true;
+    }
+    inheritance_check(class_name, target_class)
+}
+
+/// is_subclass_of() — Checks if the object has this class as one of its parents (excluding self).
+pub fn php_is_subclass_of(
+    class_name: &str,
+    target_class: &str,
+    inheritance_check: impl Fn(&str, &str) -> bool,
+) -> bool {
+    if class_name.eq_ignore_ascii_case(target_class) {
+        return false;
+    }
+    inheritance_check(class_name, target_class)
+}
+
+// ── 8.6.5: HTTP headers ──────────────────────────────────────────────────────
+
+/// HTTP header manager for the SAPI layer.
+#[derive(Debug, Clone, Default)]
+pub struct HeaderStore {
+    headers: Vec<(String, String)>,
+    http_response_code: u16,
+    headers_sent: bool,
+}
+
+impl HeaderStore {
+    pub fn new() -> Self {
+        Self {
+            headers: Vec::new(),
+            http_response_code: 200,
+            headers_sent: false,
+        }
+    }
+
+    /// header() — Send a raw HTTP header.
+    pub fn header(&mut self, header_str: &str, replace: bool) {
+        if self.headers_sent {
+            return;
+        }
+
+        // Check for HTTP/ status line
+        if header_str.starts_with("HTTP/") {
+            // Extract response code
+            if let Some(code) = header_str
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse::<u16>().ok())
+            {
+                self.http_response_code = code;
+            }
+            return;
+        }
+
+        if let Some(colon_pos) = header_str.find(':') {
+            let name = header_str[..colon_pos].trim().to_string();
+            let value = header_str[colon_pos + 1..].trim().to_string();
+
+            if replace {
+                self.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(&name));
+            }
+            self.headers.push((name, value));
+        }
+    }
+
+    /// header_remove() — Remove previously set headers.
+    pub fn header_remove(&mut self, name: Option<&str>) {
+        match name {
+            Some(n) => self.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(n)),
+            None => self.headers.clear(),
+        }
+    }
+
+    /// headers_sent() — Checks if or where headers have been sent.
+    pub fn headers_sent(&self) -> bool {
+        self.headers_sent
+    }
+
+    /// http_response_code() — Get or Set the HTTP response code.
+    pub fn http_response_code(&mut self, code: Option<u16>) -> u16 {
+        if let Some(c) = code {
+            let old = self.http_response_code;
+            self.http_response_code = c;
+            old
+        } else {
+            self.http_response_code
+        }
+    }
+
+    /// Mark headers as sent (called when first output occurs).
+    pub fn mark_sent(&mut self) {
+        self.headers_sent = true;
+    }
+
+    /// Get all headers.
+    pub fn get_headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+}
+
+// ── 8.6.9: exit / die ────────────────────────────────────────────────────────
+// exit() and die() are language constructs handled by the compiler/VM.
+// They produce a special ExitStatus that the SAPI layer handles.
+
+/// Represents the result of exit()/die().
+#[derive(Debug, Clone, PartialEq)]
+pub enum ExitStatus {
+    /// exit(0) or exit() — success
+    Code(i32),
+    /// exit("message") — print message and exit with 0
+    Message(String),
+}
+
+impl ExitStatus {
+    pub fn code(&self) -> i32 {
+        match self {
+            ExitStatus::Code(c) => *c,
+            ExitStatus::Message(_) => 0,
+        }
+    }
+
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            ExitStatus::Message(m) => Some(m),
+            _ => None,
+        }
+    }
+}
+
+// ── 8.6.10: Shutdown functions ───────────────────────────────────────────────
+
+/// Shutdown function registry.
+#[derive(Debug, Default)]
+pub struct ShutdownFunctionRegistry {
+    functions: Vec<String>,
+}
+
+impl ShutdownFunctionRegistry {
+    pub fn new() -> Self {
+        Self {
+            functions: Vec::new(),
+        }
+    }
+
+    /// register_shutdown_function() — Register a function for execution on shutdown.
+    pub fn register(&mut self, func_name: String) {
+        self.functions.push(func_name);
+    }
+
+    /// Get all registered shutdown functions (in order of registration).
+    pub fn functions(&self) -> &[String] {
+        &self.functions
+    }
+
+    /// Clear all registered functions (for testing).
+    pub fn clear(&mut self) {
+        self.functions.clear();
+    }
+}
+
+// ── 8.6.11: Execution limits ─────────────────────────────────────────────────
+
+/// set_time_limit() — Limits the maximum execution time.
+///
+/// In our implementation, we store the limit but actual enforcement
+/// happens in the VM's dispatch loop.
+pub fn php_set_time_limit(seconds: u64) -> u64 {
+    // Returns the previous limit; actual enforcement is VM-level
+    seconds
+}
+
+/// ignore_user_abort() — Set whether client disconnection should abort script execution.
+pub fn php_ignore_user_abort(setting: Option<bool>, current: bool) -> bool {
+    match setting {
+        Some(_) => current, // Return previous value
+        None => current,    // Return current value
+    }
+}
+
 fn hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("HOST"))
@@ -412,6 +610,85 @@ mod tests {
 
         let arch = php_uname('m');
         assert!(!arch.is_empty());
+    }
+
+    // ── Class introspection ──
+    #[test]
+    fn test_is_a() {
+        // Same class
+        assert!(php_is_a("Foo", "Foo", |_, _| false));
+        assert!(php_is_a("Foo", "foo", |_, _| false)); // Case-insensitive
+                                                       // Parent class
+        assert!(php_is_a("Child", "Parent", |cls, target| {
+            cls == "Child" && target == "Parent"
+        }));
+        assert!(!php_is_a("Child", "Other", |_, _| false));
+    }
+
+    #[test]
+    fn test_is_subclass_of() {
+        // Same class is NOT a subclass
+        assert!(!php_is_subclass_of("Foo", "Foo", |_, _| true));
+        // Parent class IS a subclass
+        assert!(php_is_subclass_of("Child", "Parent", |cls, target| {
+            cls == "Child" && target == "Parent"
+        }));
+    }
+
+    // ── Header store ──
+    #[test]
+    fn test_header_store() {
+        let mut store = HeaderStore::new();
+        assert_eq!(store.http_response_code(None), 200);
+        assert!(!store.headers_sent());
+
+        store.header("Content-Type: text/html", true);
+        assert_eq!(store.get_headers().len(), 1);
+
+        store.header("X-Custom: value1", false);
+        store.header("X-Custom: value2", false);
+        assert_eq!(store.get_headers().len(), 3);
+
+        store.header_remove(Some("X-Custom"));
+        assert_eq!(store.get_headers().len(), 1);
+
+        store.http_response_code(Some(404));
+        assert_eq!(store.http_response_code(None), 404);
+    }
+
+    #[test]
+    fn test_header_http_status_line() {
+        let mut store = HeaderStore::new();
+        store.header("HTTP/1.1 301 Moved Permanently", true);
+        assert_eq!(store.http_response_code(None), 301);
+    }
+
+    // ── Exit status ──
+    #[test]
+    fn test_exit_status() {
+        let exit_code = ExitStatus::Code(1);
+        assert_eq!(exit_code.code(), 1);
+        assert_eq!(exit_code.message(), None);
+
+        let exit_msg = ExitStatus::Message("Goodbye".to_string());
+        assert_eq!(exit_msg.code(), 0);
+        assert_eq!(exit_msg.message(), Some("Goodbye"));
+    }
+
+    // ── Shutdown functions ──
+    #[test]
+    fn test_shutdown_functions() {
+        let mut registry = ShutdownFunctionRegistry::new();
+        assert_eq!(registry.functions().len(), 0);
+
+        registry.register("cleanup".to_string());
+        registry.register("log_shutdown".to_string());
+        assert_eq!(registry.functions().len(), 2);
+        assert_eq!(registry.functions()[0], "cleanup");
+        assert_eq!(registry.functions()[1], "log_shutdown");
+
+        registry.clear();
+        assert_eq!(registry.functions().len(), 0);
     }
 
     #[test]

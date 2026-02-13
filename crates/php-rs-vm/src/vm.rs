@@ -7,8 +7,9 @@ use std::collections::{HashMap, HashSet};
 use php_rs_compiler::op::{OperandType, ZOp};
 use php_rs_compiler::op_array::{Literal, ZOpArray};
 use php_rs_compiler::opcode::ZOpcode;
+use php_rs_ext_json::{self, JsonValue};
 
-use crate::value::{PhpArray, PhpObject, Value};
+use crate::value::{ArrayKey, PhpArray, PhpObject, Value};
 
 /// VM execution result.
 #[derive(Debug)]
@@ -37,6 +38,8 @@ pub enum VmError {
     UndefinedClassConstant(String, String),
     /// Internal: invalid opcode / bad operand.
     InternalError(String),
+    /// exit() / die() — clean script termination with an exit code.
+    Exit(i32),
 }
 
 pub type VmResult<T> = Result<T, VmError>;
@@ -106,6 +109,8 @@ struct ClassDef {
     _name: String,
     /// Parent class name (if any).
     parent: Option<String>,
+    /// Implemented interfaces.
+    interfaces: Vec<String>,
     /// Method table: method_name → op_array index.
     methods: HashMap<String, usize>,
     /// Default property values: prop_name → default value.
@@ -136,6 +141,8 @@ pub struct Vm {
     current_exception: Option<Value>,
     /// Set of already-included files (for include_once/require_once).
     included_files: HashSet<String>,
+    /// Last return value from a frame (used for synchronous method calls).
+    last_return_value: Value,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -163,6 +170,7 @@ impl Vm {
             next_object_id: 1,
             current_exception: None,
             included_files: HashSet::new(),
+            last_return_value: Value::Null,
         }
     }
 
@@ -202,8 +210,14 @@ impl Vm {
 
     /// Main dispatch loop.
     fn dispatch_loop(&mut self) -> VmResult<()> {
+        self.dispatch_loop_until(0)
+    }
+
+    /// Dispatch loop that runs until call stack depth drops to min_depth.
+    /// Used for recursive method calls (e.g., JsonSerializable::jsonSerialize).
+    fn dispatch_loop_until(&mut self, min_depth: usize) -> VmResult<()> {
         loop {
-            if self.call_stack.is_empty() {
+            if self.call_stack.len() <= min_depth {
                 return Ok(());
             }
 
@@ -213,7 +227,8 @@ impl Vm {
 
             if ip >= self.op_arrays[op_array_idx].opcodes.len() {
                 // Fell off end — implicit return
-                self.call_stack.pop();
+                let frame = self.call_stack.pop().unwrap();
+                self.last_return_value = frame.return_value;
                 continue;
             }
 
@@ -244,6 +259,7 @@ impl Vm {
                 DispatchSignal::Return => {
                     let frame = self.call_stack.pop().unwrap();
                     let ret_val = frame.return_value;
+                    self.last_return_value = ret_val.clone();
 
                     // Write modified $this back to caller (PHP object reference semantics)
                     if let Some((dest_type, dest_slot)) = frame.this_write_back {
@@ -1108,9 +1124,31 @@ impl Vm {
     fn handle_declare_class(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let name = self.read_operand(op, 1, oa_idx)?.to_php_string();
 
+        // Parse parent/interfaces from op2: "parent\0iface1\0iface2"
+        let class_info = if op.op2_type != OperandType::Unused {
+            self.read_operand(op, 2, oa_idx)?.to_php_string()
+        } else {
+            String::new()
+        };
+        let mut parts: Vec<&str> = class_info.split('\0').collect();
+        let parent = if !parts.is_empty() && !parts[0].is_empty() {
+            Some(parts.remove(0).to_string())
+        } else {
+            if !parts.is_empty() {
+                parts.remove(0);
+            }
+            None
+        };
+        let interfaces: Vec<String> = parts
+            .iter()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
         let mut class_def = ClassDef {
             _name: name.clone(),
-            parent: None,
+            parent,
+            interfaces,
             methods: HashMap::new(),
             default_properties: HashMap::new(),
             class_constants: HashMap::new(),
@@ -1312,11 +1350,20 @@ impl Vm {
         Ok(())
     }
 
-    /// Check if a class is a subclass of another (walks parent chain).
+    /// Check if a class is a subclass of or implements a given class/interface.
     fn is_subclass(&self, child: &str, parent: &str) -> bool {
         let mut current = child.to_string();
+        let mut visited = std::collections::HashSet::new();
         loop {
+            if !visited.insert(current.clone()) {
+                return false;
+            }
             if let Some(class_def) = self.classes.get(&current) {
+                // Check implemented interfaces
+                if class_def.interfaces.iter().any(|i| i == parent) {
+                    return true;
+                }
+                // Check parent class
                 if let Some(ref p) = class_def.parent {
                     if p == parent {
                         return true;
@@ -1329,6 +1376,61 @@ impl Vm {
                 return false;
             }
         }
+    }
+
+    /// Check if a class implements a specific interface (walks class hierarchy).
+    fn implements_interface(&self, class_name: &str, interface_name: &str) -> bool {
+        let mut current = class_name.to_string();
+        let mut visited = HashSet::new();
+        loop {
+            if !visited.insert(current.clone()) {
+                return false;
+            }
+            if let Some(class_def) = self.classes.get(&current) {
+                if class_def.interfaces.iter().any(|i| i == interface_name) {
+                    return true;
+                }
+                if let Some(ref p) = class_def.parent {
+                    current = p.clone();
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+
+    /// Call a method on an object synchronously and return the result.
+    /// Used for internal callbacks like JsonSerializable::jsonSerialize().
+    fn call_method_sync(&mut self, obj: &Value, method_name: &str) -> VmResult<Value> {
+        let class_name = match obj {
+            Value::Object(ref o) => o.class_name.clone(),
+            _ => return Err(VmError::TypeError("Not an object".to_string())),
+        };
+        let method_key = format!("{}::{}", class_name, method_name);
+        let oa_idx = self
+            .functions
+            .get(&method_key)
+            .copied()
+            .ok_or_else(|| VmError::UndefinedFunction(method_key.clone()))?;
+
+        let saved_depth = self.call_stack.len();
+
+        let func_oa = &self.op_arrays[oa_idx];
+        let mut frame = Frame::new(func_oa);
+        frame.op_array_idx = oa_idx;
+
+        // Bind $this
+        let this_cv = func_oa.vars.iter().position(|v| v == "this").unwrap_or(0);
+        if this_cv < frame.cvs.len() {
+            frame.cvs[this_cv] = obj.clone();
+        }
+
+        self.call_stack.push(frame);
+        self.dispatch_loop_until(saved_depth)?;
+
+        Ok(self.last_return_value.clone())
     }
 
     /// Handle FETCH_STATIC_PROP_* — read/write static properties.
@@ -2196,7 +2298,594 @@ impl Vm {
                     Ok(Some(Value::Null))
                 }
             }
+            "json_encode" => {
+                let val = args.first().cloned().unwrap_or(Value::Null);
+                let options = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long() as u32;
+
+                // Check if object implements JsonSerializable
+                let val_to_encode = if let Value::Object(ref o) = val {
+                    if self.implements_interface(&o.class_name, "JsonSerializable") {
+                        // Call jsonSerialize() method synchronously
+                        match self.call_method_sync(&val, "jsonSerialize") {
+                            Ok(result) => result,
+                            Err(_) => val.clone(),
+                        }
+                    } else {
+                        val.clone()
+                    }
+                } else {
+                    val.clone()
+                };
+
+                let json_val = Self::value_to_json(&val_to_encode);
+                match php_rs_ext_json::json_encode(&json_val, options) {
+                    Some(s) => Ok(Some(Value::String(s))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "json_decode" => {
+                let json_str = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let assoc = args.get(1).is_some_and(|v| v.to_bool());
+                let depth = args.get(2).cloned().unwrap_or(Value::Long(512)).to_long() as usize;
+                match php_rs_ext_json::json_decode(&json_str, assoc, depth) {
+                    Some(jv) => Ok(Some(Self::json_to_value(&jv, assoc))),
+                    None => Ok(Some(Value::Null)),
+                }
+            }
+            "json_last_error" => Ok(Some(Value::Long(php_rs_ext_json::json_last_error() as i64))),
+            "json_last_error_msg" => Ok(Some(Value::String(
+                php_rs_ext_json::json_last_error_msg().to_string(),
+            ))),
+            // ── Phase 8 additions ──
+            "quoted_printable_encode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_quoted_printable_encode(s.as_bytes()))))
+            }
+            "quoted_printable_decode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_quoted_printable_decode(&s))))
+            }
+            "addslashes" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_addslashes(&s))))
+            }
+            "stripslashes" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_stripslashes(&s))))
+            }
+            "get_parent_class" => {
+                let v = args.first().cloned().unwrap_or(Value::Null);
+                let cn = match &v {
+                    Value::Object(o) => o.class_name.clone(),
+                    Value::String(s) => s.clone(),
+                    _ => return Ok(Some(Value::Bool(false))),
+                };
+                match self.classes.get(&cn).and_then(|c| c.parent.clone()) {
+                    Some(p) => Ok(Some(Value::String(p))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "is_a" => {
+                let obj = args.first().cloned().unwrap_or(Value::Null);
+                let target = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let cn = match &obj {
+                    Value::Object(o) => o.class_name.clone(),
+                    Value::String(s) => s.clone(),
+                    _ => return Ok(Some(Value::Bool(false))),
+                };
+                if cn.eq_ignore_ascii_case(&target) {
+                    return Ok(Some(Value::Bool(true)));
+                }
+                let mut cur = cn;
+                loop {
+                    match self.classes.get(&cur).and_then(|c| c.parent.clone()) {
+                        Some(p) if p.eq_ignore_ascii_case(&target) => return Ok(Some(Value::Bool(true))),
+                        Some(p) => cur = p,
+                        None => break,
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "is_subclass_of" => {
+                let obj = args.first().cloned().unwrap_or(Value::Null);
+                let target = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let cn = match &obj {
+                    Value::Object(o) => o.class_name.clone(),
+                    Value::String(s) => s.clone(),
+                    _ => return Ok(Some(Value::Bool(false))),
+                };
+                if cn.eq_ignore_ascii_case(&target) {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                let mut cur = cn;
+                loop {
+                    match self.classes.get(&cur).and_then(|c| c.parent.clone()) {
+                        Some(p) if p.eq_ignore_ascii_case(&target) => return Ok(Some(Value::Bool(true))),
+                        Some(p) => cur = p,
+                        None => break,
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "call_user_func" => {
+                let func_name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let func_args: Vec<Value> = args.get(1..).unwrap_or(&[]).to_vec();
+                // Try built-in first, then user-defined
+                match self.call_builtin(&func_name, &func_args) {
+                    Ok(Some(v)) => Ok(Some(v)),
+                    _ => {
+                        // User-defined function call would go through the main exec loop
+                        // For now, return false if not a built-in
+                        Ok(Some(Value::Bool(false)))
+                    }
+                }
+            }
+            "call_user_func_array" => {
+                let func_name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let arr = args.get(1).cloned().unwrap_or(Value::Null);
+                let func_args: Vec<Value> = if let Value::Array(ref a) = arr {
+                    a.entries().iter().map(|(_, v)| v.clone()).collect()
+                } else {
+                    vec![]
+                };
+                match self.call_builtin(&func_name, &func_args) {
+                    Ok(Some(v)) => Ok(Some(v)),
+                    _ => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "header" | "header_remove" => Ok(Some(Value::Null)),
+            "headers_sent" => Ok(Some(Value::Bool(false))),
+            "http_response_code" => {
+                let code = args.first().map(|v| v.to_long() as u16);
+                match code {
+                    Some(c) if c > 0 => Ok(Some(Value::Long(c as i64))),
+                    _ => Ok(Some(Value::Long(200))),
+                }
+            }
+            "exit" | "die" => {
+                let arg = args.first().cloned().unwrap_or(Value::Null);
+                match arg {
+                    Value::String(s) => {
+                        self.output.push_str(&s);
+                        Err(VmError::Exit(0))
+                    }
+                    Value::Long(n) => Err(VmError::Exit(n as i32)),
+                    _ => Err(VmError::Exit(0)),
+                }
+            }
+            "register_shutdown_function" => Ok(Some(Value::Null)),
+            "set_time_limit" => Ok(Some(Value::Bool(true))),
+            "ignore_user_abort" => Ok(Some(Value::Long(0))),
+            "function_exists" => {
+                let fname = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Bool(self.functions.contains_key(&fname))))
+            }
+            "is_callable" => {
+                let v = args.first().cloned().unwrap_or(Value::Null);
+                Ok(Some(Value::Bool(matches!(v, Value::String(ref s) if self.functions.contains_key(s)))))
+            }
+            "preg_match" => {
+                let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let subj = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                match parse_php_regex(&pat) {
+                    Some((re, flags)) => match regex::Regex::new(&apply_regex_flags(&re, &flags)) {
+                        Ok(r) => Ok(Some(Value::Long(if r.is_match(&subj) { 1 } else { 0 }))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    },
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "preg_match_all" => {
+                let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let subj = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                match parse_php_regex(&pat) {
+                    Some((re, flags)) => match regex::Regex::new(&apply_regex_flags(&re, &flags)) {
+                        Ok(r) => Ok(Some(Value::Long(r.find_iter(&subj).count() as i64))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    },
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "preg_replace" => {
+                let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let rep = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let subj = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
+                match parse_php_regex(&pat) {
+                    Some((re, flags)) => match regex::Regex::new(&apply_regex_flags(&re, &flags)) {
+                        Ok(r) => {
+                            let rr = rep.replace("\\1", "$1").replace("\\2", "$2").replace("\\3", "$3");
+                            Ok(Some(Value::String(r.replace_all(&subj, rr.as_str()).to_string())))
+                        }
+                        Err(_) => Ok(Some(Value::Null)),
+                    },
+                    None => Ok(Some(Value::Null)),
+                }
+            }
+            "preg_split" => {
+                let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let subj = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                match parse_php_regex(&pat) {
+                    Some((re, flags)) => match regex::Regex::new(&apply_regex_flags(&re, &flags)) {
+                        Ok(r) => {
+                            let mut arr = PhpArray::new();
+                            for part in r.split(&subj) {
+                                arr.push(Value::String(part.to_string()));
+                            }
+                            Ok(Some(Value::Array(arr)))
+                        }
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    },
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "preg_quote" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let delim = args.get(1).map(|v| v.to_php_string());
+                let special = ".\\+*?[^$(){}=!<>|:-#";
+                let mut result = String::with_capacity(s.len() + 8);
+                for ch in s.chars() {
+                    if special.contains(ch) {
+                        result.push('\\');
+                    } else if let Some(ref d) = delim {
+                        if d.contains(ch) {
+                            result.push('\\');
+                        }
+                    }
+                    result.push(ch);
+                }
+                Ok(Some(Value::String(result)))
+            }
+            "md5" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(&s))))
+            }
+            "sha1" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_sha1(&s))))
+            }
+            "base64_encode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_base64_encode(s.as_bytes()))))
+            }
+            "base64_decode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                match php_rs_ext_standard::strings::php_base64_decode(&s) {
+                    Some(b) => Ok(Some(Value::String(String::from_utf8_lossy(&b).to_string()))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "htmlspecialchars" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_htmlspecialchars(
+                    &s,
+                    php_rs_ext_standard::strings::HtmlFlags::default(),
+                ))))
+            }
+            "htmlspecialchars_decode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_htmlspecialchars_decode(&s))))
+            }
+            "urlencode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_urlencode(&s))))
+            }
+            "urldecode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_urldecode(&s))))
+            }
+            "rawurlencode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_rawurlencode(&s))))
+            }
+            "rawurldecode" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_rawurldecode(&s))))
+            }
+            "crc32" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::Long(php_rs_ext_standard::strings::php_crc32(&s))))
+            }
+            "str_rot13" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_str_rot13(&s))))
+            }
+            "ucfirst" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_ucfirst(&s))))
+            }
+            "lcfirst" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_lcfirst(&s))))
+            }
+            "ucwords" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let d = args.get(1).cloned().unwrap_or(Value::String(String::new())).to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_ucwords(&s, &d))))
+            }
+            "serialize" => {
+                let val = args.first().cloned().unwrap_or(Value::Null);
+                Ok(Some(Value::String(php_rs_ext_standard::variables::php_serialize(
+                    &value_to_serializable(&val),
+                ))))
+            }
+            "unserialize" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                match php_rs_ext_standard::variables::php_unserialize(&s) {
+                    Some(sv) => Ok(Some(serializable_to_value(&sv))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "get_debug_type" => {
+                let v = args.first().cloned().unwrap_or(Value::Null);
+                Ok(Some(Value::String(
+                    match v {
+                        Value::Null => "null",
+                        Value::Bool(_) => "bool",
+                        Value::Long(_) => "int",
+                        Value::Double(_) => "float",
+                        Value::String(_) => "string",
+                        Value::Array(_) => "array",
+                        Value::Object(_) => "object",
+                        Value::_Iterator { .. } => "unknown",
+                    }
+                    .to_string(),
+                )))
+            }
+            "time" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                Ok(Some(Value::Long(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0) as i64,
+                )))
+            }
+            "microtime" => {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default();
+                if args.first().map(|v| v.to_bool()).unwrap_or(false) {
+                    Ok(Some(Value::Double(now.as_secs_f64())))
+                } else {
+                    Ok(Some(Value::String(format!(
+                        "0.{:06}00 {}",
+                        now.subsec_micros(),
+                        now.as_secs()
+                    ))))
+                }
+            }
+            "sleep" => {
+                let secs = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Long(0))
+                    .to_long()
+                    .max(0) as u64;
+                std::thread::sleep(std::time::Duration::from_secs(secs));
+                Ok(Some(Value::Long(0)))
+            }
+            "usleep" => {
+                let us = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Long(0))
+                    .to_long()
+                    .max(0) as u64;
+                std::thread::sleep(std::time::Duration::from_micros(us));
+                Ok(Some(Value::Null))
+            }
+            "phpversion" => Ok(Some(Value::String("8.6.0-php.rs".to_string()))),
+            "php_uname" => {
+                let m = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::String("a".to_string()))
+                    .to_php_string();
+                Ok(Some(Value::String(php_rs_ext_standard::misc::php_uname(
+                    m.chars().next().unwrap_or('a'),
+                ))))
+            }
+            "php_sapi_name" => Ok(Some(Value::String("cli".to_string()))),
+            "getenv" => {
+                let n = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                match std::env::var(&n) {
+                    Ok(v) => Ok(Some(Value::String(v))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "putenv" => {
+                let s = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                if let Some(eq) = s.find('=') {
+                    std::env::set_var(&s[..eq], &s[eq + 1..]);
+                }
+                Ok(Some(Value::Bool(true)))
+            }
+            "file_get_contents" => {
+                let f = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                match std::fs::read_to_string(&f) {
+                    Ok(c) => Ok(Some(Value::String(c))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "file_put_contents" => {
+                let f = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                let d = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                match std::fs::write(&f, &d) {
+                    Ok(()) => Ok(Some(Value::Long(d.len() as i64))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "file_exists" => {
+                let p = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                Ok(Some(Value::Bool(std::path::Path::new(&p).exists())))
+            }
+            "is_file" => {
+                let p = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                Ok(Some(Value::Bool(std::path::Path::new(&p).is_file())))
+            }
+            "is_dir" => {
+                let p = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                Ok(Some(Value::Bool(std::path::Path::new(&p).is_dir())))
+            }
+            "dirname" => {
+                let p = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                Ok(Some(Value::String(
+                    std::path::Path::new(&p)
+                        .parent()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ".".to_string()),
+                )))
+            }
+            "basename" => {
+                let p = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                Ok(Some(Value::String(
+                    std::path::Path::new(&p)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                )))
+            }
+            "realpath" => {
+                let p = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                match std::fs::canonicalize(&p) {
+                    Ok(rp) => Ok(Some(Value::String(rp.to_string_lossy().to_string()))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
             _ => Ok(None),
+        }
+    }
+
+    /// Convert a VM Value to a JsonValue for encoding.
+    fn value_to_json(val: &Value) -> JsonValue {
+        match val {
+            Value::Null => JsonValue::Null,
+            Value::Bool(b) => JsonValue::Bool(*b),
+            Value::Long(n) => JsonValue::Int(*n),
+            Value::Double(f) => JsonValue::Float(*f),
+            Value::String(s) => JsonValue::Str(s.clone()),
+            Value::Array(a) => {
+                // Check if it's a sequential integer-keyed array (JSON array)
+                // or an associative array (JSON object)
+                let is_list = a
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .all(|(i, (k, _))| matches!(k, ArrayKey::Int(n) if *n == i as i64));
+                if is_list {
+                    JsonValue::Array(
+                        a.entries()
+                            .iter()
+                            .map(|(_, v)| Self::value_to_json(v))
+                            .collect(),
+                    )
+                } else {
+                    JsonValue::Object(
+                        a.entries()
+                            .iter()
+                            .map(|(k, v)| {
+                                let key = match k {
+                                    ArrayKey::Int(n) => n.to_string(),
+                                    ArrayKey::String(s) => s.clone(),
+                                };
+                                (key, Self::value_to_json(v))
+                            })
+                            .collect(),
+                    )
+                }
+            }
+            Value::Object(o) => {
+                // Encode public properties as a JSON object
+                let mut entries: Vec<(String, JsonValue)> = o
+                    .properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Self::value_to_json(v)))
+                    .collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                JsonValue::Object(entries)
+            }
+            Value::_Iterator { .. } => JsonValue::Null,
+        }
+    }
+
+    /// Convert a JsonValue to a VM Value after decoding.
+    fn json_to_value(jv: &JsonValue, assoc: bool) -> Value {
+        match jv {
+            JsonValue::Null => Value::Null,
+            JsonValue::Bool(b) => Value::Bool(*b),
+            JsonValue::Int(n) => Value::Long(*n),
+            JsonValue::Float(f) => Value::Double(*f),
+            JsonValue::Str(s) => Value::String(s.clone()),
+            JsonValue::Array(items) => {
+                let mut arr = PhpArray::new();
+                for item in items {
+                    arr.push(Self::json_to_value(item, assoc));
+                }
+                Value::Array(arr)
+            }
+            JsonValue::Object(entries) => {
+                if assoc {
+                    // Return as associative array
+                    let mut arr = PhpArray::new();
+                    for (k, v) in entries {
+                        arr.set_string(k.clone(), Self::json_to_value(v, assoc));
+                    }
+                    Value::Array(arr)
+                } else {
+                    // Return as stdClass object
+                    let mut obj = PhpObject::new("stdClass".to_string());
+                    for (k, v) in entries {
+                        obj.properties
+                            .insert(k.clone(), Self::json_to_value(v, assoc));
+                    }
+                    Value::Object(obj)
+                }
+            }
         }
     }
 
@@ -2501,6 +3190,110 @@ fn format_php_float(f: f64) -> String {
     } else {
         let s = format!("{}", f);
         s
+    }
+}
+
+// ── Helper functions for built-in implementations ──
+
+/// Parse a PHP-style regex pattern like /pattern/flags.
+fn parse_php_regex(pattern: &str) -> Option<(String, String)> {
+    if pattern.is_empty() {
+        return None;
+    }
+    let delimiter = pattern.as_bytes()[0] as char;
+    let end_delim = match delimiter {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '<' => '>',
+        c if c.is_alphanumeric() || c == '\\' => return None,
+        c => c,
+    };
+    // Find the closing delimiter (not escaped)
+    let body = &pattern[1..];
+    let mut i = 0;
+    let bytes = body.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2; // Skip escaped char
+        } else if bytes[i] == end_delim as u8 {
+            let re_pattern = &body[..i];
+            let flags = &body[i + 1..];
+            return Some((re_pattern.to_string(), flags.to_string()));
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Apply PHP regex modifier flags to a pattern string for Rust regex.
+fn apply_regex_flags(pattern: &str, flags: &str) -> String {
+    let mut prefix = String::new();
+    if flags.contains('i') {
+        prefix.push_str("(?i)");
+    }
+    if flags.contains('s') {
+        prefix.push_str("(?s)");
+    }
+    if flags.contains('m') {
+        prefix.push_str("(?m)");
+    }
+    if flags.contains('x') {
+        prefix.push_str("(?x)");
+    }
+    format!("{}{}", prefix, pattern)
+}
+
+/// Convert a VM Value to a SerializableValue for PHP serialize().
+fn value_to_serializable(val: &Value) -> php_rs_ext_standard::variables::SerializableValue {
+    use php_rs_ext_standard::variables::SerializableValue as SV;
+    match val {
+        Value::Null => SV::Null,
+        Value::Bool(b) => SV::Bool(*b),
+        Value::Long(n) => SV::Int(*n),
+        Value::Double(f) => SV::Float(*f),
+        Value::String(s) => SV::Str(s.clone()),
+        Value::Array(a) => {
+            let entries: Vec<_> = a
+                .entries()
+                .iter()
+                .map(|(k, v)| {
+                    let key = match k {
+                        crate::value::ArrayKey::Int(n) => SV::Int(*n),
+                        crate::value::ArrayKey::String(s) => SV::Str(s.clone()),
+                    };
+                    (key, value_to_serializable(v))
+                })
+                .collect();
+            SV::Array(entries)
+        }
+        Value::Object(_) => SV::Null, // Simplified: objects serialize as null for now
+        Value::_Iterator { .. } => SV::Null,
+    }
+}
+
+/// Convert a SerializableValue back to a VM Value for PHP unserialize().
+fn serializable_to_value(sv: &php_rs_ext_standard::variables::SerializableValue) -> Value {
+    use php_rs_ext_standard::variables::SerializableValue as SV;
+    match sv {
+        SV::Null => Value::Null,
+        SV::Bool(b) => Value::Bool(*b),
+        SV::Int(n) => Value::Long(*n),
+        SV::Float(f) => Value::Double(*f),
+        SV::Str(s) => Value::String(s.clone()),
+        SV::Array(entries) => {
+            let mut arr = PhpArray::new();
+            for (k, v) in entries {
+                let key = match k {
+                    SV::Int(n) => Value::Long(*n),
+                    SV::Str(s) => Value::String(s.clone()),
+                    _ => Value::String(String::new()),
+                };
+                arr.set(&key, serializable_to_value(v));
+            }
+            Value::Array(arr)
+        }
     }
 }
 
@@ -3244,5 +4037,163 @@ echo $x;
         assert_eq!(output, "X"); // Only once
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // =========================================================================
+    // json_encode / json_decode
+    // =========================================================================
+
+    #[test]
+    fn test_json_encode_scalar() {
+        assert_eq!(run_php(r#"<?php echo json_encode(42);"#), "42");
+        assert_eq!(run_php(r#"<?php echo json_encode("hello");"#), "\"hello\"");
+        assert_eq!(run_php(r#"<?php echo json_encode(true);"#), "true");
+        assert_eq!(run_php(r#"<?php echo json_encode(false);"#), "false");
+        assert_eq!(run_php(r#"<?php echo json_encode(null);"#), "null");
+        assert_eq!(run_php(r#"<?php echo json_encode(1.5);"#), "1.5");
+    }
+
+    #[test]
+    fn test_json_encode_array() {
+        assert_eq!(run_php(r#"<?php echo json_encode([1, 2, 3]);"#), "[1,2,3]");
+    }
+
+    #[test]
+    fn test_json_encode_assoc_array() {
+        assert_eq!(
+            run_php(r#"<?php echo json_encode(["a" => 1, "b" => 2]);"#),
+            r#"{"a":1,"b":2}"#
+        );
+    }
+
+    #[test]
+    fn test_json_encode_object() {
+        let output = run_php(
+            r#"<?php
+$obj = new stdClass;
+$obj->name = "PHP";
+$obj->version = 8;
+echo json_encode($obj);
+"#,
+        );
+        assert_eq!(output, r#"{"name":"PHP","version":8}"#);
+    }
+
+    #[test]
+    fn test_json_decode_scalar() {
+        assert_eq!(run_php(r#"<?php echo json_decode("42");"#), "42");
+        assert_eq!(run_php(r#"<?php echo json_decode('"hello"');"#), "hello");
+        assert_eq!(
+            run_php(r#"<?php var_dump(json_decode("true"));"#),
+            "bool(true)\n"
+        );
+        assert_eq!(run_php(r#"<?php var_dump(json_decode("null"));"#), "NULL\n");
+    }
+
+    #[test]
+    fn test_json_decode_assoc() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$data = json_decode('{"a":1,"b":"hello"}', true);
+echo $data["a"] . " " . $data["b"];
+"#
+            ),
+            "1 hello"
+        );
+    }
+
+    #[test]
+    fn test_json_last_error() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+json_decode("{bad}");
+echo json_last_error();
+"#
+            ),
+            "4"
+        );
+    }
+
+    #[test]
+    fn test_json_last_error_msg() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+json_decode("{bad}");
+echo json_last_error_msg();
+"#
+            ),
+            "Syntax error"
+        );
+    }
+
+    // =========================================================================
+    // JsonSerializable interface
+    // =========================================================================
+
+    #[test]
+    fn test_json_serializable() {
+        let output = run_php(
+            r#"<?php
+class Foo implements JsonSerializable {
+    public function jsonSerialize() {
+        return ["custom" => "data", "count" => 42];
+    }
+}
+echo json_encode(new Foo());
+"#,
+        );
+        assert_eq!(output, r#"{"custom":"data","count":42}"#);
+    }
+
+    #[test]
+    fn test_json_serializable_scalar_return() {
+        let output = run_php(
+            r#"<?php
+class Bar implements JsonSerializable {
+    public function jsonSerialize() {
+        return "just a string";
+    }
+}
+echo json_encode(new Bar());
+"#,
+        );
+        assert_eq!(output, r#""just a string""#);
+    }
+
+    // =========================================================================
+    // Interface / instanceof
+    // =========================================================================
+
+    #[test]
+    fn test_instanceof_interface() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+interface Printable {}
+class Doc implements Printable {}
+$d = new Doc();
+var_dump($d instanceof Printable);
+"#
+            ),
+            "bool(true)\n"
+        );
+    }
+
+    #[test]
+    fn test_instanceof_interface_negative() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+interface Printable {}
+class Doc {}
+$d = new Doc();
+var_dump($d instanceof Printable);
+"#
+            ),
+            "bool(false)\n"
+        );
     }
 }

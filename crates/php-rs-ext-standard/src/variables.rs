@@ -174,6 +174,177 @@ pub fn php_print_r_string(type_tag: u8, value: &str) -> String {
     }
 }
 
+// ── 8.3.6: serialize / unserialize ────────────────────────────────────────────
+
+/// Serializable PHP value for serialize/unserialize.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SerializableValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+    Array(Vec<(SerializableValue, SerializableValue)>),
+}
+
+/// serialize() — Generates a storable representation of a value.
+///
+/// PHP serialization format:
+///   N;           — NULL
+///   b:0;  b:1;  — boolean
+///   i:42;        — integer
+///   d:3.14;      — float
+///   s:5:"hello"; — string
+///   a:2:{...}    — array
+pub fn php_serialize(val: &SerializableValue) -> String {
+    match val {
+        SerializableValue::Null => "N;".to_string(),
+        SerializableValue::Bool(b) => format!("b:{};", if *b { 1 } else { 0 }),
+        SerializableValue::Int(n) => format!("i:{};", n),
+        SerializableValue::Float(f) => {
+            if f.is_infinite() {
+                if f.is_sign_positive() {
+                    "d:INF;".to_string()
+                } else {
+                    "d:-INF;".to_string()
+                }
+            } else if f.is_nan() {
+                "d:NAN;".to_string()
+            } else {
+                format!("d:{};", f)
+            }
+        }
+        SerializableValue::Str(s) => format!("s:{}:\"{}\";", s.len(), s),
+        SerializableValue::Array(entries) => {
+            let mut result = format!("a:{}:{{", entries.len());
+            for (key, value) in entries {
+                result.push_str(&php_serialize(key));
+                result.push_str(&php_serialize(value));
+            }
+            result.push('}');
+            result
+        }
+    }
+}
+
+/// unserialize() — Creates a PHP value from a stored representation.
+pub fn php_unserialize(input: &str) -> Option<SerializableValue> {
+    let bytes = input.as_bytes();
+    let (val, _) = unserialize_value(bytes, 0)?;
+    Some(val)
+}
+
+fn unserialize_value(data: &[u8], pos: usize) -> Option<(SerializableValue, usize)> {
+    if pos >= data.len() {
+        return None;
+    }
+    match data[pos] {
+        b'N' => {
+            // N;
+            if pos + 1 < data.len() && data[pos + 1] == b';' {
+                Some((SerializableValue::Null, pos + 2))
+            } else {
+                None
+            }
+        }
+        b'b' => {
+            // b:0; or b:1;
+            if pos + 3 < data.len() && data[pos + 1] == b':' && data[pos + 3] == b';' {
+                let val = data[pos + 2] != b'0';
+                Some((SerializableValue::Bool(val), pos + 4))
+            } else {
+                None
+            }
+        }
+        b'i' => {
+            // i:NUM;
+            if pos + 1 < data.len() && data[pos + 1] == b':' {
+                let start = pos + 2;
+                let end = memchr_byte(b';', data, start)?;
+                let num_str = std::str::from_utf8(&data[start..end]).ok()?;
+                let n: i64 = num_str.parse().ok()?;
+                Some((SerializableValue::Int(n), end + 1))
+            } else {
+                None
+            }
+        }
+        b'd' => {
+            // d:NUM;
+            if pos + 1 < data.len() && data[pos + 1] == b':' {
+                let start = pos + 2;
+                let end = memchr_byte(b';', data, start)?;
+                let num_str = std::str::from_utf8(&data[start..end]).ok()?;
+                let f: f64 = match num_str {
+                    "INF" => f64::INFINITY,
+                    "-INF" => f64::NEG_INFINITY,
+                    "NAN" => f64::NAN,
+                    _ => num_str.parse().ok()?,
+                };
+                Some((SerializableValue::Float(f), end + 1))
+            } else {
+                None
+            }
+        }
+        b's' => {
+            // s:LEN:"STRING";
+            if pos + 1 < data.len() && data[pos + 1] == b':' {
+                let start = pos + 2;
+                let colon = memchr_byte(b':', data, start)?;
+                let len_str = std::str::from_utf8(&data[start..colon]).ok()?;
+                let len: usize = len_str.parse().ok()?;
+                // Expect :"...", so colon+1 should be "
+                if colon + 1 >= data.len() || data[colon + 1] != b'"' {
+                    return None;
+                }
+                let str_start = colon + 2;
+                let str_end = str_start + len;
+                if str_end + 2 > data.len() || data[str_end] != b'"' || data[str_end + 1] != b';' {
+                    return None;
+                }
+                let s = std::str::from_utf8(&data[str_start..str_end]).ok()?;
+                Some((SerializableValue::Str(s.to_string()), str_end + 2))
+            } else {
+                None
+            }
+        }
+        b'a' => {
+            // a:COUNT:{...}
+            if pos + 1 < data.len() && data[pos + 1] == b':' {
+                let start = pos + 2;
+                let colon = memchr_byte(b':', data, start)?;
+                let count_str = std::str::from_utf8(&data[start..colon]).ok()?;
+                let count: usize = count_str.parse().ok()?;
+                // Expect :{
+                if colon + 1 >= data.len() || data[colon + 1] != b'{' {
+                    return None;
+                }
+                let mut cur = colon + 2;
+                let mut entries = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (key, next) = unserialize_value(data, cur)?;
+                    let (value, next2) = unserialize_value(data, next)?;
+                    entries.push((key, value));
+                    cur = next2;
+                }
+                if cur >= data.len() || data[cur] != b'}' {
+                    return None;
+                }
+                Some((SerializableValue::Array(entries), cur + 1))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn memchr_byte(needle: u8, data: &[u8], start: usize) -> Option<usize> {
+    data[start..]
+        .iter()
+        .position(|&b| b == needle)
+        .map(|p| p + start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +409,80 @@ mod tests {
         assert_eq!(php_var_dump_string(1, ""), "bool(false)\n");
         assert_eq!(php_var_dump_string(2, "42"), "int(42)\n");
         assert_eq!(php_var_dump_string(4, "hello"), "string(5) \"hello\"\n");
+    }
+
+    // ── serialize / unserialize ──
+    #[test]
+    fn test_serialize_primitives() {
+        assert_eq!(php_serialize(&SerializableValue::Null), "N;");
+        assert_eq!(php_serialize(&SerializableValue::Bool(true)), "b:1;");
+        assert_eq!(php_serialize(&SerializableValue::Bool(false)), "b:0;");
+        assert_eq!(php_serialize(&SerializableValue::Int(42)), "i:42;");
+        assert_eq!(php_serialize(&SerializableValue::Int(-7)), "i:-7;");
+        assert_eq!(php_serialize(&SerializableValue::Float(3.14)), "d:3.14;");
+        assert_eq!(
+            php_serialize(&SerializableValue::Str("hello".to_string())),
+            "s:5:\"hello\";"
+        );
+    }
+
+    #[test]
+    fn test_serialize_array() {
+        let arr = SerializableValue::Array(vec![
+            (
+                SerializableValue::Int(0),
+                SerializableValue::Str("a".to_string()),
+            ),
+            (
+                SerializableValue::Int(1),
+                SerializableValue::Str("b".to_string()),
+            ),
+        ]);
+        assert_eq!(php_serialize(&arr), "a:2:{i:0;s:1:\"a\";i:1;s:1:\"b\";}");
+    }
+
+    #[test]
+    fn test_unserialize_primitives() {
+        assert_eq!(php_unserialize("N;"), Some(SerializableValue::Null));
+        assert_eq!(php_unserialize("b:1;"), Some(SerializableValue::Bool(true)));
+        assert_eq!(
+            php_unserialize("b:0;"),
+            Some(SerializableValue::Bool(false))
+        );
+        assert_eq!(php_unserialize("i:42;"), Some(SerializableValue::Int(42)));
+        assert_eq!(
+            php_unserialize("d:3.14;"),
+            Some(SerializableValue::Float(3.14))
+        );
+        assert_eq!(
+            php_unserialize("s:5:\"hello\";"),
+            Some(SerializableValue::Str("hello".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_unserialize_array() {
+        let result = php_unserialize("a:2:{i:0;s:1:\"a\";i:1;s:1:\"b\";}");
+        assert!(result.is_some());
+        if let Some(SerializableValue::Array(entries)) = result {
+            assert_eq!(entries.len(), 2);
+        }
+    }
+
+    #[test]
+    fn test_serialize_roundtrip() {
+        let values = vec![
+            SerializableValue::Null,
+            SerializableValue::Bool(true),
+            SerializableValue::Int(123),
+            SerializableValue::Float(2.5),
+            SerializableValue::Str("test".to_string()),
+        ];
+        for val in values {
+            let serialized = php_serialize(&val);
+            let deserialized = php_unserialize(&serialized).unwrap();
+            assert_eq!(val, deserialized);
+        }
     }
 
     #[test]

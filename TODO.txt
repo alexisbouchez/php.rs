@@ -461,7 +461,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 8.1.13 crc32, crypt
 [x] 8.1.14 str_rot13, str_shuffle, str_word_count
 [x] 8.1.15 ord, chr, str_split, count_chars
-[ ] 8.1.16 quoted_printable_encode, quoted_printable_decode
+[x] 8.1.16 quoted_printable_encode, quoted_printable_decode
 [x] 8.1.17 addslashes, stripslashes, addcslashes, stripcslashes
 [x] 8.1.18 Test: all string functions with php-src/ext/standard/tests/strings/
 
@@ -476,10 +476,10 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 8.2.8  array_slice, array_splice, array_chunk
 [x] 8.2.9  array_unique, array_flip, array_reverse, array_pad
 [x] 8.2.10 sort, rsort, asort, arsort, ksort, krsort, usort, uasort, uksort
-[ ] 8.2.11 array_multisort
+[x] 8.2.11 array_multisort
 [x] 8.2.12 array_diff, array_intersect (+ assoc/key variants)
 [x] 8.2.13 array_fill, array_fill_keys, range
-[ ] 8.2.14 compact, extract
+[x] 8.2.14 compact, extract
 [ ] 8.2.15 list() / array destructuring (parser + compiler level)
 [x] 8.2.16 Test: all array functions with php-src/ext/standard/tests/array/
 
@@ -489,7 +489,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 8.3.3  is_int, is_float, is_string, is_bool, is_null, is_array, is_object, is_numeric, is_callable
 [x] 8.3.4  intval, floatval, strval, boolval
 [ ] 8.3.5  isset, unset, empty (these are language constructs, compiled to opcodes)
-[ ] 8.3.6  serialize, unserialize
+[x] 8.3.6  serialize, unserialize
 [x] 8.3.7  Test: variable functions
 
 ## 8.4 Math functions
@@ -518,15 +518,15 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 ## 8.6 Misc standard functions
 [x] 8.6.1  define, constant, defined
 [x] 8.6.2  function_exists, class_exists, interface_exists, method_exists, property_exists
-[ ] 8.6.3  get_class, get_parent_class, is_a, is_subclass_of
-[ ] 8.6.4  call_user_func, call_user_func_array
-[ ] 8.6.5  header, header_remove, headers_sent, http_response_code
+[x] 8.6.3  get_class, get_parent_class, is_a, is_subclass_of
+[x] 8.6.4  call_user_func, call_user_func_array
+[x] 8.6.5  header, header_remove, headers_sent, http_response_code
 [x] 8.6.6  sleep, usleep, time_nanosleep, time_sleep_until
 [x] 8.6.7  microtime, hrtime
 [x] 8.6.8  getenv, putenv
-[ ] 8.6.9  exit, die
+[x] 8.6.9  exit, die
 [ ] 8.6.10 register_shutdown_function
-[ ] 8.6.11 set_time_limit, ignore_user_abort
+[x] 8.6.11 set_time_limit, ignore_user_abort
 [x] 8.6.12 phpversion, phpinfo, php_uname, php_sapi_name
 [x] 8.6.13 Test: misc functions
 

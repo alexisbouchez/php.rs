@@ -2383,19 +2383,21 @@ impl Compiler {
             flags |= modifier_flag(m);
         }
 
-        // Encode extends/implements info
+        // Encode extends/implements info as "parent\0iface1\0iface2" in op2
+        let mut class_info = String::new();
         if let Some(parent) = extends {
-            let parent_name = name_parts_to_string(&parent.parts);
-            let _ = self.op_array.add_literal(Literal::String(parent_name));
+            class_info.push_str(&name_parts_to_string(&parent.parts));
         }
         for iface in implements {
-            let iface_name = name_parts_to_string(&iface.parts);
-            let _ = self.op_array.add_literal(Literal::String(iface_name));
+            class_info.push('\0');
+            class_info.push_str(&name_parts_to_string(&iface.parts));
         }
+        let info_lit = self.op_array.add_literal(Literal::String(class_info));
 
         self.op_array.emit(
             ZOp::new(ZOpcode::DeclareClass, line)
                 .with_op1(Operand::constant(name_lit), OperandType::Const)
+                .with_op2(Operand::constant(info_lit), OperandType::Const)
                 .with_extended_value(flags),
         );
 
@@ -2444,14 +2446,18 @@ impl Compiler {
         let line = span.line as u32;
         let name_lit = self.op_array.add_literal(Literal::String(name.to_string()));
 
+        // Encode parent interfaces as "\0iface1\0iface2" in op2
+        let mut class_info = String::new();
         for parent in extends {
-            let parent_name = name_parts_to_string(&parent.parts);
-            let _ = self.op_array.add_literal(Literal::String(parent_name));
+            class_info.push('\0');
+            class_info.push_str(&name_parts_to_string(&parent.parts));
         }
+        let info_lit = self.op_array.add_literal(Literal::String(class_info));
 
         self.op_array.emit(
             ZOp::new(ZOpcode::DeclareClass, line)
                 .with_op1(Operand::constant(name_lit), OperandType::Const)
+                .with_op2(Operand::constant(info_lit), OperandType::Const)
                 .with_extended_value(ZEND_ACC_INTERFACE),
         );
 
@@ -2540,14 +2546,18 @@ impl Compiler {
         let line = span.line as u32;
         let name_lit = self.op_array.add_literal(Literal::String(name.to_string()));
 
+        // Encode implements info as "\0iface1\0iface2" in op2
+        let mut class_info = String::new();
         for iface in implements {
-            let iface_name = name_parts_to_string(&iface.parts);
-            let _ = self.op_array.add_literal(Literal::String(iface_name));
+            class_info.push('\0');
+            class_info.push_str(&name_parts_to_string(&iface.parts));
         }
+        let info_lit = self.op_array.add_literal(Literal::String(class_info));
 
         self.op_array.emit(
             ZOp::new(ZOpcode::DeclareClass, line)
                 .with_op1(Operand::constant(name_lit), OperandType::Const)
+                .with_op2(Operand::constant(info_lit), OperandType::Const)
                 .with_extended_value(ZEND_ACC_ENUM),
         );
 

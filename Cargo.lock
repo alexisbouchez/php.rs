@@ -375,6 +375,9 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "php-rs-compiler",
+ "php-rs-ext-json",
+ "php-rs-ext-standard",
+ "regex",
 ]
 
 [[package]]

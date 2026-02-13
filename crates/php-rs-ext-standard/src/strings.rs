@@ -1083,6 +1083,82 @@ pub fn php_count_chars(s: &str) -> HashMap<u8, usize> {
     counts
 }
 
+// ── 8.1.16: Quoted-Printable ─────────────────────────────────────────────────
+
+/// quoted_printable_encode() — Convert a 8 bit string to a quoted-printable string.
+///
+/// Reference: RFC 2045 section 6.7
+pub fn php_quoted_printable_encode(input: &[u8]) -> String {
+    let mut result = String::new();
+    let mut line_len = 0;
+
+    for &byte in input {
+        // Rule: printable ASCII (33-126) except '=' pass through
+        // Space (32) and tab (9) are allowed unless at end of line
+        let encoded = if byte == b'=' {
+            format!("={:02X}", byte)
+        } else if (byte >= 33 && byte <= 126) || byte == b'\t' || byte == b' ' {
+            (byte as char).to_string()
+        } else if byte == b'\r' || byte == b'\n' {
+            // Pass through CRLF/LF as-is, reset line length
+            line_len = 0;
+            result.push(byte as char);
+            continue;
+        } else {
+            format!("={:02X}", byte)
+        };
+
+        // Soft line break if line would exceed 76 chars
+        if line_len + encoded.len() > 75 {
+            result.push_str("=\r\n");
+            line_len = 0;
+        }
+
+        result.push_str(&encoded);
+        line_len += encoded.len();
+    }
+
+    result
+}
+
+/// quoted_printable_decode() — Convert a quoted-printable string to an 8 bit string.
+pub fn php_quoted_printable_decode(input: &str) -> String {
+    let mut result = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'=' {
+            if i + 2 < bytes.len() {
+                let hi = hex_val(bytes[i + 1]);
+                let lo = hex_val(bytes[i + 2]);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    result.push((h << 4) | l);
+                    i += 3;
+                    continue;
+                }
+            }
+            // Soft line break: =\r\n or =\n
+            if i + 2 < bytes.len() && bytes[i + 1] == b'\r' && bytes[i + 2] == b'\n' {
+                i += 3;
+                continue;
+            }
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 2;
+                continue;
+            }
+            // Invalid sequence, pass through
+            result.push(bytes[i]);
+            i += 1;
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+
+    String::from_utf8_lossy(&result).to_string()
+}
+
 // ── 8.1.17: Escaping ────────────────────────────────────────────────────────
 
 /// addslashes() — Quote string with slashes.
@@ -1391,6 +1467,27 @@ mod tests {
         assert_eq!(php_addslashes(r#"He said "hello""#), r#"He said \"hello\""#);
         assert_eq!(php_addslashes("it's"), "it\\'s");
         assert_eq!(php_addslashes("back\\slash"), "back\\\\slash");
+    }
+
+    // ── quoted_printable ──
+    #[test]
+    fn test_quoted_printable_encode() {
+        // Basic ASCII passes through
+        assert_eq!(php_quoted_printable_encode(b"Hello World"), "Hello World");
+        // Equals sign is encoded
+        assert_eq!(php_quoted_printable_encode(b"a=b"), "a=3Db");
+        // High bytes are encoded
+        assert_eq!(php_quoted_printable_encode(&[0xFF]), "=FF");
+        assert_eq!(php_quoted_printable_encode(&[0x00]), "=00");
+    }
+
+    #[test]
+    fn test_quoted_printable_decode() {
+        assert_eq!(php_quoted_printable_decode("Hello World"), "Hello World");
+        assert_eq!(php_quoted_printable_decode("a=3Db"), "a=b");
+        // Soft line break removal
+        assert_eq!(php_quoted_printable_decode("hello=\r\nworld"), "helloworld");
+        assert_eq!(php_quoted_printable_decode("hello=\nworld"), "helloworld");
     }
 
     #[test]

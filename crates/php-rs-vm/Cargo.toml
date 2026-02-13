@@ -8,6 +8,9 @@ repository.workspace = true
 
 [dependencies]
 php-rs-compiler = { path = "../php-rs-compiler" }
+php-rs-ext-json = { path = "../php-rs-ext-json" }
+php-rs-ext-standard = { path = "../php-rs-ext-standard" }
+regex = "1"
 
 [dev-dependencies]
 criterion = "0.5"
