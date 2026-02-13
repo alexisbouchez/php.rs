@@ -694,7 +694,10 @@ impl Vm {
                 let arr = self.read_operand(op, 1, oa_idx)?;
                 match &arr {
                     Value::Array(a) => {
-                        let iter = Value::_Iterator { array: a.clone(), index: 0 };
+                        let iter = Value::_Iterator {
+                            array: a.clone(),
+                            index: 0,
+                        };
                         self.write_result(op, oa_idx, iter)?;
                         Ok(DispatchSignal::Next)
                     }
@@ -764,7 +767,9 @@ impl Vm {
                     }
                 } else if let Value::_GeneratorIterator { object_id } = iter {
                     // Generator iterator
-                    let gen_status = self.generators.get(&object_id)
+                    let gen_status = self
+                        .generators
+                        .get(&object_id)
                         .map(|g| g.status)
                         .unwrap_or(crate::value::GeneratorStatus::Closed);
 
@@ -775,10 +780,14 @@ impl Vm {
                         }
                         Ok(DispatchSignal::Jump(op.op2.val as usize))
                     } else {
-                        let gen_val = self.generators.get(&object_id)
+                        let gen_val = self
+                            .generators
+                            .get(&object_id)
                             .map(|g| g.value.clone())
                             .unwrap_or(Value::Null);
-                        let gen_key = self.generators.get(&object_id)
+                        let gen_key = self
+                            .generators
+                            .get(&object_id)
                             .map(|g| g.key.clone())
                             .unwrap_or(Value::Null);
 
@@ -797,7 +806,9 @@ impl Vm {
                         frame.temps[iter_slot] = Value::_GeneratorIterator { object_id };
 
                         // Advance generator to next yield
-                        let status = self.generators.get(&object_id)
+                        let status = self
+                            .generators
+                            .get(&object_id)
                             .map(|g| g.status)
                             .unwrap_or(crate::value::GeneratorStatus::Closed);
                         if status == crate::value::GeneratorStatus::Suspended {
@@ -963,9 +974,7 @@ impl Vm {
                 frame.return_value = val;
                 Ok(DispatchSignal::Return)
             }
-            ZOpcode::GeneratorReturn => {
-                self.handle_generator_return(op, oa_idx)
-            }
+            ZOpcode::GeneratorReturn => self.handle_generator_return(op, oa_idx),
 
             // =====================================================================
             // I/O
@@ -1223,12 +1232,8 @@ impl Vm {
                 // when it detects is_generator on the op_array.
                 Ok(DispatchSignal::Next)
             }
-            ZOpcode::Yield => {
-                self.handle_yield(op, oa_idx)
-            }
-            ZOpcode::YieldFrom => {
-                self.handle_yield_from(op, oa_idx)
-            }
+            ZOpcode::Yield => self.handle_yield(op, oa_idx),
+            ZOpcode::YieldFrom => self.handle_yield_from(op, oa_idx),
 
             // Anything else: NOP for now
             _ => Ok(DispatchSignal::Next),
@@ -1917,7 +1922,9 @@ impl Vm {
     fn resume_generator(&mut self, object_id: u64) -> VmResult<()> {
         use crate::value::*;
 
-        let gen = self.generators.get_mut(&object_id)
+        let gen = self
+            .generators
+            .get_mut(&object_id)
             .ok_or_else(|| VmError::InternalError("Generator not found".to_string()))?;
 
         if gen.status == GeneratorStatus::Closed {
@@ -1939,7 +1946,10 @@ impl Vm {
                         gen.value = val;
                         gen.status = GeneratorStatus::Suspended;
                         if index + 1 < entries.len() {
-                            gen.delegate = Some(GeneratorDelegate::Array { entries, index: index + 1 });
+                            gen.delegate = Some(GeneratorDelegate::Array {
+                                entries,
+                                index: index + 1,
+                            });
                         }
                         // else: delegate exhausted, will resume frame on next call
                         return Ok(());
@@ -1949,7 +1959,9 @@ impl Vm {
                 }
                 GeneratorDelegate::Generator { inner_id } => {
                     // Resume the inner generator
-                    let inner_status = self.generators.get(&inner_id)
+                    let inner_status = self
+                        .generators
+                        .get(&inner_id)
                         .map(|g| g.status)
                         .unwrap_or(GeneratorStatus::Closed);
 
@@ -1957,16 +1969,22 @@ impl Vm {
                         self.resume_generator(inner_id)?;
                     }
 
-                    let inner_status = self.generators.get(&inner_id)
+                    let inner_status = self
+                        .generators
+                        .get(&inner_id)
                         .map(|g| g.status)
                         .unwrap_or(GeneratorStatus::Closed);
 
                     if inner_status != GeneratorStatus::Closed {
                         // Inner still has values — proxy them
-                        let inner_val = self.generators.get(&inner_id)
+                        let inner_val = self
+                            .generators
+                            .get(&inner_id)
                             .map(|g| g.value.clone())
                             .unwrap_or(Value::Null);
-                        let inner_key = self.generators.get(&inner_id)
+                        let inner_key = self
+                            .generators
+                            .get(&inner_id)
                             .map(|g| g.key.clone())
                             .unwrap_or(Value::Null);
 
@@ -1979,7 +1997,9 @@ impl Vm {
                     }
 
                     // Inner generator closed — get return value and resume outer
-                    let inner_ret = self.generators.get(&inner_id)
+                    let inner_ret = self
+                        .generators
+                        .get(&inner_id)
                         .and_then(|g| g.return_value.clone())
                         .unwrap_or(Value::Null);
 
@@ -2027,7 +2047,9 @@ impl Vm {
 
     /// Ensure a generator is initialized (run to first yield if status == Created).
     fn ensure_generator_initialized(&mut self, object_id: u64) -> VmResult<()> {
-        let status = self.generators.get(&object_id)
+        let status = self
+            .generators
+            .get(&object_id)
             .map(|g| g.status)
             .unwrap_or(crate::value::GeneratorStatus::Closed);
 
@@ -2055,7 +2077,9 @@ impl Vm {
         let frame_oa_idx = frame.op_array_idx;
 
         // Find the generator by matching op_array_idx
-        let gen_id = self.generators.iter()
+        let gen_id = self
+            .generators
+            .iter()
             .find(|(_, g)| g.op_array_idx == frame_oa_idx && g.status == GeneratorStatus::Running)
             .map(|(id, _)| *id);
 
@@ -2064,7 +2088,7 @@ impl Vm {
             let frame = self.call_stack.pop().unwrap();
             let saved = GeneratorFrame {
                 op_array_idx: frame.op_array_idx,
-                ip: frame.ip + 1,  // resume after this yield
+                ip: frame.ip + 1, // resume after this yield
                 cvs: frame.cvs,
                 temps: frame.temps,
                 args: frame.args,
@@ -2113,7 +2137,9 @@ impl Vm {
         let frame = self.call_stack.last().unwrap();
         let frame_oa_idx = frame.op_array_idx;
 
-        let gen_id = self.generators.iter()
+        let gen_id = self
+            .generators
+            .iter()
             .find(|(_, g)| g.op_array_idx == frame_oa_idx && g.status == GeneratorStatus::Running)
             .map(|(id, _)| *id);
 
@@ -2146,7 +2172,9 @@ impl Vm {
         let frame = self.call_stack.last().unwrap();
         let frame_oa_idx = frame.op_array_idx;
 
-        let gen_id = self.generators.iter()
+        let gen_id = self
+            .generators
+            .iter()
             .find(|(_, g)| g.op_array_idx == frame_oa_idx && g.status == GeneratorStatus::Running)
             .map(|(id, _)| *id);
 
@@ -2193,22 +2221,30 @@ impl Vm {
                     let inner_id = o.object_id;
                     self.ensure_generator_initialized(inner_id)?;
 
-                    let inner_status = self.generators.get(&inner_id)
+                    let inner_status = self
+                        .generators
+                        .get(&inner_id)
                         .map(|g| g.status)
                         .unwrap_or(GeneratorStatus::Closed);
 
                     if inner_status == GeneratorStatus::Closed {
-                        let ret = self.generators.get(&inner_id)
+                        let ret = self
+                            .generators
+                            .get(&inner_id)
                             .and_then(|g| g.return_value.clone())
                             .unwrap_or(Value::Null);
                         self.write_result(op, oa_idx, ret)?;
                         return Ok(DispatchSignal::Next);
                     }
 
-                    let inner_val = self.generators.get(&inner_id)
+                    let inner_val = self
+                        .generators
+                        .get(&inner_id)
                         .map(|g| g.value.clone())
                         .unwrap_or(Value::Null);
-                    let inner_key = self.generators.get(&inner_id)
+                    let inner_key = self
+                        .generators
+                        .get(&inner_id)
                         .map(|g| g.key.clone())
                         .unwrap_or(Value::Null);
                     let delegate = GeneratorDelegate::Generator { inner_id };
@@ -2285,27 +2321,35 @@ impl Vm {
         match method_name {
             "current" => {
                 self.ensure_generator_initialized(object_id)?;
-                let val = self.generators.get(&object_id)
+                let val = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.value.clone())
                     .unwrap_or(Value::Null);
                 Ok(Some(val))
             }
             "key" => {
                 self.ensure_generator_initialized(object_id)?;
-                let val = self.generators.get(&object_id)
+                let val = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.key.clone())
                     .unwrap_or(Value::Null);
                 Ok(Some(val))
             }
             "valid" => {
                 self.ensure_generator_initialized(object_id)?;
-                let is_valid = self.generators.get(&object_id)
+                let is_valid = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.status != GeneratorStatus::Closed)
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(is_valid)))
             }
             "rewind" => {
-                let status = self.generators.get(&object_id)
+                let status = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.status)
                     .unwrap_or(GeneratorStatus::Closed);
                 if status == GeneratorStatus::Created {
@@ -2316,7 +2360,9 @@ impl Vm {
             }
             "next" => {
                 self.ensure_generator_initialized(object_id)?;
-                let status = self.generators.get(&object_id)
+                let status = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.status)
                     .unwrap_or(GeneratorStatus::Closed);
                 if status == GeneratorStatus::Suspended {
@@ -2328,7 +2374,9 @@ impl Vm {
                 let send_val = args.get(1).cloned().unwrap_or(Value::Null);
 
                 // If Created, initialize first (ignore send value for first call)
-                let status = self.generators.get(&object_id)
+                let status = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.status)
                     .unwrap_or(GeneratorStatus::Closed);
 
@@ -2336,7 +2384,9 @@ impl Vm {
                     self.ensure_generator_initialized(object_id)?;
                 }
 
-                let status = self.generators.get(&object_id)
+                let status = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.status)
                     .unwrap_or(GeneratorStatus::Closed);
 
@@ -2347,7 +2397,9 @@ impl Vm {
                     self.resume_generator(object_id)?;
                 }
 
-                let val = self.generators.get(&object_id)
+                let val = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.value.clone())
                     .unwrap_or(Value::Null);
                 Ok(Some(val))
@@ -2358,11 +2410,9 @@ impl Vm {
                     Some(g) if g.status == GeneratorStatus::Closed => {
                         Ok(Some(g.return_value.clone().unwrap_or(Value::Null)))
                     }
-                    _ => {
-                        Err(VmError::FatalError(
-                            "Cannot get return value of a generator that hasn't returned".to_string()
-                        ))
-                    }
+                    _ => Err(VmError::FatalError(
+                        "Cannot get return value of a generator that hasn't returned".to_string(),
+                    )),
                 }
             }
             "throw" => {
@@ -2370,7 +2420,9 @@ impl Vm {
                 self.ensure_generator_initialized(object_id)?;
                 // Set exception and resume
                 self.current_exception = Some(exc);
-                let status = self.generators.get(&object_id)
+                let status = self
+                    .generators
+                    .get(&object_id)
                     .map(|g| g.status)
                     .unwrap_or(GeneratorStatus::Closed);
                 if status == GeneratorStatus::Suspended {
@@ -2446,33 +2498,39 @@ impl Vm {
                     Some(f) if f.status == FiberStatus::Terminated => {
                         Ok(Some(f.return_value.clone().unwrap_or(Value::Null)))
                     }
-                    _ => {
-                        Err(VmError::FatalError(
-                            "Cannot get return value of a fiber that hasn't terminated".to_string()
-                        ))
-                    }
+                    _ => Err(VmError::FatalError(
+                        "Cannot get return value of a fiber that hasn't terminated".to_string(),
+                    )),
                 }
             }
             "isStarted" => {
-                let started = self.fibers.get(&object_id)
+                let started = self
+                    .fibers
+                    .get(&object_id)
                     .map(|f| f.status != FiberStatus::Init)
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(started)))
             }
             "isRunning" => {
-                let running = self.fibers.get(&object_id)
+                let running = self
+                    .fibers
+                    .get(&object_id)
                     .map(|f| f.status == FiberStatus::Running)
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(running)))
             }
             "isSuspended" => {
-                let suspended = self.fibers.get(&object_id)
+                let suspended = self
+                    .fibers
+                    .get(&object_id)
                     .map(|f| f.status == FiberStatus::Suspended)
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(suspended)))
             }
             "isTerminated" => {
-                let terminated = self.fibers.get(&object_id)
+                let terminated = self
+                    .fibers
+                    .get(&object_id)
                     .map(|f| f.status == FiberStatus::Terminated)
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(terminated)))
@@ -2485,20 +2543,29 @@ impl Vm {
     fn fiber_start(&mut self, object_id: u64, args: &[Value]) -> VmResult<Option<Value>> {
         use crate::value::*;
 
-        let callback_name = self.fibers.get(&object_id)
+        let callback_name = self
+            .fibers
+            .get(&object_id)
             .map(|f| f.callback_name.clone())
             .ok_or_else(|| VmError::InternalError("Fiber not found".to_string()))?;
 
-        let status = self.fibers.get(&object_id)
+        let status = self
+            .fibers
+            .get(&object_id)
             .map(|f| f.status)
             .unwrap_or(FiberStatus::Terminated);
 
         if status != FiberStatus::Init {
-            return Err(VmError::FatalError("Cannot start a fiber that is not in init state".to_string()));
+            return Err(VmError::FatalError(
+                "Cannot start a fiber that is not in init state".to_string(),
+            ));
         }
 
         // Look up the callable
-        let func_oa_idx = self.functions.get(&callback_name).copied()
+        let func_oa_idx = self
+            .functions
+            .get(&callback_name)
+            .copied()
             .ok_or_else(|| VmError::UndefinedFunction(callback_name.clone()))?;
 
         let func_oa = &self.op_arrays[func_oa_idx];
@@ -2528,7 +2595,9 @@ impl Vm {
         let result = self.dispatch_loop_until(start_depth);
 
         // Check if fiber suspended or completed
-        let fiber_status = self.fibers.get(&object_id)
+        let fiber_status = self
+            .fibers
+            .get(&object_id)
             .map(|f| f.status)
             .unwrap_or(FiberStatus::Terminated);
 
@@ -2543,7 +2612,9 @@ impl Vm {
 
         result?;
 
-        let transfer = self.fibers.get(&object_id)
+        let transfer = self
+            .fibers
+            .get(&object_id)
             .map(|f| f.transfer_value.clone())
             .unwrap_or(Value::Null);
 
@@ -2554,16 +2625,22 @@ impl Vm {
     fn fiber_resume(&mut self, object_id: u64, value: Value) -> VmResult<Option<Value>> {
         use crate::value::*;
 
-        let status = self.fibers.get(&object_id)
+        let status = self
+            .fibers
+            .get(&object_id)
             .map(|f| f.status)
             .unwrap_or(FiberStatus::Terminated);
 
         if status != FiberStatus::Suspended {
-            return Err(VmError::FatalError("Cannot resume a fiber that is not suspended".to_string()));
+            return Err(VmError::FatalError(
+                "Cannot resume a fiber that is not suspended".to_string(),
+            ));
         }
 
         // Restore saved frames
-        let saved_frames = self.fibers.get_mut(&object_id)
+        let saved_frames = self
+            .fibers
+            .get_mut(&object_id)
             .map(|f| std::mem::take(&mut f.saved_frames))
             .unwrap_or_default();
 
@@ -2595,7 +2672,9 @@ impl Vm {
         // Run until fiber suspends or completes
         let result = self.dispatch_loop_until(start_depth);
 
-        let fiber_status = self.fibers.get(&object_id)
+        let fiber_status = self
+            .fibers
+            .get(&object_id)
             .map(|f| f.status)
             .unwrap_or(FiberStatus::Terminated);
 
@@ -2609,7 +2688,9 @@ impl Vm {
 
         result?;
 
-        let transfer = self.fibers.get(&object_id)
+        let transfer = self
+            .fibers
+            .get(&object_id)
             .map(|f| f.transfer_value.clone())
             .unwrap_or(Value::Null);
 
@@ -2620,10 +2701,13 @@ impl Vm {
     fn fiber_suspend(&mut self, value: Value) -> VmResult<Value> {
         use crate::value::*;
 
-        let fiber_id = self.current_fiber_id
-            .ok_or_else(|| VmError::FatalError("Cannot call Fiber::suspend() outside of a fiber".to_string()))?;
+        let fiber_id = self.current_fiber_id.ok_or_else(|| {
+            VmError::FatalError("Cannot call Fiber::suspend() outside of a fiber".to_string())
+        })?;
 
-        let start_depth = self.fibers.get(&fiber_id)
+        let start_depth = self
+            .fibers
+            .get(&fiber_id)
             .map(|f| f.start_depth)
             .unwrap_or(0);
 
@@ -2633,7 +2717,7 @@ impl Vm {
             let frame = self.call_stack.pop().unwrap();
             saved_frames.push(FiberFrame {
                 op_array_idx: frame.op_array_idx,
-                ip: frame.ip + 1,  // resume after the DO_FCALL that called suspend
+                ip: frame.ip + 1, // resume after the DO_FCALL that called suspend
                 cvs: frame.cvs,
                 temps: frame.temps,
                 args: frame.args,
@@ -2643,7 +2727,7 @@ impl Vm {
                 is_constructor: frame.is_constructor,
             });
         }
-        saved_frames.reverse();  // Maintain original order
+        saved_frames.reverse(); // Maintain original order
 
         if let Some(fiber) = self.fibers.get_mut(&fiber_id) {
             fiber.saved_frames = saved_frames;

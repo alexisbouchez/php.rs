@@ -581,9 +581,7 @@ pub enum GeneratorDelegate {
         index: usize,
     },
     /// Yielding from an inner generator.
-    Generator {
-        inner_id: u64,
-    },
+    Generator { inner_id: u64 },
 }
 
 /// A saved generator frame — stores the execution context.
