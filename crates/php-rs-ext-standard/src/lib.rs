@@ -1,13 +1,13 @@
-//! PHP standard extension
+//! PHP standard extension (ext/standard)
 //!
-//! This crate implements ext/standard: 551 built-in functions
-//! (array_*, str_*, file_*, math_*, etc.)
-//! Equivalent to php-src/ext/standard/
+//! Implements the 551 built-in functions that ship with every PHP installation.
+//! Organized by category matching php-src/ext/standard/ layout.
+//!
+//! Reference: php-src/ext/standard/
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_placeholder() {
-        // Placeholder test to ensure the crate compiles
-    }
-}
+pub mod arrays;
+pub mod file;
+pub mod math;
+pub mod misc;
+pub mod strings;
+pub mod variables;

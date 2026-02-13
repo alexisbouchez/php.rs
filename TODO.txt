@@ -446,89 +446,89 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 ################################################################################
 
 ## 8.1 String functions (batch 1 — most critical)
-[ ] 8.1.1  strlen, substr, strpos, strrpos, strstr, str_contains, str_starts_with, str_ends_with
-[ ] 8.1.2  str_replace, str_ireplace, substr_replace, str_repeat, str_pad
-[ ] 8.1.3  strtolower, strtoupper, ucfirst, lcfirst, ucwords
-[ ] 8.1.4  trim, ltrim, rtrim
-[ ] 8.1.5  explode, implode (join)
-[ ] 8.1.6  sprintf, printf, fprintf, vsprintf, vprintf
-[ ] 8.1.7  number_format, money_format
-[ ] 8.1.8  nl2br, wordwrap, chunk_split
-[ ] 8.1.9  htmlspecialchars, htmlentities, html_entity_decode, htmlspecialchars_decode
-[ ] 8.1.10 urlencode, urldecode, rawurlencode, rawurldecode
-[ ] 8.1.11 base64_encode, base64_decode
-[ ] 8.1.12 md5, sha1 (thin wrappers over ext/hash)
-[ ] 8.1.13 crc32, crypt
-[ ] 8.1.14 str_rot13, str_shuffle, str_word_count
-[ ] 8.1.15 ord, chr, str_split, count_chars
+[x] 8.1.1  strlen, substr, strpos, strrpos, strstr, str_contains, str_starts_with, str_ends_with
+[x] 8.1.2  str_replace, str_ireplace, substr_replace, str_repeat, str_pad
+[x] 8.1.3  strtolower, strtoupper, ucfirst, lcfirst, ucwords
+[x] 8.1.4  trim, ltrim, rtrim
+[x] 8.1.5  explode, implode (join)
+[x] 8.1.6  sprintf, printf, fprintf, vsprintf, vprintf
+[x] 8.1.7  number_format, money_format
+[x] 8.1.8  nl2br, wordwrap, chunk_split
+[x] 8.1.9  htmlspecialchars, htmlentities, html_entity_decode, htmlspecialchars_decode
+[x] 8.1.10 urlencode, urldecode, rawurlencode, rawurldecode
+[x] 8.1.11 base64_encode, base64_decode
+[x] 8.1.12 md5, sha1 (thin wrappers over ext/hash)
+[x] 8.1.13 crc32, crypt
+[x] 8.1.14 str_rot13, str_shuffle, str_word_count
+[x] 8.1.15 ord, chr, str_split, count_chars
 [ ] 8.1.16 quoted_printable_encode, quoted_printable_decode
-[ ] 8.1.17 addslashes, stripslashes, addcslashes, stripcslashes
-[ ] 8.1.18 Test: all string functions with php-src/ext/standard/tests/strings/
+[x] 8.1.17 addslashes, stripslashes, addcslashes, stripcslashes
+[x] 8.1.18 Test: all string functions with php-src/ext/standard/tests/strings/
 
 ## 8.2 Array functions (batch 2 — most critical)
-[ ] 8.2.1  count, sizeof
-[ ] 8.2.2  array_push, array_pop, array_shift, array_unshift
-[ ] 8.2.3  array_merge, array_merge_recursive, array_replace, array_replace_recursive
-[ ] 8.2.4  array_keys, array_values, array_combine
-[ ] 8.2.5  array_search, in_array, array_key_exists
-[ ] 8.2.6  array_map, array_filter, array_walk, array_walk_recursive
-[ ] 8.2.7  array_reduce, array_column
-[ ] 8.2.8  array_slice, array_splice, array_chunk
-[ ] 8.2.9  array_unique, array_flip, array_reverse, array_pad
-[ ] 8.2.10 sort, rsort, asort, arsort, ksort, krsort, usort, uasort, uksort
+[x] 8.2.1  count, sizeof
+[x] 8.2.2  array_push, array_pop, array_shift, array_unshift
+[x] 8.2.3  array_merge, array_merge_recursive, array_replace, array_replace_recursive
+[x] 8.2.4  array_keys, array_values, array_combine
+[x] 8.2.5  array_search, in_array, array_key_exists
+[x] 8.2.6  array_map, array_filter, array_walk, array_walk_recursive
+[x] 8.2.7  array_reduce, array_column
+[x] 8.2.8  array_slice, array_splice, array_chunk
+[x] 8.2.9  array_unique, array_flip, array_reverse, array_pad
+[x] 8.2.10 sort, rsort, asort, arsort, ksort, krsort, usort, uasort, uksort
 [ ] 8.2.11 array_multisort
-[ ] 8.2.12 array_diff, array_intersect (+ assoc/key variants)
-[ ] 8.2.13 array_fill, array_fill_keys, range
+[x] 8.2.12 array_diff, array_intersect (+ assoc/key variants)
+[x] 8.2.13 array_fill, array_fill_keys, range
 [ ] 8.2.14 compact, extract
 [ ] 8.2.15 list() / array destructuring (parser + compiler level)
-[ ] 8.2.16 Test: all array functions with php-src/ext/standard/tests/array/
+[x] 8.2.16 Test: all array functions with php-src/ext/standard/tests/array/
 
 ## 8.3 Variable functions
-[ ] 8.3.1  var_dump, print_r, var_export
-[ ] 8.3.2  gettype, settype, get_debug_type
-[ ] 8.3.3  is_int, is_float, is_string, is_bool, is_null, is_array, is_object, is_numeric, is_callable
-[ ] 8.3.4  intval, floatval, strval, boolval
+[x] 8.3.1  var_dump, print_r, var_export
+[x] 8.3.2  gettype, settype, get_debug_type
+[x] 8.3.3  is_int, is_float, is_string, is_bool, is_null, is_array, is_object, is_numeric, is_callable
+[x] 8.3.4  intval, floatval, strval, boolval
 [ ] 8.3.5  isset, unset, empty (these are language constructs, compiled to opcodes)
 [ ] 8.3.6  serialize, unserialize
-[ ] 8.3.7  Test: variable functions
+[x] 8.3.7  Test: variable functions
 
 ## 8.4 Math functions
-[ ] 8.4.1  abs, ceil, floor, round, fmod, intdiv
-[ ] 8.4.2  max, min
-[ ] 8.4.3  pow, sqrt, log, log2, log10, exp
-[ ] 8.4.4  sin, cos, tan, asin, acos, atan, atan2
-[ ] 8.4.5  pi, M_PI, M_E (math constants)
-[ ] 8.4.6  rand, mt_rand, random_int, random_bytes
-[ ] 8.4.7  base_convert, bindec, octdec, hexdec, decoct, dechex, decbin
-[ ] 8.4.8  Test: math functions with edge cases (INF, NAN, overflow)
+[x] 8.4.1  abs, ceil, floor, round, fmod, intdiv
+[x] 8.4.2  max, min
+[x] 8.4.3  pow, sqrt, log, log2, log10, exp
+[x] 8.4.4  sin, cos, tan, asin, acos, atan, atan2
+[x] 8.4.5  pi, M_PI, M_E (math constants)
+[x] 8.4.6  rand, mt_rand, random_int, random_bytes
+[x] 8.4.7  base_convert, bindec, octdec, hexdec, decoct, dechex, decbin
+[x] 8.4.8  Test: math functions with edge cases (INF, NAN, overflow)
 
 ## 8.5 File functions
-[ ] 8.5.1  fopen, fclose, fread, fwrite, fgets, fgetc, feof, fseek, ftell, rewind, fflush
-[ ] 8.5.2  file_get_contents, file_put_contents
-[ ] 8.5.3  file, readfile, fpassthru
-[ ] 8.5.4  flock, ftruncate
-[ ] 8.5.5  file_exists, is_file, is_dir, is_readable, is_writable, is_executable
-[ ] 8.5.6  stat, lstat, fileatime, filemtime, filesize, filetype, fileperms
-[ ] 8.5.7  mkdir, rmdir, rename, unlink, copy, symlink, link, readlink
-[ ] 8.5.8  glob, scandir, opendir, readdir, closedir
-[ ] 8.5.9  tempnam, sys_get_temp_dir, tmpfile
-[ ] 8.5.10 dirname, basename, pathinfo, realpath
-[ ] 8.5.11 Test: file functions with php-src/ext/standard/tests/file/
+[x] 8.5.1  fopen, fclose, fread, fwrite, fgets, fgetc, feof, fseek, ftell, rewind, fflush
+[x] 8.5.2  file_get_contents, file_put_contents
+[x] 8.5.3  file, readfile, fpassthru
+[x] 8.5.4  flock, ftruncate
+[x] 8.5.5  file_exists, is_file, is_dir, is_readable, is_writable, is_executable
+[x] 8.5.6  stat, lstat, fileatime, filemtime, filesize, filetype, fileperms
+[x] 8.5.7  mkdir, rmdir, rename, unlink, copy, symlink, link, readlink
+[x] 8.5.8  glob, scandir, opendir, readdir, closedir
+[x] 8.5.9  tempnam, sys_get_temp_dir, tmpfile
+[x] 8.5.10 dirname, basename, pathinfo, realpath
+[x] 8.5.11 Test: file functions with php-src/ext/standard/tests/file/
 
 ## 8.6 Misc standard functions
-[ ] 8.6.1  define, constant, defined
-[ ] 8.6.2  function_exists, class_exists, interface_exists, method_exists, property_exists
+[x] 8.6.1  define, constant, defined
+[x] 8.6.2  function_exists, class_exists, interface_exists, method_exists, property_exists
 [ ] 8.6.3  get_class, get_parent_class, is_a, is_subclass_of
 [ ] 8.6.4  call_user_func, call_user_func_array
 [ ] 8.6.5  header, header_remove, headers_sent, http_response_code
-[ ] 8.6.6  sleep, usleep, time_nanosleep, time_sleep_until
-[ ] 8.6.7  microtime, hrtime
-[ ] 8.6.8  getenv, putenv
+[x] 8.6.6  sleep, usleep, time_nanosleep, time_sleep_until
+[x] 8.6.7  microtime, hrtime
+[x] 8.6.8  getenv, putenv
 [ ] 8.6.9  exit, die
 [ ] 8.6.10 register_shutdown_function
 [ ] 8.6.11 set_time_limit, ignore_user_abort
-[ ] 8.6.12 phpversion, phpinfo, php_uname, php_sapi_name
-[ ] 8.6.13 Test: misc functions
+[x] 8.6.12 phpversion, phpinfo, php_uname, php_sapi_name
+[x] 8.6.13 Test: misc functions
 
 ## 8.7 Regex via ext-standard wrappers
 [ ] 8.7.1  preg_match, preg_match_all (delegates to ext-pcre)
