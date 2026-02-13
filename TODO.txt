@@ -384,14 +384,14 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 # Reference: php-src/Zend/zend_gc.c, zend_alloc.c
 ################################################################################
 
-[ ] 6.1  Implement reference counting for ZVal (increment/decrement)
-[ ] 6.2  Implement request-scoped arena allocator (bulk free at request end)
-[ ] 6.3  Implement cycle detection (mark-and-sweep for circular references)
+[x] 6.1  Implement reference counting for ZVal (increment/decrement)
+[x] 6.2  Implement request-scoped arena allocator (bulk free at request end)
+[x] 6.3  Implement cycle detection (mark-and-sweep for circular references)
          Reference: php-src/Zend/zend_gc.c — purple, grey, white, black coloring
-[ ] 6.4  Test: simple refcount lifecycle
-[ ] 6.5  Test: circular reference detection ($a = []; $a[0] = &$a;)
-[ ] 6.6  Test: memory cleanup at request end
-[ ] 6.7  Benchmark: GC pause times with large object graphs
+[x] 6.4  Test: simple refcount lifecycle
+[x] 6.5  Test: circular reference detection ($a = []; $a[0] = &$a;)
+[x] 6.6  Test: memory cleanup at request end
+[x] 6.7  Benchmark: GC pause times with large object graphs
 
 ################################################################################
 # PHASE 7: RUNTIME SERVICES (crates/php-rs-runtime)
