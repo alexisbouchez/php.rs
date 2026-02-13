@@ -23,9 +23,12 @@
 
 use std::env;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::process;
 
 use php_rs_runtime::IniSystem;
+
+mod server;
 
 // ── CLI option parsing ──────────────────────────────────────────────────────
 
@@ -64,6 +67,12 @@ enum CliMode {
     SyntaxHighlight(String),
     /// Interactive mode: php-rs -a
     Interactive,
+    /// Built-in web server: php-rs -S localhost:8080
+    Server {
+        listen: String,
+        docroot: Option<String>,
+        router: Option<String>,
+    },
     /// Read from stdin: echo 'code' | php-rs
     Stdin,
     /// Show help: php-rs -h / --help
@@ -76,6 +85,8 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
     let mut ini_path = None;
     let mut no_ini = false;
     let mut script_args = Vec::new();
+    let mut server_listen: Option<String> = None;
+    let mut server_docroot: Option<String> = None;
     let mut i = 1; // skip argv[0]
     let mut past_separator = false;
 
@@ -173,6 +184,22 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
                 mode = Some(CliMode::Interactive);
                 i += 1;
             }
+            "-S" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -S requires an argument (e.g., localhost:8080)".to_string());
+                }
+                server_listen = Some(args[i].clone());
+                i += 1;
+            }
+            "-t" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Option -t requires an argument".to_string());
+                }
+                server_docroot = Some(args[i].clone());
+                i += 1;
+            }
             "-h" | "--help" | "-?" => {
                 mode = Some(CliMode::Help);
                 i += 1;
@@ -181,16 +208,39 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
                 return Err(format!("Unknown option: {}", arg));
             }
             _ => {
-                // Bare argument = filename
-                mode = Some(CliMode::RunFile(args[i].clone()));
-                i += 1;
-                // Remaining args go to script_args
-                while i < args.len() {
-                    script_args.push(args[i].clone());
+                // If -S was given, bare argument is router script
+                if server_listen.is_some() && mode.is_none() {
+                    mode = Some(CliMode::Server {
+                        listen: String::new(), // filled below
+                        docroot: None,
+                        router: Some(args[i].clone()),
+                    });
                     i += 1;
+                } else {
+                    // Bare argument = filename
+                    mode = Some(CliMode::RunFile(args[i].clone()));
+                    i += 1;
+                    // Remaining args go to script_args
+                    while i < args.len() {
+                        script_args.push(args[i].clone());
+                        i += 1;
+                    }
                 }
             }
         }
+    }
+
+    // If -S was given, build the Server mode
+    if let Some(listen) = server_listen {
+        let router = match &mode {
+            Some(CliMode::Server { router, .. }) => router.clone(),
+            _ => None,
+        };
+        mode = Some(CliMode::Server {
+            listen,
+            docroot: server_docroot,
+            router: router.map(|r| r.to_string()),
+        });
     }
 
     // Default: if no mode set and stdin is not a tty, read from stdin
@@ -223,12 +273,15 @@ fn print_help() {
     println!(
         "Usage: php-rs [options] [-f] <file> [--] [args...]
        php-rs [options] -r <code> [--] [args...]
+       php-rs [options] -S <addr>:<port> [-t docroot] [router.php]
        php-rs [options] < script.php
 
 Options:
   -r <code>    Run PHP <code> without using script tags <?..?>
   -f <file>    Parse and execute <file>
   -l <file>    Syntax check only (lint)
+  -S <addr>    Run with built-in web server
+  -t <docroot> Specify document root for built-in web server (default: cwd)
   -d key=val   Define INI entry
   -c <path>    Look for php.ini file in <path>
   -n           No php.ini file will be used
@@ -547,6 +600,21 @@ fn main() {
             0
         }
         CliMode::Interactive => run_interactive(),
+        CliMode::Server {
+            listen,
+            docroot,
+            router,
+        } => {
+            let docroot = docroot
+                .map(PathBuf::from)
+                .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+            let router = router.map(PathBuf::from);
+            server::run_server(server::ServerConfig {
+                listen,
+                docroot,
+                router,
+            })
+        }
         CliMode::RunCode(code) => {
             // -r wraps in <?php automatically
             let source = format!("<?php {}", code);
@@ -842,5 +910,71 @@ mod tests {
         let args = vec!["php-rs".into()];
         let opts = parse_args(&args).unwrap();
         assert!(matches!(opts.mode, CliMode::Stdin));
+    }
+
+    // ── Server argument parsing tests ──
+
+    #[test]
+    fn test_parse_server() {
+        let args = vec!["php-rs".into(), "-S".into(), "localhost:8080".into()];
+        let opts = parse_args(&args).unwrap();
+        assert!(
+            matches!(opts.mode, CliMode::Server { ref listen, ref docroot, ref router }
+                if listen == "localhost:8080" && docroot.is_none() && router.is_none())
+        );
+    }
+
+    #[test]
+    fn test_parse_server_with_docroot() {
+        let args = vec![
+            "php-rs".into(),
+            "-S".into(),
+            "0.0.0.0:9000".into(),
+            "-t".into(),
+            "/var/www".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(
+            matches!(opts.mode, CliMode::Server { ref listen, ref docroot, .. }
+                if listen == "0.0.0.0:9000" && docroot.as_deref() == Some("/var/www"))
+        );
+    }
+
+    #[test]
+    fn test_parse_server_with_router() {
+        let args = vec![
+            "php-rs".into(),
+            "-S".into(),
+            "localhost:8080".into(),
+            "router.php".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(matches!(opts.mode, CliMode::Server { ref router, .. }
+                if router.as_deref() == Some("router.php")));
+    }
+
+    #[test]
+    fn test_parse_server_with_docroot_and_router() {
+        let args = vec![
+            "php-rs".into(),
+            "-S".into(),
+            "localhost:8080".into(),
+            "-t".into(),
+            "/srv/www".into(),
+            "router.php".into(),
+        ];
+        let opts = parse_args(&args).unwrap();
+        assert!(
+            matches!(opts.mode, CliMode::Server { ref listen, ref docroot, ref router }
+                if listen == "localhost:8080"
+                && docroot.as_deref() == Some("/srv/www")
+                && router.as_deref() == Some("router.php"))
+        );
+    }
+
+    #[test]
+    fn test_parse_server_missing_addr() {
+        let args = vec!["php-rs".into(), "-S".into()];
+        assert!(parse_args(&args).is_err());
     }
 }

@@ -731,11 +731,11 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 # Reference: php-src/sapi/cli/php_cli_server.c (~86 KB)
 ################################################################################
 
-[ ] 11.1  Implement built-in HTTP server (php -S localhost:8080)
-[ ] 11.2  Implement document root serving (-t docroot)
-[ ] 11.3  Implement router script support (php -S localhost:8080 router.php)
-[ ] 11.4  Implement $_SERVER population from HTTP request
-[ ] 11.5  Test: serve a simple PHP page, form submission, file upload
+[x] 11.1  Implement built-in HTTP server (php -S localhost:8080)
+[x] 11.2  Implement document root serving (-t docroot)
+[x] 11.3  Implement router script support (php -S localhost:8080 router.php)
+[x] 11.4  Implement $_SERVER population from HTTP request
+[x] 11.5  Test: serve a simple PHP page, form submission, file upload
 
 ################################################################################
 # PHASE 12: FPM SAPI (crates/php-rs-sapi-fpm)
