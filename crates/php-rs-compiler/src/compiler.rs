@@ -46,7 +46,10 @@ impl ExprResult {
 struct LoopContext {
     /// Opline indices of ZEND_JMP instructions that need patching to point after the loop.
     break_patches: Vec<u32>,
+    /// Opline indices of ZEND_JMP instructions from `continue` that need patching.
+    continue_patches: Vec<u32>,
     /// The opline index to jump to for `continue` (loop condition or increment).
+    /// Only valid after the continue target is known; 0 means "needs patching".
     continue_target: u32,
     /// Whether this is a foreach loop (needs FE_FREE on break).
     foreach_var: Option<ExprResult>,
@@ -1499,6 +1502,7 @@ impl Compiler {
         // Push loop context
         self.loop_stack.push(LoopContext {
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             continue_target: loop_start,
             foreach_var: None,
         });
@@ -1537,6 +1541,7 @@ impl Compiler {
         // We don't know the condition location yet, so we'll set it below
         self.loop_stack.push(LoopContext {
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             continue_target: 0, // will patch
             foreach_var: None,
         });
@@ -1548,6 +1553,9 @@ impl Compiler {
         let cond_start = self.op_array.next_opline();
         if let Some(ctx) = self.loop_stack.last_mut() {
             ctx.continue_target = cond_start;
+            for patch_idx in std::mem::take(&mut ctx.continue_patches) {
+                self.op_array.opcodes[patch_idx as usize].op1 = Operand::jmp_target(cond_start);
+            }
         }
 
         let cond = self.compile_expr(condition);
@@ -1609,6 +1617,7 @@ impl Compiler {
         // We don't know it yet, push a placeholder
         self.loop_stack.push(LoopContext {
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             continue_target: 0, // will patch
             foreach_var: None,
         });
@@ -1620,6 +1629,10 @@ impl Compiler {
         let incr_start = self.op_array.next_opline();
         if let Some(ctx) = self.loop_stack.last_mut() {
             ctx.continue_target = incr_start;
+            // Patch any continue JMPs that were emitted before we knew the target
+            for patch_idx in std::mem::take(&mut ctx.continue_patches) {
+                self.op_array.opcodes[patch_idx as usize].op1 = Operand::jmp_target(incr_start);
+            }
         }
 
         for expr in increment {
@@ -1697,6 +1710,7 @@ impl Compiler {
         let fe_result = ExprResult::tmp(fe_tmp);
         self.loop_stack.push(LoopContext {
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             continue_target: fetch_start,
             foreach_var: Some(fe_result),
         });
@@ -1738,6 +1752,7 @@ impl Compiler {
 
         self.loop_stack.push(LoopContext {
             break_patches: Vec::new(),
+            continue_patches: Vec::new(),
             continue_target: 0, // continue in switch = break
             foreach_var: None,
         });
@@ -1800,6 +1815,10 @@ impl Compiler {
         for patch_idx in ctx.break_patches {
             self.op_array.opcodes[patch_idx as usize].op1 = Operand::jmp_target(after_switch);
         }
+        // In switch, continue acts like break
+        for patch_idx in ctx.continue_patches {
+            self.op_array.opcodes[patch_idx as usize].op1 = Operand::jmp_target(after_switch);
+        }
         for patch_idx in end_patches {
             self.op_array.opcodes[patch_idx as usize].op1 = Operand::jmp_target(after_switch);
         }
@@ -1851,12 +1870,21 @@ impl Compiler {
         };
 
         let loop_idx = self.loop_stack.len().saturating_sub(level);
-        if let Some(ctx) = self.loop_stack.get(loop_idx) {
+        if let Some(ctx) = self.loop_stack.get_mut(loop_idx) {
             let target = ctx.continue_target;
-            self.op_array.emit(
-                ZOp::new(ZOpcode::Jmp, line)
-                    .with_op1(Operand::jmp_target(target), OperandType::Unused),
-            );
+            if target == 0 {
+                // Target not yet known — emit placeholder JMP and record for patching
+                let jmp_idx = self.op_array.emit(
+                    ZOp::new(ZOpcode::Jmp, line)
+                        .with_op1(Operand::jmp_target(0), OperandType::Unused),
+                );
+                ctx.continue_patches.push(jmp_idx);
+            } else {
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::Jmp, line)
+                        .with_op1(Operand::jmp_target(target), OperandType::Unused),
+                );
+            }
         }
     }
 
@@ -1982,9 +2010,11 @@ impl Compiler {
     fn setup_params(&self, func_oa: &mut ZOpArray, params: &[Parameter]) {
         let mut required = 0u32;
         for param in params {
-            func_oa.lookup_cv(&param.name);
+            // Strip leading $ from parameter name to match variable reference CVs
+            let cv_name = param.name.strip_prefix('$').unwrap_or(&param.name);
+            func_oa.lookup_cv(cv_name);
             func_oa.arg_info.push(ArgInfo {
-                name: param.name.clone(),
+                name: cv_name.to_string(),
                 pass_by_reference: param.by_ref,
                 is_variadic: param.variadic,
             });

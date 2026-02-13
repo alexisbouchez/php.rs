@@ -309,6 +309,7 @@ name = "php-rs-vm"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "php-rs-compiler",
 ]
 
 [[package]]

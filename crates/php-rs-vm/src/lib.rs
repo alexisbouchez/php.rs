@@ -1,12 +1,10 @@
 //! PHP virtual machine
 //!
-//! This crate implements the Zend VM executor (212 opcodes).
+//! This crate implements the Zend VM executor.
 //! Equivalent to php-src/Zend/zend_vm_execute.h and zend_vm_def.h
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_placeholder() {
-        // Placeholder test to ensure the crate compiles
-    }
-}
+pub mod value;
+pub mod vm;
+
+pub use value::{PhpArray, Value};
+pub use vm::{Vm, VmError, VmResult};
