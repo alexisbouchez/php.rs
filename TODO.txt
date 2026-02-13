@@ -180,9 +180,9 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
          (209/211 pass = 99.1%, 2 skipped: cross-tag braces + invalid octal literal)
 
 ## 3.4 Error recovery
-[ ] 3.4.1  Implement parse error reporting with line/column
-[ ] 3.4.2  Test: meaningful error messages for common mistakes
-[ ] 3.4.3  Match PHP's exact error messages where possible
+[x] 3.4.1  Implement parse error reporting with line/column
+[x] 3.4.2  Test: meaningful error messages for common mistakes
+[x] 3.4.3  Match PHP's exact error messages where possible
 
 ################################################################################
 # PHASE 4: COMPILER (crates/php-rs-compiler)

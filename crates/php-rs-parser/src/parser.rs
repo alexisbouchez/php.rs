@@ -78,6 +78,22 @@ impl<'a> Parser<'a> {
         &self.peeked.as_ref().unwrap().0
     }
 
+    /// Create a parse error, automatically using UnexpectedEof when at end of file
+    fn error(&self, expected: &str) -> ParseError {
+        if self.current_token == Token::End {
+            ParseError::UnexpectedEof {
+                expected: expected.to_string(),
+                span: self.current_span,
+            }
+        } else {
+            ParseError::UnexpectedToken {
+                expected: expected.to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            }
+        }
+    }
+
     /// Expect a semicolon or close tag (which acts as semicolon in PHP)
     fn expect_semicolon(&mut self) -> Result<Span, ParseError> {
         if self.current_token == Token::Semicolon {
@@ -90,11 +106,7 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(span)
         } else {
-            Err(ParseError::UnexpectedToken {
-                expected: "Semicolon".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            })
+            Err(self.error("\";\""))
         }
     }
 
@@ -105,11 +117,7 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(span)
         } else {
-            Err(ParseError::UnexpectedToken {
-                expected: "Colon".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            })
+            Err(self.error("\":\""))
         }
     }
 
@@ -120,11 +128,7 @@ impl<'a> Parser<'a> {
             self.advance();
             Ok(span)
         } else {
-            Err(ParseError::UnexpectedToken {
-                expected: format!("{:?}", expected),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            })
+            Err(self.error(&format!("{}", expected)))
         }
     }
 
@@ -421,11 +425,7 @@ impl<'a> Parser<'a> {
                         self.advance();
                         n
                     } else {
-                        return Err(ParseError::UnexpectedToken {
-                            expected: "variable".to_string(),
-                            found: self.current_token.clone(),
-                            span: self.current_span,
-                        });
+                        return Err(self.error("variable"));
                     };
                     let default = if self.current_token == Token::Equals {
                         self.advance();
@@ -500,11 +500,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 n
             } else {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "directive name".to_string(),
-                    found: self.current_token.clone(),
-                    span: self.current_span,
-                });
+                return Err(self.error("directive name"));
             };
             self.expect(Token::Equals)?;
             let value = self.parse_expression(0)?;
@@ -563,11 +559,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 n
             } else {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "constant name".to_string(),
-                    found: self.current_token.clone(),
-                    span: self.current_span,
-                });
+                return Err(self.error("constant name"));
             };
             self.expect(Token::Equals)?;
             let value = self.parse_expression(0)?;
@@ -594,11 +586,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "label name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("label name"));
         };
         self.expect_semicolon()?;
         Ok(Statement::Goto {
@@ -955,11 +943,7 @@ impl<'a> Parser<'a> {
                         statements,
                     });
                 } else {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: "case or default".to_string(),
-                        found: self.current_token.clone(),
-                        span: self.current_span,
-                    });
+                    return Err(self.error("\"case\" or \"default\""));
                 }
             }
 
@@ -1007,11 +991,7 @@ impl<'a> Parser<'a> {
                         statements,
                     });
                 } else {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: "case or default".to_string(),
-                        found: self.current_token.clone(),
-                        span: self.current_span,
-                    });
+                    return Err(self.error("\"case\" or \"default\""));
                 }
             }
 
@@ -1077,11 +1057,7 @@ impl<'a> Parser<'a> {
             if self.current_token == Token::Comma {
                 self.advance();
             } else if self.current_token != Token::RBrace {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "comma or }".to_string(),
-                    found: self.current_token.clone(),
-                    span: self.current_span,
-                });
+                return Err(self.error("\",\" or \"}\""));
             }
         }
 
@@ -1179,11 +1155,7 @@ impl<'a> Parser<'a> {
 
         // Validate: must have at least one catch or a finally block
         if catches.is_empty() && finally.is_none() {
-            return Err(ParseError::UnexpectedToken {
-                expected: "catch or finally clause".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("\"catch\" or \"finally\""));
         }
 
         Ok(Statement::Try {
@@ -1292,11 +1264,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
             } else {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "identifier".to_string(),
-                    found: self.current_token.clone(),
-                    span: self.current_span,
-                });
+                return Err(self.error("identifier"));
             }
             break;
         }
@@ -1331,11 +1299,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "function name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("function name"));
         };
 
         // Parse parameter list
@@ -1403,11 +1367,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "class name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("class name"));
         };
 
         // Parse optional extends clause
@@ -1548,11 +1508,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 name
             } else {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "property name (variable)".to_string(),
-                    found: self.current_token.clone(),
-                    span: self.current_span,
-                });
+                return Err(self.error("variable"));
             };
 
             // Parse optional default value
@@ -1641,20 +1597,12 @@ impl<'a> Parser<'a> {
                     "get" => PropertyHookKind::Get,
                     "set" => PropertyHookKind::Set,
                     _ => {
-                        return Err(ParseError::UnexpectedToken {
-                            expected: "'get' or 'set'".to_string(),
-                            found: self.current_token.clone(),
-                            span: self.current_span,
-                        });
+                        return Err(self.error("\"get\" or \"set\""));
                     }
                 }
             }
             _ => {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "'get' or 'set'".to_string(),
-                    found: self.current_token.clone(),
-                    span: self.current_span,
-                });
+                return Err(self.error("\"get\" or \"set\""));
             }
         };
         self.advance();
@@ -1692,11 +1640,7 @@ impl<'a> Parser<'a> {
             self.expect(Token::RBrace)?;
             PropertyHookBody::Block(statements)
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "'=>' or '{'".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("\"=>\" or \"{\""));
         };
 
         Ok(PropertyHook {
@@ -1731,11 +1675,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "method name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("method name"));
         };
 
         // Parse parameters
@@ -1774,11 +1714,7 @@ impl<'a> Parser<'a> {
             self.expect(Token::RBrace)?;
             Some(statements)
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "';' or '{'".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("\";\" or \"{\""));
         };
 
         Ok(ClassMember::Method {
@@ -1808,11 +1744,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "constant name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("constant name"));
         };
 
         // Expect = value
@@ -1900,11 +1832,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "interface name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("interface name"));
         };
 
         // Parse optional extends clause (interfaces can extend multiple interfaces)
@@ -1957,11 +1885,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "trait name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("trait name"));
         };
 
         // Parse trait body
@@ -1996,11 +1920,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "enum name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("enum name"));
         };
 
         // Parse optional backing type (: int or : string)
@@ -2110,11 +2030,7 @@ impl<'a> Parser<'a> {
                 span: start_span,
             })
         } else {
-            Err(ParseError::UnexpectedToken {
-                expected: "';' or '{'".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            })
+            Err(self.error("\";\" or \"{\""))
         }
     }
 
@@ -2158,11 +2074,7 @@ impl<'a> Parser<'a> {
                     self.advance();
                     Some(a)
                 } else {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: "alias identifier".to_string(),
-                        found: self.current_token.clone(),
-                        span: self.current_span,
-                    });
+                    return Err(self.error("identifier"));
                 }
             } else {
                 None
@@ -2178,11 +2090,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 break;
             } else {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "',' or ';'".to_string(),
-                    found: self.current_token.clone(),
-                    span: self.current_span,
-                });
+                return Err(self.error("\",\" or \";\""));
             }
         }
 
@@ -2260,11 +2168,7 @@ impl<'a> Parser<'a> {
             self.advance();
             n
         } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "parameter name (variable)".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            });
+            return Err(self.error("variable"));
         };
 
         // Parse optional default value
@@ -2470,11 +2374,7 @@ impl<'a> Parser<'a> {
             self.expect(Token::RBrace)?;
             Ok(prop)
         } else {
-            Err(ParseError::UnexpectedToken {
-                expected: "property name".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
-            })
+            Err(self.error("property name"))
         }
     }
 
@@ -2920,11 +2820,7 @@ impl<'a> Parser<'a> {
                     if self.current_token == Token::Comma {
                         self.advance();
                     } else if self.current_token != Token::RBrace {
-                        return Err(ParseError::UnexpectedToken {
-                            expected: "comma or }".to_string(),
-                            found: self.current_token.clone(),
-                            span: self.current_span,
-                        });
+                        return Err(self.error("\",\" or \"}\""));
                     }
                 }
 
@@ -3526,11 +3422,7 @@ impl<'a> Parser<'a> {
                 self.advance();
                 n
             } else {
-                return Err(ParseError::UnexpectedToken {
-                    expected: "variable in use clause".to_string(),
-                    found: self.current_token.clone(),
-                    span: self.current_span,
-                });
+                return Err(self.error("variable"));
             };
 
             uses.push(ClosureUse { name, by_ref });
@@ -3844,11 +3736,7 @@ impl<'a> Parser<'a> {
                         span,
                     })
                 } else {
-                    Err(ParseError::UnexpectedToken {
-                        expected: "static member name".to_string(),
-                        found: self.current_token.clone(),
-                        span: self.current_span,
-                    })
+                    Err(self.error("static member name"))
                 }
             }
 
@@ -4015,7 +3903,10 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Parse error
+/// Parse error with line/column information
+///
+/// Formats error messages in PHP's style:
+/// `Parse error: syntax error, unexpected token "}", expecting ";" on line 5`
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParseError {
     UnexpectedToken {
@@ -4023,8 +3914,80 @@ pub enum ParseError {
         found: Token,
         span: Span,
     },
-    UnexpectedEof,
+    UnexpectedEof {
+        expected: String,
+        span: Span,
+    },
 }
+
+impl ParseError {
+    /// Returns the line number where the error occurred (1-indexed).
+    pub fn line(&self) -> usize {
+        match self {
+            ParseError::UnexpectedToken { span, .. } => span.line,
+            ParseError::UnexpectedEof { span, .. } => span.line,
+        }
+    }
+
+    /// Returns the column number where the error occurred (1-indexed).
+    pub fn column(&self) -> usize {
+        match self {
+            ParseError::UnexpectedToken { span, .. } => span.column,
+            ParseError::UnexpectedEof { span, .. } => span.column,
+        }
+    }
+
+    /// Returns the span where the error occurred.
+    pub fn span(&self) -> &Span {
+        match self {
+            ParseError::UnexpectedToken { span, .. } => span,
+            ParseError::UnexpectedEof { span, .. } => span,
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::UnexpectedToken {
+                expected,
+                found,
+                span,
+            } => {
+                if expected.is_empty() {
+                    write!(
+                        f,
+                        "Parse error: syntax error, unexpected token {} on line {}",
+                        found, span.line
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Parse error: syntax error, unexpected token {}, expecting {} on line {}",
+                        found, expected, span.line
+                    )
+                }
+            }
+            ParseError::UnexpectedEof { expected, span } => {
+                if expected.is_empty() {
+                    write!(
+                        f,
+                        "Parse error: syntax error, unexpected end of file on line {}",
+                        span.line
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Parse error: syntax error, unexpected end of file, expecting {} on line {}",
+                        expected, span.line
+                    )
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 #[cfg(test)]
 mod tests {
@@ -6454,5 +6417,157 @@ mod tests {
             }
             _ => panic!("Expected class declaration"),
         }
+    }
+
+    // ================================================================
+    // Error reporting tests (3.4.1, 3.4.2)
+    // ================================================================
+
+    #[test]
+    fn test_error_has_line_number() {
+        let source = "<?php\n$x = 1;\n$y = ;\n";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        // The error should be on line 3 where the unexpected ";" is
+        assert_eq!(err.line(), 3);
+        let msg = format!("{}", err);
+        assert!(msg.contains("on line 3"), "Error message: {}", msg);
+    }
+
+    #[test]
+    fn test_error_has_column_info() {
+        let source = "<?php $x = ;";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        assert!(err.column() > 1);
+    }
+
+    #[test]
+    fn test_error_missing_semicolon() {
+        let source = "<?php echo 1\necho 2;";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("expecting") && msg.contains("\";\""),
+            "Expected semicolon message, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_error_unexpected_token_display() {
+        let source = "<?php if ( { }";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.starts_with("Parse error: syntax error, unexpected token"),
+            "Error message: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_error_unexpected_eof() {
+        let source = "<?php function foo(";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("unexpected end of file") || msg.contains("unexpected token"),
+            "Error message: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_error_unclosed_brace() {
+        let source = "<?php if (true) {";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("end of file"),
+            "Expected EOF error for unclosed brace, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_error_multiline_reports_correct_line() {
+        let source = "<?php\n\n\n\n\n$x = ;";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        assert_eq!(err.line(), 6, "Error should be on line 6");
+    }
+
+    #[test]
+    fn test_error_is_std_error() {
+        // Verify ParseError implements std::error::Error
+        let source = "<?php $x = ;";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        let _: &dyn std::error::Error = &err;
+    }
+
+    #[test]
+    fn test_error_span_accessor() {
+        let source = "<?php $x = ;";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        let span = err.span();
+        assert!(span.line >= 1);
+        assert!(span.column >= 1);
+        assert!(span.start <= span.end);
+    }
+
+    #[test]
+    fn test_error_missing_closing_paren() {
+        let source = "<?php if (true { }";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("\")\"") || msg.contains("RParen"),
+            "Expected closing paren in error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_error_invalid_class_member() {
+        let source = "<?php class Foo { 42; }";
+        let mut parser = Parser::new(source);
+        let err = parser.parse().unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Parse error"),
+            "Expected parse error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_token_display_names() {
+        // Test PHP-style token display names
+        assert_eq!(format!("{}", Token::Semicolon), "\";\"");
+        assert_eq!(format!("{}", Token::LBrace), "\"{\"");
+        assert_eq!(format!("{}", Token::RBrace), "\"}\"");
+        assert_eq!(format!("{}", Token::LParen), "\"(\"");
+        assert_eq!(format!("{}", Token::RParen), "\")\"");
+        assert_eq!(format!("{}", Token::If), "\"if\"");
+        assert_eq!(format!("{}", Token::Class), "\"class\"");
+        assert_eq!(format!("{}", Token::Function), "\"function\"");
+        assert_eq!(format!("{}", Token::End), "end of file");
+        assert_eq!(format!("{}", Token::Variable), "variable");
+        assert_eq!(format!("{}", Token::LNumber), "integer");
+        assert_eq!(format!("{}", Token::DNumber), "floating-point number");
+        assert_eq!(format!("{}", Token::ConstantEncapsedString), "string");
+        assert_eq!(format!("{}", Token::String), "identifier");
+        assert_eq!(format!("{}", Token::PaamayimNekudotayim), "\"::\"");
+        assert_eq!(format!("{}", Token::ObjectOperator), "\"->\"");
+        assert_eq!(format!("{}", Token::DoubleArrow), "\"=>\"");
+        assert_eq!(format!("{}", Token::Ellipsis), "\"...\"");
     }
 }

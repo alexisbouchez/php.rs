@@ -431,6 +431,231 @@ pub enum Token {
     Error,
 }
 
+impl std::fmt::Display for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            // Literals
+            Token::LNumber => "integer",
+            Token::DNumber => "floating-point number",
+            Token::String => "identifier",
+            Token::NameFullyQualified => "fully qualified name",
+            Token::NameRelative => "namespace-relative name",
+            Token::NameQualified => "qualified name",
+            Token::Variable => "variable",
+            Token::InlineHtml => "inline HTML",
+            Token::EncapsedAndWhitespace => "string content",
+            Token::ConstantEncapsedString => "string",
+            Token::StringVarname => "variable name",
+            Token::NumString => "number",
+
+            // Keywords
+            Token::Include => "\"include\"",
+            Token::IncludeOnce => "\"include_once\"",
+            Token::Eval => "\"eval\"",
+            Token::Require => "\"require\"",
+            Token::RequireOnce => "\"require_once\"",
+            Token::LogicalOr => "\"or\"",
+            Token::LogicalXor => "\"xor\"",
+            Token::LogicalAnd => "\"and\"",
+            Token::Print => "\"print\"",
+            Token::Yield => "\"yield\"",
+            Token::YieldFrom => "\"yield from\"",
+            Token::Instanceof => "\"instanceof\"",
+            Token::New => "\"new\"",
+            Token::Clone => "\"clone\"",
+            Token::Exit => "\"exit\"",
+            Token::If => "\"if\"",
+            Token::Elseif => "\"elseif\"",
+            Token::Else => "\"else\"",
+            Token::Endif => "\"endif\"",
+            Token::Echo => "\"echo\"",
+            Token::Do => "\"do\"",
+            Token::While => "\"while\"",
+            Token::Endwhile => "\"endwhile\"",
+            Token::For => "\"for\"",
+            Token::Endfor => "\"endfor\"",
+            Token::Foreach => "\"foreach\"",
+            Token::Endforeach => "\"endforeach\"",
+            Token::Declare => "\"declare\"",
+            Token::Enddeclare => "\"enddeclare\"",
+            Token::As => "\"as\"",
+            Token::Switch => "\"switch\"",
+            Token::Endswitch => "\"endswitch\"",
+            Token::Case => "\"case\"",
+            Token::Default => "\"default\"",
+            Token::Match => "\"match\"",
+            Token::Break => "\"break\"",
+            Token::Continue => "\"continue\"",
+            Token::Goto => "\"goto\"",
+            Token::Function => "\"function\"",
+            Token::Fn => "\"fn\"",
+            Token::Const => "\"const\"",
+            Token::Return => "\"return\"",
+            Token::Try => "\"try\"",
+            Token::Catch => "\"catch\"",
+            Token::Finally => "\"finally\"",
+            Token::Throw => "\"throw\"",
+            Token::Use => "\"use\"",
+            Token::Insteadof => "\"insteadof\"",
+            Token::Global => "\"global\"",
+            Token::Static => "\"static\"",
+            Token::Abstract => "\"abstract\"",
+            Token::Final => "\"final\"",
+            Token::Private => "\"private\"",
+            Token::Protected => "\"protected\"",
+            Token::Public => "\"public\"",
+            Token::PrivateSet => "\"private(set)\"",
+            Token::ProtectedSet => "\"protected(set)\"",
+            Token::PublicSet => "\"public(set)\"",
+            Token::Readonly => "\"readonly\"",
+            Token::Var => "\"var\"",
+            Token::Unset => "\"unset\"",
+            Token::Isset => "\"isset\"",
+            Token::Empty => "\"empty\"",
+            Token::HaltCompiler => "\"__halt_compiler\"",
+            Token::Class => "\"class\"",
+            Token::Trait => "\"trait\"",
+            Token::Interface => "\"interface\"",
+            Token::Enum => "\"enum\"",
+            Token::Extends => "\"extends\"",
+            Token::Implements => "\"implements\"",
+            Token::Namespace => "\"namespace\"",
+            Token::List => "\"list\"",
+            Token::Array => "\"array\"",
+            Token::Callable => "\"callable\"",
+
+            // Magic constants
+            Token::Line => "\"__LINE__\"",
+            Token::File => "\"__FILE__\"",
+            Token::Dir => "\"__DIR__\"",
+            Token::ClassC => "\"__CLASS__\"",
+            Token::TraitC => "\"__TRAIT__\"",
+            Token::MethodC => "\"__METHOD__\"",
+            Token::FuncC => "\"__FUNCTION__\"",
+            Token::PropertyC => "\"__PROPERTY__\"",
+            Token::NsC => "\"__NAMESPACE__\"",
+
+            // Special
+            Token::End => "end of file",
+            Token::Attribute => "\"#[\"",
+
+            // Compound assignment
+            Token::PlusEqual => "\"+=\"",
+            Token::MinusEqual => "\"-=\"",
+            Token::MulEqual => "\"*=\"",
+            Token::DivEqual => "\"/=\"",
+            Token::ConcatEqual => "\".=\"",
+            Token::ModEqual => "\"%=\"",
+            Token::AndEqual => "\"&=\"",
+            Token::OrEqual => "\"|=\"",
+            Token::XorEqual => "\"^=\"",
+            Token::SlEqual => "\"<<=\"",
+            Token::SrEqual => "\">>=\"",
+            Token::CoalesceEqual => "\"??=\"",
+
+            // Boolean operators
+            Token::BooleanOr => "\"||\"",
+            Token::BooleanAnd => "\"&&\"",
+
+            // Comparison
+            Token::IsEqual => "\"==\"",
+            Token::IsNotEqual => "\"!=\"",
+            Token::IsIdentical => "\"===\"",
+            Token::IsNotIdentical => "\"!==\"",
+            Token::IsSmallerOrEqual => "\"<=\"",
+            Token::IsGreaterOrEqual => "\">=\"",
+            Token::Spaceship => "\"<=>\"",
+
+            // Bitwise shift
+            Token::Sl => "\"<<\"",
+            Token::Sr => "\">>\"",
+
+            // Increment/decrement
+            Token::Inc => "\"++\"",
+            Token::Dec => "\"--\"",
+
+            // Cast
+            Token::IntCast => "\"(int)\"",
+            Token::DoubleCast => "\"(double)\"",
+            Token::StringCast => "\"(string)\"",
+            Token::ArrayCast => "\"(array)\"",
+            Token::ObjectCast => "\"(object)\"",
+            Token::BoolCast => "\"(bool)\"",
+            Token::UnsetCast => "\"(unset)\"",
+            Token::VoidCast => "\"(void)\"",
+
+            // Object operators
+            Token::ObjectOperator => "\"->\"",
+            Token::NullsafeObjectOperator => "\"?->\"",
+            Token::DoubleArrow => "\"=>\"",
+
+            // Comments/whitespace
+            Token::Comment => "comment",
+            Token::DocComment => "doc comment",
+            Token::Whitespace => "whitespace",
+
+            // PHP tags
+            Token::OpenTag => "\"<?php\"",
+            Token::OpenTagWithEcho => "\"<?=\"",
+            Token::CloseTag => "\"?>\"",
+
+            // Heredoc/Nowdoc
+            Token::StartHeredoc => "heredoc start",
+            Token::EndHeredoc => "heredoc end",
+
+            // String interpolation
+            Token::DollarOpenCurlyBraces => "\"${\"",
+            Token::CurlyOpen => "\"{$\"",
+
+            // Scope resolution
+            Token::PaamayimNekudotayim => "\"::\"",
+            Token::NsSeparator => "\"\\\"",
+
+            // Other operators
+            Token::Ellipsis => "\"...\"",
+            Token::Coalesce => "\"??\"",
+            Token::Pow => "\"**\"",
+            Token::PowEqual => "\"**=\"",
+            Token::Pipe => "\"|>\"",
+            Token::AmpersandFollowedByVarOrVararg => "\"&\"",
+            Token::AmpersandNotFollowedByVarOrVararg => "\"&\"",
+
+            // Single-character
+            Token::Plus => "\"+\"",
+            Token::Minus => "\"-\"",
+            Token::Star => "\"*\"",
+            Token::Slash => "\"/\"",
+            Token::Percent => "\"%\"",
+            Token::Equals => "\"=\"",
+            Token::LessThan => "\"<\"",
+            Token::GreaterThan => "\">\"",
+            Token::Exclamation => "\"!\"",
+            Token::Ampersand => "\"&\"",
+            Token::VerticalBar => "\"|\"",
+            Token::Caret => "\"^\"",
+            Token::Tilde => "\"~\"",
+            Token::LParen => "\"(\"",
+            Token::RParen => "\")\"",
+            Token::LBrace => "\"{\"",
+            Token::RBrace => "\"}\"",
+            Token::LBracket => "\"[\"",
+            Token::RBracket => "\"]\"",
+            Token::Semicolon => "\";\"",
+            Token::Comma => "\",\"",
+            Token::Dot => "\".\"",
+            Token::Colon => "\":\"",
+            Token::Question => "\"?\"",
+            Token::At => "\"@\"",
+            Token::Backslash => "\"\\\"",
+
+            // Error tokens
+            Token::BadCharacter => "bad character",
+            Token::Error => "error",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
