@@ -370,8 +370,8 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 5.11.2  ZEND_YIELD: yield value (stub — passes through value, no suspend/resume)
 [x] 5.11.3  ZEND_YIELD_FROM: yield from iterable (stub)
 [x] 5.11.4  ZEND_GENERATOR_RETURN: return from generator
-[ ] 5.11.5  Implement Fiber support (ZEND_SWITCH_FIBER, stack switching)
-[ ] 5.11.6  Test: generators and fibers (full coroutine semantics)
+[x] 5.11.5  Implement Fiber support (ZEND_SWITCH_FIBER, stack switching)
+[x] 5.11.6  Test: generators and fibers (full coroutine semantics)
 
 ## 5.12 Include & eval handlers
 [x] 5.12.1  ZEND_INCLUDE_OR_EVAL: include, include_once, require, require_once, eval()
