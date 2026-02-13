@@ -348,6 +348,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "php-rs-sapi-embed"
+version = "0.1.0"
+dependencies = [
+ "php-rs-compiler",
+ "php-rs-runtime",
+ "php-rs-vm",
+]
+
+[[package]]
+name = "php-rs-sapi-fpm"
+version = "0.1.0"
+dependencies = [
+ "php-rs-compiler",
+ "php-rs-runtime",
+ "php-rs-vm",
+]
+
+[[package]]
 name = "php-rs-types"
 version = "0.1.0"
 

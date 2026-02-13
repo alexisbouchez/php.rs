@@ -743,14 +743,14 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 # Reference: php-src/sapi/fpm/ (32 C files)
 ################################################################################
 
-[ ] 12.1  Implement FastCGI protocol (request parsing, response framing)
-[ ] 12.2  Implement master process (signal handling, config loading)
-[ ] 12.3  Implement worker pool management (spawn, retire, max_children)
-[ ] 12.4  Implement pm modes: static, dynamic, ondemand
-[ ] 12.5  Implement pool configuration (listen, user, group, pm.*)
-[ ] 12.6  Implement slow log, access log
-[ ] 12.7  Implement status page (/status, /ping)
-[ ] 12.8  Implement graceful reload (SIGUSR2)
+[x] 12.1  Implement FastCGI protocol (request parsing, response framing)
+[x] 12.2  Implement master process (signal handling, config loading)
+[x] 12.3  Implement worker pool management (spawn, retire, max_children)
+[x] 12.4  Implement pm modes: static, dynamic, ondemand
+[x] 12.5  Implement pool configuration (listen, user, group, pm.*)
+[x] 12.6  Implement slow log, access log
+[x] 12.7  Implement status page (/status, /ping)
+[x] 12.8  Implement graceful reload (SIGUSR2)
 [ ] 12.9  Test: FPM behind nginx, concurrent request handling
 
 ################################################################################
@@ -759,10 +759,10 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 # Reference: php-src/sapi/embed/
 ################################################################################
 
-[ ] 13.1  Implement embeddable library interface (php_embed_init, php_embed_shutdown)
-[ ] 13.2  Implement eval_string, execute_file from host application
-[ ] 13.3  Implement value exchange between Rust host and PHP runtime
-[ ] 13.4  Test: embed in a Rust application, call PHP functions from Rust
+[x] 13.1  Implement embeddable library interface (php_embed_init, php_embed_shutdown)
+[x] 13.2  Implement eval_string, execute_file from host application
+[x] 13.3  Implement value exchange between Rust host and PHP runtime
+[x] 13.4  Test: embed in a Rust application, call PHP functions from Rust
 
 ################################################################################
 # PHASE 14: COMPATIBILITY TEST SUITE

@@ -19,6 +19,8 @@ members = [
     "crates/php-rs-ext-ctype",
     "crates/php-rs-ext-tokenizer",
     "crates/php-rs-sapi-cli",
+    "crates/php-rs-sapi-fpm",
+    "crates/php-rs-sapi-embed",
 ]
 
 [workspace.package]

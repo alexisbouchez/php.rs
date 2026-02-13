@@ -1,0 +1,14 @@
+[package]
+name = "php-rs-sapi-embed"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+php-rs-compiler = { path = "../php-rs-compiler" }
+php-rs-vm = { path = "../php-rs-vm" }
+php-rs-runtime = { path = "../php-rs-runtime" }
+
+[dev-dependencies]
