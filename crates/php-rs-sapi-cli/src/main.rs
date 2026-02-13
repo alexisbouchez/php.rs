@@ -1011,7 +1011,11 @@ mod tests {
 
     #[test]
     fn test_superglobal_server_argv_array() {
-        let argv = vec!["script.php".to_string(), "one".to_string(), "two".to_string()];
+        let argv = vec![
+            "script.php".to_string(),
+            "one".to_string(),
+            "two".to_string(),
+        ];
         let (code, out) = execute_php_capture(
             "<?php $a = $_SERVER['argv']; echo $a[0].','.$a[1].','.$a[2];",
             &IniSystem::new(),

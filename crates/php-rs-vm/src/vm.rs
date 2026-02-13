@@ -151,6 +151,10 @@ pub struct Vm {
     fibers: HashMap<u64, crate::value::FiberState>,
     /// Currently executing fiber object_id (if any).
     current_fiber_id: Option<u64>,
+    /// Next closure ID for unique naming.
+    next_closure_id: u64,
+    /// Captured variable bindings for closures: closure_name → [(var_name, value)].
+    closure_bindings: HashMap<String, Vec<(String, Value)>>,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -185,6 +189,8 @@ impl Vm {
             generators: HashMap::new(),
             fibers: HashMap::new(),
             current_fiber_id: None,
+            next_closure_id: 0,
+            closure_bindings: HashMap::new(),
         }
     }
 
@@ -258,10 +264,15 @@ impl Vm {
     }
 
     /// Register dynamic_func_defs from an op_array into the function table.
+    /// Skips closures ({closure}) — those are registered at runtime via DeclareLambdaFunction.
     fn register_dynamic_func_defs(&mut self, parent_idx: usize) {
         let defs: Vec<ZOpArray> = self.op_arrays[parent_idx].dynamic_func_defs.clone();
         for def in defs {
             if let Some(ref name) = def.function_name {
+                // Skip closures; they're registered dynamically when DeclareLambdaFunction executes
+                if name == "{closure}" {
+                    continue;
+                }
                 let idx = self.op_arrays.len();
                 let name = name.clone();
                 self.op_arrays.push(def);
@@ -721,7 +732,10 @@ impl Vm {
                         let obj_id = o.object_id;
                         // Initialize the generator
                         self.ensure_generator_initialized(obj_id)?;
-                        let iter = Value::_GeneratorIterator { object_id: obj_id };
+                        let iter = Value::_GeneratorIterator {
+                            object_id: obj_id,
+                            needs_advance: false,
+                        };
                         self.write_result(op, oa_idx, iter)?;
                         Ok(DispatchSignal::Next)
                     }
@@ -781,8 +795,23 @@ impl Vm {
                         }
                         Ok(DispatchSignal::Jump(op.op2.val as usize))
                     }
-                } else if let Value::_GeneratorIterator { object_id } = iter {
-                    // Generator iterator
+                } else if let Value::_GeneratorIterator {
+                    object_id,
+                    needs_advance,
+                } = iter
+                {
+                    // Generator iterator: advance first (if not the first fetch), then read.
+                    if needs_advance {
+                        let status = self
+                            .generators
+                            .get(&object_id)
+                            .map(|g| g.status)
+                            .unwrap_or(crate::value::GeneratorStatus::Closed);
+                        if status == crate::value::GeneratorStatus::Suspended {
+                            self.resume_generator(object_id)?;
+                        }
+                    }
+
                     let gen_status = self
                         .generators
                         .get(&object_id)
@@ -817,19 +846,12 @@ impl Vm {
                             frame.ip += 1;
                         }
 
-                        // Restore the iterator in the iter slot
+                        // Mark iterator as needing advance on next fetch
                         let frame = self.call_stack.last_mut().unwrap();
-                        frame.temps[iter_slot] = Value::_GeneratorIterator { object_id };
-
-                        // Advance generator to next yield
-                        let status = self
-                            .generators
-                            .get(&object_id)
-                            .map(|g| g.status)
-                            .unwrap_or(crate::value::GeneratorStatus::Closed);
-                        if status == crate::value::GeneratorStatus::Suspended {
-                            self.resume_generator(object_id)?;
-                        }
+                        frame.temps[iter_slot] = Value::_GeneratorIterator {
+                            object_id,
+                            needs_advance: true,
+                        };
 
                         Ok(DispatchSignal::Next)
                     }
@@ -899,7 +921,7 @@ impl Vm {
                 Ok(DispatchSignal::Next)
             }
             ZOpcode::InitDynamicCall => {
-                let name_val = self.read_operand(op, 2, oa_idx)?;
+                let name_val = self.read_operand(op, 1, oa_idx)?;
                 let name = name_val.to_php_string();
                 let frame = self.call_stack.last_mut().unwrap();
                 frame.call_stack_pending.push(PendingCall {
@@ -1102,8 +1124,43 @@ impl Vm {
             }
             ZOpcode::DeclareLambdaFunction => {
                 // Creates a closure value
-                // op1 = index into dynamic_func_defs
-                // For now just produce Null
+                // op1 = index into dynamic_func_defs (as constant)
+                let func_idx = op.op1.val as usize;
+                let parent_oa = &self.op_arrays[oa_idx];
+                if func_idx < parent_oa.dynamic_func_defs.len() {
+                    let closure_oa = parent_oa.dynamic_func_defs[func_idx].clone();
+                    let unique_name = format!("{{closure}}#{}", self.next_closure_id);
+                    self.next_closure_id += 1;
+                    let idx = self.op_arrays.len();
+                    self.op_arrays.push(closure_oa);
+                    self.functions.insert(unique_name.clone(), idx);
+                    self.write_result(op, oa_idx, Value::String(unique_name))?;
+                } else {
+                    self.write_result(op, oa_idx, Value::Null)?;
+                }
+                Ok(DispatchSignal::Next)
+            }
+            ZOpcode::BindLexical => {
+                // Bind a captured variable into a closure
+                // op1 = tmp_var holding closure name
+                // op2 = cv of the variable in parent scope
+                // extended_value = 0 (by value) or 1 (by reference)
+                let closure_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
+                let captured_value = self.read_operand(op, 2, oa_idx)?;
+                // Get the variable name from the parent op_array's vars list
+                let var_name = if op.op2_type == OperandType::Cv {
+                    let cv_idx = op.op2.val as usize;
+                    let parent_oa = &self.op_arrays[oa_idx];
+                    parent_oa.vars.get(cv_idx).cloned().unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                if !var_name.is_empty() {
+                    self.closure_bindings
+                        .entry(closure_name)
+                        .or_default()
+                        .push((var_name, captured_value));
+                }
                 Ok(DispatchSignal::Next)
             }
             ZOpcode::New => {
@@ -1874,6 +1931,17 @@ impl Vm {
                 }
             }
 
+            // Apply closure bindings (captured `use` variables)
+            if let Some(bindings) = self.closure_bindings.get(&func_name) {
+                for (var_name, val) in bindings {
+                    if let Some(cv_idx) = func_oa.vars.iter().position(|v| v == var_name) {
+                        if cv_idx < new_frame.cvs.len() {
+                            new_frame.cvs[cv_idx] = val.clone();
+                        }
+                    }
+                }
+            }
+
             self.call_stack.push(new_frame);
             return Ok(DispatchSignal::CallPushed);
         }
@@ -2619,6 +2687,17 @@ impl Vm {
             }
         }
 
+        // Apply closure bindings (captured `use` variables)
+        if let Some(bindings) = self.closure_bindings.get(&callback_name) {
+            for (var_name, val) in bindings {
+                if let Some(cv_idx) = func_oa.vars.iter().position(|v| v == var_name) {
+                    if cv_idx < new_frame.cvs.len() {
+                        new_frame.cvs[cv_idx] = val.clone();
+                    }
+                }
+            }
+        }
+
         let start_depth = self.call_stack.len();
 
         if let Some(fiber) = self.fibers.get_mut(&object_id) {
@@ -2651,13 +2730,17 @@ impl Vm {
         result?;
 
         // When the fiber terminated, return its return value; when suspended, return transfer_value.
-        let value = self.fibers.get(&object_id).map(|f| {
-            if f.status == FiberStatus::Terminated {
-                f.return_value.clone().unwrap_or(Value::Null)
-            } else {
-                f.transfer_value.clone()
-            }
-        }).unwrap_or(Value::Null);
+        let value = self
+            .fibers
+            .get(&object_id)
+            .map(|f| {
+                if f.status == FiberStatus::Terminated {
+                    f.return_value.clone().unwrap_or(Value::Null)
+                } else {
+                    f.transfer_value.clone()
+                }
+            })
+            .unwrap_or(Value::Null);
 
         Ok(Some(value))
     }
@@ -2704,11 +2787,24 @@ impl Vm {
 
         if let Some(fiber) = self.fibers.get_mut(&object_id) {
             fiber.status = FiberStatus::Running;
-            fiber.transfer_value = value;
+            fiber.transfer_value = value.clone();
             fiber.start_depth = start_depth;
         }
 
         self.current_fiber_id = Some(object_id);
+
+        // Write the resume value to the Fiber::suspend() result slot.
+        // The topmost frame's IP was saved past the DO_FCALL, so ip-1 is the DO_FCALL op.
+        if let Some(top_frame) = self.call_stack.last() {
+            let oa_idx = top_frame.op_array_idx;
+            let prev_ip = top_frame.ip.wrapping_sub(1);
+            if prev_ip < self.op_arrays[oa_idx].opcodes.len() {
+                let prev_op = self.op_arrays[oa_idx].opcodes[prev_ip].clone();
+                if prev_op.result_type != OperandType::Unused {
+                    self.write_result(&prev_op, oa_idx, value)?;
+                }
+            }
+        }
 
         // Run until fiber suspends or completes
         let result = self.dispatch_loop_until(start_depth);
@@ -2730,13 +2826,17 @@ impl Vm {
         result?;
 
         // When the fiber terminated, return its return value; when suspended, return transfer_value.
-        let value = self.fibers.get(&object_id).map(|f| {
-            if f.status == FiberStatus::Terminated {
-                f.return_value.clone().unwrap_or(Value::Null)
-            } else {
-                f.transfer_value.clone()
-            }
-        }).unwrap_or(Value::Null);
+        let value = self
+            .fibers
+            .get(&object_id)
+            .map(|f| {
+                if f.status == FiberStatus::Terminated {
+                    f.return_value.clone().unwrap_or(Value::Null)
+                } else {
+                    f.transfer_value.clone()
+                }
+            })
+            .unwrap_or(Value::Null);
 
         Ok(Some(value))
     }
@@ -5940,9 +6040,8 @@ foreach (gen() as $v) { echo $v . "\n"; }
 
     #[test]
     fn test_generator_yield_from_generator() {
-        // Note: in PHP's bytecode, FE_FETCH_R calls move_forward() after getting the
-        // current value but before the loop body runs. So the generator's echo happens
-        // during the advance, before the loop body's echo for that iteration.
+        // Generator foreach now correctly advances before reading (not after),
+        // so the output matches PHP's actual behavior.
         assert_eq!(
             run_php(
                 r#"<?php
@@ -5955,7 +6054,261 @@ function outer() {
 foreach (outer() as $v) { echo $v . "\n"; }
 "#
             ),
-            "1\ninner returned: ret\n2\n3\n"
+            "1\n2\ninner returned: ret\n3\n"
         );
+    }
+
+    // =========================================================================
+    // Closure tests
+    // =========================================================================
+
+    #[test]
+    fn test_closure_basic() {
+        assert_eq!(
+            run_php(r#"<?php $fn = function() { echo "hello\n"; }; $fn();"#),
+            "hello\n"
+        );
+    }
+
+    #[test]
+    fn test_closure_with_args() {
+        assert_eq!(
+            run_php(r#"<?php $fn = function($x) { return $x * 2; }; echo $fn(21) . "\n";"#),
+            "42\n"
+        );
+    }
+
+    #[test]
+    fn test_closure_use_by_value() {
+        assert_eq!(
+            run_php(
+                r#"<?php $x = 10; $fn = function($y) use ($x) { return $x + $y; }; echo $fn(5) . "\n";"#
+            ),
+            "15\n"
+        );
+    }
+
+    #[test]
+    fn test_closure_multiple_use() {
+        assert_eq!(
+            run_php(
+                r#"<?php $a = 1; $b = 2; $fn = function() use ($a, $b) { return $a + $b; }; echo $fn() . "\n";"#
+            ),
+            "3\n"
+        );
+    }
+
+    #[test]
+    fn test_closure_nested() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$make_adder = function($x) {
+    return function($y) use ($x) { return $x + $y; };
+};
+$add5 = $make_adder(5);
+echo $add5(3) . "\n";
+echo $add5(10) . "\n";
+"#
+            ),
+            "8\n15\n"
+        );
+    }
+
+    #[test]
+    fn test_arrow_function() {
+        assert_eq!(
+            run_php(r#"<?php $fn = fn($x) => $x * 3; echo $fn(7) . "\n";"#),
+            "21\n"
+        );
+    }
+
+    #[test]
+    fn test_dynamic_function_call() {
+        assert_eq!(
+            run_php(r#"<?php $name = "strlen"; echo $name("hello") . "\n";"#),
+            "5\n"
+        );
+    }
+
+    // =========================================================================
+    // Generator tests (comprehensive)
+    // =========================================================================
+
+    #[test]
+    fn test_generator_fibonacci_sequence() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+function fib() {
+    $a = 0; $b = 1;
+    while (true) {
+        yield $a;
+        $tmp = $a + $b;
+        $a = $b;
+        $b = $tmp;
+    }
+}
+$g = fib();
+$result = [];
+for ($i = 0; $i < 8; $i++) {
+    $result[] = $g->current();
+    $g->next();
+}
+echo implode(" ", $result) . "\n";
+"#
+            ),
+            "0 1 1 2 3 5 8 13\n"
+        );
+    }
+
+    #[test]
+    fn test_generator_send_bidirectional() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+function gen() {
+    $v = yield "first";
+    echo "got: " . $v . "\n";
+    $v2 = yield "second";
+    echo "got: " . $v2 . "\n";
+}
+$g = gen();
+echo $g->current() . "\n";
+$g->send("hello");
+echo $g->current() . "\n";
+$g->send("world");
+"#
+            ),
+            "first\ngot: hello\nsecond\ngot: world\n"
+        );
+    }
+
+    #[test]
+    fn test_generator_key_value() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+function gen() {
+    yield "a" => 1;
+    yield "b" => 2;
+    yield "c" => 3;
+}
+foreach (gen() as $k => $v) {
+    echo $k . ":" . $v . "\n";
+}
+"#
+            ),
+            "a:1\nb:2\nc:3\n"
+        );
+    }
+
+    #[test]
+    fn test_generator_return_value() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+function gen() {
+    yield 1;
+    yield 2;
+    return "done";
+}
+$g = gen();
+$g->current();
+$g->next();
+$g->next();
+echo $g->getReturn() . "\n";
+"#
+            ),
+            "done\n"
+        );
+    }
+
+    #[test]
+    fn test_generator_valid() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+function gen() {
+    yield 1;
+}
+$g = gen();
+var_dump($g->valid());
+$g->next();
+var_dump($g->valid());
+"#
+            ),
+            "bool(true)\nbool(false)\n"
+        );
+    }
+
+    // =========================================================================
+    // Fiber tests (comprehensive)
+    // =========================================================================
+
+    #[test]
+    fn test_fiber_with_closure() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$fiber = new Fiber(function () {
+    $val = Fiber::suspend("suspended");
+    echo "resumed with: " . $val . "\n";
+});
+$result = $fiber->start();
+echo "fiber said: " . $result . "\n";
+$fiber->resume("go");
+"#
+            ),
+            "fiber said: suspended\nresumed with: go\n"
+        );
+    }
+
+    #[test]
+    fn test_fiber_multiple_suspends() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+function work() {
+    Fiber::suspend(1);
+    Fiber::suspend(2);
+    Fiber::suspend(3);
+    return 4;
+}
+$f = new Fiber('work');
+echo $f->start() . "\n";
+echo $f->resume() . "\n";
+echo $f->resume() . "\n";
+$f->resume();
+echo $f->getReturn() . "\n";
+"#
+            ),
+            "1\n2\n3\n4\n"
+        );
+    }
+
+    // =========================================================================
+    // String interpolation tests
+    // =========================================================================
+
+    #[test]
+    fn test_string_interpolation_simple() {
+        assert_eq!(
+            run_php(r#"<?php $name = "World"; echo "Hello, $name!\n";"#),
+            "Hello, World!\n"
+        );
+    }
+
+    #[test]
+    fn test_string_interpolation_multiple_vars() {
+        assert_eq!(
+            run_php(r#"<?php $a = 1; $b = 2; echo "$a + $b\n";"#),
+            "1 + 2\n"
+        );
+    }
+
+    #[test]
+    fn test_string_interpolation_escape_sequences() {
+        assert_eq!(run_php(r#"<?php echo "tab\there\n";"#), "tab\there\n");
     }
 }

@@ -28,6 +28,9 @@ pub enum Value {
     /// Internal: generator iterator state for foreach over generators.
     _GeneratorIterator {
         object_id: u64,
+        /// Whether the generator needs to be advanced before reading.
+        /// False on the first fetch (already positioned at first yield from FE_RESET).
+        needs_advance: bool,
     },
 }
 

@@ -3211,41 +3211,75 @@ impl<'a> Parser<'a> {
 
             // Encapsed string (double-quoted with interpolation)
             // The lexer emits EncapsedAndWhitespace and Variable tokens for
-            // interpolated strings. We consume all parts as a StringLiteral.
+            // interpolated strings. Build a concat expression tree.
             Token::EncapsedAndWhitespace => {
-                // Consume all interpolation parts
+                let mut parts: Vec<Expression> = Vec::new();
                 loop {
                     match &self.current_token {
                         Token::EncapsedAndWhitespace => {
+                            let text = self.lexer.source_text(&self.current_span);
+                            // Strip trailing " if this is the last part (closing quote)
+                            let text = text.strip_suffix('"').unwrap_or(text);
+                            if !text.is_empty() {
+                                let value = unescape_double_quoted(text);
+                                parts.push(Expression::StringLiteral {
+                                    value,
+                                    span: self.current_span.clone(),
+                                });
+                            }
                             self.advance();
                         }
                         Token::Variable => {
+                            let text = self.lexer.source_text(&self.current_span);
+                            let name = text.strip_prefix('$').unwrap_or(text).to_string();
+                            let var_span = self.current_span.clone();
                             self.advance();
-                            // Check for ->prop or [index] after variable in string
+                            let mut expr = Expression::Variable {
+                                name,
+                                span: var_span.clone(),
+                            };
+                            // Check for ->prop after variable in string
                             if self.current_token == Token::ObjectOperator {
                                 self.advance();
                                 if let Token::String = self.current_token {
+                                    let prop =
+                                        self.lexer.source_text(&self.current_span).to_string();
+                                    let prop_span = self.current_span.clone();
                                     self.advance();
+                                    expr = Expression::PropertyAccess {
+                                        object: Box::new(expr),
+                                        property: Box::new(Expression::StringLiteral {
+                                            value: prop,
+                                            span: prop_span.clone(),
+                                        }),
+                                        span: prop_span,
+                                    };
                                 }
                             } else if self.current_token == Token::LBracket {
                                 self.advance();
-                                // Consume index expression
-                                while self.current_token != Token::RBracket
-                                    && self.current_token != Token::End
-                                {
-                                    self.advance();
-                                }
+                                let index = self.parse_expression(0)?;
                                 if self.current_token == Token::RBracket {
                                     self.advance();
                                 }
+                                expr = Expression::ArrayAccess {
+                                    array: Box::new(expr),
+                                    index: Some(Box::new(index)),
+                                    span: var_span,
+                                };
                             }
+                            parts.push(expr);
                         }
                         Token::DollarOpenCurlyBraces => {
                             self.advance();
-                            while self.current_token != Token::RBrace
-                                && self.current_token != Token::End
-                            {
+                            // Parse ${varname} — simple variable lookup
+                            if let Token::String = self.current_token {
+                                let name = self.lexer.source_text(&self.current_span).to_string();
+                                let var_span = self.current_span.clone();
                                 self.advance();
+                                parts.push(Expression::Variable {
+                                    name,
+                                    span: var_span,
+                                });
                             }
                             if self.current_token == Token::RBrace {
                                 self.advance();
@@ -3253,30 +3287,35 @@ impl<'a> Parser<'a> {
                         }
                         Token::CurlyOpen => {
                             self.advance();
-                            // Consume until matching }
-                            let mut depth = 1;
-                            while depth > 0 && self.current_token != Token::End {
-                                if self.current_token == Token::LBrace
-                                    || self.current_token == Token::CurlyOpen
-                                {
-                                    depth += 1;
-                                } else if self.current_token == Token::RBrace {
-                                    depth -= 1;
-                                    if depth == 0 {
-                                        self.advance();
-                                        break;
-                                    }
-                                }
+                            // Parse {$expr} — full expression inside braces
+                            let expr = self.parse_expression(0)?;
+                            parts.push(expr);
+                            if self.current_token == Token::RBrace {
                                 self.advance();
                             }
                         }
                         _ => break,
                     }
                 }
-                Ok(Expression::StringLiteral {
-                    value: String::new(),
-                    span,
-                })
+                // Build a left-associative concat tree
+                if parts.is_empty() {
+                    Ok(Expression::StringLiteral {
+                        value: String::new(),
+                        span,
+                    })
+                } else {
+                    let mut result = parts.remove(0);
+                    for part in parts {
+                        let s = span.clone();
+                        result = Expression::BinaryOp {
+                            lhs: Box::new(result),
+                            op: BinaryOperator::Concat,
+                            rhs: Box::new(part),
+                            span: s,
+                        };
+                    }
+                    Ok(result)
+                }
             }
 
             // Variable variable: $$var, ${expr} — `$` is tokenized as BadCharacter
@@ -3418,9 +3457,10 @@ impl<'a> Parser<'a> {
                 false
             };
 
-            // Parse variable name
+            // Parse variable name (strip leading $)
             let name = if let Token::Variable = self.current_token {
-                let n = self.lexer.source_text(&self.current_span).to_string();
+                let text = self.lexer.source_text(&self.current_span);
+                let n = text.strip_prefix('$').unwrap_or(text).to_string();
                 self.advance();
                 n
             } else {
@@ -4106,6 +4146,70 @@ fn parse_string_literal(text: &str) -> String {
         }
         result
     }
+}
+
+/// Unescape a double-quoted string fragment (without surrounding quotes).
+/// Handles PHP escape sequences: \n, \r, \t, \v, \e, \f, \\, \$, \", \xHH, \0oo.
+fn unescape_double_quoted(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n') => result.push('\n'),
+                Some('r') => result.push('\r'),
+                Some('t') => result.push('\t'),
+                Some('v') => result.push('\x0B'),
+                Some('e') => result.push('\x1B'),
+                Some('f') => result.push('\x0C'),
+                Some('\\') => result.push('\\'),
+                Some('$') => result.push('$'),
+                Some('"') => result.push('"'),
+                Some('x') | Some('X') => {
+                    let mut hex = String::new();
+                    for _ in 0..2 {
+                        if let Some(&c) = chars.peek() {
+                            if c.is_ascii_hexdigit() {
+                                hex.push(c);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                        result.push(val as char);
+                    }
+                }
+                Some('0') => {
+                    let mut oct = String::from("0");
+                    for _ in 0..2 {
+                        if let Some(&c) = chars.peek() {
+                            if ('0'..='7').contains(&c) {
+                                oct.push(c);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    if let Ok(val) = u32::from_str_radix(&oct, 8) {
+                        if let Some(ch) = char::from_u32(val) {
+                            result.push(ch);
+                        }
+                    }
+                }
+                Some(other) => {
+                    result.push('\\');
+                    result.push(other);
+                }
+                None => result.push('\\'),
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -5388,7 +5492,7 @@ mod tests {
                 Expression::Assign { rhs, .. } => match rhs.as_ref() {
                     Expression::Closure { uses, .. } => {
                         assert_eq!(uses.len(), 1);
-                        assert_eq!(uses[0].name, "$y");
+                        assert_eq!(uses[0].name, "y");
                         assert!(!uses[0].by_ref);
                     }
                     _ => panic!("Expected closure"),
