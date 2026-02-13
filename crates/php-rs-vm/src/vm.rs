@@ -5812,6 +5812,9 @@ foreach (gen() as $v) { echo $v . "\n"; }
 
     #[test]
     fn test_generator_yield_from_generator() {
+        // Note: in PHP's bytecode, FE_FETCH_R calls move_forward() after getting the
+        // current value but before the loop body runs. So the generator's echo happens
+        // during the advance, before the loop body's echo for that iteration.
         assert_eq!(
             run_php(
                 r#"<?php
@@ -5824,7 +5827,7 @@ function outer() {
 foreach (outer() as $v) { echo $v . "\n"; }
 "#
             ),
-            "1\n2\ninner returned: ret\n3\n"
+            "1\ninner returned: ret\n2\n3\n"
         );
     }
 }
