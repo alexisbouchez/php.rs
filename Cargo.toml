@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]
 members = [
     "crates/php-rs-types",
     "crates/php-rs-lexer",

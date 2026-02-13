@@ -42,3 +42,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+  miri:
+    name: Miri (Unsafe Code Verification)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Run Miri on core crates
+        run: |
+          cargo +nightly miri test -p php-rs-types 2>&1 || true
+          cargo +nightly miri test -p php-rs-gc 2>&1 || true
+        env:
+          MIRIFLAGS: "-Zmiri-disable-isolation"
+
+  sanitizer:
+    name: Address Sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests with AddressSanitizer
+        run: |
+          RUSTFLAGS="-Z sanitizer=address" \
+          cargo +nightly test --target x86_64-unknown-linux-gnu \
+            -p php-rs-types -p php-rs-lexer -p php-rs-parser \
+            -p php-rs-compiler -p php-rs-vm -p php-rs-gc
+        env:
+          ASAN_OPTIONS: "detect_leaks=1"

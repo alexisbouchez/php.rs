@@ -95,6 +95,238 @@ impl Superglobals {
         }
     }
 
+    /// Populate $_SERVER for an HTTP request (used by built-in web server / FPM).
+    pub fn populate_server_http(
+        &mut self,
+        method: &str,
+        uri: &str,
+        host: &str,
+        remote_addr: &str,
+        content_type: &str,
+        content_length: usize,
+    ) {
+        self.server
+            .insert("REQUEST_METHOD".to_string(), method.to_string());
+        self.server
+            .insert("REQUEST_URI".to_string(), uri.to_string());
+        self.server
+            .insert("SERVER_PROTOCOL".to_string(), "HTTP/1.1".to_string());
+        self.server
+            .insert("HTTP_HOST".to_string(), host.to_string());
+        self.server
+            .insert("REMOTE_ADDR".to_string(), remote_addr.to_string());
+        self.server
+            .insert("CONTENT_TYPE".to_string(), content_type.to_string());
+        self.server
+            .insert("CONTENT_LENGTH".to_string(), content_length.to_string());
+        self.server
+            .insert("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string());
+        self.server.insert(
+            "REQUEST_TIME".to_string(),
+            current_timestamp().to_string(),
+        );
+        self.server.insert(
+            "REQUEST_TIME_FLOAT".to_string(),
+            current_timestamp_float().to_string(),
+        );
+        self.server
+            .insert("SERVER_SOFTWARE".to_string(), "php.rs".to_string());
+
+        // Parse query string from URI
+        if let Some(q) = uri.find('?') {
+            let query = &uri[q + 1..];
+            self.server
+                .insert("QUERY_STRING".to_string(), query.to_string());
+            let path = &uri[..q];
+            self.server
+                .insert("SCRIPT_NAME".to_string(), path.to_string());
+            self.server
+                .insert("PHP_SELF".to_string(), path.to_string());
+            self.parse_query_string(query);
+        } else {
+            self.server
+                .insert("QUERY_STRING".to_string(), String::new());
+            self.server
+                .insert("SCRIPT_NAME".to_string(), uri.to_string());
+            self.server
+                .insert("PHP_SELF".to_string(), uri.to_string());
+        }
+    }
+
+    /// Parse an application/x-www-form-urlencoded POST body into $_POST.
+    pub fn parse_post_body(&mut self, body: &str) {
+        for pair in body.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            let (key, value) = if let Some(eq) = pair.find('=') {
+                (url_decode(&pair[..eq]), url_decode(&pair[eq + 1..]))
+            } else {
+                (url_decode(pair), String::new())
+            };
+            self.post.insert(key, value);
+        }
+    }
+
+    /// Parse a multipart/form-data body, populating $_POST and $_FILES.
+    ///
+    /// `boundary` is the boundary string from the Content-Type header.
+    /// `max_file_size` is the upload_max_filesize INI limit in bytes (0 = unlimited).
+    /// `max_post_size` is the post_max_size INI limit in bytes (0 = unlimited).
+    ///
+    /// Returns Ok(()) or an error string if limits are exceeded.
+    pub fn parse_multipart(
+        &mut self,
+        body: &[u8],
+        boundary: &str,
+        max_file_size: usize,
+        max_post_size: usize,
+    ) -> Result<(), String> {
+        // Check post_max_size
+        if max_post_size > 0 && body.len() > max_post_size {
+            return Err(format!(
+                "POST Content-Length of {} bytes exceeds the limit of {} bytes",
+                body.len(),
+                max_post_size
+            ));
+        }
+
+        let delimiter = format!("--{}", boundary);
+        let body_str = String::from_utf8_lossy(body);
+
+        // Split on boundary
+        let parts: Vec<&str> = body_str.split(&delimiter).collect();
+
+        for part in parts.iter().skip(1) {
+            // Skip the final closing delimiter
+            if part.starts_with("--") {
+                continue;
+            }
+
+            // Split headers from body at the double newline
+            let (headers_section, content) =
+                if let Some(pos) = part.find("\r\n\r\n") {
+                    (&part[..pos], &part[pos + 4..])
+                } else if let Some(pos) = part.find("\n\n") {
+                    (&part[..pos], &part[pos + 2..])
+                } else {
+                    continue;
+                };
+
+            // Strip trailing \r\n from content
+            let content = content.trim_end_matches("\r\n").trim_end_matches('\n');
+
+            // Parse Content-Disposition
+            let mut field_name = None;
+            let mut filename = None;
+            let mut content_type_val = "application/octet-stream".to_string();
+
+            for line in headers_section.lines() {
+                let line = line.trim();
+                let lower = line.to_lowercase();
+                if lower.starts_with("content-disposition:") {
+                    // Extract name="..."
+                    if let Some(npos) = line.find("name=\"") {
+                        let rest = &line[npos + 6..];
+                        if let Some(end) = rest.find('"') {
+                            field_name = Some(rest[..end].to_string());
+                        }
+                    }
+                    // Extract filename="..."
+                    if let Some(fpos) = line.find("filename=\"") {
+                        let rest = &line[fpos + 10..];
+                        if let Some(end) = rest.find('"') {
+                            filename = Some(rest[..end].to_string());
+                        }
+                    }
+                } else if lower.starts_with("content-type:") {
+                    content_type_val = line["content-type:".len()..].trim().to_string();
+                }
+            }
+
+            let field_name = match field_name {
+                Some(n) => n,
+                None => continue,
+            };
+
+            if let Some(fname) = filename {
+                // File upload
+                let size = content.len();
+
+                if max_file_size > 0 && size > max_file_size {
+                    // PHP sets error code 1 (UPLOAD_ERR_INI_SIZE)
+                    self.files.insert(
+                        format!("{}[name]", field_name),
+                        fname,
+                    );
+                    self.files.insert(
+                        format!("{}[error]", field_name),
+                        "1".to_string(),
+                    );
+                    self.files.insert(
+                        format!("{}[size]", field_name),
+                        "0".to_string(),
+                    );
+                    continue;
+                }
+
+                // Write to temp file
+                let tmp_dir = std::env::temp_dir();
+                let tmp_name = format!(
+                    "php_rs_upload_{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                );
+                let tmp_path = tmp_dir.join(&tmp_name);
+                if let Err(e) = std::fs::write(&tmp_path, content.as_bytes()) {
+                    self.files.insert(
+                        format!("{}[error]", field_name),
+                        format!("7"), // UPLOAD_ERR_CANT_WRITE
+                    );
+                    self.files.insert(
+                        format!("{}[name]", field_name),
+                        fname,
+                    );
+                    let _ = e;
+                    continue;
+                }
+
+                // Populate $_FILES entries (PHP's nested array structure flattened)
+                self.files
+                    .insert(format!("{}[name]", field_name), fname);
+                self.files
+                    .insert(format!("{}[type]", field_name), content_type_val);
+                self.files.insert(
+                    format!("{}[tmp_name]", field_name),
+                    tmp_path.to_string_lossy().to_string(),
+                );
+                self.files
+                    .insert(format!("{}[error]", field_name), "0".to_string());
+                self.files
+                    .insert(format!("{}[size]", field_name), size.to_string());
+            } else {
+                // Regular form field → $_POST
+                self.post.insert(field_name, content.to_string());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Extract the boundary from a Content-Type header value.
+    /// e.g. "multipart/form-data; boundary=----WebKitFormBoundary" → "----WebKitFormBoundary"
+    pub fn extract_boundary(content_type: &str) -> Option<String> {
+        for part in content_type.split(';') {
+            let part = part.trim();
+            if let Some(val) = part.strip_prefix("boundary=") {
+                return Some(val.trim_matches('"').to_string());
+            }
+        }
+        None
+    }
+
     /// Parse a query string into $_GET (e.g., "foo=bar&baz=qux").
     pub fn parse_query_string(&mut self, query: &str) {
         for pair in query.split('&') {
@@ -311,5 +543,131 @@ mod tests {
         assert_eq!(url_decode("%2F"), "/");
         assert_eq!(url_decode("plain"), "plain");
         assert_eq!(url_decode(""), "");
+    }
+
+    #[test]
+    fn test_parse_post_body() {
+        let mut sg = Superglobals::new();
+        sg.parse_post_body("name=John+Doe&age=30&city=New+York");
+        assert_eq!(sg.post.get("name"), Some(&"John Doe".to_string()));
+        assert_eq!(sg.post.get("age"), Some(&"30".to_string()));
+        assert_eq!(sg.post.get("city"), Some(&"New York".to_string()));
+    }
+
+    #[test]
+    fn test_parse_multipart_form_fields() {
+        let mut sg = Superglobals::new();
+        let boundary = "----boundary123";
+        let body = format!(
+            "------boundary123\r\n\
+             Content-Disposition: form-data; name=\"field1\"\r\n\
+             \r\n\
+             value1\r\n\
+             ------boundary123\r\n\
+             Content-Disposition: form-data; name=\"field2\"\r\n\
+             \r\n\
+             value2\r\n\
+             ------boundary123--\r\n"
+        );
+        sg.parse_multipart(body.as_bytes(), boundary, 0, 0).unwrap();
+        assert_eq!(sg.post.get("field1"), Some(&"value1".to_string()));
+        assert_eq!(sg.post.get("field2"), Some(&"value2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_multipart_file_upload() {
+        let mut sg = Superglobals::new();
+        let boundary = "----boundary456";
+        let body = format!(
+            "------boundary456\r\n\
+             Content-Disposition: form-data; name=\"myfile\"; filename=\"test.txt\"\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             Hello file content\r\n\
+             ------boundary456--\r\n"
+        );
+        sg.parse_multipart(body.as_bytes(), boundary, 0, 0).unwrap();
+        assert_eq!(
+            sg.files.get("myfile[name]"),
+            Some(&"test.txt".to_string())
+        );
+        assert_eq!(
+            sg.files.get("myfile[type]"),
+            Some(&"text/plain".to_string())
+        );
+        assert_eq!(
+            sg.files.get("myfile[error]"),
+            Some(&"0".to_string())
+        );
+        assert!(sg.files.get("myfile[tmp_name]").is_some());
+        // Clean up temp file
+        if let Some(tmp) = sg.files.get("myfile[tmp_name]") {
+            let _ = std::fs::remove_file(tmp);
+        }
+    }
+
+    #[test]
+    fn test_parse_multipart_exceeds_file_size() {
+        let mut sg = Superglobals::new();
+        let boundary = "----boundary789";
+        let body = format!(
+            "------boundary789\r\n\
+             Content-Disposition: form-data; name=\"bigfile\"; filename=\"big.bin\"\r\n\
+             Content-Type: application/octet-stream\r\n\
+             \r\n\
+             This content is too large for the limit\r\n\
+             ------boundary789--\r\n"
+        );
+        // Set max file size to 10 bytes — content is larger
+        sg.parse_multipart(body.as_bytes(), boundary, 10, 0).unwrap();
+        // Should have error = 1 (UPLOAD_ERR_INI_SIZE)
+        assert_eq!(
+            sg.files.get("bigfile[error]"),
+            Some(&"1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_multipart_exceeds_post_size() {
+        let mut sg = Superglobals::new();
+        let boundary = "----boundary000";
+        let body = b"------boundary000\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\ndata\r\n------boundary000--\r\n";
+        let result = sg.parse_multipart(body, boundary, 0, 10);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("exceeds the limit"));
+    }
+
+    #[test]
+    fn test_extract_boundary() {
+        assert_eq!(
+            Superglobals::extract_boundary("multipart/form-data; boundary=----WebKit123"),
+            Some("----WebKit123".to_string())
+        );
+        assert_eq!(
+            Superglobals::extract_boundary("multipart/form-data; boundary=\"quoted-bound\""),
+            Some("quoted-bound".to_string())
+        );
+        assert_eq!(
+            Superglobals::extract_boundary("application/json"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_populate_server_http() {
+        let mut sg = Superglobals::new();
+        sg.populate_server_http(
+            "POST",
+            "/api/upload?token=abc",
+            "example.com",
+            "127.0.0.1",
+            "application/json",
+            42,
+        );
+        assert_eq!(sg.server.get("REQUEST_METHOD"), Some(&"POST".to_string()));
+        assert_eq!(sg.server.get("HTTP_HOST"), Some(&"example.com".to_string()));
+        assert_eq!(sg.server.get("QUERY_STRING"), Some(&"token=abc".to_string()));
+        assert_eq!(sg.server.get("SCRIPT_NAME"), Some(&"/api/upload".to_string()));
+        assert_eq!(sg.get.get("token"), Some(&"abc".to_string()));
     }
 }

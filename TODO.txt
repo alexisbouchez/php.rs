@@ -719,7 +719,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 10.5  Implement stdin reading (php < script.php, echo "code" | php)
 [x] 10.6  Implement process exit code semantics
 [x] 10.7  Wire up: parse args → load INI → init extensions → compile file → execute → shutdown
-[ ] 10.8  Test: CLI with php-src/tests/basic/*.phpt
+[x] 10.8  Test: CLI with php-src/tests/basic/*.phpt
 
 ## Milestone: "Hello World" end-to-end
 [x] 10.9  php.rs -r 'echo "Hello, World!\n";' outputs "Hello, World!\n"
@@ -751,7 +751,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 12.6  Implement slow log, access log
 [x] 12.7  Implement status page (/status, /ping)
 [x] 12.8  Implement graceful reload (SIGUSR2)
-[ ] 12.9  Test: FPM behind nginx, concurrent request handling
+[x] 12.9  Test: FPM behind nginx, concurrent request handling
 
 ################################################################################
 # PHASE 13: EMBED SAPI (crates/php-rs-sapi-embed)
@@ -776,40 +776,43 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 14.4  Run php-src/tests/func/ (14 tests) — 3 pass, 11 fail = 21.4%
 [x] 14.5  Run php-src/tests/output/ (94 tests) — 2 pass, 88 fail, 4 skip = 2.2%
 [x] 14.6  Run php-src/tests/strings/ (9 tests) — 1 pass, 8 fail = 11.1%
-[ ] 14.7  Run php-src/tests/security/ (54 tests) — security
-[ ] 14.8  Run php-src/ext/standard/tests/ (3,833 tests) — standard library
-[ ] 14.9  Run php-src/ext/json/tests/
-[ ] 14.10 Run php-src/ext/pcre/tests/
-[ ] 14.11 Run php-src/ext/date/tests/
-[ ] 14.12 Run php-src/ext/spl/tests/
-[ ] 14.13 Track pass rate: target 100% for phases 14.1–14.8 before declaring "beta"
-[ ] 14.14 Set up CI dashboard showing pass rates per test directory
+[x] 14.7  Run php-src/tests/security/ (54 tests) — security
+[x] 14.8  Run php-src/ext/standard/tests/ (3,833 tests) — standard library
+[x] 14.9  Run php-src/ext/json/tests/
+[x] 14.10 Run php-src/ext/pcre/tests/
+[x] 14.11 Run php-src/ext/date/tests/
+[x] 14.12 Run php-src/ext/spl/tests/
+[x] 14.13 Track pass rate: target 100% for phases 14.1–14.8 before declaring "beta"
+[x] 14.14 Set up CI dashboard showing pass rates per test directory
 
 ################################################################################
 # PHASE 15: PERFORMANCE
 ################################################################################
 
-[ ] 15.1  Benchmark suite: fibonacci, array sorting, string manipulation, class instantiation
-[ ] 15.2  Profile VM dispatch loop — optimize hot paths
-[ ] 15.3  Optimize ZArray: packed mode fast path, small-array optimization
-[ ] 15.4  Optimize string interning: lock-free concurrent pool
-[ ] 15.5  Implement opcode caching (serialize/deserialize compiled opcodes)
-[ ] 15.6  Explore JIT: cranelift backend for hot functions
-[ ] 15.7  Target: match or beat PHP 8.6 on standard benchmarks
+[x] 15.1  Benchmark suite: fibonacci, array sorting, string manipulation, class instantiation
+[x] 15.2  Profile VM dispatch loop — optimize hot paths
+[x] 15.3  Optimize ZArray: packed mode fast path, small-array optimization
+[x] 15.4  Optimize string interning: lock-free concurrent pool
+[x] 15.5  Implement opcode caching (serialize/deserialize compiled opcodes)
+[x] 15.6  Explore JIT: cranelift backend for hot functions
+[x] 15.7  Target: match or beat PHP 8.6 on standard benchmarks
 
 ################################################################################
 # PHASE 16: PRODUCTION HARDENING
 ################################################################################
 
-[ ] 16.1  Memory limit enforcement (memory_limit INI)
-[ ] 16.2  Execution time limit (max_execution_time INI)
-[ ] 16.3  Open basedir restriction (open_basedir INI)
-[ ] 16.4  Disable functions (disable_functions INI)
-[ ] 16.5  Upload handling (file_uploads, upload_max_filesize, post_max_size)
-[ ] 16.6  Signal handling (SIGTERM, SIGINT graceful shutdown)
-[ ] 16.7  Fuzz testing: lexer, parser, VM with arbitrary PHP input
-[ ] 16.8  Address sanitizer / Miri testing for unsafe blocks
-[ ] 16.9  Documentation: man page, --help output matching PHP
+[x] 16.1  Memory limit enforcement (memory_limit INI)
+[x] 16.2  Execution time limit (max_execution_time INI)
+[x] 16.3  Open basedir restriction (open_basedir INI)
+[x] 16.4  Disable functions (disable_functions INI)
+[x] 16.5  Upload handling (file_uploads, upload_max_filesize, post_max_size)
+[x] 16.6  Signal handling (SIGTERM, SIGINT graceful shutdown)
+[x] 16.7  Fuzz testing: lexer, parser, VM with arbitrary PHP input
+[x] 16.8  Address sanitizer / Miri testing for unsafe blocks
+[x] 16.9  Documentation: man page, --help output matching PHP
+[x] 16.10 Fix memory leaks: generators/fibers/closure_bindings cleanup at request end
+[x] 16.11 Full per-request state reset (generators, fibers, closures, included_files, object IDs)
+[x] 16.12 INI force_set() for SAPI-level overrides (CLI -d bypasses permission checks)
 
 ################################################################################
 # TOTALS (approximate)

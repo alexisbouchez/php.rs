@@ -1,100 +1,204 @@
 // Criterion benchmarks for php-rs-vm
-// These benchmarks will measure VM performance once the VM is implemented.
-// For now, they provide a scaffold that verifies the benchmark harness is working.
+//
+// Benchmarks real PHP code compiled and executed through the full pipeline:
+// lexer → parser → compiler → VM execution.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use php_rs_vm::Vm;
 
-/// Benchmark placeholder: simple arithmetic operations
-///
-/// This will benchmark VM execution of arithmetic opcodes like ZEND_ADD, ZEND_MUL, etc.
-/// Currently a no-op until the VM is implemented.
-fn bench_arithmetic_ops(c: &mut Criterion) {
-    c.bench_function("noop_arithmetic", |b| {
+/// Helper: compile PHP source to an op_array.
+fn compile(source: &str) -> php_rs_compiler::op_array::ZOpArray {
+    php_rs_compiler::compile(source).expect("benchmark source must compile")
+}
+
+/// Helper: compile + execute PHP, return output.
+fn run(source: &str) -> String {
+    let oa = compile(source);
+    let mut vm = Vm::new();
+    vm.execute(&oa, None).expect("benchmark must execute")
+}
+
+// ─── Fibonacci (recursive) ──────────────────────────────────────────────────
+
+fn bench_fibonacci(c: &mut Criterion) {
+    let source = r#"<?php
+function fib($n) {
+    if ($n <= 1) return $n;
+    return fib($n - 1) + fib($n - 2);
+}
+echo fib(20);
+"#;
+    // Pre-compile once; benchmark compile+execute
+    c.bench_function("fibonacci_20", |b| {
         b.iter(|| {
-            // Placeholder: will execute compiled opcodes for: $a = 2 + 3 * 4;
-            // Expected: ZEND_MUL(3, 4, T1), ZEND_ADD(2, T1, result)
-            black_box(2 + 3 * 4)
+            black_box(run(source));
+        });
+    });
+
+    // Benchmark execution only (pre-compiled)
+    let oa = compile(source);
+    c.bench_function("fibonacci_20_exec_only", |b| {
+        b.iter(|| {
+            let mut vm = Vm::new();
+            black_box(vm.execute(&oa, None).unwrap());
         });
     });
 }
 
-/// Benchmark placeholder: function call overhead
-///
-/// This will benchmark the VM's function call mechanism (ZEND_INIT_FCALL, ZEND_DO_FCALL)
-/// Currently a no-op until the VM is implemented.
-fn bench_function_calls(c: &mut Criterion) {
-    c.bench_function("noop_function_call", |b| {
+// ─── Array sorting ──────────────────────────────────────────────────────────
+
+fn bench_array_sort(c: &mut Criterion) {
+    let source = r#"<?php
+$arr = [];
+for ($i = 1000; $i > 0; $i--) {
+    $arr[] = $i;
+}
+sort($arr);
+echo $arr[0] . " " . $arr[999];
+"#;
+    c.bench_function("array_sort_1000", |b| {
         b.iter(|| {
-            // Placeholder: will benchmark calling an empty function 1000 times
-            black_box(())
+            black_box(run(source));
         });
     });
 }
 
-/// Benchmark placeholder: array operations
-///
-/// This will benchmark array creation, access, and modification
-/// Currently a no-op until ZArray and VM are implemented.
-fn bench_array_operations(c: &mut Criterion) {
-    c.bench_function("noop_array_ops", |b| {
-        b.iter(|| {
-            // Placeholder: will benchmark: $arr = []; for($i=0;$i<100;$i++) $arr[$i]=$i;
-            let mut v = Vec::with_capacity(100);
-            for i in 0..100 {
-                v.push(black_box(i));
-            }
-            black_box(v)
-        });
-    });
-}
+// ─── String manipulation ────────────────────────────────────────────────────
 
-/// Benchmark placeholder: string concatenation
-///
-/// This will benchmark ZEND_CONCAT opcodes
-/// Currently a no-op until ZString and VM are implemented.
 fn bench_string_concat(c: &mut Criterion) {
-    c.bench_function("noop_string_concat", |b| {
+    let source = r#"<?php
+$s = "";
+for ($i = 0; $i < 1000; $i++) {
+    $s .= "x";
+}
+echo strlen($s);
+"#;
+    c.bench_function("string_concat_1000", |b| {
         b.iter(|| {
-            // Placeholder: will benchmark: $s = ""; for($i=0;$i<100;$i++) $s .= "x";
-            let mut s = String::new();
-            for _ in 0..100 {
-                s.push_str(black_box("x"));
-            }
-            black_box(s)
+            black_box(run(source));
         });
     });
 }
 
-/// Benchmark placeholder: object instantiation and property access
-///
-/// This will benchmark ZEND_NEW, ZEND_FETCH_OBJ_W, etc.
-/// Currently a no-op until ZObject and VM are implemented.
-fn bench_object_ops(c: &mut Criterion) {
-    c.bench_function("noop_object_ops", |b| {
+fn bench_string_functions(c: &mut Criterion) {
+    let source = r#"<?php
+$s = str_repeat("Hello World ", 100);
+for ($i = 0; $i < 100; $i++) {
+    $upper = strtoupper($s);
+    $lower = strtolower($s);
+    $len = strlen($s);
+}
+echo $len;
+"#;
+    c.bench_function("string_functions_100", |b| {
         b.iter(|| {
-            // Placeholder: will benchmark creating objects and accessing properties
-            black_box(())
+            black_box(run(source));
+        });
+    });
+}
+
+// ─── Class instantiation ────────────────────────────────────────────────────
+
+fn bench_class_instantiation(c: &mut Criterion) {
+    let source = r#"<?php
+class Point {
+    public $x;
+    public $y;
+    public function __construct($x, $y) {
+        $this->x = $x;
+        $this->y = $y;
+    }
+    public function distance($other) {
+        $dx = $this->x - $other->x;
+        $dy = $this->y - $other->y;
+        return sqrt($dx * $dx + $dy * $dy);
+    }
+}
+$sum = 0;
+for ($i = 0; $i < 100; $i++) {
+    $a = new Point($i, $i * 2);
+    $b = new Point($i * 3, $i * 4);
+    $sum = $sum + $a->distance($b);
+}
+echo intval($sum);
+"#;
+    c.bench_function("class_instantiation_100", |b| {
+        b.iter(|| {
+            black_box(run(source));
+        });
+    });
+}
+
+// ─── Function call overhead ─────────────────────────────────────────────────
+
+fn bench_function_calls(c: &mut Criterion) {
+    let source = r#"<?php
+function add($a, $b) { return $a + $b; }
+$sum = 0;
+for ($i = 0; $i < 1000; $i++) {
+    $sum = add($sum, $i);
+}
+echo $sum;
+"#;
+    c.bench_function("function_calls_1000", |b| {
+        b.iter(|| {
+            black_box(run(source));
+        });
+    });
+}
+
+// ─── Arithmetic loop ────────────────────────────────────────────────────────
+
+fn bench_arithmetic_loop(c: &mut Criterion) {
+    let source = r#"<?php
+$x = 0;
+for ($i = 0; $i < 10000; $i++) {
+    $x = $x + $i * 2 - 1;
+}
+echo $x;
+"#;
+    c.bench_function("arithmetic_loop_10k", |b| {
+        b.iter(|| {
+            black_box(run(source));
+        });
+    });
+}
+
+// ─── Compile-only benchmark ─────────────────────────────────────────────────
+
+fn bench_compile_only(c: &mut Criterion) {
+    let source = r#"<?php
+function fib($n) {
+    if ($n <= 1) return $n;
+    return fib($n - 1) + fib($n - 2);
+}
+class Foo {
+    public $x;
+    public function bar($y) {
+        return $this->x + $y;
+    }
+}
+for ($i = 0; $i < 100; $i++) {
+    $arr[] = $i * 2;
+}
+echo "done";
+"#;
+    c.bench_function("compile_medium_script", |b| {
+        b.iter(|| {
+            black_box(compile(source));
         });
     });
 }
 
 criterion_group!(
     benches,
-    bench_arithmetic_ops,
-    bench_function_calls,
-    bench_array_operations,
+    bench_fibonacci,
+    bench_array_sort,
     bench_string_concat,
-    bench_object_ops
+    bench_string_functions,
+    bench_class_instantiation,
+    bench_function_calls,
+    bench_arithmetic_loop,
+    bench_compile_only
 );
 criterion_main!(benches);
-
-#[cfg(test)]
-mod tests {
-    /// Test that the benchmark module compiles and can be imported
-    #[test]
-    fn test_benchmark_harness_exists() {
-        // This test verifies that the benchmark harness is set up correctly.
-        // The actual benchmarks are no-ops until the VM is implemented.
-        assert!(true, "Benchmark harness is properly configured");
-    }
-}
