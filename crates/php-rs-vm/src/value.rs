@@ -3,6 +3,7 @@
 //! High-level representation for correctness-first development.
 //! Can be optimized to use the 16-byte ZVal layout from php-rs-types later.
 
+use std::collections::HashMap;
 use std::fmt;
 
 /// A PHP value used during VM execution.
@@ -14,6 +15,7 @@ pub enum Value {
     Double(f64),
     String(String),
     Array(PhpArray),
+    Object(PhpObject),
 
     /// Internal: foreach iterator state (not a PHP type).
     _Iterator {
@@ -59,6 +61,7 @@ impl Value {
                     1
                 }
             }
+            Value::Object(_) => 1,
             Value::_Iterator { .. } => 0,
         }
     }
@@ -79,6 +82,7 @@ impl Value {
                     1.0
                 }
             }
+            Value::Object(_) => 1.0,
             Value::_Iterator { .. } => 0.0,
         }
     }
@@ -92,6 +96,7 @@ impl Value {
             Value::Double(f) => *f != 0.0 && !f.is_nan(),
             Value::String(s) => !s.is_empty() && s != "0",
             Value::Array(a) => !a.is_empty(),
+            Value::Object(_) => true,
             Value::_Iterator { .. } => true,
         }
     }
@@ -126,6 +131,11 @@ impl Value {
             }
             Value::String(s) => s.clone(),
             Value::Array(_) => "Array".to_string(),
+            Value::Object(o) => {
+                // PHP: if __toString is defined, call it; otherwise error
+                // For now, return class name as placeholder
+                format!("{} Object", o.class_name)
+            }
             Value::_Iterator { .. } => String::new(),
         }
     }
@@ -454,10 +464,40 @@ impl Value {
                 match self {
                     Value::Null => Value::Array(PhpArray::new()),
                     Value::Array(_) => self.clone(),
+                    Value::Object(o) => {
+                        let mut arr = PhpArray::new();
+                        for (k, v) in &o.properties {
+                            arr.set_string(k.clone(), v.clone());
+                        }
+                        Value::Array(arr)
+                    }
                     _ => {
                         let mut arr = PhpArray::new();
                         arr.push(self.clone());
                         Value::Array(arr)
+                    }
+                }
+            }
+            8 => {
+                // Cast to object
+                match self {
+                    Value::Object(_) => self.clone(),
+                    Value::Array(a) => {
+                        let mut obj = PhpObject::new("stdClass".to_string());
+                        for (key, val) in a.entries() {
+                            let key_str = match key {
+                                ArrayKey::Int(n) => n.to_string(),
+                                ArrayKey::String(s) => s.clone(),
+                            };
+                            obj.properties.insert(key_str, val.clone());
+                        }
+                        Value::Object(obj)
+                    }
+                    Value::Null => Value::Object(PhpObject::new("stdClass".to_string())),
+                    _ => {
+                        let mut obj = PhpObject::new("stdClass".to_string());
+                        obj.properties.insert("scalar".to_string(), self.clone());
+                        Value::Object(obj)
                     }
                 }
             }
@@ -476,6 +516,40 @@ impl fmt::Display for Value {
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         self.strict_eq(other)
+    }
+}
+
+// =============================================================================
+// PhpObject — simplified object for VM execution
+// =============================================================================
+
+/// A PHP object instance.
+#[derive(Debug, Clone)]
+pub struct PhpObject {
+    /// The class name this object is an instance of.
+    pub class_name: String,
+    /// Instance properties (name → value).
+    pub properties: HashMap<String, Value>,
+    /// Object ID (unique per-request, monotonically increasing).
+    pub object_id: u64,
+}
+
+impl PhpObject {
+    pub fn new(class_name: String) -> Self {
+        // Object IDs will be assigned by the VM when creating objects
+        Self {
+            class_name,
+            properties: HashMap::new(),
+            object_id: 0,
+        }
+    }
+
+    pub fn get_property(&self, name: &str) -> Option<&Value> {
+        self.properties.get(name)
+    }
+
+    pub fn set_property(&mut self, name: String, value: Value) {
+        self.properties.insert(name, value);
     }
 }
 

@@ -873,6 +873,26 @@ impl Compiler {
                 );
                 ExprResult::tmp(tmp)
             }
+            // Property assignment: $obj->prop = $val
+            Expression::PropertyAccess {
+                object, property, ..
+            } => {
+                let obj = self.compile_expr(object);
+                let prop = self.compile_expr(property);
+                let tmp = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::AssignObj, line)
+                        .with_op1(obj.operand, obj.op_type)
+                        .with_op2(prop.operand, prop.op_type)
+                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                );
+                // OP_DATA follows with the value
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::OpData, line)
+                        .with_op1(rhs_result.operand, rhs_result.op_type),
+                );
+                ExprResult::tmp(tmp)
+            }
             _ => {
                 // Fallback — just emit assign with the lhs compiled
                 let lhs_result = self.compile_expr(lhs);

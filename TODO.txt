@@ -298,11 +298,11 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 5.4.1  ZEND_ASSIGN: simple variable assignment
 [ ] 5.4.2  ZEND_ASSIGN_REF: reference assignment
 [x] 5.4.3  ZEND_ASSIGN_DIM: $a[$key] = $val
-[ ] 5.4.4  ZEND_ASSIGN_OBJ: $obj->prop = $val
+[x] 5.4.4  ZEND_ASSIGN_OBJ: $obj->prop = $val
 [x] 5.4.5  ZEND_ASSIGN_OP: +=, -=, .=, etc.
 [x] 5.4.6  ZEND_PRE_INC, ZEND_PRE_DEC, ZEND_POST_INC, ZEND_POST_DEC
 [x] 5.4.7  ZEND_FETCH_DIM_R/W/RW/IS/UNSET: array element access
-[ ] 5.4.8  ZEND_FETCH_OBJ_R/W/RW/IS/UNSET: object property access
+[x] 5.4.8  ZEND_FETCH_OBJ_R/W/RW/IS/UNSET: object property access
 [x] 5.4.9  ZEND_ISSET_ISEMPTY_VAR, ZEND_ISSET_ISEMPTY_DIM_OBJ
 [x] 5.4.10 ZEND_UNSET_VAR, ZEND_UNSET_DIM, ZEND_UNSET_OBJ
 [x] 5.4.11 ZEND_CHECK_VAR (undefined variable notice)
@@ -312,12 +312,12 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 5.5.1  ZEND_JMP: unconditional jump
 [x] 5.5.2  ZEND_JMPZ, ZEND_JMPNZ: conditional jump
 [x] 5.5.3  ZEND_JMPZ_EX, ZEND_JMPNZ_EX: jump + assign boolean result (&&, ||)
-[ ] 5.5.4  ZEND_JMPZNZ: ternary dispatch
+[x] 5.5.4  ZEND_JMPZNZ: ternary dispatch (N/A — uses JmpzEx in our enum)
 [x] 5.5.5  ZEND_CASE: switch case comparison
 [x] 5.5.6  ZEND_MATCH: match expression
 [x] 5.5.7  ZEND_JMP_SET: short-circuit ternary ($a ?: $b)
 [x] 5.5.8  ZEND_COALESCE: null coalesce ($a ?? $b)
-[ ] 5.5.9  ZEND_JMP_NULL: nullsafe operator ($a?->b)
+[x] 5.5.9  ZEND_JMP_NULL: nullsafe operator ($a?->b)
 [x] 5.5.10 ZEND_FE_RESET_R/RW + ZEND_FE_FETCH_R/RW + ZEND_FE_FREE: foreach
 [x] 5.5.11 Test: all control flow with php-src/tests/lang/
 
@@ -325,8 +325,8 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 5.6.1  ZEND_INIT_FCALL: resolve and prepare named function call
 [x] 5.6.2  ZEND_INIT_FCALL_BY_NAME: late-binding function call
 [x] 5.6.3  ZEND_INIT_DYNAMIC_CALL: $func() variable function call
-[ ] 5.6.4  ZEND_INIT_METHOD_CALL: $obj->method()
-[ ] 5.6.5  ZEND_INIT_STATIC_METHOD_CALL: Class::method()
+[x] 5.6.4  ZEND_INIT_METHOD_CALL: $obj->method()
+[x] 5.6.5  ZEND_INIT_STATIC_METHOD_CALL: Class::method()
 [x] 5.6.6  ZEND_SEND_VAL, ZEND_SEND_VAR, ZEND_SEND_REF: argument passing
 [x] 5.6.7  ZEND_SEND_VAR_EX: by-val or by-ref depending on callee
 [x] 5.6.8  ZEND_SEND_UNPACK: ...$args spread
@@ -341,29 +341,29 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 
 ## 5.8 Exception handlers
 [x] 5.8.1  ZEND_THROW: throw exception
-[ ] 5.8.2  ZEND_CATCH: catch block handler
-[ ] 5.8.3  ZEND_HANDLE_EXCEPTION: unwind stack to nearest catch/finally
-[ ] 5.8.4  ZEND_DISCARD_EXCEPTION: finally block completion
-[ ] 5.8.5  ZEND_FAST_CALL, ZEND_FAST_RET: finally block enter/exit
-[ ] 5.8.6  Test: exception handling, nested try/catch, finally
+[x] 5.8.2  ZEND_CATCH: catch block handler
+[x] 5.8.3  ZEND_HANDLE_EXCEPTION: unwind stack to nearest catch/finally
+[x] 5.8.4  ZEND_DISCARD_EXCEPTION: finally block completion
+[x] 5.8.5  ZEND_FAST_CALL, ZEND_FAST_RET: finally block enter/exit
+[x] 5.8.6  Test: exception handling, nested try/catch, finally
 
 ## 5.9 Type & cast handlers
 [x] 5.9.1  ZEND_CAST: (int), (string), (float), (bool), (array), (object)
 [x] 5.9.2  ZEND_TYPE_CHECK: is_int, is_string, etc.
-[ ] 5.9.3  ZEND_INSTANCEOF: instanceof operator
+[x] 5.9.3  ZEND_INSTANCEOF: instanceof operator
 [x] 5.9.4  ZEND_STRLEN: strlen() dedicated opcode
 [x] 5.9.5  ZEND_COUNT: count() dedicated opcode
 [x] 5.9.6  Test: type operations from php-src/tests/lang/type_hints/
 
 ## 5.10 Class & object handlers
-[ ] 5.10.1  ZEND_NEW: object instantiation
-[ ] 5.10.2  ZEND_CLONE: clone operator
-[ ] 5.10.3  ZEND_DECLARE_CLASS: register class in class table
+[x] 5.10.1  ZEND_NEW: object instantiation
+[x] 5.10.2  ZEND_CLONE: clone operator
+[x] 5.10.3  ZEND_DECLARE_CLASS: register class in class table
 [x] 5.10.4  ZEND_DECLARE_FUNCTION: register function in function table
-[ ] 5.10.5  ZEND_FETCH_CLASS: resolve class name
-[ ] 5.10.6  ZEND_FETCH_CLASS_CONSTANT: Class::CONST
-[ ] 5.10.7  ZEND_FETCH_STATIC_PROP_R/W/RW/IS/UNSET
-[ ] 5.10.8  Test: OOP with php-src/tests/classes/*.phpt (291 tests)
+[x] 5.10.5  ZEND_FETCH_CLASS: resolve class name
+[x] 5.10.6  ZEND_FETCH_CLASS_CONSTANT: Class::CONST
+[x] 5.10.7  ZEND_FETCH_STATIC_PROP_R/W/RW/IS/UNSET
+[x] 5.10.8  Test: OOP with php-src/tests/classes/*.phpt (291 tests)
 
 ## 5.11 Generator & Fiber handlers
 [ ] 5.11.1  ZEND_GENERATOR_CREATE: create generator from function
