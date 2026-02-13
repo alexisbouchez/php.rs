@@ -163,6 +163,20 @@ impl IniSystem {
         Some(old)
     }
 
+    /// Force-set an INI directive bypassing permission checks.
+    /// Used for SAPI-level overrides like CLI `-d` flags and php.ini loading.
+    pub fn force_set(&mut self, name: &str, value: impl Into<String>) {
+        if let Some(entry) = self.entries.get_mut(name) {
+            entry.value = value.into();
+            entry.modified = true;
+        } else {
+            self.entries.insert(
+                name.to_string(),
+                IniEntry::new(name, value, IniPermission::All),
+            );
+        }
+    }
+
     /// Restore an INI directive to its default value (ini_restore).
     pub fn restore(&mut self, name: &str) {
         if let Some(entry) = self.entries.get_mut(name) {

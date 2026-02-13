@@ -604,6 +604,7 @@ version = "0.1.0"
 name = "php-rs-sapi-cli"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "php-rs-compiler",
  "php-rs-runtime",
  "php-rs-vm",

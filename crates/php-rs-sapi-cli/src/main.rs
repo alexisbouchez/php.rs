@@ -25,6 +25,7 @@ use std::env;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::Ordering;
 
 use php_rs_runtime::{IniSystem, Superglobals};
 use php_rs_vm::{PhpArray, Value};
@@ -387,12 +388,31 @@ fn superglobals_for_vm(sg: &Superglobals, argv: &[String]) -> HashMap<String, Va
     map
 }
 
+/// Build a VmConfig from INI settings.
+fn vm_config_from_ini(ini: &IniSystem) -> php_rs_vm::VmConfig {
+    let mut config = php_rs_vm::VmConfig::default();
+
+    // memory_limit
+    let mem = ini.get_long("memory_limit");
+    config.memory_limit = if mem < 0 { 0 } else { mem as usize };
+
+    // max_execution_time (0 = unlimited; CLI defaults to 0 for no limit)
+    let time = ini.get_long("max_execution_time");
+    config.max_execution_time = if time <= 0 { 0 } else { time as u64 };
+
+    // disable_functions
+    config.set_disabled_functions(ini.get("disable_functions"));
+
+    // open_basedir
+    config.set_open_basedir(ini.get("open_basedir"));
+
+    config
+}
+
 /// Compile and execute PHP source code, returning the exit code.
 /// `script_path` is the script name (e.g. "test.php" or "-" for stdin/-r).
 /// `argv` is the full argument list for this run (script path + script args), used for $_SERVER['argv'] and argc.
 fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]) -> i32 {
-    let _ = ini; // Will be used when VM integrates INI
-
     // Compile
     let op_array = match php_rs_compiler::compile(source) {
         Ok(oa) => oa,
@@ -409,8 +429,9 @@ fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]
     sg.build_request("GP");
     let sg_map = superglobals_for_vm(&sg, argv);
 
-    // Execute
-    let mut vm = php_rs_vm::Vm::new();
+    // Execute with INI-derived limits
+    let config = vm_config_from_ini(ini);
+    let mut vm = php_rs_vm::Vm::with_config(config);
     match vm.execute(&op_array, Some(&sg_map)) {
         Ok(output) => {
             print!("{}", output);
@@ -430,7 +451,6 @@ fn execute_php_capture(
     script_path: &str,
     argv: &[String],
 ) -> (i32, String) {
-    let _ = ini;
     let op_array = match php_rs_compiler::compile(source) {
         Ok(oa) => oa,
         Err(e) => {
@@ -443,7 +463,8 @@ fn execute_php_capture(
     sg.populate_server_cli(script_path, argv);
     sg.build_request("GP");
     let sg_map = superglobals_for_vm(&sg, argv);
-    let mut vm = php_rs_vm::Vm::new();
+    let config = vm_config_from_ini(ini);
+    let mut vm = php_rs_vm::Vm::with_config(config);
     match vm.execute(&op_array, Some(&sg_map)) {
         Ok(output) => (0, output),
         Err(e) => {
@@ -494,6 +515,9 @@ fn read_stdin() -> Result<String, i32> {
 fn setup_ini(opts: &CliOptions) -> IniSystem {
     let mut ini = IniSystem::new();
 
+    // CLI SAPI defaults: no execution time limit (matches PHP CLI behavior)
+    ini.set("max_execution_time", "0");
+
     // Load php.ini if applicable
     if !opts.no_ini {
         if let Some(ref path) = opts.ini_path {
@@ -504,9 +528,9 @@ fn setup_ini(opts: &CliOptions) -> IniSystem {
         // TODO: search default paths for php.ini
     }
 
-    // Apply -d overrides
+    // Apply -d overrides (force_set bypasses permission — CLI -d is system-level)
     for (key, value) in &opts.ini_overrides {
-        ini.set(key, value);
+        ini.force_set(key, value);
     }
 
     ini
@@ -658,7 +682,31 @@ fn syntax_highlight(source: &str) -> String {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+/// Install signal handlers for SIGINT and SIGTERM to enable graceful shutdown.
+fn install_signal_handlers() {
+    #[cfg(unix)]
+    {
+        extern "C" fn signal_handler(_sig: libc::c_int) {
+            php_rs_vm::vm::SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+        }
+
+        unsafe {
+            libc::signal(
+                libc::SIGINT,
+                signal_handler as *const () as libc::sighandler_t,
+            );
+            libc::signal(
+                libc::SIGTERM,
+                signal_handler as *const () as libc::sighandler_t,
+            );
+        }
+    }
+}
+
 fn main() {
+    // Install signal handlers for graceful shutdown (SIGINT, SIGTERM)
+    install_signal_handlers();
+
     let args: Vec<String> = env::args().collect();
 
     let opts = match parse_args(&args) {

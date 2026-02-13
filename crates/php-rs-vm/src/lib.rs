@@ -7,4 +7,4 @@ pub mod value;
 pub mod vm;
 
 pub use value::{PhpArray, PhpObject, Value};
-pub use vm::{Vm, VmError, VmResult};
+pub use vm::{Vm, VmConfig, VmError, VmResult};

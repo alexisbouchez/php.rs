@@ -3,6 +3,8 @@
 //! Equivalent to php-src/Zend/zend_execute.c and zend_vm_def.h.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use php_rs_compiler::op::{OperandType, ZOp};
 use php_rs_compiler::op_array::{Literal, ZOpArray};
@@ -10,6 +12,9 @@ use php_rs_compiler::opcode::ZOpcode;
 use php_rs_ext_json::{self, JsonValue};
 
 use crate::value::{ArrayKey, PhpArray, PhpObject, Value};
+
+/// Global flag set by signal handlers (SIGINT/SIGTERM) for graceful shutdown.
+pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// VM execution result.
 #[derive(Debug)]
@@ -40,6 +45,12 @@ pub enum VmError {
     InternalError(String),
     /// exit() / die() — clean script termination with an exit code.
     Exit(i32),
+    /// Memory limit exceeded (memory_limit INI).
+    MemoryLimitExceeded(String),
+    /// Execution time limit exceeded (max_execution_time INI).
+    TimeLimitExceeded(String),
+    /// Function has been disabled via disable_functions INI.
+    DisabledFunction(String),
 }
 
 pub type VmResult<T> = Result<T, VmError>;
@@ -121,6 +132,56 @@ struct ClassDef {
     static_properties: HashMap<String, Value>,
 }
 
+/// Configuration for VM execution limits, parsed from INI settings.
+#[derive(Debug, Clone)]
+pub struct VmConfig {
+    /// Memory limit in bytes (0 = unlimited). From `memory_limit` INI.
+    pub memory_limit: usize,
+    /// Maximum execution time in seconds (0 = unlimited). From `max_execution_time` INI.
+    pub max_execution_time: u64,
+    /// Set of disabled function names. From `disable_functions` INI.
+    pub disabled_functions: HashSet<String>,
+    /// Open basedir restriction paths (empty = no restriction). From `open_basedir` INI.
+    pub open_basedir: Vec<String>,
+}
+
+impl Default for VmConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit: 128 * 1024 * 1024, // 128M
+            max_execution_time: 30,
+            disabled_functions: HashSet::new(),
+            open_basedir: Vec::new(),
+        }
+    }
+}
+
+impl VmConfig {
+    /// Parse a `disable_functions` INI string into the config.
+    pub fn set_disabled_functions(&mut self, val: &str) {
+        self.disabled_functions = if val.is_empty() {
+            HashSet::new()
+        } else {
+            val.split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+    }
+
+    /// Parse an `open_basedir` INI string into the config.
+    pub fn set_open_basedir(&mut self, val: &str) {
+        self.open_basedir = if val.is_empty() {
+            Vec::new()
+        } else {
+            val.split(if cfg!(windows) { ';' } else { ':' })
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+    }
+}
+
 /// The PHP Virtual Machine.
 pub struct Vm {
     /// Output buffer (captures echo output).
@@ -155,6 +216,12 @@ pub struct Vm {
     next_closure_id: u64,
     /// Captured variable bindings for closures: closure_name → [(var_name, value)].
     closure_bindings: HashMap<String, Vec<(String, Value)>>,
+    /// Execution limits and security config.
+    config: VmConfig,
+    /// Execution start time (for max_execution_time enforcement).
+    execution_start: Option<Instant>,
+    /// Opcode counter for periodic limit checks (avoids checking clock on every op).
+    opcode_counter: u64,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -172,8 +239,13 @@ enum DispatchSignal {
 }
 
 impl Vm {
-    /// Create a new VM.
+    /// Create a new VM with default configuration.
     pub fn new() -> Self {
+        Self::with_config(VmConfig::default())
+    }
+
+    /// Create a new VM with explicit configuration.
+    pub fn with_config(config: VmConfig) -> Self {
         Self {
             output: String::new(),
             functions: HashMap::new(),
@@ -191,7 +263,55 @@ impl Vm {
             current_fiber_id: None,
             next_closure_id: 0,
             closure_bindings: HashMap::new(),
+            config,
+            execution_start: None,
+            opcode_counter: 0,
         }
+    }
+
+    /// Check if a file path is allowed by open_basedir restriction.
+    /// Returns Ok(()) if allowed, Err with warning if not.
+    pub fn check_open_basedir(&self, path: &str) -> VmResult<()> {
+        if self.config.open_basedir.is_empty() {
+            return Ok(());
+        }
+
+        // Canonicalize the target path (resolve symlinks, .., etc.)
+        let canonical = std::fs::canonicalize(path)
+            .or_else(|_| {
+                // If file doesn't exist yet, canonicalize the parent directory
+                let p = std::path::Path::new(path);
+                if let Some(parent) = p.parent() {
+                    std::fs::canonicalize(parent)
+                        .map(|pp| pp.join(p.file_name().unwrap_or_default()))
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Cannot resolve path",
+                    ))
+                }
+            })
+            .unwrap_or_else(|_| std::path::PathBuf::from(path));
+
+        let canonical_str = canonical.to_string_lossy();
+
+        for base in &self.config.open_basedir {
+            let base_canonical =
+                std::fs::canonicalize(base).unwrap_or_else(|_| std::path::PathBuf::from(base));
+            let base_str = base_canonical.to_string_lossy();
+            // Path must start with the base directory
+            if canonical_str.starts_with(base_str.as_ref()) {
+                return Ok(());
+            }
+        }
+
+        Err(VmError::FatalError(format!(
+            "open_basedir restriction in effect. File({}) is not within the allowed path(s): ({})",
+            path,
+            self.config
+                .open_basedir
+                .join(if cfg!(windows) { ";" } else { ":" })
+        )))
     }
 
     /// Execute a compiled op_array and return the output.
@@ -203,12 +323,29 @@ impl Vm {
         op_array: &ZOpArray,
         superglobals: Option<&HashMap<String, Value>>,
     ) -> VmResult<String> {
-        // Store the main op_array
+        // ── Request-start cleanup: clear all per-request state ──
         self.op_arrays.clear();
         self.op_arrays.push(op_array.clone());
         self.functions.clear();
         self.output.clear();
         self.shutdown_functions.clear();
+        self.generators.clear();
+        self.fibers.clear();
+        self.closure_bindings.clear();
+        self.included_files.clear();
+        self.current_exception = None;
+        self.current_fiber_id = None;
+        self.next_object_id = 1;
+        self.next_closure_id = 0;
+        self.last_return_value = Value::Null;
+        self.opcode_counter = 0;
+
+        // Start execution timer
+        if self.config.max_execution_time > 0 {
+            self.execution_start = Some(Instant::now());
+        } else {
+            self.execution_start = None;
+        }
 
         // Pre-register any nested function definitions from dynamic_func_defs
         self.register_dynamic_func_defs(0);
@@ -263,6 +400,66 @@ impl Vm {
         }
     }
 
+    /// Check execution time, memory limits, and shutdown signals.
+    /// Called periodically from dispatch loop (every 1024 opcodes).
+    fn check_execution_limits(&self) -> VmResult<()> {
+        // Check for graceful shutdown signal (SIGINT/SIGTERM)
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            return Err(VmError::Exit(130)); // 128 + SIGINT(2)
+        }
+
+        // Check execution time limit
+        if let Some(start) = self.execution_start {
+            let elapsed = start.elapsed().as_secs();
+            if elapsed >= self.config.max_execution_time {
+                return Err(VmError::TimeLimitExceeded(format!(
+                    "Maximum execution time of {} seconds exceeded",
+                    self.config.max_execution_time
+                )));
+            }
+        }
+
+        // Check approximate memory usage (output buffer + data structures)
+        if self.config.memory_limit > 0 {
+            let approx_usage = self.approximate_memory_usage();
+            if approx_usage > self.config.memory_limit {
+                return Err(VmError::MemoryLimitExceeded(format!(
+                    "Allowed memory size of {} bytes exhausted (tried to allocate approx {} bytes)",
+                    self.config.memory_limit, approx_usage
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Approximate the current memory usage of the VM.
+    fn approximate_memory_usage(&self) -> usize {
+        let mut usage = 0usize;
+        // Output buffer
+        usage += self.output.capacity();
+        // Op arrays (compiled bytecode)
+        usage += self.op_arrays.len() * std::mem::size_of::<ZOpArray>();
+        // Call stack frames
+        for frame in &self.call_stack {
+            usage += frame.cvs.len() * std::mem::size_of::<Value>();
+            usage += frame.temps.len() * std::mem::size_of::<Value>();
+            usage += frame.args.len() * std::mem::size_of::<Value>();
+        }
+        // Generator states
+        usage += self.generators.len() * 256; // estimate per generator
+                                              // Fiber states
+        usage += self.fibers.len() * 512; // estimate per fiber
+                                          // Closure bindings
+        for bindings in self.closure_bindings.values() {
+            usage += bindings.len() * std::mem::size_of::<(String, Value)>();
+        }
+        // Constants and class defs
+        usage += self.constants.len() * 64;
+        usage += self.classes.len() * 256;
+        usage
+    }
+
     /// Register dynamic_func_defs from an op_array into the function table.
     /// Skips closures ({closure}) — those are registered at runtime via DeclareLambdaFunction.
     fn register_dynamic_func_defs(&mut self, parent_idx: usize) {
@@ -292,6 +489,12 @@ impl Vm {
         loop {
             if self.call_stack.len() <= min_depth {
                 return Ok(());
+            }
+
+            // ── Periodic limit checks (every 1024 opcodes) ──
+            self.opcode_counter += 1;
+            if self.opcode_counter & 0x3FF == 0 {
+                self.check_execution_limits()?;
             }
 
             let frame = self.call_stack.last().unwrap();
@@ -1728,6 +1931,9 @@ impl Vm {
             1 | 2 | 3 | 4 => {
                 let path = operand.to_php_string();
 
+                // open_basedir check for include/require
+                self.check_open_basedir(&path)?;
+
                 // For once variants, check if already included
                 if (mode == 2 || mode == 4) && self.included_files.contains(&path) {
                     self.write_result(op, oa_idx, Value::Bool(true))?;
@@ -2885,6 +3091,18 @@ impl Vm {
 
     /// Call a built-in function. Returns Some(Value) if handled, None if not a built-in.
     fn call_builtin(&mut self, name: &str, args: &[Value]) -> VmResult<Option<Value>> {
+        // Check disable_functions
+        if self
+            .config
+            .disabled_functions
+            .contains(&name.to_lowercase())
+        {
+            return Err(VmError::DisabledFunction(format!(
+                "{}() has been disabled for security reasons",
+                name
+            )));
+        }
+
         match name {
             "strlen" => {
                 let s = args.first().cloned().unwrap_or(Value::Null);
@@ -4049,6 +4267,7 @@ impl Vm {
             }
             "file_get_contents" => {
                 let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&f)?;
                 match std::fs::read_to_string(&f) {
                     Ok(c) => Ok(Some(Value::String(c))),
                     Err(_) => Ok(Some(Value::Bool(false))),
@@ -4056,6 +4275,7 @@ impl Vm {
             }
             "file_put_contents" => {
                 let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&f)?;
                 let d = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 match std::fs::write(&f, &d) {
                     Ok(()) => Ok(Some(Value::Long(d.len() as i64))),
@@ -4064,14 +4284,17 @@ impl Vm {
             }
             "file_exists" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
                 Ok(Some(Value::Bool(std::path::Path::new(&p).exists())))
             }
             "is_file" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
                 Ok(Some(Value::Bool(std::path::Path::new(&p).is_file())))
             }
             "is_dir" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
                 Ok(Some(Value::Bool(std::path::Path::new(&p).is_dir())))
             }
             "dirname" => {
@@ -4094,6 +4317,7 @@ impl Vm {
             }
             "realpath" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.check_open_basedir(&p)?;
                 match std::fs::canonicalize(&p) {
                     Ok(rp) => Ok(Some(Value::String(rp.to_string_lossy().to_string()))),
                     Err(_) => Ok(Some(Value::Bool(false))),
@@ -6310,5 +6534,144 @@ echo $f->getReturn() . "\n";
     #[test]
     fn test_string_interpolation_escape_sequences() {
         assert_eq!(run_php(r#"<?php echo "tab\there\n";"#), "tab\there\n");
+    }
+
+    // =========================================================================
+    // Production hardening tests
+    // =========================================================================
+
+    fn run_php_with_config(source: &str, config: VmConfig) -> Result<String, VmError> {
+        let op_array = compile(source).unwrap_or_else(|e| {
+            panic!("Compilation failed for:\n{}\nError: {:?}", source, e);
+        });
+        let mut vm = Vm::with_config(config);
+        vm.execute(&op_array, None)
+    }
+
+    #[test]
+    fn test_execution_time_limit() {
+        // Set a very short time limit (1 second) and run an infinite loop
+        let mut config = VmConfig::default();
+        config.max_execution_time = 1;
+        let result = run_php_with_config("<?php while(true) { $x = 1; }", config);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            VmError::TimeLimitExceeded(msg) => {
+                assert!(msg.contains("Maximum execution time"));
+            }
+            other => panic!("Expected TimeLimitExceeded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_memory_limit_enforcement() {
+        // Set a very small memory limit
+        let mut config = VmConfig::default();
+        config.memory_limit = 64; // 64 bytes — absurdly small
+        let result = run_php_with_config(
+            r#"<?php
+$a = "x";
+for ($i = 0; $i < 10000; $i++) {
+    $a = $a . "x";
+}
+echo $a;
+"#,
+            config,
+        );
+        // With 64 bytes limit, this should fail due to memory
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            VmError::MemoryLimitExceeded(msg) => {
+                assert!(msg.contains("memory size"));
+            }
+            other => panic!("Expected MemoryLimitExceeded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_disable_functions() {
+        let mut config = VmConfig::default();
+        config.set_disabled_functions("strlen,var_dump");
+        let result = run_php_with_config(r#"<?php echo strlen("hello");"#, config);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            VmError::DisabledFunction(msg) => {
+                assert!(msg.contains("strlen"));
+                assert!(msg.contains("disabled"));
+            }
+            other => panic!("Expected DisabledFunction, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_disable_functions_other_functions_work() {
+        let mut config = VmConfig::default();
+        config.set_disabled_functions("exec,system");
+        // strlen is NOT disabled, so it should work fine
+        let result = run_php_with_config(r#"<?php echo strlen("hello");"#, config);
+        assert_eq!(result.unwrap(), "5");
+    }
+
+    #[test]
+    fn test_no_time_limit_when_zero() {
+        // 0 means no limit — should run fine
+        let mut config = VmConfig::default();
+        config.max_execution_time = 0;
+        let result = run_php_with_config("<?php echo 42;", config);
+        assert_eq!(result.unwrap(), "42");
+    }
+
+    #[test]
+    fn test_no_memory_limit_when_zero() {
+        // 0 means no limit — should run fine
+        let mut config = VmConfig::default();
+        config.memory_limit = 0;
+        let result = run_php_with_config("<?php echo 42;", config);
+        assert_eq!(result.unwrap(), "42");
+    }
+
+    #[test]
+    fn test_request_state_cleanup() {
+        // Test that state is properly cleaned between execute() calls
+        let mut vm = Vm::new();
+        let source1 = compile("<?php $x = 42; echo $x;").unwrap();
+        let source2 = compile("<?php echo isset($x) ? 'yes' : 'no';").unwrap();
+
+        let output1 = vm.execute(&source1, None).unwrap();
+        assert_eq!(output1, "42");
+
+        // Second execution should not see $x from first — CVs are per-frame
+        let output2 = vm.execute(&source2, None).unwrap();
+        assert_eq!(output2, "no");
+    }
+
+    #[test]
+    fn test_vm_config_set_disabled_functions() {
+        let mut config = VmConfig::default();
+        assert!(config.disabled_functions.is_empty());
+
+        config.set_disabled_functions("strlen, var_dump, echo");
+        assert!(config.disabled_functions.contains("strlen"));
+        assert!(config.disabled_functions.contains("var_dump"));
+        assert!(config.disabled_functions.contains("echo"));
+        assert_eq!(config.disabled_functions.len(), 3);
+    }
+
+    #[test]
+    fn test_vm_config_set_open_basedir() {
+        let mut config = VmConfig::default();
+        assert!(config.open_basedir.is_empty());
+
+        config.set_open_basedir("/tmp:/var/www");
+        assert_eq!(config.open_basedir, vec!["/tmp", "/var/www"]);
+    }
+
+    #[test]
+    fn test_vm_config_defaults() {
+        let config = VmConfig::default();
+        assert_eq!(config.memory_limit, 128 * 1024 * 1024);
+        assert_eq!(config.max_execution_time, 30);
+        assert!(config.disabled_functions.is_empty());
+        assert!(config.open_basedir.is_empty());
     }
 }
