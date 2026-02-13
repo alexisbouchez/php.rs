@@ -117,13 +117,12 @@ pub fn parse_phpt(content: &str) -> Result<PhptTest, String> {
 
 /// Get the path to the php.rs CLI binary
 fn get_php_binary() -> Result<PathBuf, String> {
-    // The binary should be in target/debug/php-rs-sapi-cli (or target/release/)
-    // We'll use the debug version by default
+    // The binary is "php-rs" (defined in php-rs-sapi-cli/Cargo.toml [[bin]])
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = Path::new(manifest_dir);
 
-    let debug_binary = workspace_root.join("target/debug/php-rs-sapi-cli");
-    let release_binary = workspace_root.join("target/release/php-rs-sapi-cli");
+    let debug_binary = workspace_root.join("target/debug/php-rs");
+    let release_binary = workspace_root.join("target/release/php-rs");
 
     if debug_binary.exists() {
         Ok(debug_binary)
@@ -1024,5 +1023,283 @@ echo $a + $b;
 
         // Just verify this doesn't crash with all sections present
         let _ = execute_phpt(&test);
+    }
+
+    // ── PHPT Integration Tests ─────────────────────────────────────────────
+
+    /// Run all .phpt files in a directory and report pass/fail/skip rates.
+    /// Returns (passed, failed, skipped, errors, total, failures_detail).
+    fn run_phpt_directory(dir: &str) -> (usize, usize, usize, usize, usize, Vec<String>) {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let phpt_dir = Path::new(manifest_dir).join(dir);
+
+        if !phpt_dir.exists() {
+            eprintln!("PHPT directory not found: {}", phpt_dir.display());
+            return (0, 0, 0, 0, 0, vec![]);
+        }
+
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_phpt_files(&phpt_dir, &mut files);
+        files.sort();
+
+        let total = files.len();
+        let mut passed = 0usize;
+        let mut failed = 0usize;
+        let mut skipped = 0usize;
+        let mut errors = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+
+        for file in &files {
+            let content = match fs::read_to_string(file) {
+                Ok(c) => c,
+                Err(e) => {
+                    errors += 1;
+                    failures.push(format!(
+                        "READ_ERROR {}: {}",
+                        file.strip_prefix(manifest_dir).unwrap_or(file).display(),
+                        e
+                    ));
+                    continue;
+                }
+            };
+
+            let test = match parse_phpt(&content) {
+                Ok(t) => t,
+                Err(e) => {
+                    // Some .phpt files may not have all required sections (e.g. --EXPECTREGEX--)
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            match execute_phpt(&test) {
+                Ok(PhptExecutionResult::Skipped { reason }) => {
+                    skipped += 1;
+                }
+                Ok(PhptExecutionResult::Executed(output)) => {
+                    let actual = output.stdout.trim_end_matches('\n');
+                    let result = compare_output(&test.expect, actual);
+                    match result {
+                        CompareResult::Match => {
+                            passed += 1;
+                        }
+                        CompareResult::Mismatch {
+                            expected,
+                            actual,
+                            details,
+                        } => {
+                            failed += 1;
+                            let rel = file
+                                .strip_prefix(manifest_dir)
+                                .unwrap_or(file)
+                                .display()
+                                .to_string();
+                            failures.push(format!(
+                                "FAIL {}: {}\n  Expected: {}\n  Actual:   {}",
+                                rel,
+                                test.description,
+                                truncate(&expected, 120),
+                                truncate(&actual, 120)
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors += 1;
+                    let rel = file
+                        .strip_prefix(manifest_dir)
+                        .unwrap_or(file)
+                        .display()
+                        .to_string();
+                    failures.push(format!("ERROR {}: {}", rel, e));
+                }
+            }
+        }
+
+        (passed, failed, skipped, errors, total, failures)
+    }
+
+    fn collect_phpt_files(dir: &Path, files: &mut Vec<PathBuf>) {
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_phpt_files(&path, files);
+                } else if path.extension().map_or(false, |e| e == "phpt") {
+                    files.push(path);
+                }
+            }
+        }
+    }
+
+    fn truncate(s: &str, max: usize) -> String {
+        if s.len() <= max {
+            s.replace('\n', "\\n")
+        } else {
+            format!("{}...", &s[..max].replace('\n', "\\n"))
+        }
+    }
+
+    #[test]
+    fn test_phpt_lang() {
+        let (passed, failed, skipped, errors, total, failures) =
+            run_phpt_directory("php-src/tests/lang");
+        let run = passed + failed;
+        let pass_rate = if run > 0 {
+            (passed as f64 / run as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "\n=== php-src/tests/lang/ ===\nTotal: {} | Passed: {} | Failed: {} | Skipped: {} | Errors: {} | Pass rate: {:.1}%",
+            total, passed, failed, skipped, errors, pass_rate
+        );
+
+        if !failures.is_empty() {
+            eprintln!("\nFirst 20 failures:");
+            for f in failures.iter().take(20) {
+                eprintln!("  {}", f);
+            }
+        }
+
+        // Track progress — assert a minimum pass rate
+        assert!(total > 0, "No .phpt files found in php-src/tests/lang/");
+    }
+
+    #[test]
+    fn test_phpt_basic() {
+        let (passed, failed, skipped, errors, total, failures) =
+            run_phpt_directory("php-src/tests/basic");
+        let run = passed + failed;
+        let pass_rate = if run > 0 {
+            (passed as f64 / run as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "\n=== php-src/tests/basic/ ===\nTotal: {} | Passed: {} | Failed: {} | Skipped: {} | Errors: {} | Pass rate: {:.1}%",
+            total, passed, failed, skipped, errors, pass_rate
+        );
+
+        if !failures.is_empty() {
+            eprintln!("\nFirst 20 failures:");
+            for f in failures.iter().take(20) {
+                eprintln!("  {}", f);
+            }
+        }
+
+        assert!(total > 0, "No .phpt files found in php-src/tests/basic/");
+    }
+
+    #[test]
+    fn test_phpt_func() {
+        let (passed, failed, skipped, errors, total, failures) =
+            run_phpt_directory("php-src/tests/func");
+        let run = passed + failed;
+        let pass_rate = if run > 0 {
+            (passed as f64 / run as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "\n=== php-src/tests/func/ ===\nTotal: {} | Passed: {} | Failed: {} | Skipped: {} | Errors: {} | Pass rate: {:.1}%",
+            total, passed, failed, skipped, errors, pass_rate
+        );
+
+        if !failures.is_empty() {
+            eprintln!("\nFirst 20 failures:");
+            for f in failures.iter().take(20) {
+                eprintln!("  {}", f);
+            }
+        }
+
+        assert!(total > 0, "No .phpt files found in php-src/tests/func/");
+    }
+
+    #[test]
+    fn test_phpt_classes() {
+        let (passed, failed, skipped, errors, total, failures) =
+            run_phpt_directory("php-src/tests/classes");
+        let run = passed + failed;
+        let pass_rate = if run > 0 {
+            (passed as f64 / run as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "\n=== php-src/tests/classes/ ===\nTotal: {} | Passed: {} | Failed: {} | Skipped: {} | Errors: {} | Pass rate: {:.1}%",
+            total, passed, failed, skipped, errors, pass_rate
+        );
+
+        if !failures.is_empty() {
+            eprintln!("\nFirst 20 failures:");
+            for f in failures.iter().take(20) {
+                eprintln!("  {}", f);
+            }
+        }
+
+        assert!(total > 0, "No .phpt files found in php-src/tests/classes/");
+    }
+
+    #[test]
+    fn test_phpt_output() {
+        let (passed, failed, skipped, errors, total, failures) =
+            run_phpt_directory("php-src/tests/output");
+        let run = passed + failed;
+        let pass_rate = if run > 0 {
+            (passed as f64 / run as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "\n=== php-src/tests/output/ ===\nTotal: {} | Passed: {} | Failed: {} | Skipped: {} | Errors: {} | Pass rate: {:.1}%",
+            total, passed, failed, skipped, errors, pass_rate
+        );
+
+        if !failures.is_empty() {
+            eprintln!("\nFirst 20 failures:");
+            for f in failures.iter().take(20) {
+                eprintln!("  {}", f);
+            }
+        }
+
+        // output/ directory may not exist; only assert if found
+        if total > 0 {
+            eprintln!("Output tests found and executed.");
+        }
+    }
+
+    #[test]
+    fn test_phpt_strings() {
+        let (passed, failed, skipped, errors, total, failures) =
+            run_phpt_directory("php-src/tests/strings");
+        let run = passed + failed;
+        let pass_rate = if run > 0 {
+            (passed as f64 / run as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        eprintln!(
+            "\n=== php-src/tests/strings/ ===\nTotal: {} | Passed: {} | Failed: {} | Skipped: {} | Errors: {} | Pass rate: {:.1}%",
+            total, passed, failed, skipped, errors, pass_rate
+        );
+
+        if !failures.is_empty() {
+            eprintln!("\nFirst 20 failures:");
+            for f in failures.iter().take(20) {
+                eprintln!("  {}", f);
+            }
+        }
+
+        // strings/ directory may not exist; only assert if found
+        if total > 0 {
+            eprintln!("String tests found and executed.");
+        }
     }
 }

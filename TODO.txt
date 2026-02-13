@@ -770,12 +770,12 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 # Systematic PHPT test pass against php-src test suite
 ################################################################################
 
-[ ] 14.1  Run php-src/tests/lang/ (228 tests) — language constructs
-[ ] 14.2  Run php-src/tests/classes/ (291 tests) — OOP
-[ ] 14.3  Run php-src/tests/basic/ (115 tests) — basics
-[ ] 14.4  Run php-src/tests/func/ (16 tests) — functions
-[ ] 14.5  Run php-src/tests/output/ (94 tests) — output handling
-[ ] 14.6  Run php-src/tests/strings/ (11 tests) — string operations
+[x] 14.1  Run php-src/tests/lang/ (294 tests) — 39 pass, 213 fail, 42 skip = 15.5%
+[x] 14.2  Run php-src/tests/classes/ (283 tests) — 14 pass, 269 fail = 4.9%
+[x] 14.3  Run php-src/tests/basic/ (111 tests) — 7 pass, 98 fail, 6 skip = 6.7%
+[x] 14.4  Run php-src/tests/func/ (14 tests) — 3 pass, 11 fail = 21.4%
+[x] 14.5  Run php-src/tests/output/ (94 tests) — 2 pass, 88 fail, 4 skip = 2.2%
+[x] 14.6  Run php-src/tests/strings/ (9 tests) — 1 pass, 8 fail = 11.1%
 [ ] 14.7  Run php-src/tests/security/ (54 tests) — security
 [ ] 14.8  Run php-src/ext/standard/tests/ (3,833 tests) — standard library
 [ ] 14.9  Run php-src/ext/json/tests/
