@@ -143,6 +143,8 @@ pub struct Vm {
     included_files: HashSet<String>,
     /// Last return value from a frame (used for synchronous method calls).
     last_return_value: Value,
+    /// Shutdown functions registered via register_shutdown_function().
+    shutdown_functions: Vec<String>,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -171,6 +173,7 @@ impl Vm {
             current_exception: None,
             included_files: HashSet::new(),
             last_return_value: Value::Null,
+            shutdown_functions: Vec::new(),
         }
     }
 
@@ -181,6 +184,7 @@ impl Vm {
         self.op_arrays.push(op_array.clone());
         self.functions.clear();
         self.output.clear();
+        self.shutdown_functions.clear();
 
         // Pre-register any nested function definitions from dynamic_func_defs
         self.register_dynamic_func_defs(0);
@@ -190,9 +194,40 @@ impl Vm {
         frame.op_array_idx = 0;
 
         self.call_stack.push(frame);
-        self.dispatch_loop()?;
+
+        let dispatch_result = self.dispatch_loop();
+
+        // Run registered shutdown functions regardless of script result
+        self.run_shutdown_functions();
+
+        // Propagate any error from dispatch (except Exit which is normal termination)
+        match dispatch_result {
+            Err(VmError::Exit(_)) => {}
+            Err(e) => return Err(e),
+            Ok(()) => {}
+        }
 
         Ok(self.output.clone())
+    }
+
+    /// Run registered shutdown functions (called after script execution).
+    fn run_shutdown_functions(&mut self) {
+        let funcs: Vec<String> = self.shutdown_functions.drain(..).collect();
+        for func_name in funcs {
+            // Try built-in first
+            if let Ok(Some(_)) = self.call_builtin(&func_name, &[]) {
+                continue;
+            }
+            // Try user-defined function
+            if let Some(&oa_idx) = self.functions.get(&func_name) {
+                let func_oa = &self.op_arrays[oa_idx];
+                let mut new_frame = Frame::new(func_oa);
+                new_frame.op_array_idx = oa_idx;
+                self.call_stack.push(new_frame);
+                // Ignore errors during shutdown
+                let _ = self.dispatch_loop();
+            }
+        }
     }
 
     /// Register dynamic_func_defs from an op_array into the function table.
@@ -867,6 +902,18 @@ impl Vm {
                 // Check type: extended_value encodes which type to check
                 let val = self.read_operand(op, 1, oa_idx)?;
                 let result = match op.extended_value {
+                    0 => {
+                        // empty() check: value is "empty" if it's falsy in PHP
+                        match &val {
+                            Value::Null => true,
+                            Value::Bool(b) => !b,
+                            Value::Long(n) => *n == 0,
+                            Value::Double(f) => *f == 0.0,
+                            Value::String(s) => s.is_empty() || s == "0",
+                            Value::Array(a) => a.is_empty(),
+                            _ => false,
+                        }
+                    }
                     1 => val.is_null(),                     // IS_NULL
                     2 => matches!(val, Value::Bool(false)), // IS_FALSE
                     4 => matches!(val, Value::Bool(true)),  // IS_TRUE
@@ -2339,19 +2386,27 @@ impl Vm {
             // ── Phase 8 additions ──
             "quoted_printable_encode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_quoted_printable_encode(s.as_bytes()))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_quoted_printable_encode(s.as_bytes()),
+                )))
             }
             "quoted_printable_decode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_quoted_printable_decode(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_quoted_printable_decode(&s),
+                )))
             }
             "addslashes" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_addslashes(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_addslashes(&s),
+                )))
             }
             "stripslashes" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_stripslashes(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_stripslashes(&s),
+                )))
             }
             "get_parent_class" => {
                 let v = args.first().cloned().unwrap_or(Value::Null);
@@ -2379,7 +2434,9 @@ impl Vm {
                 let mut cur = cn;
                 loop {
                     match self.classes.get(&cur).and_then(|c| c.parent.clone()) {
-                        Some(p) if p.eq_ignore_ascii_case(&target) => return Ok(Some(Value::Bool(true))),
+                        Some(p) if p.eq_ignore_ascii_case(&target) => {
+                            return Ok(Some(Value::Bool(true)))
+                        }
                         Some(p) => cur = p,
                         None => break,
                     }
@@ -2400,7 +2457,9 @@ impl Vm {
                 let mut cur = cn;
                 loop {
                     match self.classes.get(&cur).and_then(|c| c.parent.clone()) {
-                        Some(p) if p.eq_ignore_ascii_case(&target) => return Ok(Some(Value::Bool(true))),
+                        Some(p) if p.eq_ignore_ascii_case(&target) => {
+                            return Ok(Some(Value::Bool(true)))
+                        }
                         Some(p) => cur = p,
                         None => break,
                     }
@@ -2453,7 +2512,13 @@ impl Vm {
                     _ => Err(VmError::Exit(0)),
                 }
             }
-            "register_shutdown_function" => Ok(Some(Value::Null)),
+            "register_shutdown_function" => {
+                let func_name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                if !func_name.is_empty() {
+                    self.shutdown_functions.push(func_name);
+                }
+                Ok(Some(Value::Null))
+            }
             "set_time_limit" => Ok(Some(Value::Bool(true))),
             "ignore_user_abort" => Ok(Some(Value::Long(0))),
             "function_exists" => {
@@ -2462,7 +2527,9 @@ impl Vm {
             }
             "is_callable" => {
                 let v = args.first().cloned().unwrap_or(Value::Null);
-                Ok(Some(Value::Bool(matches!(v, Value::String(ref s) if self.functions.contains_key(s)))))
+                Ok(Some(Value::Bool(
+                    matches!(v, Value::String(ref s) if self.functions.contains_key(s)),
+                )))
             }
             "preg_match" => {
                 let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -2493,8 +2560,13 @@ impl Vm {
                 match parse_php_regex(&pat) {
                     Some((re, flags)) => match regex::Regex::new(&apply_regex_flags(&re, &flags)) {
                         Ok(r) => {
-                            let rr = rep.replace("\\1", "$1").replace("\\2", "$2").replace("\\3", "$3");
-                            Ok(Some(Value::String(r.replace_all(&subj, rr.as_str()).to_string())))
+                            let rr = rep
+                                .replace("\\1", "$1")
+                                .replace("\\2", "$2")
+                                .replace("\\3", "$3");
+                            Ok(Some(Value::String(
+                                r.replace_all(&subj, rr.as_str()).to_string(),
+                            )))
                         }
                         Err(_) => Ok(Some(Value::Null)),
                     },
@@ -2518,6 +2590,57 @@ impl Vm {
                     None => Ok(Some(Value::Bool(false))),
                 }
             }
+            "preg_replace_callback" => {
+                // Stub: return the subject unchanged (callback execution is complex)
+                let subject = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
+                Ok(Some(Value::String(subject)))
+            }
+            "preg_last_error" => {
+                // PREG_NO_ERROR = 0
+                Ok(Some(Value::Long(0)))
+            }
+            "preg_last_error_msg" => Ok(Some(Value::String("No error".to_string()))),
+            "preg_grep" => {
+                let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let input = args.get(1).cloned().unwrap_or(Value::Null);
+                let flags = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+                let invert = flags & 1 != 0; // PREG_GREP_INVERT = 1
+
+                match parse_php_regex(&pat) {
+                    Some((pattern, modifiers)) => {
+                        let case_insensitive = modifiers.contains('i');
+                        let regex_pattern = if case_insensitive {
+                            format!("(?i){}", pattern)
+                        } else {
+                            pattern
+                        };
+                        match regex::Regex::new(&regex_pattern) {
+                            Ok(re) => {
+                                let mut result = PhpArray::new();
+                                if let Value::Array(ref arr) = input {
+                                    for (key, val) in arr.entries() {
+                                        let s = val.to_php_string();
+                                        let matched = re.is_match(&s);
+                                        if matched != invert {
+                                            match key {
+                                                ArrayKey::Int(i) => {
+                                                    result.set_int(*i, val.clone());
+                                                }
+                                                ArrayKey::String(s) => {
+                                                    result.set_string(s.clone(), val.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Ok(Some(Value::Array(result)))
+                            }
+                            Err(_) => Ok(Some(Value::Bool(false))),
+                        }
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
             "preg_quote" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let delim = args.get(1).map(|v| v.to_php_string());
@@ -2537,15 +2660,21 @@ impl Vm {
             }
             "md5" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(&s))))
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(
+                    &s,
+                ))))
             }
             "sha1" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_sha1(&s))))
+                Ok(Some(Value::String(php_rs_ext_standard::strings::php_sha1(
+                    &s,
+                ))))
             }
             "base64_encode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_base64_encode(s.as_bytes()))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_base64_encode(s.as_bytes()),
+                )))
             }
             "base64_decode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -2556,57 +2685,83 @@ impl Vm {
             }
             "htmlspecialchars" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_htmlspecialchars(
-                    &s,
-                    php_rs_ext_standard::strings::HtmlFlags::default(),
-                ))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_htmlspecialchars(
+                        &s,
+                        php_rs_ext_standard::strings::HtmlFlags::default(),
+                    ),
+                )))
             }
             "htmlspecialchars_decode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_htmlspecialchars_decode(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_htmlspecialchars_decode(&s),
+                )))
             }
             "urlencode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_urlencode(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_urlencode(&s),
+                )))
             }
             "urldecode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_urldecode(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_urldecode(&s),
+                )))
             }
             "rawurlencode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_rawurlencode(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_rawurlencode(&s),
+                )))
             }
             "rawurldecode" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_rawurldecode(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_rawurldecode(&s),
+                )))
             }
             "crc32" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Long(php_rs_ext_standard::strings::php_crc32(&s))))
+                Ok(Some(Value::Long(php_rs_ext_standard::strings::php_crc32(
+                    &s,
+                ))))
             }
             "str_rot13" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_str_rot13(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_str_rot13(&s),
+                )))
             }
             "ucfirst" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_ucfirst(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_ucfirst(&s),
+                )))
             }
             "lcfirst" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_lcfirst(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_lcfirst(&s),
+                )))
             }
             "ucwords" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                let d = args.get(1).cloned().unwrap_or(Value::String(String::new())).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_ucwords(&s, &d))))
+                let d = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()))
+                    .to_php_string();
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_ucwords(&s, &d),
+                )))
             }
             "serialize" => {
                 let val = args.first().cloned().unwrap_or(Value::Null);
-                Ok(Some(Value::String(php_rs_ext_standard::variables::php_serialize(
-                    &value_to_serializable(&val),
-                ))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::variables::php_serialize(&value_to_serializable(&val)),
+                )))
             }
             "unserialize" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -2688,84 +2843,48 @@ impl Vm {
             }
             "php_sapi_name" => Ok(Some(Value::String("cli".to_string()))),
             "getenv" => {
-                let n = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let n = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 match std::env::var(&n) {
                     Ok(v) => Ok(Some(Value::String(v))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
             "putenv" => {
-                let s = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 if let Some(eq) = s.find('=') {
                     std::env::set_var(&s[..eq], &s[eq + 1..]);
                 }
                 Ok(Some(Value::Bool(true)))
             }
             "file_get_contents" => {
-                let f = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 match std::fs::read_to_string(&f) {
                     Ok(c) => Ok(Some(Value::String(c))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
             "file_put_contents" => {
-                let f = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
-                let d = args
-                    .get(1)
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let d = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 match std::fs::write(&f, &d) {
                     Ok(()) => Ok(Some(Value::Long(d.len() as i64))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
             "file_exists" => {
-                let p = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::Bool(std::path::Path::new(&p).exists())))
             }
             "is_file" => {
-                let p = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::Bool(std::path::Path::new(&p).is_file())))
             }
             "is_dir" => {
-                let p = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::Bool(std::path::Path::new(&p).is_dir())))
             }
             "dirname" => {
-                let p = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(
                     std::path::Path::new(&p)
                         .parent()
@@ -2774,11 +2893,7 @@ impl Vm {
                 )))
             }
             "basename" => {
-                let p = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(
                     std::path::Path::new(&p)
                         .file_name()
@@ -2787,11 +2902,7 @@ impl Vm {
                 )))
             }
             "realpath" => {
-                let p = args
-                    .first()
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 match std::fs::canonicalize(&p) {
                     Ok(rp) => Ok(Some(Value::String(rp.to_string_lossy().to_string()))),
                     Err(_) => Ok(Some(Value::Bool(false))),
@@ -4194,6 +4305,238 @@ var_dump($d instanceof Printable);
 "#
             ),
             "bool(false)\n"
+        );
+    }
+
+    // =========================================================================
+    // 8.2.15: list() / array destructuring
+    // =========================================================================
+
+    #[test]
+    fn test_list_simple() {
+        assert_eq!(
+            run_php("<?php list($a, $b) = [1, 2]; echo $a . ',' . $b;"),
+            "1,2"
+        );
+    }
+
+    #[test]
+    fn test_list_with_skip() {
+        assert_eq!(
+            run_php("<?php list($a, , $c) = [1, 2, 3]; echo $a . ',' . $c;"),
+            "1,3"
+        );
+    }
+
+    #[test]
+    fn test_list_from_variable() {
+        assert_eq!(
+            run_php("<?php $arr = [10, 20, 30]; list($x, $y, $z) = $arr; echo $x . ' ' . $y . ' ' . $z;"),
+            "10 20 30"
+        );
+    }
+
+    // =========================================================================
+    // 8.3.5: isset, unset, empty
+    // =========================================================================
+
+    #[test]
+    fn test_isset_single() {
+        assert_eq!(
+            run_php("<?php $a = 1; var_dump(isset($a));"),
+            "bool(true)\n"
+        );
+    }
+
+    #[test]
+    fn test_isset_unset_variable() {
+        assert_eq!(
+            run_php("<?php $a = 1; unset($a); var_dump(isset($a));"),
+            "bool(false)\n"
+        );
+    }
+
+    #[test]
+    fn test_unset_array_element() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$arr = [1, 2, 3];
+unset($arr[1]);
+var_dump(count($arr));
+echo $arr[0] . "," . $arr[2];
+"#
+            ),
+            "int(2)\n1,3"
+        );
+    }
+
+    #[test]
+    fn test_isset_array_element() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$arr = ['a' => 1, 'b' => 2];
+var_dump(isset($arr['a']));
+var_dump(isset($arr['c']));
+"#
+            ),
+            "bool(true)\nbool(false)\n"
+        );
+    }
+
+    #[test]
+    fn test_isset_multiple_variables() {
+        assert_eq!(
+            run_php("<?php $a = 1; $b = 2; var_dump(isset($a, $b));"),
+            "bool(true)\n"
+        );
+    }
+
+    #[test]
+    fn test_isset_multiple_one_unset() {
+        assert_eq!(
+            run_php("<?php $a = 1; var_dump(isset($a, $b));"),
+            "bool(false)\n"
+        );
+    }
+
+    #[test]
+    fn test_empty_variable() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$a = "";
+$b = "hello";
+$c = 0;
+var_dump(empty($a));
+var_dump(empty($b));
+var_dump(empty($c));
+"#
+            ),
+            "bool(true)\nbool(false)\nbool(true)\n"
+        );
+    }
+
+    // =========================================================================
+    // 8.6.10: register_shutdown_function
+    // =========================================================================
+
+    #[test]
+    fn test_register_shutdown_function() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+function my_shutdown() {
+    echo "shutdown!";
+}
+register_shutdown_function("my_shutdown");
+echo "main ";
+"#
+            ),
+            "main shutdown!"
+        );
+    }
+
+    #[test]
+    fn test_register_multiple_shutdown_functions() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+function shutdown1() { echo "1"; }
+function shutdown2() { echo "2"; }
+register_shutdown_function("shutdown1");
+register_shutdown_function("shutdown2");
+echo "main ";
+"#
+            ),
+            "main 12"
+        );
+    }
+
+    // =========================================================================
+    // 8.7.1-8.7.4: preg_* regex functions
+    // =========================================================================
+
+    #[test]
+    fn test_preg_replace_callback_stub() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$result = preg_replace_callback("/foo/", "strtoupper", "hello foo world");
+echo $result;
+"#
+            ),
+            "hello foo world"
+        );
+    }
+
+    #[test]
+    fn test_preg_last_error() {
+        assert_eq!(run_php("<?php echo preg_last_error();"), "0");
+    }
+
+    #[test]
+    fn test_preg_last_error_msg() {
+        assert_eq!(run_php("<?php echo preg_last_error_msg();"), "No error");
+    }
+
+    #[test]
+    fn test_preg_grep() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$arr = ["foo", "bar", "baz", "foobar"];
+$result = preg_grep("/^foo/", $arr);
+echo count($result);
+"#
+            ),
+            "2"
+        );
+    }
+
+    #[test]
+    fn test_preg_match() {
+        assert_eq!(
+            run_php("<?php echo preg_match('/hello/', 'hello world');"),
+            "1"
+        );
+    }
+
+    #[test]
+    fn test_preg_match_no_match() {
+        assert_eq!(
+            run_php("<?php echo preg_match('/xyz/', 'hello world');"),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_preg_replace() {
+        assert_eq!(
+            run_php(r#"<?php echo preg_replace('/world/', 'PHP', 'hello world');"#),
+            "hello PHP"
+        );
+    }
+
+    #[test]
+    fn test_preg_split() {
+        assert_eq!(
+            run_php(
+                r#"<?php
+$parts = preg_split('/[\s,]+/', 'one, two, three');
+echo count($parts);
+"#
+            ),
+            "3"
+        );
+    }
+
+    #[test]
+    fn test_preg_quote() {
+        assert_eq!(
+            run_php(r#"<?php echo preg_quote('$var.test+value');"#),
+            r#"\$var\.test\+value"#
         );
     }
 }

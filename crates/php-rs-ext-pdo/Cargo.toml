@@ -1,0 +1,12 @@
+[package]
+name = "php-rs-ext-pdo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]

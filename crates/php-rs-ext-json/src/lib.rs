@@ -32,6 +32,41 @@ pub const JSON_HEX_APOS: u32 = 4;
 pub const JSON_HEX_QUOT: u32 = 8;
 pub const JSON_THROW_ON_ERROR: u32 = 4194304;
 
+// ── JsonSerializable interface ───────────────────────────────────────────────
+
+/// PHP's JsonSerializable interface.
+///
+/// Objects implementing this trait can customize their JSON representation.
+/// When `json_encode()` is called on an object implementing `JsonSerializable`,
+/// the `json_serialize()` method is invoked to obtain the value that should be
+/// serialized instead of the default object-to-JSON conversion.
+///
+/// Reference: php-src/ext/json/php_json.h — php_json_serializable_ce
+///
+/// PHP signature:
+/// ```php
+/// interface JsonSerializable {
+///     public function jsonSerialize(): mixed;
+/// }
+/// ```
+pub trait JsonSerializable {
+    /// Specify data which should be serialized to JSON.
+    ///
+    /// Returns a `JsonValue` that represents the data this object should
+    /// serialize to. The returned value is encoded as JSON in place of the
+    /// object itself.
+    fn json_serialize(&self) -> JsonValue;
+}
+
+/// Encode a `JsonSerializable` implementor to a JSON string.
+///
+/// This is a convenience wrapper that calls `json_serialize()` on the object
+/// and then encodes the resulting `JsonValue` with the given options.
+pub fn json_encode_serializable<T: JsonSerializable>(obj: &T, options: u32) -> Option<String> {
+    let value = obj.json_serialize();
+    json_encode(&value, options)
+}
+
 // ── JSON error codes ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -819,5 +854,255 @@ mod tests {
 
         json_decode("42", false, 0);
         assert_eq!(json_last_error(), JsonError::None);
+    }
+
+    // ── JsonSerializable tests ──
+
+    /// A simple struct implementing JsonSerializable that returns an object.
+    struct UserData {
+        name: String,
+        age: i64,
+    }
+
+    impl JsonSerializable for UserData {
+        fn json_serialize(&self) -> JsonValue {
+            JsonValue::Object(vec![
+                ("name".to_string(), JsonValue::Str(self.name.clone())),
+                ("age".to_string(), JsonValue::Int(self.age)),
+            ])
+        }
+    }
+
+    #[test]
+    fn test_json_serializable_object_return() {
+        let user = UserData {
+            name: "Alice".to_string(),
+            age: 30,
+        };
+        let result = json_encode_serializable(&user, 0);
+        assert_eq!(result, Some("{\"name\":\"Alice\",\"age\":30}".to_string()));
+    }
+
+    /// A struct implementing JsonSerializable that returns a scalar value.
+    struct ScalarWrapper {
+        value: String,
+    }
+
+    impl JsonSerializable for ScalarWrapper {
+        fn json_serialize(&self) -> JsonValue {
+            JsonValue::Str(self.value.clone())
+        }
+    }
+
+    #[test]
+    fn test_json_serializable_scalar_return() {
+        let wrapper = ScalarWrapper {
+            value: "just a string".to_string(),
+        };
+        let result = json_encode_serializable(&wrapper, 0);
+        assert_eq!(result, Some("\"just a string\"".to_string()));
+    }
+
+    /// A struct implementing JsonSerializable that returns null.
+    struct NullSerializer;
+
+    impl JsonSerializable for NullSerializer {
+        fn json_serialize(&self) -> JsonValue {
+            JsonValue::Null
+        }
+    }
+
+    #[test]
+    fn test_json_serializable_null_return() {
+        let ns = NullSerializer;
+        let result = json_encode_serializable(&ns, 0);
+        assert_eq!(result, Some("null".to_string()));
+    }
+
+    /// A struct implementing JsonSerializable that returns an array.
+    struct ArraySerializer {
+        items: Vec<i64>,
+    }
+
+    impl JsonSerializable for ArraySerializer {
+        fn json_serialize(&self) -> JsonValue {
+            JsonValue::Array(self.items.iter().map(|n| JsonValue::Int(*n)).collect())
+        }
+    }
+
+    #[test]
+    fn test_json_serializable_array_return() {
+        let a = ArraySerializer {
+            items: vec![1, 2, 3],
+        };
+        let result = json_encode_serializable(&a, 0);
+        assert_eq!(result, Some("[1,2,3]".to_string()));
+    }
+
+    #[test]
+    fn test_json_serializable_with_options() {
+        let user = UserData {
+            name: "Bob".to_string(),
+            age: 25,
+        };
+        let result = json_encode_serializable(&user, JSON_PRETTY_PRINT).unwrap();
+        assert!(result.contains('\n'));
+        assert!(result.contains("    "));
+        assert!(result.contains("\"name\""));
+        assert!(result.contains("\"Bob\""));
+        assert!(result.contains("25"));
+    }
+
+    /// A struct implementing JsonSerializable that returns a nested structure.
+    struct NestedSerializer;
+
+    impl JsonSerializable for NestedSerializer {
+        fn json_serialize(&self) -> JsonValue {
+            JsonValue::Object(vec![
+                ("type".to_string(), JsonValue::Str("nested".to_string())),
+                (
+                    "data".to_string(),
+                    JsonValue::Array(vec![
+                        JsonValue::Int(1),
+                        JsonValue::Object(vec![("inner".to_string(), JsonValue::Bool(true))]),
+                    ]),
+                ),
+            ])
+        }
+    }
+
+    #[test]
+    fn test_json_serializable_nested_structure() {
+        let ns = NestedSerializer;
+        let result = json_encode_serializable(&ns, 0);
+        assert_eq!(
+            result,
+            Some("{\"type\":\"nested\",\"data\":[1,{\"inner\":true}]}".to_string())
+        );
+    }
+
+    /// A struct implementing JsonSerializable that returns a boolean.
+    struct BoolSerializer(bool);
+
+    impl JsonSerializable for BoolSerializer {
+        fn json_serialize(&self) -> JsonValue {
+            JsonValue::Bool(self.0)
+        }
+    }
+
+    #[test]
+    fn test_json_serializable_bool_return() {
+        assert_eq!(
+            json_encode_serializable(&BoolSerializer(true), 0),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            json_encode_serializable(&BoolSerializer(false), 0),
+            Some("false".to_string())
+        );
+    }
+
+    /// A struct implementing JsonSerializable that returns an integer.
+    struct IntSerializer(i64);
+
+    impl JsonSerializable for IntSerializer {
+        fn json_serialize(&self) -> JsonValue {
+            JsonValue::Int(self.0)
+        }
+    }
+
+    #[test]
+    fn test_json_serializable_int_return() {
+        assert_eq!(
+            json_encode_serializable(&IntSerializer(42), 0),
+            Some("42".to_string())
+        );
+        assert_eq!(
+            json_encode_serializable(&IntSerializer(-100), 0),
+            Some("-100".to_string())
+        );
+    }
+
+    /// A struct implementing JsonSerializable that returns a float.
+    struct FloatSerializer(f64);
+
+    impl JsonSerializable for FloatSerializer {
+        fn json_serialize(&self) -> JsonValue {
+            JsonValue::Float(self.0)
+        }
+    }
+
+    #[test]
+    fn test_json_serializable_float_return() {
+        assert_eq!(
+            json_encode_serializable(&FloatSerializer(2.75), 0),
+            Some("2.75".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_serializable_float_inf_returns_none() {
+        // JsonSerializable returning INF should cause json_encode to fail
+        let result = json_encode_serializable(&FloatSerializer(f64::INFINITY), 0);
+        assert_eq!(result, None);
+        assert_eq!(json_last_error(), JsonError::InfOrNan);
+    }
+
+    #[test]
+    fn test_json_serializable_with_unescaped_slashes() {
+        struct UrlSerializer;
+        impl JsonSerializable for UrlSerializer {
+            fn json_serialize(&self) -> JsonValue {
+                JsonValue::Str("https://example.com/path".to_string())
+            }
+        }
+        // Default: slashes are escaped
+        assert_eq!(
+            json_encode_serializable(&UrlSerializer, 0),
+            Some("\"https:\\/\\/example.com\\/path\"".to_string())
+        );
+        // With JSON_UNESCAPED_SLASHES: slashes are not escaped
+        assert_eq!(
+            json_encode_serializable(&UrlSerializer, JSON_UNESCAPED_SLASHES),
+            Some("\"https://example.com/path\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_serializable_with_force_object() {
+        // JsonSerializable returning an array with JSON_FORCE_OBJECT should produce an object
+        let a = ArraySerializer {
+            items: vec![10, 20],
+        };
+        let result = json_encode_serializable(&a, JSON_FORCE_OBJECT);
+        assert_eq!(result, Some("{\"0\":10,\"1\":20}".to_string()));
+    }
+
+    #[test]
+    fn test_json_serializable_empty_object() {
+        struct EmptyObjectSerializer;
+        impl JsonSerializable for EmptyObjectSerializer {
+            fn json_serialize(&self) -> JsonValue {
+                JsonValue::Object(vec![])
+            }
+        }
+        assert_eq!(
+            json_encode_serializable(&EmptyObjectSerializer, 0),
+            Some("{}".to_string())
+        );
+    }
+
+    #[test]
+    fn test_json_serializable_empty_array() {
+        struct EmptyArraySerializer;
+        impl JsonSerializable for EmptyArraySerializer {
+            fn json_serialize(&self) -> JsonValue {
+                JsonValue::Array(vec![])
+            }
+        }
+        assert_eq!(
+            json_encode_serializable(&EmptyArraySerializer, 0),
+            Some("[]".to_string())
+        );
     }
 }

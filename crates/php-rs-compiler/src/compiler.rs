@@ -225,12 +225,39 @@ impl Compiler {
 
             Statement::Unset { vars, span } => {
                 for var in vars {
-                    if let Expression::Variable { name, .. } = var {
-                        let cv = self.op_array.lookup_cv(name);
-                        self.op_array.emit(
-                            ZOp::new(ZOpcode::UnsetCv, span.line as u32)
-                                .with_op1(Operand::cv(cv), OperandType::Cv),
-                        );
+                    match var {
+                        Expression::Variable { name, .. } => {
+                            let cv = self.op_array.lookup_cv(name);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::UnsetCv, span.line as u32)
+                                    .with_op1(Operand::cv(cv), OperandType::Cv),
+                            );
+                        }
+                        Expression::ArrayAccess { array, index, .. } => {
+                            let arr = self.compile_expr(array);
+                            if let Some(idx_expr) = index {
+                                let idx = self.compile_expr(idx_expr);
+                                self.op_array.emit(
+                                    ZOp::new(ZOpcode::UnsetDim, span.line as u32)
+                                        .with_op1(arr.operand, arr.op_type)
+                                        .with_op2(idx.operand, idx.op_type),
+                                );
+                            }
+                        }
+                        Expression::PropertyAccess {
+                            object, property, ..
+                        } => {
+                            let obj = self.compile_expr(object);
+                            let prop = self.compile_expr(property);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::UnsetObj, span.line as u32)
+                                    .with_op1(obj.operand, obj.op_type)
+                                    .with_op2(prop.operand, prop.op_type),
+                            );
+                        }
+                        _ => {
+                            // Fallback: try to compile as variable-like expression
+                        }
                     }
                 }
             }
@@ -893,6 +920,62 @@ impl Compiler {
                 );
                 ExprResult::tmp(tmp)
             }
+            // List/array destructuring: list($a, $b) = expr
+            Expression::List { elements, .. } => {
+                // rhs_result is the source array. For each element in the list,
+                // emit FetchDimR to read the corresponding index, then Assign.
+                for (i, elem) in elements.iter().enumerate() {
+                    if let Some(target) = elem {
+                        let idx_lit = self.op_array.add_literal(Literal::Long(i as i64));
+                        let fetch_tmp = self.op_array.alloc_temp();
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::FetchDimR, line)
+                                .with_op1(rhs_result.operand, rhs_result.op_type)
+                                .with_op2(Operand::constant(idx_lit), OperandType::Const)
+                                .with_result(Operand::tmp_var(fetch_tmp), OperandType::TmpVar),
+                        );
+                        match target {
+                            Expression::Variable { name, .. } => {
+                                let cv = self.op_array.lookup_cv(name);
+                                let assign_tmp = self.op_array.alloc_temp();
+                                self.op_array.emit(
+                                    ZOp::new(ZOpcode::Assign, line)
+                                        .with_op1(Operand::cv(cv), OperandType::Cv)
+                                        .with_op2(Operand::tmp_var(fetch_tmp), OperandType::TmpVar)
+                                        .with_result(
+                                            Operand::tmp_var(assign_tmp),
+                                            OperandType::TmpVar,
+                                        ),
+                                );
+                            }
+                            // Nested list: list($a, list($b, $c)) = expr
+                            Expression::List {
+                                elements: nested, ..
+                            } => {
+                                // Recursively compile nested list destructuring
+                                let fetch_result = ExprResult::tmp(fetch_tmp);
+                                self.compile_list_destructure(nested, fetch_result, line);
+                            }
+                            _ => {
+                                // Compile target as an expression (e.g., $arr[$key])
+                                let lhs_result = self.compile_expr(target);
+                                let assign_tmp = self.op_array.alloc_temp();
+                                self.op_array.emit(
+                                    ZOp::new(ZOpcode::Assign, line)
+                                        .with_op1(lhs_result.operand, lhs_result.op_type)
+                                        .with_op2(Operand::tmp_var(fetch_tmp), OperandType::TmpVar)
+                                        .with_result(
+                                            Operand::tmp_var(assign_tmp),
+                                            OperandType::TmpVar,
+                                        ),
+                                );
+                            }
+                        }
+                    }
+                }
+                rhs_result
+            }
+
             _ => {
                 // Fallback — just emit assign with the lhs compiled
                 let lhs_result = self.compile_expr(lhs);
@@ -904,6 +987,55 @@ impl Compiler {
                         .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
                 );
                 ExprResult::tmp(tmp)
+            }
+        }
+    }
+
+    /// Helper for nested list destructuring.
+    fn compile_list_destructure(
+        &mut self,
+        elements: &[Option<Expression>],
+        source: ExprResult,
+        line: u32,
+    ) {
+        for (i, elem) in elements.iter().enumerate() {
+            if let Some(target) = elem {
+                let idx_lit = self.op_array.add_literal(Literal::Long(i as i64));
+                let fetch_tmp = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::FetchDimR, line)
+                        .with_op1(source.operand, source.op_type)
+                        .with_op2(Operand::constant(idx_lit), OperandType::Const)
+                        .with_result(Operand::tmp_var(fetch_tmp), OperandType::TmpVar),
+                );
+                match target {
+                    Expression::Variable { name, .. } => {
+                        let cv = self.op_array.lookup_cv(name);
+                        let assign_tmp = self.op_array.alloc_temp();
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::Assign, line)
+                                .with_op1(Operand::cv(cv), OperandType::Cv)
+                                .with_op2(Operand::tmp_var(fetch_tmp), OperandType::TmpVar)
+                                .with_result(Operand::tmp_var(assign_tmp), OperandType::TmpVar),
+                        );
+                    }
+                    Expression::List {
+                        elements: nested, ..
+                    } => {
+                        let fetch_result = ExprResult::tmp(fetch_tmp);
+                        self.compile_list_destructure(nested, fetch_result, line);
+                    }
+                    _ => {
+                        let lhs_result = self.compile_expr(target);
+                        let assign_tmp = self.op_array.alloc_temp();
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::Assign, line)
+                                .with_op1(lhs_result.operand, lhs_result.op_type)
+                                .with_op2(Operand::tmp_var(fetch_tmp), OperandType::TmpVar)
+                                .with_result(Operand::tmp_var(assign_tmp), OperandType::TmpVar),
+                        );
+                    }
+                }
             }
         }
     }
@@ -1318,41 +1450,123 @@ impl Compiler {
     }
 
     fn compile_isset(&mut self, vars: &[Expression], line: u32) -> ExprResult {
-        // For single variable, emit ISSET_ISEMPTY_CV
-        // For multiple, AND them together
+        // Compile a single isset check for one variable expression
+        let compile_isset_single = |compiler: &mut Compiler, var: &Expression| -> ExprResult {
+            match var {
+                Expression::Variable { name, .. } => {
+                    let cv = compiler.op_array.lookup_cv(name);
+                    let tmp = compiler.op_array.alloc_temp();
+                    compiler.op_array.emit(
+                        ZOp::new(ZOpcode::IssetIsemptyCv, line)
+                            .with_op1(Operand::cv(cv), OperandType::Cv)
+                            .with_result(Operand::tmp_var(tmp), OperandType::TmpVar)
+                            .with_extended_value(0), // ISSET mode
+                    );
+                    ExprResult::tmp(tmp)
+                }
+                Expression::ArrayAccess { array, index, .. } => {
+                    let arr = compiler.compile_expr(array);
+                    let tmp = compiler.op_array.alloc_temp();
+                    if let Some(idx_expr) = index {
+                        let idx = compiler.compile_expr(idx_expr);
+                        compiler.op_array.emit(
+                            ZOp::new(ZOpcode::IssetIsemptyDimObj, line)
+                                .with_op1(arr.operand, arr.op_type)
+                                .with_op2(idx.operand, idx.op_type)
+                                .with_result(Operand::tmp_var(tmp), OperandType::TmpVar)
+                                .with_extended_value(0), // ISSET mode
+                        );
+                    } else {
+                        compiler.op_array.emit(
+                            ZOp::new(ZOpcode::IssetIsemptyDimObj, line)
+                                .with_op1(arr.operand, arr.op_type)
+                                .with_result(Operand::tmp_var(tmp), OperandType::TmpVar)
+                                .with_extended_value(0),
+                        );
+                    }
+                    ExprResult::tmp(tmp)
+                }
+                Expression::PropertyAccess {
+                    object, property, ..
+                } => {
+                    let obj = compiler.compile_expr(object);
+                    let prop = compiler.compile_expr(property);
+                    let tmp = compiler.op_array.alloc_temp();
+                    compiler.op_array.emit(
+                        ZOp::new(ZOpcode::IssetIsemptyDimObj, line)
+                            .with_op1(obj.operand, obj.op_type)
+                            .with_op2(prop.operand, prop.op_type)
+                            .with_result(Operand::tmp_var(tmp), OperandType::TmpVar)
+                            .with_extended_value(0x100), // property mode
+                    );
+                    ExprResult::tmp(tmp)
+                }
+                _ => {
+                    // Fallback: compile as expression and check non-null
+                    let val = compiler.compile_expr(var);
+                    let tmp = compiler.op_array.alloc_temp();
+                    compiler.op_array.emit(
+                        ZOp::new(ZOpcode::TypeCheck, line)
+                            .with_op1(val.operand, val.op_type)
+                            .with_result(Operand::tmp_var(tmp), OperandType::TmpVar)
+                            .with_extended_value(1), // isset-like check
+                    );
+                    ExprResult::tmp(tmp)
+                }
+            }
+        };
+
         if vars.len() == 1 {
-            if let Expression::Variable { name, .. } = &vars[0] {
-                let cv = self.op_array.lookup_cv(name);
-                let tmp = self.op_array.alloc_temp();
-                self.op_array.emit(
-                    ZOp::new(ZOpcode::IssetIsemptyCv, line)
-                        .with_op1(Operand::cv(cv), OperandType::Cv)
-                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar)
-                        .with_extended_value(0), // ISSET mode
-                );
-                return ExprResult::tmp(tmp);
-            }
+            return compile_isset_single(self, &vars[0]);
         }
 
-        // Multiple vars: isset($a, $b) = isset($a) && isset($b)
-        let mut result = None;
-        for var in vars {
-            let single = self.compile_isset(std::slice::from_ref(var), line);
-            if let Some(prev) = result {
-                let tmp = self.op_array.alloc_temp();
-                self.op_array.emit(
-                    ZOp::new(ZOpcode::BoolNot, line) // placeholder for AND logic
-                        .with_op1(single.operand, single.op_type)
-                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
-                );
-                let _ = prev; // TODO: proper AND chain
-                result = Some(ExprResult::tmp(tmp));
+        // Multiple vars: isset($a, $b, $c) => isset($a) && isset($b) && isset($c)
+        // Use JmpZ chain: check first, if false jump to end with false result
+        let result_tmp = self.op_array.alloc_temp();
+        let mut end_patches = Vec::new();
+
+        for (i, var) in vars.iter().enumerate() {
+            let check = compile_isset_single(self, var);
+
+            if i < vars.len() - 1 {
+                // Not the last: emit JmpZ to short-circuit to false
+                let jmpz_idx = self
+                    .op_array
+                    .emit(ZOp::new(ZOpcode::Jmpz, line).with_op1(check.operand, check.op_type));
+                end_patches.push(jmpz_idx);
             } else {
-                result = Some(single);
+                // Last variable: store its result as the overall result
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::QmAssign, line)
+                        .with_op1(check.operand, check.op_type)
+                        .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                );
+                let jmp_end_idx = self.op_array.emit(ZOp::new(ZOpcode::Jmp, line));
+                end_patches.push(jmp_end_idx);
+
+                // False target: store false
+                let false_target = self.op_array.next_opline();
+                // Patch all JmpZ to here
+                for &patch_idx in &end_patches[..end_patches.len() - 1] {
+                    self.op_array.opcodes[patch_idx as usize].op2 =
+                        Operand::jmp_target(false_target);
+                }
+
+                let false_lit = self.op_array.add_literal(Literal::Bool(false));
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::QmAssign, line)
+                        .with_op1(Operand::constant(false_lit), OperandType::Const)
+                        .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                );
+
+                // Patch the JMP-past-false to here (Jmp uses op1 for target)
+                let end_target = self.op_array.next_opline();
+                let jmp_idx = end_patches[end_patches.len() - 1];
+                self.op_array.opcodes[jmp_idx as usize].op1 = Operand::jmp_target(end_target);
             }
         }
 
-        result.unwrap()
+        ExprResult::tmp(result_tmp)
     }
 
     fn compile_match_expr(
@@ -3989,5 +4203,116 @@ mod tests {
         let oa = compile_optimized("<?php echo $x + 1;").unwrap();
         let ops = opcodes(&oa);
         assert!(ops.contains(&ZOpcode::Add)); // Can't fold: $x is runtime
+    }
+
+    // =========================================================================
+    // 8.2.15: list() / array destructuring
+    // =========================================================================
+
+    #[test]
+    fn test_compile_list_assignment() {
+        let oa = compile_php("<?php list($a, $b) = [1, 2];");
+        let ops = opcodes(&oa);
+        // Should contain FetchDimR for reading indices from the array
+        assert!(
+            ops.contains(&ZOpcode::FetchDimR),
+            "list() assignment should emit FetchDimR to read array elements"
+        );
+        // Should contain Assign for writing to the variables
+        assert!(
+            ops.contains(&ZOpcode::Assign),
+            "list() assignment should emit Assign to write to variables"
+        );
+        // Should have CVs for $a and $b
+        assert!(oa.vars.contains(&"a".to_string()));
+        assert!(oa.vars.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn test_compile_list_with_skip() {
+        let oa = compile_php("<?php list($a, , $c) = [1, 2, 3];");
+        let ops = opcodes(&oa);
+        assert!(ops.contains(&ZOpcode::FetchDimR));
+        assert!(ops.contains(&ZOpcode::Assign));
+        assert!(oa.vars.contains(&"a".to_string()));
+        assert!(oa.vars.contains(&"c".to_string()));
+    }
+
+    // =========================================================================
+    // 8.3.5: unset($arr[$key]), unset($obj->prop)
+    // =========================================================================
+
+    #[test]
+    fn test_compile_unset_array_element() {
+        let oa = compile_php("<?php unset($arr[0]);");
+        let ops = opcodes(&oa);
+        assert!(
+            ops.contains(&ZOpcode::UnsetDim),
+            "unset($arr[$key]) should emit UnsetDim"
+        );
+    }
+
+    #[test]
+    fn test_compile_unset_object_property() {
+        let oa = compile_php("<?php unset($obj->prop);");
+        let ops = opcodes(&oa);
+        assert!(
+            ops.contains(&ZOpcode::UnsetObj),
+            "unset($obj->prop) should emit UnsetObj"
+        );
+    }
+
+    #[test]
+    fn test_compile_unset_simple_variable() {
+        let oa = compile_php("<?php unset($x);");
+        let ops = opcodes(&oa);
+        assert!(
+            ops.contains(&ZOpcode::UnsetCv),
+            "unset($x) should emit UnsetCv"
+        );
+    }
+
+    // =========================================================================
+    // 8.3.5: isset with multiple variables and array access
+    // =========================================================================
+
+    #[test]
+    fn test_compile_isset_single() {
+        let oa = compile_php("<?php echo isset($x);");
+        let ops = opcodes(&oa);
+        assert!(
+            ops.contains(&ZOpcode::IssetIsemptyCv),
+            "isset($x) should emit IssetIsemptyCv"
+        );
+    }
+
+    #[test]
+    fn test_compile_isset_multiple() {
+        let oa = compile_php("<?php echo isset($a, $b, $c);");
+        let ops = opcodes(&oa);
+        // Should have multiple IssetIsemptyCv and JmpZ for short-circuit evaluation
+        let isset_count = ops
+            .iter()
+            .filter(|&&o| o == ZOpcode::IssetIsemptyCv)
+            .count();
+        assert!(
+            isset_count >= 3,
+            "isset($a, $b, $c) should emit 3 IssetIsemptyCv opcodes, got {}",
+            isset_count
+        );
+        assert!(
+            ops.contains(&ZOpcode::Jmpz),
+            "isset($a, $b, $c) should emit Jmpz for short-circuit"
+        );
+    }
+
+    #[test]
+    fn test_compile_isset_array_access() {
+        let oa = compile_php("<?php echo isset($arr[0]);");
+        let ops = opcodes(&oa);
+        assert!(
+            ops.contains(&ZOpcode::IssetIsemptyDimObj),
+            "isset($arr[0]) should emit IssetIsemptyDimObj"
+        );
     }
 }

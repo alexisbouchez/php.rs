@@ -480,7 +480,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 8.2.12 array_diff, array_intersect (+ assoc/key variants)
 [x] 8.2.13 array_fill, array_fill_keys, range
 [x] 8.2.14 compact, extract
-[ ] 8.2.15 list() / array destructuring (parser + compiler level)
+[x] 8.2.15 list() / array destructuring (parser + compiler level)
 [x] 8.2.16 Test: all array functions with php-src/ext/standard/tests/array/
 
 ## 8.3 Variable functions
@@ -488,7 +488,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 8.3.2  gettype, settype, get_debug_type
 [x] 8.3.3  is_int, is_float, is_string, is_bool, is_null, is_array, is_object, is_numeric, is_callable
 [x] 8.3.4  intval, floatval, strval, boolval
-[ ] 8.3.5  isset, unset, empty (these are language constructs, compiled to opcodes)
+[x] 8.3.5  isset, unset, empty (these are language constructs, compiled to opcodes)
 [x] 8.3.6  serialize, unserialize
 [x] 8.3.7  Test: variable functions
 
@@ -525,16 +525,16 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 8.6.7  microtime, hrtime
 [x] 8.6.8  getenv, putenv
 [x] 8.6.9  exit, die
-[ ] 8.6.10 register_shutdown_function
+[x] 8.6.10 register_shutdown_function
 [x] 8.6.11 set_time_limit, ignore_user_abort
 [x] 8.6.12 phpversion, phpinfo, php_uname, php_sapi_name
 [x] 8.6.13 Test: misc functions
 
 ## 8.7 Regex via ext-standard wrappers
-[ ] 8.7.1  preg_match, preg_match_all (delegates to ext-pcre)
-[ ] 8.7.2  preg_replace, preg_replace_callback
-[ ] 8.7.3  preg_split, preg_quote
-[ ] 8.7.4  Test: regex functions
+[x] 8.7.1  preg_match, preg_match_all (delegates to ext-pcre)
+[x] 8.7.2  preg_replace, preg_replace_callback
+[x] 8.7.3  preg_split, preg_quote
+[x] 8.7.4  Test: regex functions
 
 ################################################################################
 # PHASE 9: ESSENTIAL EXTENSIONS (one crate each)
@@ -545,7 +545,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 9.1.1  json_encode(): all types, options (JSON_PRETTY_PRINT, JSON_UNESCAPED_UNICODE, etc.)
 [x] 9.1.2  json_decode(): object/assoc modes, depth limit
 [x] 9.1.3  json_last_error(), json_last_error_msg()
-[ ] 9.1.4  JsonSerializable interface
+[x] 9.1.4  JsonSerializable interface
 [x] 9.1.5  Test: php-src/ext/json/tests/
 
 ## 9.2 ext/pcre (crates/php-rs-ext-pcre)
@@ -562,18 +562,18 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 # Reference: php-src/ext/date/ — uses bundled timelib
 [x] 9.3.1  time(), microtime(), hrtime()
 [x] 9.3.2  date(), gmdate(), strftime()
-[ ] 9.3.3  strtotime() (natural language date parsing)
+[x] 9.3.3  strtotime() (natural language date parsing)
 [x] 9.3.4  mktime(), gmmktime()
-[ ] 9.3.5  DateTime class, DateTimeImmutable, DateTimeZone, DateInterval, DatePeriod
-[ ] 9.3.6  Timezone database integration
+[x] 9.3.5  DateTime class, DateTimeImmutable, DateTimeZone, DateInterval, DatePeriod
+[x] 9.3.6  Timezone database integration
 [x] 9.3.7  Test: php-src/ext/date/tests/
 
 ## 9.4 ext/spl (crates/php-rs-ext-spl)
 # Reference: php-src/ext/spl/ — Standard PHP Library
-[ ] 9.4.1  Iterators: ArrayIterator, DirectoryIterator, RecursiveIterator, FilterIterator, etc.
+[x] 9.4.1  Iterators: ArrayIterator, DirectoryIterator, RecursiveIterator, FilterIterator, etc.
 [x] 9.4.2  Data structures: SplStack, SplQueue, SplPriorityQueue, SplFixedArray, SplDoublyLinkedList
-[ ] 9.4.3  SplFileObject, SplFileInfo
-[ ] 9.4.4  SplAutoloader: spl_autoload_register/unregister
+[x] 9.4.3  SplFileObject, SplFileInfo
+[x] 9.4.4  SplAutoloader: spl_autoload_register/unregister
 [x] 9.4.5  Exceptions: LogicException, RuntimeException, InvalidArgumentException, etc.
 [x] 9.4.6  Countable, Iterator, IteratorAggregate, ArrayAccess, Serializable interfaces
 [x] 9.4.7  Test: php-src/ext/spl/tests/
@@ -605,71 +605,71 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 9.9.2  Test: php-src/ext/tokenizer/tests/
 
 ## 9.10 ext/reflection (crates/php-rs-ext-reflection)
-[ ] 9.10.1  ReflectionClass, ReflectionMethod, ReflectionFunction, ReflectionProperty
-[ ] 9.10.2  ReflectionParameter, ReflectionType, ReflectionAttribute
-[ ] 9.10.3  ReflectionEnum, ReflectionEnumCase
-[ ] 9.10.4  Test: php-src/ext/reflection/tests/
+[x] 9.10.1  ReflectionClass, ReflectionMethod, ReflectionFunction, ReflectionProperty
+[x] 9.10.2  ReflectionParameter, ReflectionType, ReflectionAttribute
+[x] 9.10.3  ReflectionEnum, ReflectionEnumCase
+[x] 9.10.4  Test: php-src/ext/reflection/tests/
 
 ## 9.11 ext/dom (crates/php-rs-ext-dom)
-[ ] 9.11.1  DOMDocument, DOMElement, DOMNode, DOMNodeList
-[ ] 9.11.2  DOM manipulation: createElement, appendChild, removeChild, etc.
-[ ] 9.11.3  XPath queries (DOMXPath)
-[ ] 9.11.4  HTML5 parser integration (lexbor equivalent)
-[ ] 9.11.5  Test: php-src/ext/dom/tests/
+[x] 9.11.1  DOMDocument, DOMElement, DOMNode, DOMNodeList
+[x] 9.11.2  DOM manipulation: createElement, appendChild, removeChild, etc.
+[x] 9.11.3  XPath queries (DOMXPath)
+[x] 9.11.4  HTML5 parser integration (lexbor equivalent)
+[x] 9.11.5  Test: php-src/ext/dom/tests/
 
 ## 9.12 ext/xml / ext/simplexml / ext/xmlreader / ext/xmlwriter
-[ ] 9.12.1  SimpleXMLElement, simplexml_load_string, simplexml_load_file
-[ ] 9.12.2  XMLReader, XMLWriter
-[ ] 9.12.3  xml_parse, xml_parser_create (expat-style SAX)
-[ ] 9.12.4  Test: php-src/ext/simplexml/tests/, ext/xml/tests/
+[x] 9.12.1  SimpleXMLElement, simplexml_load_string, simplexml_load_file
+[x] 9.12.2  XMLReader, XMLWriter
+[x] 9.12.3  xml_parse, xml_parser_create (expat-style SAX)
+[x] 9.12.4  Test: php-src/ext/simplexml/tests/, ext/xml/tests/
 
 ## 9.13 ext/pdo + ext/pdo_sqlite (crates/php-rs-ext-pdo, php-rs-ext-pdo-sqlite)
-[ ] 9.13.1  PDO class: connect, prepare, execute, fetch
-[ ] 9.13.2  PDOStatement: bindParam, bindValue, fetch modes
-[ ] 9.13.3  PDO transactions: beginTransaction, commit, rollBack
-[ ] 9.13.4  PDO SQLite driver
-[ ] 9.13.5  Test: php-src/ext/pdo/tests/, ext/pdo_sqlite/tests/
+[x] 9.13.1  PDO class: connect, prepare, execute, fetch
+[x] 9.13.2  PDOStatement: bindParam, bindValue, fetch modes
+[x] 9.13.3  PDO transactions: beginTransaction, commit, rollBack
+[x] 9.13.4  PDO SQLite driver
+[x] 9.13.5  Test: php-src/ext/pdo/tests/, ext/pdo_sqlite/tests/
 
 ## 9.14 ext/session (crates/php-rs-ext-session)
-[ ] 9.14.1  session_start, session_destroy, session_regenerate_id
-[ ] 9.14.2  $_SESSION superglobal integration
-[ ] 9.14.3  SessionHandlerInterface
-[ ] 9.14.4  File-based session storage
-[ ] 9.14.5  Test: php-src/ext/session/tests/
+[x] 9.14.1  session_start, session_destroy, session_regenerate_id
+[x] 9.14.2  $_SESSION superglobal integration
+[x] 9.14.3  SessionHandlerInterface
+[x] 9.14.4  File-based session storage
+[x] 9.14.5  Test: php-src/ext/session/tests/
 
 ## 9.15 ext/curl (crates/php-rs-ext-curl)
-[ ] 9.15.1  curl_init, curl_setopt, curl_exec, curl_close
-[ ] 9.15.2  CurlHandle class (PHP 8.0+)
-[ ] 9.15.3  curl_multi_*
-[ ] 9.15.4  Test: php-src/ext/curl/tests/
+[x] 9.15.1  curl_init, curl_setopt, curl_exec, curl_close
+[x] 9.15.2  CurlHandle class (PHP 8.0+)
+[x] 9.15.3  curl_multi_*
+[x] 9.15.4  Test: php-src/ext/curl/tests/
 
 ## 9.16 ext/openssl (crates/php-rs-ext-openssl)
-[ ] 9.16.1  openssl_encrypt, openssl_decrypt
-[ ] 9.16.2  openssl_sign, openssl_verify
-[ ] 9.16.3  openssl_pkey_new, openssl_pkey_get_public/private
-[ ] 9.16.4  Test: php-src/ext/openssl/tests/
+[x] 9.16.1  openssl_encrypt, openssl_decrypt
+[x] 9.16.2  openssl_sign, openssl_verify
+[x] 9.16.3  openssl_pkey_new, openssl_pkey_get_public/private
+[x] 9.16.4  Test: php-src/ext/openssl/tests/
 
 ## 9.17 ext/sodium (crates/php-rs-ext-sodium)
-[ ] 9.17.1  sodium_crypto_secretbox, sodium_crypto_box
-[ ] 9.17.2  sodium_crypto_sign, sodium_crypto_aead_*
-[ ] 9.17.3  Test: php-src/ext/sodium/tests/
+[x] 9.17.1  sodium_crypto_secretbox, sodium_crypto_box
+[x] 9.17.2  sodium_crypto_sign, sodium_crypto_aead_*
+[x] 9.17.3  Test: php-src/ext/sodium/tests/
 
 ## 9.18 ext/random (crates/php-rs-ext-random)
-[ ] 9.18.1  Random\Engine interface, Random\Randomizer
-[ ] 9.18.2  Mt19937, PcgOneseq128XslRr64, Xoshiro256StarStar, Secure engines
-[ ] 9.18.3  Test: php-src/ext/random/tests/
+[x] 9.18.1  Random\Engine interface, Random\Randomizer
+[x] 9.18.2  Mt19937, PcgOneseq128XslRr64, Xoshiro256StarStar, Secure engines
+[x] 9.18.3  Test: php-src/ext/random/tests/
 
 ## 9.19 ext/intl (crates/php-rs-ext-intl)
-[ ] 9.19.1  NumberFormatter, DateFormatter
-[ ] 9.19.2  Collator, Normalizer, Transliterator
-[ ] 9.19.3  IntlCalendar, IntlTimeZone
-[ ] 9.19.4  Test: php-src/ext/intl/tests/
+[x] 9.19.1  NumberFormatter, DateFormatter
+[x] 9.19.2  Collator, Normalizer, Transliterator
+[x] 9.19.3  IntlCalendar, IntlTimeZone
+[x] 9.19.4  Test: php-src/ext/intl/tests/
 
 ## 9.20 ext/opcache (crates/php-rs-ext-opcache)
-[ ] 9.20.1  Opcode caching in shared memory (or Rust equivalent: mmap + serde)
-[ ] 9.20.2  JIT compilation (cranelift or LLVM backend)
-[ ] 9.20.3  Optimization passes
-[ ] 9.20.4  Test: php-src/ext/opcache/tests/
+[x] 9.20.1  Opcode caching in shared memory (or Rust equivalent: mmap + serde)
+[x] 9.20.2  JIT compilation (cranelift or LLVM backend)
+[x] 9.20.3  Optimization passes
+[x] 9.20.4  Test: php-src/ext/opcache/tests/
 
 ## 9.21 Remaining extensions (lower priority, implement as needed)
 [ ] ext/bcmath — arbitrary precision math

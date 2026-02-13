@@ -153,7 +153,11 @@ enum SkipResult {
 /// Reference: https://qa.php.net/phpt_details.php
 fn check_skipif(php_binary: &Path, skipif_code: &str) -> Result<SkipResult, String> {
     let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join(format!("phpt_skipif_{}_{:?}.php", std::process::id(), std::thread::current().id()));
+    let temp_file = temp_dir.join(format!(
+        "phpt_skipif_{}_{:?}.php",
+        std::process::id(),
+        std::thread::current().id()
+    ));
 
     // Write the SKIPIF code to a temporary file
     fs::write(&temp_file, skipif_code)
@@ -196,7 +200,11 @@ fn check_skipif(php_binary: &Path, skipif_code: &str) -> Result<SkipResult, Stri
 /// Errors are ignored since the test result is already determined.
 fn run_clean(php_binary: &Path, clean_code: &str) -> Result<(), String> {
     let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join(format!("phpt_clean_{}_{:?}.php", std::process::id(), std::thread::current().id()));
+    let temp_file = temp_dir.join(format!(
+        "phpt_clean_{}_{:?}.php",
+        std::process::id(),
+        std::thread::current().id()
+    ));
 
     // Write the CLEAN code to a temporary file
     fs::write(&temp_file, clean_code)
@@ -241,7 +249,11 @@ pub fn execute_phpt(test: &PhptTest) -> Result<PhptExecutionResult, String> {
 
     // Create a temporary file with the PHP code
     let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join(format!("phpt_test_{}_{:?}.php", std::process::id(), std::thread::current().id()));
+    let temp_file = temp_dir.join(format!(
+        "phpt_test_{}_{:?}.php",
+        std::process::id(),
+        std::thread::current().id()
+    ));
 
     // Write the --FILE-- content to the temporary file
     fs::write(&temp_file, &test.file)
