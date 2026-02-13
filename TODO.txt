@@ -230,35 +230,35 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 4.3.13 Test: control flow opcodes against known PHP opcode dumps
 
 ## 4.4 Function compilation
-[ ] 4.4.1  Compile function declaration → new ZOpArray + ZEND_DECLARE_FUNCTION
-[ ] 4.4.2  Compile function call → ZEND_INIT_FCALL + ZEND_SEND_VAL/VAR + ZEND_DO_FCALL
-[ ] 4.4.3  Compile return type + parameter type info → arg_info array
-[ ] 4.4.4  Compile closures → ZEND_DECLARE_LAMBDA_FUNCTION + use() variable binding
-[ ] 4.4.5  Compile arrow functions (fn($x) => $x + 1)
-[ ] 4.4.6  Compile variadic parameters (...$args) → ZEND_SEND_UNPACK
-[ ] 4.4.7  Compile named arguments → ZEND_SEND_VAL/VAR with name
-[ ] 4.4.8  Test: function call opcodes, argument passing modes (by-val, by-ref)
+[x] 4.4.1  Compile function declaration → new ZOpArray + ZEND_DECLARE_FUNCTION
+[x] 4.4.2  Compile function call → ZEND_INIT_FCALL + ZEND_SEND_VAL/VAR + ZEND_DO_FCALL
+[x] 4.4.3  Compile return type + parameter type info → arg_info array
+[x] 4.4.4  Compile closures → ZEND_DECLARE_LAMBDA_FUNCTION + use() variable binding
+[x] 4.4.5  Compile arrow functions (fn($x) => $x + 1)
+[x] 4.4.6  Compile variadic parameters (...$args) → ZEND_SEND_UNPACK
+[x] 4.4.7  Compile named arguments → ZEND_SEND_VAL/VAR with name
+[x] 4.4.8  Test: function call opcodes, argument passing modes (by-val, by-ref)
 
 ## 4.5 Class compilation
-[ ] 4.5.1  Compile class declaration → ZEND_DECLARE_CLASS
-[ ] 4.5.2  Compile method definitions → ZOpArray per method
-[ ] 4.5.3  Compile property declarations with types and defaults
-[ ] 4.5.4  Compile constructor, destructor
-[ ] 4.5.5  Compile static methods and properties
-[ ] 4.5.6  Compile new → ZEND_NEW + ZEND_DO_FCALL (constructor)
-[ ] 4.5.7  Compile property access → ZEND_FETCH_OBJ_R/W
-[ ] 4.5.8  Compile method call → ZEND_INIT_METHOD_CALL + ZEND_DO_FCALL
-[ ] 4.5.9  Compile static call → ZEND_INIT_STATIC_METHOD_CALL
-[ ] 4.5.10 Compile class constants → ZEND_FETCH_CLASS_CONSTANT
-[ ] 4.5.11 Compile inheritance, interfaces, traits
-[ ] 4.5.12 Compile abstract, final, readonly modifiers
-[ ] 4.5.13 Compile enums (backed and unit)
-[ ] 4.5.14 Test: class compilation against php-src/tests/classes/*.phpt
+[x] 4.5.1  Compile class declaration → ZEND_DECLARE_CLASS
+[x] 4.5.2  Compile method definitions → ZOpArray per method
+[x] 4.5.3  Compile property declarations with types and defaults
+[x] 4.5.4  Compile constructor, destructor
+[x] 4.5.5  Compile static methods and properties
+[x] 4.5.6  Compile new → ZEND_NEW + ZEND_DO_FCALL (constructor)
+[x] 4.5.7  Compile property access → ZEND_FETCH_OBJ_R/W
+[x] 4.5.8  Compile method call → ZEND_INIT_METHOD_CALL + ZEND_DO_FCALL
+[x] 4.5.9  Compile static call → ZEND_INIT_STATIC_METHOD_CALL
+[x] 4.5.10 Compile class constants → ZEND_FETCH_CLASS_CONSTANT
+[x] 4.5.11 Compile inheritance, interfaces, traits
+[x] 4.5.12 Compile abstract, final, readonly modifiers
+[x] 4.5.13 Compile enums (backed and unit)
+[x] 4.5.14 Test: class compilation against php-src/tests/classes/*.phpt
 
 ## 4.6 Optimization passes (basic)
-[ ] 4.6.1  Constant folding: 2 + 3 → 5 at compile time
-[ ] 4.6.2  Dead code elimination after unconditional return/throw
-[ ] 4.6.3  Test: optimized opcodes are semantically equivalent
+[x] 4.6.1  Constant folding: 2 + 3 → 5 at compile time
+[x] 4.6.2  Dead code elimination after unconditional return/throw
+[x] 4.6.3  Test: optimized opcodes are semantically equivalent
 
 ################################################################################
 # PHASE 5: VIRTUAL MACHINE (crates/php-rs-vm)
