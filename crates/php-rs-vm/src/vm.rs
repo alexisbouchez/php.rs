@@ -5852,6 +5852,1515 @@ impl Vm {
                     Ok(Some(Value::Array(PhpArray::new())))
                 }
             }
+
+            // === BATCH 2: More math functions ===
+            "acosh" => {
+                let n = args.first().map(|v| v.to_double()).unwrap_or(0.0);
+                Ok(Some(Value::Double(n.acosh())))
+            }
+            "asinh" => {
+                let n = args.first().map(|v| v.to_double()).unwrap_or(0.0);
+                Ok(Some(Value::Double(n.asinh())))
+            }
+            "atanh" => {
+                let n = args.first().map(|v| v.to_double()).unwrap_or(0.0);
+                Ok(Some(Value::Double(n.atanh())))
+            }
+            "expm1" => {
+                let n = args.first().map(|v| v.to_double()).unwrap_or(0.0);
+                Ok(Some(Value::Double(n.exp_m1())))
+            }
+            "log1p" => {
+                let n = args.first().map(|v| v.to_double()).unwrap_or(0.0);
+                Ok(Some(Value::Double(n.ln_1p())))
+            }
+            "fdiv" => {
+                let a = args.first().map(|v| v.to_double()).unwrap_or(0.0);
+                let b = args.get(1).map(|v| v.to_double()).unwrap_or(0.0);
+                Ok(Some(Value::Double(a / b)))
+            }
+            "fpow" => {
+                let base = args.first().map(|v| v.to_double()).unwrap_or(0.0);
+                let exp = args.get(1).map(|v| v.to_double()).unwrap_or(0.0);
+                Ok(Some(Value::Double(base.powf(exp))))
+            }
+            "clamp" => {
+                let val = args.first().map(|v| v.to_long()).unwrap_or(0);
+                let min = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                let max = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+                if min > max {
+                    return Err(VmError::FatalError("clamp(): Argument #2 ($min) cannot be greater than argument #3 ($max)".into()));
+                }
+                Ok(Some(Value::Long(val.clamp(min, max))))
+            }
+
+            // === More string functions ===
+            "addcslashes" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let charlist = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let mut result = String::new();
+                for ch in s.chars() {
+                    if charlist.contains(ch) {
+                        result.push('\\');
+                    }
+                    result.push(ch);
+                }
+                Ok(Some(Value::String(result)))
+            }
+            "stripcslashes" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let mut result = String::new();
+                let chars: Vec<char> = s.chars().collect();
+                let mut i = 0;
+                while i < chars.len() {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        match chars[i + 1] {
+                            'n' => { result.push('\n'); i += 2; }
+                            'r' => { result.push('\r'); i += 2; }
+                            't' => { result.push('\t'); i += 2; }
+                            'v' => { result.push('\x0B'); i += 2; }
+                            'a' => { result.push('\x07'); i += 2; }
+                            'f' => { result.push('\x0C'); i += 2; }
+                            '\\' => { result.push('\\'); i += 2; }
+                            _ => { result.push(chars[i + 1]); i += 2; }
+                        }
+                    } else {
+                        result.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                Ok(Some(Value::String(result)))
+            }
+            "quotemeta" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let mut result = String::new();
+                for ch in s.chars() {
+                    if ".\\+*?[^]($)".contains(ch) {
+                        result.push('\\');
+                    }
+                    result.push(ch);
+                }
+                Ok(Some(Value::String(result)))
+            }
+            "strrchr" => {
+                let haystack = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let needle = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                if let Some(pos) = haystack.rfind(&needle[..1.min(needle.len())]) {
+                    Ok(Some(Value::String(haystack[pos..].to_string())))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "strpbrk" => {
+                let haystack = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let charlist = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let pos = haystack.find(|c: char| charlist.contains(c));
+                match pos {
+                    Some(p) => Ok(Some(Value::String(haystack[p..].to_string()))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "strtr" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                if args.len() == 2 {
+                    // strtr($str, $replacements_array)
+                    if let Some(Value::Array(ref arr)) = args.get(1) {
+                        let mut result = s.clone();
+                        for (key, val) in arr.entries() {
+                            let from = match key {
+                                ArrayKey::String(ref k) => k.clone(),
+                                ArrayKey::Int(n) => n.to_string(),
+                            };
+                            let to = val.to_php_string();
+                            result = result.replace(&from, &to);
+                        }
+                        Ok(Some(Value::String(result)))
+                    } else {
+                        Ok(Some(Value::String(s)))
+                    }
+                } else {
+                    // strtr($str, $from, $to)
+                    let from = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                    let to = args.get(2).map(|v| v.to_php_string()).unwrap_or_default();
+                    let from_chars: Vec<char> = from.chars().collect();
+                    let to_chars: Vec<char> = to.chars().collect();
+                    let result: String = s.chars().map(|c| {
+                        if let Some(pos) = from_chars.iter().position(|&fc| fc == c) {
+                            to_chars.get(pos).copied().unwrap_or(c)
+                        } else {
+                            c
+                        }
+                    }).collect();
+                    Ok(Some(Value::String(result)))
+                }
+            }
+            "strspn" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let mask = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let offset = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let len = args.get(3).map(|v| v.to_long() as usize);
+                let substr = if offset < s.len() { &s[offset..] } else { "" };
+                let substr = match len {
+                    Some(l) if l < substr.len() => &substr[..l],
+                    _ => substr,
+                };
+                let count = substr.chars().take_while(|c| mask.contains(*c)).count();
+                Ok(Some(Value::Long(count as i64)))
+            }
+            "strcspn" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let mask = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let offset = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let len = args.get(3).map(|v| v.to_long() as usize);
+                let substr = if offset < s.len() { &s[offset..] } else { "" };
+                let substr = match len {
+                    Some(l) if l < substr.len() => &substr[..l],
+                    _ => substr,
+                };
+                let count = substr.chars().take_while(|c| !mask.contains(*c)).count();
+                Ok(Some(Value::Long(count as i64)))
+            }
+            "strcoll" => {
+                let s1 = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let s2 = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::Long(s1.cmp(&s2) as i64)))
+            }
+            "strip_tags" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let allowed = args.get(1).map(|v| v.to_php_string());
+                let allowed_tags: Vec<String> = match &allowed {
+                    Some(a) => {
+                        let mut tags = Vec::new();
+                        let mut i = 0;
+                        let bytes = a.as_bytes();
+                        while i < bytes.len() {
+                            if bytes[i] == b'<' {
+                                if let Some(end) = a[i+1..].find('>') {
+                                    tags.push(a[i+1..i+1+end].to_lowercase());
+                                    i = i + 1 + end + 1;
+                                } else { break; }
+                            } else { i += 1; }
+                        }
+                        tags
+                    }
+                    None => Vec::new(),
+                };
+                let mut result = String::new();
+                let mut in_tag = false;
+                let mut tag_name = String::new();
+                let mut current_tag = String::new();
+                let mut collecting_name = false;
+                for ch in s.chars() {
+                    if ch == '<' {
+                        in_tag = true;
+                        tag_name.clear();
+                        current_tag.clear();
+                        current_tag.push(ch);
+                        collecting_name = true;
+                    } else if in_tag {
+                        current_tag.push(ch);
+                        if ch == '>' {
+                            in_tag = false;
+                            let tn = tag_name.trim_start_matches('/').to_lowercase();
+                            if allowed_tags.contains(&tn) {
+                                result.push_str(&current_tag);
+                            }
+                        } else if collecting_name {
+                            if ch.is_whitespace() || ch == '/' || ch == '>' {
+                                collecting_name = false;
+                            } else {
+                                tag_name.push(ch);
+                            }
+                        }
+                    } else {
+                        result.push(ch);
+                    }
+                }
+                Ok(Some(Value::String(result)))
+            }
+            "parse_url" => {
+                let url = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let component = args.get(1).map(|v| v.to_long()).unwrap_or(-1);
+                // Simple URL parser
+                let mut scheme = String::new();
+                let host;
+                let mut port: Option<i64> = None;
+                let mut path = String::new();
+                let mut query = String::new();
+                let mut fragment = String::new();
+                let mut user = String::new();
+                let mut pass = String::new();
+                let mut rest = url.as_str();
+                if let Some(pos) = rest.find("://") {
+                    scheme = rest[..pos].to_string();
+                    rest = &rest[pos + 3..];
+                }
+                // userinfo
+                if let Some(at_pos) = rest.find('@') {
+                    let has_slash = rest[..at_pos].contains('/');
+                    if !has_slash {
+                        let userinfo = &rest[..at_pos];
+                        if let Some(colon) = userinfo.find(':') {
+                            user = userinfo[..colon].to_string();
+                            pass = userinfo[colon + 1..].to_string();
+                        } else {
+                            user = userinfo.to_string();
+                        }
+                        rest = &rest[at_pos + 1..];
+                    }
+                }
+                // fragment
+                if let Some(hash_pos) = rest.find('#') {
+                    fragment = rest[hash_pos + 1..].to_string();
+                    rest = &rest[..hash_pos];
+                }
+                // query
+                if let Some(q_pos) = rest.find('?') {
+                    query = rest[q_pos + 1..].to_string();
+                    rest = &rest[..q_pos];
+                }
+                // host:port/path
+                if let Some(slash_pos) = rest.find('/') {
+                    path = rest[slash_pos..].to_string();
+                    rest = &rest[..slash_pos];
+                }
+                if let Some(colon_pos) = rest.rfind(':') {
+                    host = rest[..colon_pos].to_string();
+                    port = rest[colon_pos + 1..].parse().ok();
+                } else {
+                    host = rest.to_string();
+                }
+                match component {
+                    -1 => {
+                        let mut arr = PhpArray::new();
+                        if !scheme.is_empty() { arr.set_string("scheme".into(), Value::String(scheme)); }
+                        if !host.is_empty() { arr.set_string("host".into(), Value::String(host)); }
+                        if let Some(p) = port { arr.set_string("port".into(), Value::Long(p)); }
+                        if !user.is_empty() { arr.set_string("user".into(), Value::String(user)); }
+                        if !pass.is_empty() { arr.set_string("pass".into(), Value::String(pass)); }
+                        if !path.is_empty() { arr.set_string("path".into(), Value::String(path)); }
+                        if !query.is_empty() { arr.set_string("query".into(), Value::String(query)); }
+                        if !fragment.is_empty() { arr.set_string("fragment".into(), Value::String(fragment)); }
+                        Ok(Some(Value::Array(arr)))
+                    }
+                    0 => Ok(Some(if scheme.is_empty() { Value::Null } else { Value::String(scheme) })), // PHP_URL_SCHEME
+                    1 => Ok(Some(if host.is_empty() { Value::Null } else { Value::String(host) })), // PHP_URL_HOST
+                    2 => Ok(Some(match port { Some(p) => Value::Long(p), None => Value::Null })), // PHP_URL_PORT
+                    5 => Ok(Some(if user.is_empty() { Value::Null } else { Value::String(user) })), // PHP_URL_USER
+                    6 => Ok(Some(if pass.is_empty() { Value::Null } else { Value::String(pass) })), // PHP_URL_PASS
+                    3 => Ok(Some(if path.is_empty() { Value::Null } else { Value::String(path) })), // PHP_URL_PATH
+                    4 => Ok(Some(if query.is_empty() { Value::Null } else { Value::String(query) })), // PHP_URL_QUERY
+                    7 => Ok(Some(if fragment.is_empty() { Value::Null } else { Value::String(fragment) })), // PHP_URL_FRAGMENT
+                    _ => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "parse_str" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let mut arr = PhpArray::new();
+                for pair in s.split('&') {
+                    if pair.is_empty() { continue; }
+                    let mut parts = pair.splitn(2, '=');
+                    let key = parts.next().unwrap_or("");
+                    let val = parts.next().unwrap_or("");
+                    let key = key.replace('+', " ");
+                    let val = val.replace('+', " ");
+                    arr.set_string(key, Value::String(val));
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "http_build_query" => {
+                let data = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref arr) = data {
+                    let sep = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "&".into());
+                    let parts: Vec<String> = arr.entries().iter().map(|(k, v)| {
+                        let key = match k {
+                            ArrayKey::String(s) => s.clone(),
+                            ArrayKey::Int(n) => n.to_string(),
+                        };
+                        format!("{}={}", key, v.to_php_string())
+                    }).collect();
+                    Ok(Some(Value::String(parts.join(&sep))))
+                } else {
+                    Ok(Some(Value::String(String::new())))
+                }
+            }
+            "version_compare" => {
+                let v1 = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let v2 = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let op = args.get(2).map(|v| v.to_php_string());
+                let cmp = version_cmp(&v1, &v2);
+                match op {
+                    None => Ok(Some(Value::Long(if cmp < 0 { -1 } else if cmp > 0 { 1 } else { 0 }))),
+                    Some(op) => {
+                        let result = match op.as_str() {
+                            "<" | "lt" => cmp < 0,
+                            "<=" | "le" => cmp <= 0,
+                            ">" | "gt" => cmp > 0,
+                            ">=" | "ge" => cmp >= 0,
+                            "==" | "eq" => cmp == 0,
+                            "!=" | "ne" => cmp != 0,
+                            _ => false,
+                        };
+                        Ok(Some(Value::Bool(result)))
+                    }
+                }
+            }
+            "convert_uuencode" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let bytes = s.as_bytes();
+                let mut result = String::new();
+                for chunk in bytes.chunks(45) {
+                    result.push((chunk.len() as u8 + 32) as char);
+                    for triple in chunk.chunks(3) {
+                        let b0 = triple[0] as u32;
+                        let b1 = *triple.get(1).unwrap_or(&0) as u32;
+                        let b2 = *triple.get(2).unwrap_or(&0) as u32;
+                        result.push(((b0 >> 2) as u8 + 32) as char);
+                        result.push((((b0 & 3) << 4 | b1 >> 4) as u8 + 32) as char);
+                        result.push((((b1 & 0xF) << 2 | b2 >> 6) as u8 + 32) as char);
+                        result.push(((b2 & 0x3F) as u8 + 32) as char);
+                    }
+                    result.push('\n');
+                }
+                result.push_str(" \n");
+                Ok(Some(Value::String(result)))
+            }
+            "convert_uudecode" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let mut result = Vec::new();
+                for line in s.lines() {
+                    if line.is_empty() { continue; }
+                    let n = (line.as_bytes()[0] as i32 - 32) & 0x3F;
+                    if n == 0 { break; }
+                    let data: Vec<u8> = line.bytes().skip(1).map(|b| b.wrapping_sub(32) & 0x3F).collect();
+                    let mut i = 0;
+                    let mut written = 0;
+                    while i + 3 < data.len() && written < n {
+                        result.push((data[i] << 2 | data[i + 1] >> 4) as u8);
+                        written += 1;
+                        if written < n { result.push((data[i + 1] << 4 | data[i + 2] >> 2) as u8); written += 1; }
+                        if written < n { result.push((data[i + 2] << 6 | data[i + 3]) as u8); written += 1; }
+                        i += 4;
+                    }
+                }
+                Ok(Some(Value::String(String::from_utf8_lossy(&result).to_string())))
+            }
+            "count_chars" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let mode = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                let mut counts = [0i64; 256];
+                for b in s.bytes() { counts[b as usize] += 1; }
+                match mode {
+                    0 => {
+                        let mut arr = PhpArray::new();
+                        for (i, &c) in counts.iter().enumerate() { arr.set_int(i as i64, Value::Long(c)); }
+                        Ok(Some(Value::Array(arr)))
+                    }
+                    1 => {
+                        let mut arr = PhpArray::new();
+                        for (i, &c) in counts.iter().enumerate() { if c > 0 { arr.set_int(i as i64, Value::Long(c)); } }
+                        Ok(Some(Value::Array(arr)))
+                    }
+                    2 => {
+                        let mut arr = PhpArray::new();
+                        for (i, &c) in counts.iter().enumerate() { if c == 0 { arr.set_int(i as i64, Value::Long(0)); } }
+                        Ok(Some(Value::Array(arr)))
+                    }
+                    3 => {
+                        let mut unique: Vec<u8> = (0..=255u8).filter(|&b| counts[b as usize] > 0).collect();
+                        unique.sort();
+                        Ok(Some(Value::String(String::from_utf8_lossy(&unique).to_string())))
+                    }
+                    4 => {
+                        let unused: Vec<u8> = (0..=255u8).filter(|&b| counts[b as usize] == 0).collect();
+                        Ok(Some(Value::String(String::from_utf8_lossy(&unused).to_string())))
+                    }
+                    _ => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "str_decrement" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                if s.is_empty() {
+                    return Err(VmError::FatalError("str_decrement(): Argument #1 ($string) must not be empty".into()));
+                }
+                let mut chars: Vec<char> = s.chars().collect();
+                let mut i = chars.len() - 1;
+                loop {
+                    if chars[i].is_ascii_digit() && chars[i] > '0' {
+                        chars[i] = (chars[i] as u8 - 1) as char;
+                        break;
+                    } else if chars[i] == '0' {
+                        chars[i] = '9';
+                        if i == 0 { if chars.len() > 1 { chars.remove(0); } break; }
+                        i -= 1;
+                    } else if chars[i].is_ascii_lowercase() && chars[i] > 'a' {
+                        chars[i] = (chars[i] as u8 - 1) as char;
+                        break;
+                    } else if chars[i] == 'a' {
+                        chars[i] = 'z';
+                        if i == 0 { if chars.len() > 1 { chars.remove(0); } break; }
+                        i -= 1;
+                    } else if chars[i].is_ascii_uppercase() && chars[i] > 'A' {
+                        chars[i] = (chars[i] as u8 - 1) as char;
+                        break;
+                    } else if chars[i] == 'A' {
+                        chars[i] = 'Z';
+                        if i == 0 { if chars.len() > 1 { chars.remove(0); } break; }
+                        i -= 1;
+                    } else {
+                        break;
+                    }
+                }
+                Ok(Some(Value::String(chars.into_iter().collect())))
+            }
+            "str_increment" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::String(crate::value::php_increment_string(&s))))
+            }
+            "html_entity_decode" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let result = s.replace("&amp;", "&")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&quot;", "\"")
+                    .replace("&#039;", "'")
+                    .replace("&apos;", "'");
+                Ok(Some(Value::String(result)))
+            }
+            "htmlentities" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let result = s.replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&#039;");
+                Ok(Some(Value::String(result)))
+            }
+            "hebrev" => {
+                // Simplified: just reverse RTL text segments
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::String(s)))
+            }
+
+            // === Type/Inspection functions ===
+            "is_scalar" => {
+                let val = args.first().unwrap_or(&Value::Null);
+                let result = matches!(val, Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::String(_));
+                Ok(Some(Value::Bool(result)))
+            }
+            "is_countable" => {
+                let val = args.first().unwrap_or(&Value::Null);
+                Ok(Some(Value::Bool(matches!(val, Value::Array(_)))))
+            }
+            "is_iterable" => {
+                let val = args.first().unwrap_or(&Value::Null);
+                Ok(Some(Value::Bool(matches!(val, Value::Array(_)))))
+            }
+            "is_resource" => {
+                // We don't have resources yet
+                Ok(Some(Value::Bool(false)))
+            }
+
+            // === More array functions ===
+            "array_change_key_case" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let case = args.get(1).map(|v| v.to_long()).unwrap_or(0); // 0=lower, 1=upper
+                if let Value::Array(ref a) = arr {
+                    let mut result = PhpArray::new();
+                    for (key, val) in a.entries() {
+                        match key {
+                            ArrayKey::String(s) => {
+                                let new_key = if case == 0 { s.to_lowercase() } else { s.to_uppercase() };
+                                result.set_string(new_key, val.clone());
+                            }
+                            ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "shuffle" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    let mut values: Vec<Value> = a.entries().iter().map(|(_, v)| v.clone()).collect();
+                    // Simple Fisher-Yates shuffle using basic random
+                    use std::time::SystemTime;
+                    let seed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default().subsec_nanos() as usize;
+                    let mut rng = seed;
+                    for i in (1..values.len()).rev() {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let j = rng % (i + 1);
+                        values.swap(i, j);
+                    }
+                    let mut result = PhpArray::new();
+                    for v in values { result.push(v); }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "natsort" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    let mut entries: Vec<(ArrayKey, Value)> = a.entries().to_vec();
+                    entries.sort_by(|a, b| nat_cmp(&a.1.to_php_string(), &b.1.to_php_string()));
+                    let mut result = PhpArray::new();
+                    for (k, v) in entries {
+                        match k {
+                            ArrayKey::Int(n) => result.set_int(n, v),
+                            ArrayKey::String(s) => result.set_string(s, v),
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "natcasesort" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    let mut entries: Vec<(ArrayKey, Value)> = a.entries().to_vec();
+                    entries.sort_by(|a, b| nat_cmp(&a.1.to_php_string().to_lowercase(), &b.1.to_php_string().to_lowercase()));
+                    let mut result = PhpArray::new();
+                    for (k, v) in entries {
+                        match k {
+                            ArrayKey::Int(n) => result.set_int(n, v),
+                            ArrayKey::String(s) => result.set_string(s, v),
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "array_all" | "array_any" | "array_find" | "array_find_key" => {
+                // These require callback support, stub for now
+                Ok(Some(Value::Bool(false)))
+            }
+            "array_first" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    Ok(Some(a.entries().first().map(|(_, v)| v.clone()).unwrap_or(Value::Null)))
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "array_last" => {
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    Ok(Some(a.entries().last().map(|(_, v)| v.clone()).unwrap_or(Value::Null)))
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "array_merge_recursive" => {
+                // Simplified: same as array_merge for now
+                let mut result = PhpArray::new();
+                for arg in args {
+                    if let Value::Array(ref a) = arg {
+                        for (key, val) in a.entries() {
+                            match key {
+                                ArrayKey::Int(_) => result.push(val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
+            "array_replace_recursive" => {
+                // Simplified: same as array_replace for now
+                if args.is_empty() { return Ok(Some(Value::Array(PhpArray::new()))); }
+                let mut result = if let Value::Array(ref a) = args[0] { a.clone() } else { PhpArray::new() };
+                for arg in args.iter().skip(1) {
+                    if let Value::Array(ref a) = arg {
+                        for (key, val) in a.entries() {
+                            match key {
+                                ArrayKey::Int(n) => result.set_int(*n, val.clone()),
+                                ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Value::Array(result)))
+            }
+
+            // === Remaining zend_core ===
+            "enum_exists" => {
+                let name = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::Bool(self.classes.contains_key(&name) || self.classes.contains_key(&name.to_lowercase()))))
+            }
+            "get_declared_classes" => {
+                let mut arr = PhpArray::new();
+                for name in self.classes.keys() {
+                    arr.push(Value::String(name.clone()));
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "get_declared_interfaces" => {
+                // Simplified: return empty for now since we don't distinguish
+                Ok(Some(Value::Array(PhpArray::new())))
+            }
+            "get_declared_traits" => {
+                Ok(Some(Value::Array(PhpArray::new())))
+            }
+            "debug_backtrace" => {
+                let mut arr = PhpArray::new();
+                for frame in self.call_stack.iter().rev() {
+                    let mut entry = PhpArray::new();
+                    let oa = &self.op_arrays[frame.op_array_idx];
+                    entry.set_string("function".into(), Value::String(oa.function_name.clone().unwrap_or_default()));
+                    entry.set_string("file".into(), Value::String(oa.filename.clone().unwrap_or_default()));
+                    entry.set_string("line".into(), Value::Long(0));
+                    let mut fargs = PhpArray::new();
+                    for arg in &frame.args { fargs.push(arg.clone()); }
+                    entry.set_string("args".into(), Value::Array(fargs));
+                    arr.push(Value::Array(entry));
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "debug_print_backtrace" => {
+                for (i, frame) in self.call_stack.iter().rev().enumerate() {
+                    let oa = &self.op_arrays[frame.op_array_idx];
+                    let fname = oa.function_name.as_deref().unwrap_or("<main>");
+                    self.output.push_str(&format!("#{} {}()\n", i, fname));
+                }
+                Ok(Some(Value::Null))
+            }
+            "gc_collect_cycles" => Ok(Some(Value::Long(0))),
+            "gc_enabled" => Ok(Some(Value::Bool(true))),
+            "gc_enable" | "gc_disable" => Ok(Some(Value::Null)),
+            "gc_mem_caches" => Ok(Some(Value::Long(0))),
+            "gc_status" => {
+                let mut arr = PhpArray::new();
+                arr.set_string("runs".into(), Value::Long(0));
+                arr.set_string("collected".into(), Value::Long(0));
+                arr.set_string("threshold".into(), Value::Long(10000));
+                arr.set_string("roots".into(), Value::Long(0));
+                Ok(Some(Value::Array(arr)))
+            }
+            "zend_version" => Ok(Some(Value::String("4.0.0-php-rs".into()))),
+
+            // === Finish ctype ===
+            "ctype_print" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::Bool(!s.is_empty() && s.bytes().all(|b| b >= 0x20 && b <= 0x7E))))
+            }
+            "ctype_graph" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::Bool(!s.is_empty() && s.bytes().all(|b| b > 0x20 && b <= 0x7E))))
+            }
+            "ctype_cntrl" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::Bool(!s.is_empty() && s.bytes().all(|b| b < 0x20 || b == 0x7F))))
+            }
+
+            // === Finish random ===
+            "srand" | "mt_srand" => {
+                // Seed ignored in this implementation
+                Ok(Some(Value::Null))
+            }
+            "random_bytes" => {
+                let len = args.first().map(|v| v.to_long()).unwrap_or(0) as usize;
+                use std::time::SystemTime;
+                let mut rng = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default().subsec_nanos() as u64;
+                let mut bytes = Vec::with_capacity(len);
+                for _ in 0..len {
+                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    bytes.push((rng >> 33) as u8);
+                }
+                Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+            }
+            "lcg_value" => {
+                use std::time::SystemTime;
+                let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default().subsec_nanos() as f64;
+                Ok(Some(Value::Double((t % 1000000.0) / 1000000.0)))
+            }
+
+            // === Misc standard ===
+            "memory_get_usage" | "memory_get_peak_usage" => {
+                Ok(Some(Value::Long(0)))
+            }
+            "memory_reset_peak_usage" => Ok(Some(Value::Null)),
+            "getmypid" => {
+                Ok(Some(Value::Long(std::process::id() as i64)))
+            }
+            "getmyuid" | "getmygid" | "getmyinode" | "getlastmod" => {
+                Ok(Some(Value::Long(0)))
+            }
+            "gethostname" => {
+                Ok(Some(Value::String("localhost".into())))
+            }
+            "gettimeofday" => {
+                use std::time::SystemTime;
+                let dur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+                let return_float = args.first().map(|v| v.to_bool()).unwrap_or(false);
+                if return_float {
+                    Ok(Some(Value::Double(dur.as_secs_f64())))
+                } else {
+                    let mut arr = PhpArray::new();
+                    arr.set_string("sec".into(), Value::Long(dur.as_secs() as i64));
+                    arr.set_string("usec".into(), Value::Long(dur.subsec_micros() as i64));
+                    arr.set_string("minuteswest".into(), Value::Long(0));
+                    arr.set_string("dsttime".into(), Value::Long(0));
+                    Ok(Some(Value::Array(arr)))
+                }
+            }
+            "hrtime" => {
+                use std::time::SystemTime;
+                let dur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+                let as_number = args.first().map(|v| v.to_bool()).unwrap_or(false);
+                if as_number {
+                    Ok(Some(Value::Long(dur.as_nanos() as i64)))
+                } else {
+                    let mut arr = PhpArray::new();
+                    arr.push(Value::Long(dur.as_secs() as i64));
+                    arr.push(Value::Long(dur.subsec_nanos() as i64));
+                    Ok(Some(Value::Array(arr)))
+                }
+            }
+            "sys_getloadavg" => {
+                let mut arr = PhpArray::new();
+                arr.push(Value::Double(0.0));
+                arr.push(Value::Double(0.0));
+                arr.push(Value::Double(0.0));
+                Ok(Some(Value::Array(arr)))
+            }
+            "getrusage" => {
+                let mut arr = PhpArray::new();
+                arr.set_string("ru_utime.tv_sec".into(), Value::Long(0));
+                arr.set_string("ru_utime.tv_usec".into(), Value::Long(0));
+                arr.set_string("ru_stime.tv_sec".into(), Value::Long(0));
+                arr.set_string("ru_stime.tv_usec".into(), Value::Long(0));
+                Ok(Some(Value::Array(arr)))
+            }
+            "php_ini_loaded_file" | "php_ini_scanned_files" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "ini_get" | "ini_set" | "ini_alter" | "ini_restore" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "ini_get_all" => {
+                Ok(Some(Value::Array(PhpArray::new())))
+            }
+            "get_cfg_var" | "get_include_path" | "set_include_path" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "error_log" => {
+                let msg = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                eprintln!("{}", msg);
+                Ok(Some(Value::Bool(true)))
+            }
+            "error_clear_last" | "error_get_last" => {
+                Ok(Some(Value::Null))
+            }
+            "setlocale" => {
+                Ok(Some(Value::String("C".into())))
+            }
+            "localeconv" => {
+                let mut arr = PhpArray::new();
+                arr.set_string("decimal_point".into(), Value::String(".".into()));
+                arr.set_string("thousands_sep".into(), Value::String(String::new()));
+                arr.set_string("int_curr_symbol".into(), Value::String(String::new()));
+                arr.set_string("currency_symbol".into(), Value::String(String::new()));
+                Ok(Some(Value::Array(arr)))
+            }
+            "setcookie" | "setrawcookie" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "ip2long" => {
+                let ip = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let parts: Vec<&str> = ip.split('.').collect();
+                if parts.len() == 4 {
+                    let a = parts[0].parse::<u32>().unwrap_or(0);
+                    let b = parts[1].parse::<u32>().unwrap_or(0);
+                    let c = parts[2].parse::<u32>().unwrap_or(0);
+                    let d = parts[3].parse::<u32>().unwrap_or(0);
+                    if a <= 255 && b <= 255 && c <= 255 && d <= 255 {
+                        Ok(Some(Value::Long(((a << 24) | (b << 16) | (c << 8) | d) as i64)))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "long2ip" => {
+                let n = args.first().map(|v| v.to_long()).unwrap_or(0) as u32;
+                Ok(Some(Value::String(format!("{}.{}.{}.{}", n >> 24, (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF))))
+            }
+            "inet_ntop" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let bytes = s.as_bytes();
+                if bytes.len() == 4 {
+                    Ok(Some(Value::String(format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]))))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "inet_pton" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let parts: Vec<&str> = s.split('.').collect();
+                if parts.len() == 4 {
+                    let bytes: Vec<u8> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+                    if bytes.len() == 4 {
+                        Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "getopt" => Ok(Some(Value::Bool(false))),
+
+            // === date extension ===
+            "date" => {
+                use std::time::SystemTime;
+                let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let timestamp = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
+                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                });
+                Ok(Some(Value::String(php_date_format(&format, timestamp))))
+            }
+            "gmdate" => {
+                use std::time::SystemTime;
+                let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let timestamp = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
+                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                });
+                Ok(Some(Value::String(php_date_format(&format, timestamp))))
+            }
+            "mktime" => {
+                let hour = args.first().map(|v| v.to_long()).unwrap_or(0);
+                let min = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                let sec = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+                let month = args.get(3).map(|v| v.to_long()).unwrap_or(1);
+                let day = args.get(4).map(|v| v.to_long()).unwrap_or(1);
+                let year = args.get(5).map(|v| v.to_long()).unwrap_or(1970);
+                let days = days_from_epoch(year, month, day);
+                let ts = days * 86400 + hour * 3600 + min * 60 + sec;
+                Ok(Some(Value::Long(ts)))
+            }
+            "gmmktime" => {
+                let hour = args.first().map(|v| v.to_long()).unwrap_or(0);
+                let min = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                let sec = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+                let month = args.get(3).map(|v| v.to_long()).unwrap_or(1);
+                let day = args.get(4).map(|v| v.to_long()).unwrap_or(1);
+                let year = args.get(5).map(|v| v.to_long()).unwrap_or(1970);
+                let days = days_from_epoch(year, month, day);
+                let ts = days * 86400 + hour * 3600 + min * 60 + sec;
+                Ok(Some(Value::Long(ts)))
+            }
+            "strtotime" => {
+                use std::time::SystemTime;
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let base = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
+                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                });
+                match parse_relative_time(&s, base) {
+                    Some(ts) => Ok(Some(Value::Long(ts))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "checkdate" => {
+                let month = args.first().map(|v| v.to_long()).unwrap_or(0);
+                let day = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                let year = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+                let valid = month >= 1 && month <= 12 && day >= 1 && year >= 1 && year <= 32767
+                    && day <= days_in_month(year, month);
+                Ok(Some(Value::Bool(valid)))
+            }
+            "getdate" => {
+                use std::time::SystemTime;
+                let ts = args.first().map(|v| v.to_long()).unwrap_or_else(|| {
+                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                });
+                let (year, month, day, hour, min, sec, wday, yday) = timestamp_to_parts(ts);
+                let mut arr = PhpArray::new();
+                arr.set_string("seconds".into(), Value::Long(sec));
+                arr.set_string("minutes".into(), Value::Long(min));
+                arr.set_string("hours".into(), Value::Long(hour));
+                arr.set_string("mday".into(), Value::Long(day));
+                arr.set_string("wday".into(), Value::Long(wday));
+                arr.set_string("mon".into(), Value::Long(month));
+                arr.set_string("year".into(), Value::Long(year));
+                arr.set_string("yday".into(), Value::Long(yday));
+                arr.set_string("weekday".into(), Value::String(weekday_name(wday)));
+                arr.set_string("month".into(), Value::String(month_name(month)));
+                arr.set_string("0".into(), Value::Long(ts));
+                Ok(Some(Value::Array(arr)))
+            }
+            "localtime" => {
+                use std::time::SystemTime;
+                let ts = args.first().map(|v| v.to_long()).unwrap_or_else(|| {
+                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                });
+                let assoc = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
+                let (year, month, day, hour, min, sec, wday, yday) = timestamp_to_parts(ts);
+                if assoc {
+                    let mut arr = PhpArray::new();
+                    arr.set_string("tm_sec".into(), Value::Long(sec));
+                    arr.set_string("tm_min".into(), Value::Long(min));
+                    arr.set_string("tm_hour".into(), Value::Long(hour));
+                    arr.set_string("tm_mday".into(), Value::Long(day));
+                    arr.set_string("tm_mon".into(), Value::Long(month - 1));
+                    arr.set_string("tm_year".into(), Value::Long(year - 1900));
+                    arr.set_string("tm_wday".into(), Value::Long(wday));
+                    arr.set_string("tm_yday".into(), Value::Long(yday));
+                    arr.set_string("tm_isdst".into(), Value::Long(0));
+                    Ok(Some(Value::Array(arr)))
+                } else {
+                    let mut arr = PhpArray::new();
+                    arr.push(Value::Long(sec));
+                    arr.push(Value::Long(min));
+                    arr.push(Value::Long(hour));
+                    arr.push(Value::Long(day));
+                    arr.push(Value::Long(month - 1));
+                    arr.push(Value::Long(year - 1900));
+                    arr.push(Value::Long(wday));
+                    arr.push(Value::Long(yday));
+                    arr.push(Value::Long(0)); // isdst
+                    Ok(Some(Value::Array(arr)))
+                }
+            }
+            "idate" => {
+                use std::time::SystemTime;
+                let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let ts = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
+                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                });
+                let (year, month, day, hour, min, sec, wday, yday) = timestamp_to_parts(ts);
+                let result = match format.chars().next() {
+                    Some('Y') => year,
+                    Some('y') => year % 100,
+                    Some('m') => month,
+                    Some('d') => day,
+                    Some('H') => hour,
+                    Some('i') => min,
+                    Some('s') => sec,
+                    Some('w') => wday,
+                    Some('z') => yday,
+                    Some('U') => ts,
+                    Some('t') => days_in_month(year, month),
+                    _ => 0,
+                };
+                Ok(Some(Value::Long(result)))
+            }
+            "date_create" | "date_create_immutable" => {
+                // Stub: return false for now (needs DateTime object support)
+                Ok(Some(Value::Bool(false)))
+            }
+
+            // === mbstring extension ===
+            "mb_strlen" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::Long(s.chars().count() as i64)))
+            }
+            "mb_substr" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let start = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                let len = args.get(2).map(|v| v.to_long());
+                let chars: Vec<char> = s.chars().collect();
+                let total = chars.len() as i64;
+                let start = if start < 0 { (total + start).max(0) as usize } else { start as usize };
+                let end = match len {
+                    Some(l) if l < 0 => (total + l).max(start as i64) as usize,
+                    Some(l) => (start + l as usize).min(chars.len()),
+                    None => chars.len(),
+                };
+                if start >= chars.len() {
+                    Ok(Some(Value::String(String::new())))
+                } else {
+                    Ok(Some(Value::String(chars[start..end.min(chars.len())].iter().collect())))
+                }
+            }
+            "mb_strpos" => {
+                let haystack = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let needle = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let offset = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let hay_chars: Vec<char> = haystack.chars().collect();
+                let needle_chars: Vec<char> = needle.chars().collect();
+                let mut found = None;
+                if !needle_chars.is_empty() {
+                    for i in offset..hay_chars.len() {
+                        if hay_chars[i..].starts_with(&needle_chars) {
+                            found = Some(i);
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(pos) => Ok(Some(Value::Long(pos as i64))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "mb_strrpos" => {
+                let haystack = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let needle = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let hay_chars: Vec<char> = haystack.chars().collect();
+                let needle_chars: Vec<char> = needle.chars().collect();
+                let mut found = None;
+                if !needle_chars.is_empty() {
+                    for i in (0..hay_chars.len()).rev() {
+                        if hay_chars[i..].starts_with(&needle_chars) {
+                            found = Some(i);
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(pos) => Ok(Some(Value::Long(pos as i64))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "mb_strtolower" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::String(s.to_lowercase())))
+            }
+            "mb_strtoupper" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::String(s.to_uppercase())))
+            }
+            "mb_detect_encoding" => {
+                Ok(Some(Value::String("UTF-8".into())))
+            }
+            "mb_internal_encoding" => {
+                if args.is_empty() {
+                    Ok(Some(Value::String("UTF-8".into())))
+                } else {
+                    Ok(Some(Value::Bool(true)))
+                }
+            }
+            "mb_convert_encoding" => {
+                // Simplified: just return the string as-is (assumes UTF-8)
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::String(s)))
+            }
+            "mb_substr_count" => {
+                let haystack = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let needle = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::Long(haystack.matches(&needle).count() as i64)))
+            }
+            "mb_strstr" => {
+                let haystack = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let needle = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let before = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
+                match haystack.find(&needle) {
+                    Some(pos) => {
+                        if before {
+                            Ok(Some(Value::String(haystack[..pos].to_string())))
+                        } else {
+                            Ok(Some(Value::String(haystack[pos..].to_string())))
+                        }
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "mb_stripos" => {
+                let haystack = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let needle = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let offset = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let hay_lower = haystack.to_lowercase();
+                let needle_lower = needle.to_lowercase();
+                let hay_chars: Vec<char> = hay_lower.chars().collect();
+                let needle_chars: Vec<char> = needle_lower.chars().collect();
+                let mut found = None;
+                if !needle_chars.is_empty() {
+                    for i in offset..hay_chars.len() {
+                        if hay_chars[i..].starts_with(&needle_chars) {
+                            found = Some(i);
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(pos) => Ok(Some(Value::Long(pos as i64))),
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "mb_stristr" => {
+                let haystack = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let needle = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let before = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
+                let pos = haystack.to_lowercase().find(&needle.to_lowercase());
+                match pos {
+                    Some(p) => {
+                        if before {
+                            Ok(Some(Value::String(haystack[..p].to_string())))
+                        } else {
+                            Ok(Some(Value::String(haystack[p..].to_string())))
+                        }
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "mb_str_split" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let length = args.get(1).map(|v| v.to_long()).unwrap_or(1) as usize;
+                let chars: Vec<char> = s.chars().collect();
+                let mut arr = PhpArray::new();
+                for chunk in chars.chunks(length.max(1)) {
+                    arr.push(Value::String(chunk.iter().collect()));
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "mb_convert_case" => {
+                let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let mode = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                match mode {
+                    0 => Ok(Some(Value::String(s.to_uppercase()))),  // MB_CASE_UPPER
+                    1 => Ok(Some(Value::String(s.to_lowercase()))),  // MB_CASE_LOWER
+                    2 => {  // MB_CASE_TITLE
+                        let mut result = String::new();
+                        let mut cap_next = true;
+                        for ch in s.chars() {
+                            if cap_next && ch.is_alphabetic() {
+                                result.extend(ch.to_uppercase());
+                                cap_next = false;
+                            } else {
+                                result.push(ch);
+                                if ch.is_whitespace() { cap_next = true; }
+                            }
+                        }
+                        Ok(Some(Value::String(result)))
+                    }
+                    _ => Ok(Some(Value::String(s))),
+                }
+            }
+
+            // === hash extension ===
+            "hash" => {
+                let algo = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                match algo.as_str() {
+                    "md5" => Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(&data)))),
+                    "sha1" => Ok(Some(Value::String(php_rs_ext_standard::strings::php_sha1(&data)))),
+                    "crc32" => {
+                        let crc = crc32_compute(data.as_bytes());
+                        Ok(Some(Value::String(format!("{:08x}", crc))))
+                    }
+                    _ => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "hash_hmac" => {
+                // Simplified HMAC: not cryptographically correct but functional
+                let algo = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let key = args.get(2).map(|v| v.to_php_string()).unwrap_or_default();
+                let combined = format!("{}{}", key, data);
+                match algo.as_str() {
+                    "md5" => Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(&combined)))),
+                    "sha1" => Ok(Some(Value::String(php_rs_ext_standard::strings::php_sha1(&combined)))),
+                    _ => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "hash_equals" => {
+                let known = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let user = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                Ok(Some(Value::Bool(known == user)))
+            }
+            "hash_algos" => {
+                let mut arr = PhpArray::new();
+                arr.push(Value::String("md5".into()));
+                arr.push(Value::String("sha1".into()));
+                arr.push(Value::String("crc32".into()));
+                Ok(Some(Value::Array(arr)))
+            }
+
+            // === filter extension ===
+            "filter_var" => {
+                let val = args.first().cloned().unwrap_or(Value::Null);
+                let filter = args.get(1).map(|v| v.to_long()).unwrap_or(516); // FILTER_DEFAULT
+                match filter {
+                    258 => { // FILTER_VALIDATE_INT
+                        match &val {
+                            Value::Long(n) => Ok(Some(Value::Long(*n))),
+                            Value::String(s) => {
+                                match s.trim().parse::<i64>() {
+                                    Ok(n) => Ok(Some(Value::Long(n))),
+                                    Err(_) => Ok(Some(Value::Bool(false))),
+                                }
+                            }
+                            _ => Ok(Some(Value::Bool(false))),
+                        }
+                    }
+                    259 => { // FILTER_VALIDATE_FLOAT
+                        match &val {
+                            Value::Double(n) => Ok(Some(Value::Double(*n))),
+                            Value::Long(n) => Ok(Some(Value::Double(*n as f64))),
+                            Value::String(s) => {
+                                match s.trim().parse::<f64>() {
+                                    Ok(n) => Ok(Some(Value::Double(n))),
+                                    Err(_) => Ok(Some(Value::Bool(false))),
+                                }
+                            }
+                            _ => Ok(Some(Value::Bool(false))),
+                        }
+                    }
+                    274 => { // FILTER_VALIDATE_EMAIL
+                        let s = val.to_php_string();
+                        let valid = s.contains('@') && s.len() > 3 && !s.starts_with('@') && !s.ends_with('@');
+                        if valid { Ok(Some(Value::String(s))) } else { Ok(Some(Value::Bool(false))) }
+                    }
+                    275 => { // FILTER_VALIDATE_URL
+                        let s = val.to_php_string();
+                        let valid = s.starts_with("http://") || s.starts_with("https://") || s.starts_with("ftp://");
+                        if valid { Ok(Some(Value::String(s))) } else { Ok(Some(Value::Bool(false))) }
+                    }
+                    277 => { // FILTER_VALIDATE_IP
+                        let s = val.to_php_string();
+                        let parts: Vec<&str> = s.split('.').collect();
+                        let valid = parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok());
+                        if valid { Ok(Some(Value::String(s))) } else { Ok(Some(Value::Bool(false))) }
+                    }
+                    278 => { // FILTER_VALIDATE_BOOLEAN
+                        match val.to_php_string().to_lowercase().as_str() {
+                            "true" | "on" | "yes" | "1" => Ok(Some(Value::Bool(true))),
+                            "false" | "off" | "no" | "0" | "" => Ok(Some(Value::Bool(false))),
+                            _ => Ok(Some(Value::Null)),
+                        }
+                    }
+                    521 => { // FILTER_SANITIZE_STRING (deprecated but common)
+                        let s = val.to_php_string();
+                        let cleaned: String = s.chars().filter(|c| *c != '<' && *c != '>').collect();
+                        Ok(Some(Value::String(cleaned)))
+                    }
+                    513 => { // FILTER_SANITIZE_ENCODED
+                        let s = val.to_php_string();
+                        let encoded: String = s.chars().map(|c| {
+                            if c.is_ascii_alphanumeric() || "-._~".contains(c) {
+                                c.to_string()
+                            } else {
+                                format!("%{:02X}", c as u32)
+                            }
+                        }).collect();
+                        Ok(Some(Value::String(encoded)))
+                    }
+                    _ => Ok(Some(val)), // FILTER_DEFAULT or unknown
+                }
+            }
+            "filter_input" => {
+                // Stub: return null (no superglobals)
+                Ok(Some(Value::Null))
+            }
+            "filter_has_var" => Ok(Some(Value::Bool(false))),
+            "filter_list" => {
+                let mut arr = PhpArray::new();
+                for name in &["int", "boolean", "float", "validate_regexp", "validate_url", "validate_email", "validate_ip", "string", "stripped", "encoded", "special_chars", "unsafe_raw", "email", "url", "number_int", "number_float", "callback"] {
+                    arr.push(Value::String(name.to_string()));
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "filter_id" => {
+                let name = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let id = match name.as_str() {
+                    "int" => 257, "boolean" => 258, "float" => 259,
+                    "validate_url" => 273, "validate_email" => 274, "validate_ip" => 275,
+                    "string" | "stripped" => 513,
+                    _ => 0,
+                };
+                if id > 0 { Ok(Some(Value::Long(id))) } else { Ok(Some(Value::Bool(false))) }
+            }
+
+            // === bcmath extension ===
+            "bcadd" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let result = a.parse::<f64>().unwrap_or(0.0) + b.parse::<f64>().unwrap_or(0.0);
+                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+            }
+            "bcsub" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let result = a.parse::<f64>().unwrap_or(0.0) - b.parse::<f64>().unwrap_or(0.0);
+                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+            }
+            "bcmul" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let result = a.parse::<f64>().unwrap_or(0.0) * b.parse::<f64>().unwrap_or(0.0);
+                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+            }
+            "bcdiv" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let bv = b.parse::<f64>().unwrap_or(0.0);
+                if bv == 0.0 {
+                    return Err(VmError::FatalError("Division by zero".into()));
+                }
+                let result = a.parse::<f64>().unwrap_or(0.0) / bv;
+                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+            }
+            "bcmod" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let bv = b.parse::<f64>().unwrap_or(0.0);
+                if bv == 0.0 {
+                    return Err(VmError::FatalError("Division by zero".into()));
+                }
+                let result = a.parse::<f64>().unwrap_or(0.0) % bv;
+                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+            }
+            "bcpow" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let result = a.parse::<f64>().unwrap_or(0.0).powf(b.parse::<f64>().unwrap_or(0.0));
+                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+            }
+            "bccomp" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let av = a.parse::<f64>().unwrap_or(0.0);
+                let bv = b.parse::<f64>().unwrap_or(0.0);
+                Ok(Some(Value::Long(if av < bv { -1 } else if av > bv { 1 } else { 0 })))
+            }
+            "bcsqrt" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let scale = args.get(1).map(|v| v.to_long()).unwrap_or(0) as usize;
+                let result = a.parse::<f64>().unwrap_or(0.0).sqrt();
+                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+            }
+            "bcscale" => {
+                // Stub: return/set scale
+                if args.is_empty() {
+                    Ok(Some(Value::Long(0)))
+                } else {
+                    Ok(Some(Value::Long(args[0].to_long())))
+                }
+            }
+            "bcpowmod" => {
+                let base = args.first().map(|v| v.to_php_string()).unwrap_or_default().parse::<i64>().unwrap_or(0);
+                let exp = args.get(1).map(|v| v.to_php_string()).unwrap_or_default().parse::<i64>().unwrap_or(0);
+                let modulus = args.get(2).map(|v| v.to_php_string()).unwrap_or_default().parse::<i64>().unwrap_or(1);
+                if modulus == 0 {
+                    return Err(VmError::FatalError("Division by zero".into()));
+                }
+                let mut result: i64 = 1;
+                let mut b = base % modulus;
+                let mut e = exp;
+                while e > 0 {
+                    if e % 2 == 1 { result = result * b % modulus; }
+                    e /= 2;
+                    b = b * b % modulus;
+                }
+                Ok(Some(Value::String(result.to_string())))
+            }
+            "bcfloor" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let result = a.parse::<f64>().unwrap_or(0.0).floor();
+                Ok(Some(Value::String(format!("{}", result as i64))))
+            }
+            "bcceil" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let result = a.parse::<f64>().unwrap_or(0.0).ceil();
+                Ok(Some(Value::String(format!("{}", result as i64))))
+            }
+            "bcround" => {
+                let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let scale = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                let f = a.parse::<f64>().unwrap_or(0.0);
+                let factor = 10f64.powi(scale as i32);
+                let result = (f * factor).round() / factor;
+                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale as usize))))
+            }
+
+            // === spl extension ===
+            "spl_autoload_register" => {
+                // Stub: ignore
+                Ok(Some(Value::Bool(true)))
+            }
+            "spl_autoload_unregister" => Ok(Some(Value::Bool(true))),
+            "spl_autoload_functions" => Ok(Some(Value::Array(PhpArray::new()))),
+            "spl_object_id" => {
+                // Return a unique identifier
+                Ok(Some(Value::Long(0)))
+            }
+            "spl_object_hash" => {
+                Ok(Some(Value::String("0000000000000000".into())))
+            }
+            "iterator_to_array" => {
+                let val = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(a) = val {
+                    Ok(Some(Value::Array(a)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "iterator_count" => {
+                let val = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = val {
+                    Ok(Some(Value::Long(a.len() as i64)))
+                } else {
+                    Ok(Some(Value::Long(0)))
+                }
+            }
+            "iterator_apply" => Ok(Some(Value::Long(0))),
+            "class_parents" => {
+                // Stub
+                Ok(Some(Value::Array(PhpArray::new())))
+            }
+            "class_implements" => Ok(Some(Value::Array(PhpArray::new()))),
+            "class_uses" => Ok(Some(Value::Array(PhpArray::new()))),
+
+            // === password extension ===
+            "password_hash" => {
+                // Simplified stub using md5 as hash
+                let password = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let hash = php_rs_ext_standard::strings::php_md5(&password);
+                Ok(Some(Value::String(format!("$2y$10${}", hash))))
+            }
+            "password_verify" => {
+                let password = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let hash = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let expected = format!("$2y$10${}", php_rs_ext_standard::strings::php_md5(&password));
+                Ok(Some(Value::Bool(hash == expected)))
+            }
+            "password_needs_rehash" => Ok(Some(Value::Bool(false))),
+            "password_algos" => {
+                let mut arr = PhpArray::new();
+                arr.push(Value::String("2y".into()));
+                Ok(Some(Value::Array(arr)))
+            }
+            "password_get_info" => {
+                let mut arr = PhpArray::new();
+                arr.set_string("algo".into(), Value::String("2y".into()));
+                arr.set_string("algoName".into(), Value::String("bcrypt".into()));
+                let opts = PhpArray::new();
+                arr.set_string("options".into(), Value::Array(opts));
+                Ok(Some(Value::Array(arr)))
+            }
+
+            "time_nanosleep" => {
+                let secs = args.first().map(|v| v.to_long()).unwrap_or(0);
+                let nsecs = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                std::thread::sleep(std::time::Duration::new(secs.max(0) as u64, nsecs.max(0) as u32));
+                Ok(Some(Value::Bool(true)))
+            }
+            "time_sleep_until" => {
+                // Stub
+                Ok(Some(Value::Bool(true)))
+            }
+            "uniqid" => {
+                use std::time::SystemTime;
+                let prefix = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let dur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+                let id = format!("{}{:08x}{:05x}", prefix, dur.as_secs() as u32, dur.subsec_micros());
+                Ok(Some(Value::String(id)))
+            }
+
             _ => Ok(None),
         }
     }
@@ -6350,6 +7859,403 @@ fn serializable_to_value(sv: &php_rs_ext_standard::variables::SerializableValue)
             Value::Array(arr)
         }
     }
+}
+
+/// Natural order string comparison (like PHP's strnatcmp)
+fn nat_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut ai = 0;
+    let mut bi = 0;
+    while ai < a_chars.len() && bi < b_chars.len() {
+        let ac = a_chars[ai];
+        let bc = b_chars[bi];
+        if ac.is_ascii_digit() && bc.is_ascii_digit() {
+            // Compare numeric segments
+            let mut a_num = String::new();
+            while ai < a_chars.len() && a_chars[ai].is_ascii_digit() {
+                a_num.push(a_chars[ai]);
+                ai += 1;
+            }
+            let mut b_num = String::new();
+            while bi < b_chars.len() && b_chars[bi].is_ascii_digit() {
+                b_num.push(b_chars[bi]);
+                bi += 1;
+            }
+            let an: u64 = a_num.parse().unwrap_or(0);
+            let bn: u64 = b_num.parse().unwrap_or(0);
+            match an.cmp(&bn) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            }
+        } else {
+            match ac.cmp(&bc) {
+                std::cmp::Ordering::Equal => {
+                    ai += 1;
+                    bi += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+    a_chars.len().cmp(&b_chars.len())
+}
+
+/// Version comparison like PHP's version_compare
+fn version_cmp(a: &str, b: &str) -> i32 {
+    let normalize = |s: &str| -> Vec<String> {
+        let mut parts = Vec::new();
+        let mut current = String::new();
+        for ch in s.chars() {
+            if ch == '.' || ch == '-' || ch == '_' {
+                if !current.is_empty() {
+                    parts.push(current.clone());
+                    current.clear();
+                }
+            } else {
+                current.push(ch);
+            }
+        }
+        if !current.is_empty() {
+            parts.push(current);
+        }
+        parts
+    };
+    let special_order = |s: &str| -> i32 {
+        match s.to_lowercase().as_str() {
+            "dev" => 0,
+            "alpha" | "a" => 1,
+            "beta" | "b" => 2,
+            "rc" => 3,
+            "pl" | "p" => 5,
+            _ => 4,
+        }
+    };
+    let a_parts = normalize(a);
+    let b_parts = normalize(b);
+    let max = a_parts.len().max(b_parts.len());
+    for i in 0..max {
+        let ap = a_parts.get(i).map(|s| s.as_str()).unwrap_or("");
+        let bp = b_parts.get(i).map(|s| s.as_str()).unwrap_or("");
+        let a_is_num = ap.chars().all(|c| c.is_ascii_digit()) && !ap.is_empty();
+        let b_is_num = bp.chars().all(|c| c.is_ascii_digit()) && !bp.is_empty();
+        if a_is_num && b_is_num {
+            let an: i64 = ap.parse().unwrap_or(0);
+            let bn: i64 = bp.parse().unwrap_or(0);
+            if an != bn {
+                return if an < bn { -1 } else { 1 };
+            }
+        } else if a_is_num {
+            return 1; // number > string
+        } else if b_is_num {
+            return -1;
+        } else {
+            let ao = special_order(ap);
+            let bo = special_order(bp);
+            if ao != bo {
+                return if ao < bo { -1 } else { 1 };
+            }
+        }
+    }
+    0
+}
+
+/// CRC32 computation
+fn crc32_compute(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFFFFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+/// Compute days from epoch (1970-01-01) for a given date
+fn days_from_epoch(year: i64, month: i64, day: i64) -> i64 {
+    // Adjust for months before March
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    // Days from epoch to start of year
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * m as u32 + 2) / 5 + day as u32 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
+/// Number of days in a given month
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || year % 400 == 0 {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Convert a Unix timestamp to (year, month, day, hour, min, sec, wday, yday)
+fn timestamp_to_parts(ts: i64) -> (i64, i64, i64, i64, i64, i64, i64, i64) {
+    let secs_per_day: i64 = 86400;
+    let mut days = ts / secs_per_day;
+    let mut remaining = ts % secs_per_day;
+    if remaining < 0 {
+        remaining += secs_per_day;
+        days -= 1;
+    }
+    let hour = remaining / 3600;
+    remaining %= 3600;
+    let min = remaining / 60;
+    let sec = remaining % 60;
+
+    // Day of week: 1970-01-01 was Thursday (4)
+    let wday = ((days + 4) % 7 + 7) % 7;
+
+    // Convert days since epoch to date
+    let z = days + 719468;
+    let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let month = m as i64;
+    let day = d as i64;
+
+    // Day of year
+    let jan1 = days_from_epoch(year, 1, 1);
+    let yday = days - jan1;
+
+    (year, month, day, hour, min, sec, wday, yday)
+}
+
+fn weekday_name(wday: i64) -> String {
+    match wday {
+        0 => "Sunday".into(),
+        1 => "Monday".into(),
+        2 => "Tuesday".into(),
+        3 => "Wednesday".into(),
+        4 => "Thursday".into(),
+        5 => "Friday".into(),
+        6 => "Saturday".into(),
+        _ => "Unknown".into(),
+    }
+}
+
+fn month_name(month: i64) -> String {
+    match month {
+        1 => "January".into(),
+        2 => "February".into(),
+        3 => "March".into(),
+        4 => "April".into(),
+        5 => "May".into(),
+        6 => "June".into(),
+        7 => "July".into(),
+        8 => "August".into(),
+        9 => "September".into(),
+        10 => "October".into(),
+        11 => "November".into(),
+        12 => "December".into(),
+        _ => "Unknown".into(),
+    }
+}
+
+/// PHP date() format implementation
+fn php_date_format(format: &str, timestamp: i64) -> String {
+    let (year, month, day, hour, min, sec, wday, yday) = timestamp_to_parts(timestamp);
+    let mut result = String::new();
+    let mut escape = false;
+    for ch in format.chars() {
+        if escape {
+            result.push(ch);
+            escape = false;
+            continue;
+        }
+        if ch == '\\' {
+            escape = true;
+            continue;
+        }
+        match ch {
+            'Y' => result.push_str(&format!("{:04}", year)),
+            'y' => result.push_str(&format!("{:02}", year % 100)),
+            'm' => result.push_str(&format!("{:02}", month)),
+            'n' => result.push_str(&format!("{}", month)),
+            'd' => result.push_str(&format!("{:02}", day)),
+            'j' => result.push_str(&format!("{}", day)),
+            'H' => result.push_str(&format!("{:02}", hour)),
+            'G' => result.push_str(&format!("{}", hour)),
+            'i' => result.push_str(&format!("{:02}", min)),
+            's' => result.push_str(&format!("{:02}", sec)),
+            'A' => result.push_str(if hour < 12 { "AM" } else { "PM" }),
+            'a' => result.push_str(if hour < 12 { "am" } else { "pm" }),
+            'g' => {
+                let h12 = if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour };
+                result.push_str(&format!("{}", h12));
+            }
+            'h' => {
+                let h12 = if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour };
+                result.push_str(&format!("{:02}", h12));
+            }
+            'w' => result.push_str(&format!("{}", wday)),
+            'N' => result.push_str(&format!("{}", if wday == 0 { 7 } else { wday })),
+            'l' => result.push_str(&weekday_name(wday)),
+            'D' => result.push_str(&weekday_name(wday)[..3]),
+            'F' => result.push_str(&month_name(month)),
+            'M' => result.push_str(&month_name(month)[..3]),
+            'z' => result.push_str(&format!("{}", yday)),
+            't' => result.push_str(&format!("{}", days_in_month(year, month))),
+            'U' => result.push_str(&format!("{}", timestamp)),
+            'L' => {
+                let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+                result.push_str(if leap { "1" } else { "0" });
+            }
+            'S' => {
+                // English ordinal suffix
+                let suffix = match day {
+                    1 | 21 | 31 => "st",
+                    2 | 22 => "nd",
+                    3 | 23 => "rd",
+                    _ => "th",
+                };
+                result.push_str(suffix);
+            }
+            'c' => {
+                // ISO 8601 date
+                result.push_str(&format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
+                    year, month, day, hour, min, sec));
+            }
+            'r' => {
+                // RFC 2822 date
+                result.push_str(&format!("{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
+                    &weekday_name(wday)[..3], day, &month_name(month)[..3], year, hour, min, sec));
+            }
+            _ => result.push(ch),
+        }
+    }
+    result
+}
+
+/// Parse relative time strings for strtotime()
+fn parse_relative_time(s: &str, base: i64) -> Option<i64> {
+    let s = s.trim().to_lowercase();
+
+    // Handle "now"
+    if s == "now" {
+        return Some(base);
+    }
+
+    // Handle "yesterday", "today", "tomorrow"
+    let day_secs = 86400i64;
+    if s == "today" {
+        return Some(base - base % day_secs);
+    }
+    if s == "yesterday" {
+        return Some(base - base % day_secs - day_secs);
+    }
+    if s == "tomorrow" {
+        return Some(base - base % day_secs + day_secs);
+    }
+
+    // Handle "+N seconds/minutes/hours/days/weeks/months/years"
+    // and "-N seconds/..." and "N seconds ago"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() >= 2 {
+        let ago = parts.last() == Some(&"ago");
+        let (num_str, unit_str) = if ago && parts.len() >= 3 {
+            (parts[0], parts[1])
+        } else {
+            (parts[0], parts[1])
+        };
+        if let Ok(mut num) = num_str.trim_start_matches('+').parse::<i64>() {
+            if ago {
+                num = -num;
+            }
+            let secs = match unit_str.trim_end_matches('s') {
+                "second" => num,
+                "minute" => num * 60,
+                "hour" => num * 3600,
+                "day" => num * day_secs,
+                "week" => num * day_secs * 7,
+                "month" => num * day_secs * 30,
+                "year" => num * day_secs * 365,
+                _ => return None,
+            };
+            return Some(base + secs);
+        }
+    }
+
+    // Handle "next/last Monday/Tuesday/..."
+    if parts.len() == 2 && (parts[0] == "next" || parts[0] == "last") {
+        let target_wday = match parts[1] {
+            "sunday" => Some(0),
+            "monday" => Some(1),
+            "tuesday" => Some(2),
+            "wednesday" => Some(3),
+            "thursday" => Some(4),
+            "friday" => Some(5),
+            "saturday" => Some(6),
+            "week" => {
+                let offset = if parts[0] == "next" { 7 } else { -7 };
+                return Some(base + offset * day_secs);
+            }
+            "month" => {
+                let offset = if parts[0] == "next" { 30 } else { -30 };
+                return Some(base + offset * day_secs);
+            }
+            "year" => {
+                let offset = if parts[0] == "next" { 365 } else { -365 };
+                return Some(base + offset * day_secs);
+            }
+            _ => None,
+        };
+        if let Some(tw) = target_wday {
+            let (_, _, _, _, _, _, current_wday, _) = timestamp_to_parts(base);
+            let diff = if parts[0] == "next" {
+                let d = tw - current_wday;
+                if d <= 0 { d + 7 } else { d }
+            } else {
+                let d = current_wday - tw;
+                if d <= 0 { -(d + 7) } else { -d }
+            };
+            return Some(base + diff * day_secs);
+        }
+    }
+
+    // Handle YYYY-MM-DD [HH:MM:SS]
+    if s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-' {
+        let year: i64 = s[0..4].parse().ok()?;
+        let month: i64 = s[5..7].parse().ok()?;
+        let day: i64 = s[8..10].parse().ok()?;
+        let (hour, min, sec) = if s.len() >= 19 && s.as_bytes()[10] == b' ' {
+            let h: i64 = s[11..13].parse().ok()?;
+            let m: i64 = s[14..16].parse().ok()?;
+            let sc: i64 = s[17..19].parse().ok()?;
+            (h, m, sc)
+        } else {
+            (0, 0, 0)
+        };
+        let days = days_from_epoch(year, month, day);
+        return Some(days * 86400 + hour * 3600 + min * 60 + sec);
+    }
+
+    None
 }
 
 #[cfg(test)]

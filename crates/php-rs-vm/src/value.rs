@@ -1034,7 +1034,7 @@ fn string_to_double(s: &str) -> f64 {
 }
 
 /// PHP-style alphanumeric string increment.
-fn php_increment_string(s: &str) -> String {
+pub fn php_increment_string(s: &str) -> String {
     let mut chars: Vec<char> = s.chars().collect();
     let mut carry = true;
 
