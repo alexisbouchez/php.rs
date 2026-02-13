@@ -200,34 +200,34 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 4.1.4  Test: ZOp serialization/debug
 
 ## 4.2 Expression compilation
-[ ] 4.2.1  Compile literals: int, float, string, bool, null → ZEND_QM_ASSIGN / constants
-[ ] 4.2.2  Compile binary ops: +, -, *, /, %, **, ., &, |, ^, <<, >>
+[x] 4.2.1  Compile literals: int, float, string, bool, null → ZEND_QM_ASSIGN / constants
+[x] 4.2.2  Compile binary ops: +, -, *, /, %, **, ., &, |, ^, <<, >>
            → ZEND_ADD, ZEND_SUB, ZEND_MUL, ZEND_DIV, ZEND_MOD, ZEND_POW, ZEND_CONCAT, etc.
-[ ] 4.2.3  Compile comparison ops: ==, ===, !=, !==, <, <=, >, >=, <=>
+[x] 4.2.3  Compile comparison ops: ==, ===, !=, !==, <, <=, >, >=, <=>
            → ZEND_IS_EQUAL, ZEND_IS_IDENTICAL, ZEND_IS_SMALLER, ZEND_SPACESHIP, etc.
-[ ] 4.2.4  Compile unary ops: -, +, ~, ! → ZEND_BW_NOT, ZEND_BOOL_NOT, ZEND_MUL(-1)
-[ ] 4.2.5  Compile variable read: $var → ZEND_FETCH with CV (compiled variable) slot
-[ ] 4.2.6  Compile assignment: $a = expr → ZEND_ASSIGN
-[ ] 4.2.7  Compile compound assignment: $a += expr → ZEND_ASSIGN_OP
-[ ] 4.2.8  Compile increment/decrement: $a++, ++$a → ZEND_POST_INC, ZEND_PRE_INC
-[ ] 4.2.9  Compile string concat: "a" . "b" → ZEND_CONCAT / ZEND_FAST_CONCAT
-[ ] 4.2.10 Compile array literal: [1, 'a' => 2] → ZEND_INIT_ARRAY + ZEND_ADD_ARRAY_ELEMENT
-[ ] 4.2.11 Test: compile expressions and verify opcode sequences match php -d opcache.opt_debug_level=0x10000
+[x] 4.2.4  Compile unary ops: -, +, ~, ! → ZEND_BW_NOT, ZEND_BOOL_NOT, ZEND_MUL(-1)
+[x] 4.2.5  Compile variable read: $var → ZEND_FETCH with CV (compiled variable) slot
+[x] 4.2.6  Compile assignment: $a = expr → ZEND_ASSIGN
+[x] 4.2.7  Compile compound assignment: $a += expr → ZEND_ASSIGN_OP
+[x] 4.2.8  Compile increment/decrement: $a++, ++$a → ZEND_POST_INC, ZEND_PRE_INC
+[x] 4.2.9  Compile string concat: "a" . "b" → ZEND_CONCAT / ZEND_FAST_CONCAT
+[x] 4.2.10 Compile array literal: [1, 'a' => 2] → ZEND_INIT_ARRAY + ZEND_ADD_ARRAY_ELEMENT
+[x] 4.2.11 Test: compile expressions and verify opcode sequences match php -d opcache.opt_debug_level=0x10000
 
 ## 4.3 Control flow compilation
-[ ] 4.3.1  Compile echo/print → ZEND_ECHO
-[ ] 4.3.2  Compile if/else → ZEND_JMPZ + ZEND_JMP
-[ ] 4.3.3  Compile while → ZEND_JMPZ (loop back with ZEND_JMP)
-[ ] 4.3.4  Compile do-while → ZEND_JMPNZ
-[ ] 4.3.5  Compile for → init + ZEND_JMPZ + body + increment + ZEND_JMP
-[ ] 4.3.6  Compile foreach → ZEND_FE_RESET_R + ZEND_FE_FETCH_R + ZEND_FE_FREE
-[ ] 4.3.7  Compile switch → ZEND_CASE + ZEND_JMPZ chain
-[ ] 4.3.8  Compile match → ZEND_MATCH + ZEND_MATCH_ERROR
-[ ] 4.3.9  Compile break/continue with depth → ZEND_JMP (+ ZEND_FE_FREE for foreach)
-[ ] 4.3.10 Compile return → ZEND_RETURN
-[ ] 4.3.11 Compile try/catch/finally → try_catch_element array + ZEND_CATCH
-[ ] 4.3.12 Compile throw → ZEND_THROW
-[ ] 4.3.13 Test: control flow opcodes against known PHP opcode dumps
+[x] 4.3.1  Compile echo/print → ZEND_ECHO
+[x] 4.3.2  Compile if/else → ZEND_JMPZ + ZEND_JMP
+[x] 4.3.3  Compile while → ZEND_JMPZ (loop back with ZEND_JMP)
+[x] 4.3.4  Compile do-while → ZEND_JMPNZ
+[x] 4.3.5  Compile for → init + ZEND_JMPZ + body + increment + ZEND_JMP
+[x] 4.3.6  Compile foreach → ZEND_FE_RESET_R + ZEND_FE_FETCH_R + ZEND_FE_FREE
+[x] 4.3.7  Compile switch → ZEND_CASE + ZEND_JMPZ chain
+[x] 4.3.8  Compile match → ZEND_MATCH + ZEND_MATCH_ERROR
+[x] 4.3.9  Compile break/continue with depth → ZEND_JMP (+ ZEND_FE_FREE for foreach)
+[x] 4.3.10 Compile return → ZEND_RETURN
+[x] 4.3.11 Compile try/catch/finally → try_catch_element array + ZEND_CATCH
+[x] 4.3.12 Compile throw → ZEND_THROW
+[x] 4.3.13 Test: control flow opcodes against known PHP opcode dumps
 
 ## 4.4 Function compilation
 [ ] 4.4.1  Compile function declaration → new ZOpArray + ZEND_DECLARE_FUNCTION

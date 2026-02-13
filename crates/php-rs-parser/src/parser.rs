@@ -2604,33 +2604,35 @@ impl<'a> Parser<'a> {
         match token {
             // Integer literal
             Token::LNumber => {
+                let text = self.lexer.source_text(&span);
+                let value = parse_int_literal(text);
                 self.advance();
-                // Extract value from span (placeholder - real implementation needs lexer support)
-                Ok(Expression::IntLiteral { value: 0, span })
+                Ok(Expression::IntLiteral { value, span })
             }
 
             // Float literal
             Token::DNumber => {
+                let text = self.lexer.source_text(&span);
+                let value = parse_float_literal(text);
                 self.advance();
-                Ok(Expression::FloatLiteral { value: 0.0, span })
+                Ok(Expression::FloatLiteral { value, span })
             }
 
             // String literal
             Token::ConstantEncapsedString => {
+                let text = self.lexer.source_text(&span);
+                let value = parse_string_literal(text);
                 self.advance();
-                Ok(Expression::StringLiteral {
-                    value: String::new(),
-                    span,
-                })
+                Ok(Expression::StringLiteral { value, span })
             }
 
             // Variable
             Token::Variable => {
+                let text = self.lexer.source_text(&span);
+                // Strip leading $
+                let name = text.strip_prefix('$').unwrap_or(text).to_string();
                 self.advance();
-                Ok(Expression::Variable {
-                    name: String::new(),
-                    span,
-                })
+                Ok(Expression::Variable { name, span })
             }
 
             // Parenthesized expression
@@ -3988,6 +3990,123 @@ impl std::fmt::Display for ParseError {
 }
 
 impl std::error::Error for ParseError {}
+
+/// Parse a PHP integer literal string to i64.
+/// Handles decimal, hex (0x), octal (0o, 0), binary (0b), and underscores.
+fn parse_int_literal(text: &str) -> i64 {
+    let s = text.replace('_', "");
+    if s.starts_with("0x") || s.starts_with("0X") {
+        i64::from_str_radix(&s[2..], 16).unwrap_or(0)
+    } else if s.starts_with("0b") || s.starts_with("0B") {
+        i64::from_str_radix(&s[2..], 2).unwrap_or(0)
+    } else if s.starts_with("0o") || s.starts_with("0O") {
+        i64::from_str_radix(&s[2..], 8).unwrap_or(0)
+    } else if s.starts_with('0') && s.len() > 1 && !s.contains('.') {
+        // Legacy octal: 0777
+        i64::from_str_radix(&s[1..], 8).unwrap_or(0)
+    } else {
+        s.parse::<i64>().unwrap_or(0)
+    }
+}
+
+/// Parse a PHP float literal string to f64.
+fn parse_float_literal(text: &str) -> f64 {
+    let s = text.replace('_', "");
+    s.parse::<f64>().unwrap_or(0.0)
+}
+
+/// Parse a PHP string literal, stripping quotes and processing escapes.
+fn parse_string_literal(text: &str) -> String {
+    if text.len() < 2 {
+        return text.to_string();
+    }
+
+    let quote = text.as_bytes()[0];
+    let inner = &text[1..text.len() - 1];
+
+    if quote == b'\'' {
+        // Single-quoted: only \\ and \' are escape sequences
+        let mut result = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('\\') => result.push('\\'),
+                    Some('\'') => result.push('\''),
+                    Some(other) => {
+                        result.push('\\');
+                        result.push(other);
+                    }
+                    None => result.push('\\'),
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        result
+    } else {
+        // Double-quoted: full escape sequence processing
+        let mut result = String::with_capacity(inner.len());
+        let mut chars = inner.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                match chars.next() {
+                    Some('n') => result.push('\n'),
+                    Some('r') => result.push('\r'),
+                    Some('t') => result.push('\t'),
+                    Some('v') => result.push('\x0B'),
+                    Some('e') => result.push('\x1B'),
+                    Some('f') => result.push('\x0C'),
+                    Some('\\') => result.push('\\'),
+                    Some('$') => result.push('$'),
+                    Some('"') => result.push('"'),
+                    Some('x') | Some('X') => {
+                        let mut hex = String::new();
+                        for _ in 0..2 {
+                            if let Some(&c) = chars.peek() {
+                                if c.is_ascii_hexdigit() {
+                                    hex.push(c);
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        if let Ok(val) = u8::from_str_radix(&hex, 16) {
+                            result.push(val as char);
+                        }
+                    }
+                    Some('0') => {
+                        let mut oct = String::from("0");
+                        for _ in 0..2 {
+                            if let Some(&c) = chars.peek() {
+                                if ('0'..='7').contains(&c) {
+                                    oct.push(c);
+                                    chars.next();
+                                } else {
+                                    break;
+                                }
+                            }
+                        }
+                        if let Ok(val) = u32::from_str_radix(&oct, 8) {
+                            if let Some(ch) = char::from_u32(val) {
+                                result.push(ch);
+                            }
+                        }
+                    }
+                    Some(other) => {
+                        result.push('\\');
+                        result.push(other);
+                    }
+                    None => result.push('\\'),
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        result
+    }
+}
 
 #[cfg(test)]
 mod tests {
