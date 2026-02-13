@@ -2222,11 +2222,38 @@ impl Compiler {
         for s in body {
             sub.compile_stmt(s);
         }
-        // Implicit return null
-        let null = sub.op_array.add_literal(Literal::Null);
-        sub.op_array.emit(
-            ZOp::new(ZOpcode::Return, line).with_op1(Operand::constant(null), OperandType::Const),
-        );
+        // Check if function body contains yield/yield_from → mark as generator
+        let has_yield = sub
+            .op_array
+            .opcodes
+            .iter()
+            .any(|o| matches!(o.opcode, ZOpcode::Yield | ZOpcode::YieldFrom));
+
+        if has_yield {
+            sub.op_array.is_generator = true;
+            // Convert all existing Return opcodes to GeneratorReturn
+            for op in sub.op_array.opcodes.iter_mut() {
+                if op.opcode == ZOpcode::Return {
+                    op.opcode = ZOpcode::GeneratorReturn;
+                }
+            }
+            // Prepend GeneratorCreate opcode at position 0
+            let gen_create = ZOp::new(ZOpcode::GeneratorCreate, line);
+            sub.op_array.opcodes.insert(0, gen_create);
+            // Add implicit GeneratorReturn at the end
+            let null = sub.op_array.add_literal(Literal::Null);
+            sub.op_array.emit(
+                ZOp::new(ZOpcode::GeneratorReturn, line)
+                    .with_op1(Operand::constant(null), OperandType::Const),
+            );
+        } else {
+            // Implicit return null
+            let null = sub.op_array.add_literal(Literal::Null);
+            sub.op_array.emit(
+                ZOp::new(ZOpcode::Return, line)
+                    .with_op1(Operand::constant(null), OperandType::Const),
+            );
+        }
 
         let func_idx = self.op_array.dynamic_func_defs.len() as u32;
         self.op_array.dynamic_func_defs.push(sub.op_array);

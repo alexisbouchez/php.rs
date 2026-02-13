@@ -133,6 +133,9 @@ pub struct ZOpArray {
 
     /// Nested function definitions (closures, arrow functions).
     pub dynamic_func_defs: Vec<ZOpArray>,
+
+    /// Whether this function contains yield/yield from (is a generator).
+    pub is_generator: bool,
 }
 
 /// A literal value in the constant pool.
@@ -203,6 +206,7 @@ impl ZOpArray {
             line_start: 0,
             line_end: 0,
             dynamic_func_defs: Vec::new(),
+            is_generator: false,
         }
     }
 

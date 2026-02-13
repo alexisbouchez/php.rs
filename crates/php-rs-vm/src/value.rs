@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use php_rs_compiler::op::OperandType;
+
 /// A PHP value used during VM execution.
 #[derive(Debug, Clone)]
 pub enum Value {
@@ -21,6 +23,11 @@ pub enum Value {
     _Iterator {
         array: PhpArray,
         index: usize,
+    },
+
+    /// Internal: generator iterator state for foreach over generators.
+    _GeneratorIterator {
+        object_id: u64,
     },
 }
 
@@ -62,7 +69,7 @@ impl Value {
                 }
             }
             Value::Object(_) => 1,
-            Value::_Iterator { .. } => 0,
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => 0,
         }
     }
 
@@ -83,7 +90,7 @@ impl Value {
                 }
             }
             Value::Object(_) => 1.0,
-            Value::_Iterator { .. } => 0.0,
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => 0.0,
         }
     }
 
@@ -97,7 +104,7 @@ impl Value {
             Value::String(s) => !s.is_empty() && s != "0",
             Value::Array(a) => !a.is_empty(),
             Value::Object(_) => true,
-            Value::_Iterator { .. } => true,
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => true,
         }
     }
 
@@ -136,7 +143,7 @@ impl Value {
                 // For now, return class name as placeholder
                 format!("{} Object", o.class_name)
             }
-            Value::_Iterator { .. } => String::new(),
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => String::new(),
         }
     }
 
@@ -520,6 +527,116 @@ impl PartialEq for Value {
 }
 
 // =============================================================================
+// Generator & Fiber state types
+// =============================================================================
+
+/// Internal state marker for objects that are generators or fibers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InternalState {
+    None,
+    Generator,
+    Fiber,
+}
+
+/// Status of a generator.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GeneratorStatus {
+    Created,
+    Running,
+    Suspended,
+    Closed,
+}
+
+/// Saved state for a generator.
+#[derive(Debug, Clone)]
+pub struct GeneratorState {
+    /// Saved execution frame (None when running or closed).
+    pub frame: Option<GeneratorFrame>,
+    /// Which op_array this generator executes.
+    pub op_array_idx: usize,
+    /// Currently yielded value.
+    pub value: Value,
+    /// Currently yielded key.
+    pub key: Value,
+    /// Return value (set when generator returns).
+    pub return_value: Option<Value>,
+    /// Value sent via send() — written to the yield result slot on resume.
+    pub send_value: Value,
+    /// Auto-incrementing integer key for yield without explicit key.
+    pub largest_int_key: i64,
+    /// Generator status.
+    pub status: GeneratorStatus,
+    /// Where to write the send_value in the frame (result_type, slot).
+    pub yield_result_slot: Option<(OperandType, u32)>,
+    /// Active delegate for yield from (array elements or inner generator id).
+    pub delegate: Option<GeneratorDelegate>,
+}
+
+/// Active delegate for yield from.
+#[derive(Debug, Clone)]
+pub enum GeneratorDelegate {
+    /// Yielding from an array, tracking current index.
+    Array {
+        entries: Vec<(ArrayKey, Value)>,
+        index: usize,
+    },
+    /// Yielding from an inner generator.
+    Generator {
+        inner_id: u64,
+    },
+}
+
+/// A saved generator frame — stores the execution context.
+#[derive(Debug, Clone)]
+pub struct GeneratorFrame {
+    pub op_array_idx: usize,
+    pub ip: usize,
+    pub cvs: Vec<Value>,
+    pub temps: Vec<Value>,
+    pub args: Vec<Value>,
+}
+
+/// Status of a fiber.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FiberStatus {
+    Init,
+    Running,
+    Suspended,
+    Terminated,
+}
+
+/// Saved state for a fiber.
+#[derive(Debug, Clone)]
+pub struct FiberState {
+    /// Saved frames from the fiber's call stack.
+    pub saved_frames: Vec<FiberFrame>,
+    /// Fiber status.
+    pub status: FiberStatus,
+    /// Callable name to execute.
+    pub callback_name: String,
+    /// Value passed between suspend/resume.
+    pub transfer_value: Value,
+    /// Return value (set when fiber completes).
+    pub return_value: Option<Value>,
+    /// Call stack depth when fiber started (used for draining).
+    pub start_depth: usize,
+}
+
+/// A saved fiber frame.
+#[derive(Debug, Clone)]
+pub struct FiberFrame {
+    pub op_array_idx: usize,
+    pub ip: usize,
+    pub cvs: Vec<Value>,
+    pub temps: Vec<Value>,
+    pub args: Vec<Value>,
+    pub return_value: Value,
+    pub return_dest: Option<(OperandType, u32)>,
+    pub this_write_back: Option<(OperandType, u32)>,
+    pub is_constructor: bool,
+}
+
+// =============================================================================
 // PhpObject — simplified object for VM execution
 // =============================================================================
 
@@ -532,6 +649,8 @@ pub struct PhpObject {
     pub properties: HashMap<String, Value>,
     /// Object ID (unique per-request, monotonically increasing).
     pub object_id: u64,
+    /// Internal state: marks whether this is a Generator or Fiber object.
+    pub internal: InternalState,
 }
 
 impl PhpObject {
@@ -541,6 +660,7 @@ impl PhpObject {
             class_name,
             properties: HashMap::new(),
             object_id: 0,
+            internal: InternalState::None,
         }
     }
 
