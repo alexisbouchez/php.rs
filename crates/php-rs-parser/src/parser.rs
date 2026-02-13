@@ -18,9 +18,19 @@ impl<'a> Parser<'a> {
     /// Create a new parser from source code
     pub fn new(source: &'a str) -> Self {
         let mut lexer = Lexer::new(source);
-        let (current_token, current_span) = lexer
-            .next_token()
-            .unwrap_or((Token::End, Span::new(0, 0, 1, 1)));
+        // Skip initial comments
+        let mut current_token;
+        let mut current_span;
+        loop {
+            let (t, s) = lexer
+                .next_token()
+                .unwrap_or((Token::End, Span::new(0, 0, 1, 1)));
+            current_token = t;
+            current_span = s;
+            if current_token != Token::Comment && current_token != Token::DocComment {
+                break;
+            }
+        }
         Self {
             lexer,
             current_token,
@@ -29,31 +39,78 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Advance to the next token
+    /// Advance to the next token, skipping comments
     fn advance(&mut self) {
-        if let Some((token, span)) = self.peeked.take() {
-            self.current_token = token;
-            self.current_span = span;
-        } else {
-            let (token, span) = self
-                .lexer
-                .next_token()
-                .unwrap_or((Token::End, Span::new(0, 0, 1, 1)));
-            self.current_token = token;
-            self.current_span = span;
+        loop {
+            if let Some((token, span)) = self.peeked.take() {
+                self.current_token = token;
+                self.current_span = span;
+            } else {
+                let (token, span) = self
+                    .lexer
+                    .next_token()
+                    .unwrap_or((Token::End, Span::new(0, 0, 1, 1)));
+                self.current_token = token;
+                self.current_span = span;
+            }
+            // Skip comments automatically
+            if self.current_token != Token::Comment && self.current_token != Token::DocComment {
+                break;
+            }
         }
     }
 
-    /// Peek at the next token without consuming it
+    /// Peek at the next token without consuming it (skipping comments)
     fn peek(&mut self) -> &Token {
         if self.peeked.is_none() {
-            if let Some((token, span)) = self.lexer.next_token() {
-                self.peeked = Some((token, span));
-            } else {
-                self.peeked = Some((Token::End, Span::new(0, 0, 1, 1)));
+            loop {
+                if let Some((token, span)) = self.lexer.next_token() {
+                    if token == Token::Comment || token == Token::DocComment {
+                        continue;
+                    }
+                    self.peeked = Some((token, span));
+                } else {
+                    self.peeked = Some((Token::End, Span::new(0, 0, 1, 1)));
+                }
+                break;
             }
         }
         &self.peeked.as_ref().unwrap().0
+    }
+
+    /// Expect a semicolon or close tag (which acts as semicolon in PHP)
+    fn expect_semicolon(&mut self) -> Result<Span, ParseError> {
+        if self.current_token == Token::Semicolon {
+            let span = self.current_span;
+            self.advance();
+            Ok(span)
+        } else if self.current_token == Token::CloseTag {
+            // ?> acts as a statement terminator
+            let span = self.current_span;
+            self.advance();
+            Ok(span)
+        } else {
+            Err(ParseError::UnexpectedToken {
+                expected: "Semicolon".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            })
+        }
+    }
+
+    /// Expect a colon or semicolon (PHP allows both after case/default labels)
+    fn expect_case_separator(&mut self) -> Result<Span, ParseError> {
+        if self.current_token == Token::Colon || self.current_token == Token::Semicolon {
+            let span = self.current_span;
+            self.advance();
+            Ok(span)
+        } else {
+            Err(ParseError::UnexpectedToken {
+                expected: "Colon".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            })
+        }
     }
 
     /// Check if current token matches expected token
@@ -69,6 +126,48 @@ impl<'a> Parser<'a> {
                 span: self.current_span,
             })
         }
+    }
+
+    /// Parse a complete PHP program, returning a Program with all statements
+    pub fn parse(&mut self) -> Result<Program, ParseError> {
+        let mut statements = Vec::new();
+
+        // Handle inline HTML before <?php
+        if self.current_token == Token::InlineHtml {
+            let span = self.current_span;
+            let content = self.lexer.source_text(&span).to_string();
+            self.advance();
+            statements.push(Statement::InlineHtml { content, span });
+        }
+
+        // Skip the opening <?php tag if present
+        if self.current_token == Token::OpenTag {
+            self.advance();
+        } else if self.current_token == Token::OpenTagWithEcho {
+            // <?= is shorthand for <?php echo
+            let span = self.current_span;
+            self.advance();
+            let mut exprs = Vec::new();
+            loop {
+                exprs.push(self.parse_expression(0)?);
+                if self.current_token == Token::Comma {
+                    self.advance();
+                    continue;
+                }
+                break;
+            }
+            if self.current_token == Token::Semicolon {
+                self.advance();
+            }
+            statements.push(Statement::Echo { exprs, span });
+        }
+
+        // Parse statements until end of file
+        while self.current_token != Token::End {
+            statements.push(self.parse_statement()?);
+        }
+
+        Ok(Program { statements })
     }
 
     /// Parse an expression with given minimum precedence (Pratt parsing)
@@ -99,6 +198,7 @@ impl<'a> Parser<'a> {
         };
 
         match self.current_token {
+            Token::Echo => self.parse_echo_statement(),
             Token::If => self.parse_if_statement(),
             Token::Return => self.parse_return_statement(),
             Token::While => self.parse_while_statement(),
@@ -108,8 +208,17 @@ impl<'a> Parser<'a> {
             Token::Switch => self.parse_switch_statement(),
             Token::Match => self.parse_match_statement(),
             Token::Try => self.parse_try_statement(),
+            Token::Throw => self.parse_throw_statement(),
+            Token::Break => self.parse_break_statement(),
+            Token::Continue => self.parse_continue_statement(),
             Token::Namespace => self.parse_namespace_statement(),
             Token::Use => self.parse_use_statement(),
+            Token::Global => self.parse_global_statement(),
+            Token::Static => self.parse_static_or_class_statement(attributes),
+            Token::Unset => self.parse_unset_statement(),
+            Token::Declare => self.parse_declare_statement(),
+            Token::Const => self.parse_const_statement(),
+            Token::Goto => self.parse_goto_statement(),
             Token::Function => self.parse_function_statement_with_attributes(attributes),
             Token::Class | Token::Abstract | Token::Final | Token::Readonly => {
                 self.parse_class_statement_with_attributes(attributes)
@@ -117,11 +226,67 @@ impl<'a> Parser<'a> {
             Token::Interface => self.parse_interface_statement_with_attributes(attributes),
             Token::Trait => self.parse_trait_statement_with_attributes(attributes),
             Token::Enum => self.parse_enum_statement_with_attributes(attributes),
+            Token::LBrace => self.parse_block_statement(),
+            Token::InlineHtml => self.parse_inline_html_statement(),
+            Token::CloseTag => self.parse_close_tag(),
+            Token::OpenTag => {
+                // Re-entering PHP mode after ?>
+                self.advance();
+                self.parse_statement()
+            }
+            Token::OpenTagWithEcho => {
+                // <?= shorthand for echo
+                let span = self.current_span;
+                self.advance();
+                let mut exprs = Vec::new();
+                loop {
+                    exprs.push(self.parse_expression(0)?);
+                    if self.current_token == Token::Comma {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                if self.current_token == Token::Semicolon {
+                    self.advance();
+                }
+                Ok(Statement::Echo { exprs, span })
+            }
+            Token::HaltCompiler => {
+                let span = self.current_span;
+                self.advance();
+                // __halt_compiler();
+                self.expect(Token::LParen)?;
+                self.expect(Token::RParen)?;
+                self.expect_semicolon()?;
+                // Everything after __halt_compiler(); is treated as data
+                let remaining = String::new(); // TODO: capture remaining data
+                Ok(Statement::HaltCompiler { remaining, span })
+            }
+            Token::Semicolon => {
+                // Empty statement
+                let span = self.current_span;
+                self.advance();
+                Ok(Statement::Block {
+                    statements: vec![],
+                    span,
+                })
+            }
             _ => {
+                // Check for label: `identifier:`
+                if let Token::String = self.current_token {
+                    let name = self.lexer.source_text(&self.current_span).to_string();
+                    let span = self.current_span;
+                    if matches!(self.peek(), Token::Colon) {
+                        self.advance(); // consume identifier
+                        self.advance(); // consume colon
+                        return Ok(Statement::Label { name, span });
+                    }
+                }
                 // Default case: try to parse as expression statement
                 let start_span = self.current_span;
                 let expr = self.parse_expression(0)?;
-                self.expect(Token::Semicolon)?;
+                self.expect_semicolon()?;
                 Ok(Statement::Expression {
                     expr,
                     span: start_span,
@@ -142,12 +307,344 @@ impl<'a> Parser<'a> {
             Some(Box::new(self.parse_expression(0)?))
         };
 
-        self.expect(Token::Semicolon)?;
+        self.expect_semicolon()?;
 
         Ok(Statement::Return {
             value,
             span: start_span,
         })
+    }
+
+    /// Parse echo statement: `echo expr [, expr...];`
+    fn parse_echo_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Echo)?;
+
+        let mut exprs = Vec::new();
+        loop {
+            exprs.push(self.parse_expression(0)?);
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_semicolon()?;
+
+        Ok(Statement::Echo {
+            exprs,
+            span: start_span,
+        })
+    }
+
+    /// Parse throw statement: `throw expr;`
+    fn parse_throw_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Throw)?;
+        let exception = Box::new(self.parse_expression(0)?);
+        self.expect_semicolon()?;
+        Ok(Statement::Throw {
+            exception,
+            span: start_span,
+        })
+    }
+
+    /// Parse break statement: `break [depth];`
+    fn parse_break_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Break)?;
+        let depth = if self.current_token != Token::Semicolon {
+            Some(Box::new(self.parse_expression(0)?))
+        } else {
+            None
+        };
+        self.expect_semicolon()?;
+        Ok(Statement::Break {
+            depth,
+            span: start_span,
+        })
+    }
+
+    /// Parse continue statement: `continue [depth];`
+    fn parse_continue_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Continue)?;
+        let depth = if self.current_token != Token::Semicolon {
+            Some(Box::new(self.parse_expression(0)?))
+        } else {
+            None
+        };
+        self.expect_semicolon()?;
+        Ok(Statement::Continue {
+            depth,
+            span: start_span,
+        })
+    }
+
+    /// Parse global statement: `global $var [, $var...];`
+    fn parse_global_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Global)?;
+        let mut vars = Vec::new();
+        loop {
+            vars.push(self.parse_expression(0)?);
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_semicolon()?;
+        Ok(Statement::Global {
+            vars,
+            span: start_span,
+        })
+    }
+
+    /// Parse static variable declaration or class/closure statement
+    fn parse_static_or_class_statement(
+        &mut self,
+        _attributes: Vec<Attribute>,
+    ) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        // Peek to determine: `static $var` (static var) vs `static function`/`static fn` (closure in expression)
+        // vs class with `static` modifier (but that wouldn't start with `static` in a statement)
+        let next = self.peek().clone();
+        match next {
+            Token::Variable => {
+                // Static variable declaration
+                self.expect(Token::Static)?;
+                let mut vars = Vec::new();
+                loop {
+                    let var_name = if let Token::Variable = self.current_token {
+                        let n = self.lexer.source_text(&self.current_span).to_string();
+                        self.advance();
+                        n
+                    } else {
+                        return Err(ParseError::UnexpectedToken {
+                            expected: "variable".to_string(),
+                            found: self.current_token.clone(),
+                            span: self.current_span,
+                        });
+                    };
+                    let default = if self.current_token == Token::Equals {
+                        self.advance();
+                        Some(self.parse_expression(0)?)
+                    } else {
+                        None
+                    };
+                    vars.push(StaticVar {
+                        name: var_name,
+                        default,
+                    });
+                    if self.current_token == Token::Comma {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect_semicolon()?;
+                Ok(Statement::Static {
+                    vars,
+                    span: start_span,
+                })
+            }
+            _ => {
+                // Treat as expression (static function/closure) or class modifier
+                // Check if this could be a class declaration: static is not a class modifier
+                // by itself, but the parse_class_statement_with_attributes handles it along
+                // with abstract/final/readonly. Actually "static" can't start a class.
+                // So fall through to expression statement (handles `static function(){}` etc.)
+                let expr = self.parse_expression(0)?;
+                self.expect_semicolon()?;
+                Ok(Statement::Expression {
+                    expr,
+                    span: start_span,
+                })
+            }
+        }
+    }
+
+    /// Parse unset statement: `unset($var [, $var...]);`
+    fn parse_unset_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Unset)?;
+        self.expect(Token::LParen)?;
+        let mut vars = Vec::new();
+        loop {
+            vars.push(self.parse_expression(0)?);
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen)?;
+        self.expect_semicolon()?;
+        Ok(Statement::Unset {
+            vars,
+            span: start_span,
+        })
+    }
+
+    /// Parse declare statement: `declare(key=value) { ... }` or `declare(key=value);`
+    fn parse_declare_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Declare)?;
+        self.expect(Token::LParen)?;
+
+        let mut directives = Vec::new();
+        loop {
+            let name = if let Token::String = self.current_token {
+                let n = self.lexer.source_text(&self.current_span).to_string();
+                self.advance();
+                n
+            } else {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "directive name".to_string(),
+                    found: self.current_token.clone(),
+                    span: self.current_span,
+                });
+            };
+            self.expect(Token::Equals)?;
+            let value = self.parse_expression(0)?;
+            directives.push((name, value));
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect(Token::RParen)?;
+
+        // Three forms: declare(k=v); or declare(k=v) {} or declare(k=v): ... enddeclare;
+        let body = if self.current_token == Token::Semicolon {
+            self.advance();
+            Box::new(Statement::Block {
+                statements: vec![],
+                span: start_span,
+            })
+        } else if self.current_token == Token::LBrace {
+            Box::new(self.parse_block_statement()?)
+        } else if self.current_token == Token::Colon {
+            // Alternative syntax: declare(...): ... enddeclare;
+            self.advance();
+            let mut stmts = Vec::new();
+            while self.current_token != Token::Enddeclare && self.current_token != Token::End {
+                stmts.push(self.parse_statement()?);
+            }
+            self.expect(Token::Enddeclare)?;
+            self.expect_semicolon()?;
+            Box::new(Statement::Block {
+                statements: stmts,
+                span: start_span,
+            })
+        } else {
+            // Single statement form
+            Box::new(self.parse_statement()?)
+        };
+
+        Ok(Statement::Declare {
+            directives,
+            body,
+            span: start_span,
+        })
+    }
+
+    /// Parse const declaration: `const NAME = value [, ...];`
+    fn parse_const_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Const)?;
+
+        let mut consts = Vec::new();
+        loop {
+            let name = if let Token::String = self.current_token {
+                let n = self.lexer.source_text(&self.current_span).to_string();
+                self.advance();
+                n
+            } else {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "constant name".to_string(),
+                    found: self.current_token.clone(),
+                    span: self.current_span,
+                });
+            };
+            self.expect(Token::Equals)?;
+            let value = self.parse_expression(0)?;
+            consts.push((name, value));
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect_semicolon()?;
+        Ok(Statement::Const {
+            consts,
+            span: start_span,
+        })
+    }
+
+    /// Parse goto statement: `goto label;`
+    fn parse_goto_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::Goto)?;
+        let label = if let Token::String = self.current_token {
+            let n = self.lexer.source_text(&self.current_span).to_string();
+            self.advance();
+            n
+        } else {
+            return Err(ParseError::UnexpectedToken {
+                expected: "label name".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            });
+        };
+        self.expect_semicolon()?;
+        Ok(Statement::Goto {
+            label,
+            span: start_span,
+        })
+    }
+
+    /// Parse block statement: `{ statements }`
+    fn parse_block_statement(&mut self) -> Result<Statement, ParseError> {
+        let start_span = self.current_span;
+        self.expect(Token::LBrace)?;
+        let mut statements = Vec::new();
+        while self.current_token != Token::RBrace {
+            statements.push(self.parse_statement()?);
+        }
+        self.expect(Token::RBrace)?;
+        Ok(Statement::Block {
+            statements,
+            span: start_span,
+        })
+    }
+
+    /// Parse inline HTML (outside PHP tags)
+    fn parse_inline_html_statement(&mut self) -> Result<Statement, ParseError> {
+        let span = self.current_span;
+        let content = self.lexer.source_text(&span).to_string();
+        self.advance();
+        Ok(Statement::InlineHtml { content, span })
+    }
+
+    /// Parse close tag: `?>` transitions to inline HTML mode
+    fn parse_close_tag(&mut self) -> Result<Statement, ParseError> {
+        // ?> acts as a statement terminator and transitions to HTML mode
+        // It also outputs a newline
+        self.advance(); // consume ?>
+                        // After ?>, we might have inline HTML or another open tag
+        if self.current_token == Token::InlineHtml {
+            self.parse_inline_html_statement()
+        } else {
+            // Empty inline HTML (just the close tag)
+            Ok(Statement::InlineHtml {
+                content: String::new(),
+                span: self.current_span,
+            })
+        }
     }
 
     /// Parse while statement
@@ -174,7 +671,7 @@ impl<'a> Parser<'a> {
             }
 
             self.expect(Token::Endwhile)?;
-            self.expect(Token::Semicolon)?;
+            self.expect_semicolon()?;
 
             let body = Box::new(Statement::Block {
                 statements: body_statements,
@@ -215,7 +712,7 @@ impl<'a> Parser<'a> {
         self.expect(Token::RParen)?;
 
         // Expect semicolon
-        self.expect(Token::Semicolon)?;
+        self.expect_semicolon()?;
 
         Ok(Statement::DoWhile {
             body,
@@ -242,7 +739,7 @@ impl<'a> Parser<'a> {
                 self.advance(); // consume comma
             }
         }
-        self.expect(Token::Semicolon)?;
+        self.expect_semicolon()?;
 
         // Parse condition expressions (comma-separated)
         let mut condition = Vec::new();
@@ -255,7 +752,7 @@ impl<'a> Parser<'a> {
                 self.advance(); // consume comma
             }
         }
-        self.expect(Token::Semicolon)?;
+        self.expect_semicolon()?;
 
         // Parse increment expressions (comma-separated)
         let mut increment = Vec::new();
@@ -284,7 +781,7 @@ impl<'a> Parser<'a> {
             }
 
             self.expect(Token::Endfor)?;
-            self.expect(Token::Semicolon)?;
+            self.expect_semicolon()?;
 
             let body = Box::new(Statement::Block {
                 statements: body_statements,
@@ -326,11 +823,18 @@ impl<'a> Parser<'a> {
         self.expect(Token::As)?;
 
         // Parse key => value or just value
-        // First, parse potential key or the value
+        // Check for &$value (by reference without key)
+        let direct_ref = if self.current_token == Token::Ampersand {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
         let first_expr = self.parse_expression(0)?;
 
         let (key, value, by_ref) = if self.current_token == Token::DoubleArrow {
-            // key => value syntax
+            // key => value syntax (first_expr is the key)
             self.advance(); // consume =>
 
             // Check if value is by reference
@@ -346,10 +850,7 @@ impl<'a> Parser<'a> {
             (Some(Box::new(first_expr)), Box::new(value_expr), by_ref)
         } else {
             // Just value (first_expr is the value)
-            // Check if it was prefixed with & (by reference)
-            // Note: In proper implementation, we'd check if first_expr was parsed with &
-            // For now, we assume by_ref is false
-            (None, Box::new(first_expr), false)
+            (None, Box::new(first_expr), direct_ref)
         };
 
         self.expect(Token::RParen)?;
@@ -368,7 +869,7 @@ impl<'a> Parser<'a> {
             }
 
             self.expect(Token::Endforeach)?;
-            self.expect(Token::Semicolon)?;
+            self.expect_semicolon()?;
 
             let body = Box::new(Statement::Block {
                 statements: body_statements,
@@ -422,7 +923,7 @@ impl<'a> Parser<'a> {
                 if self.current_token == Token::Case {
                     self.advance(); // consume case
                     let case_condition = Some(self.parse_expression(0)?);
-                    self.expect(Token::Colon)?;
+                    self.expect_case_separator()?;
 
                     // Parse statements until next case/default/endswitch
                     let mut statements = Vec::new();
@@ -439,7 +940,7 @@ impl<'a> Parser<'a> {
                     });
                 } else if self.current_token == Token::Default {
                     self.advance(); // consume default
-                    self.expect(Token::Colon)?;
+                    self.expect_case_separator()?;
 
                     // Parse statements until next case/endswitch
                     let mut statements = Vec::new();
@@ -463,7 +964,7 @@ impl<'a> Parser<'a> {
             }
 
             self.expect(Token::Endswitch)?;
-            self.expect(Token::Semicolon)?;
+            self.expect_semicolon()?;
 
             cases
         } else {
@@ -476,7 +977,7 @@ impl<'a> Parser<'a> {
                 if self.current_token == Token::Case {
                     self.advance(); // consume case
                     let case_condition = Some(self.parse_expression(0)?);
-                    self.expect(Token::Colon)?;
+                    self.expect_case_separator()?;
 
                     // Parse statements until next case/default/rbrace
                     let mut statements = Vec::new();
@@ -493,7 +994,7 @@ impl<'a> Parser<'a> {
                     });
                 } else if self.current_token == Token::Default {
                     self.advance(); // consume default
-                    self.expect(Token::Colon)?;
+                    self.expect_case_separator()?;
 
                     // Parse statements until next case/rbrace
                     let mut statements = Vec::new();
@@ -777,9 +1278,8 @@ impl<'a> Parser<'a> {
 
         // Parse name parts separated by \
         loop {
-            // Expect an identifier (String token)
-            if let Token::String = self.current_token {
-                // Extract the actual identifier from source
+            // Accept identifiers and keyword tokens that can be used as type/class names
+            if self.is_identifier_or_keyword() {
                 let part = self.lexer.source_text(&self.current_span).to_string();
                 parts.push(part);
                 self.advance();
@@ -967,7 +1467,7 @@ impl<'a> Parser<'a> {
             let mut modifiers = Vec::new();
             loop {
                 match self.current_token {
-                    Token::Public => {
+                    Token::Public | Token::Var => {
                         modifiers.push(Modifier::Public);
                         self.advance();
                     }
@@ -1012,7 +1512,9 @@ impl<'a> Parser<'a> {
                 }
                 _ => {
                     // Must be a property (with optional type hint)
-                    members.push(self.parse_class_property(modifiers, attributes)?);
+                    // Could have multiple comma-separated properties
+                    let mut props = self.parse_class_properties(modifiers, attributes)?;
+                    members.append(&mut props);
                 }
             }
         }
@@ -1020,12 +1522,12 @@ impl<'a> Parser<'a> {
         Ok(members)
     }
 
-    /// Parse a class property with optional hooks
-    fn parse_class_property(
+    /// Parse one or more class properties (comma-separated) with optional hooks
+    fn parse_class_properties(
         &mut self,
         modifiers: Vec<Modifier>,
         attributes: Vec<Attribute>,
-    ) -> Result<ClassMember, ParseError> {
+    ) -> Result<Vec<ClassMember>, ParseError> {
         let start_span = self.current_span;
 
         // Parse optional type
@@ -1035,50 +1537,68 @@ impl<'a> Parser<'a> {
             None
         };
 
-        // Parse variable name
-        let name = if let Token::Variable = self.current_token {
-            let var_name = self.lexer.source_text(&self.current_span).to_string();
-            // Remove leading $
-            let name = var_name.trim_start_matches('$').to_string();
-            self.advance();
-            name
-        } else {
-            return Err(ParseError::UnexpectedToken {
-                expected: "property name (variable)".to_string(),
-                found: self.current_token.clone(),
-                span: self.current_span,
+        let mut results = Vec::new();
+
+        loop {
+            // Parse variable name
+            let name = if let Token::Variable = self.current_token {
+                let var_name = self.lexer.source_text(&self.current_span).to_string();
+                // Remove leading $
+                let name = var_name.trim_start_matches('$').to_string();
+                self.advance();
+                name
+            } else {
+                return Err(ParseError::UnexpectedToken {
+                    expected: "property name (variable)".to_string(),
+                    found: self.current_token.clone(),
+                    span: self.current_span,
+                });
+            };
+
+            // Parse optional default value
+            let default = if self.current_token == Token::Equals {
+                self.advance();
+                Some(self.parse_expression(0)?)
+            } else {
+                None
+            };
+
+            // Parse optional hooks (PHP 8.4+)
+            let hooks = if self.current_token == Token::LBrace {
+                self.parse_property_hooks()?
+            } else {
+                Vec::new()
+            };
+
+            results.push(ClassMember::Property {
+                name,
+                modifiers: modifiers.clone(),
+                prop_type: prop_type.clone(),
+                default,
+                hooks,
+                attributes: attributes.clone(),
+                span: start_span,
             });
-        };
 
-        // Parse optional default value
-        let default = if self.current_token == Token::Equals {
-            self.advance();
-            Some(self.parse_expression(0)?)
-        } else {
-            None
-        };
-
-        // Parse optional hooks (PHP 8.4+)
-        let hooks = if self.current_token == Token::LBrace {
-            self.parse_property_hooks()?
-        } else {
-            Vec::new()
-        };
-
-        // Expect semicolon (unless we have hooks, which consume their own brace)
-        if hooks.is_empty() {
-            self.expect(Token::Semicolon)?;
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+            break;
         }
 
-        Ok(ClassMember::Property {
-            name,
-            modifiers,
-            prop_type,
-            default,
-            hooks,
-            attributes,
-            span: start_span,
-        })
+        // Expect semicolon (unless last property had hooks)
+        if results.last().map_or(true, |m| {
+            if let ClassMember::Property { hooks, .. } = m {
+                hooks.is_empty()
+            } else {
+                true
+            }
+        }) {
+            self.expect_semicolon()?;
+        }
+
+        Ok(results)
     }
 
     /// Parse property hooks { get => expr; set { ... } }
@@ -1298,7 +1818,7 @@ impl<'a> Parser<'a> {
         // Expect = value
         self.expect(Token::Equals)?;
         let value = self.parse_expression(0)?;
-        self.expect(Token::Semicolon)?;
+        self.expect_semicolon()?;
 
         Ok(ClassMember::Constant {
             name,
@@ -1336,7 +1856,7 @@ impl<'a> Parser<'a> {
             self.expect(Token::RBrace)?;
             adaptations
         } else {
-            self.expect(Token::Semicolon)?;
+            self.expect_semicolon()?;
             Vec::new()
         };
 
@@ -1357,6 +1877,9 @@ impl<'a> Parser<'a> {
                 | Token::Question
                 | Token::VerticalBar  // for union types
                 | Token::Ampersand // for intersection types
+                | Token::NsSeparator // for fully-qualified types
+                | Token::Backslash // for fully-qualified types
+                | Token::Static // for static type
         )
     }
 
@@ -1693,9 +2216,20 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a single parameter
-    /// Syntax: [type] [&] [...]$name [= default]
+    /// Syntax: [visibility] [readonly] [type] [&] [...]$name [= default]
     fn parse_parameter(&mut self) -> Result<Parameter, ParseError> {
         let start_span = self.current_span;
+
+        // Parse optional visibility modifier (constructor promotion, PHP 8.0+)
+        // and readonly modifier (PHP 8.1+)
+        loop {
+            match self.current_token {
+                Token::Public | Token::Protected | Token::Private | Token::Readonly => {
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
 
         // Parse optional type
         let param_type = if self.is_type_token() {
@@ -1790,6 +2324,176 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse array elements for array() or [] syntax
+    fn parse_array_elements(&mut self, end_token: Token) -> Result<Vec<ArrayElement>, ParseError> {
+        let mut elements = Vec::new();
+        while self.current_token != end_token && self.current_token != Token::End {
+            // Handle trailing comma
+            if self.current_token == Token::Comma {
+                self.advance();
+                continue;
+            }
+
+            // Check for spread operator
+            let unpack = if self.current_token == Token::Ellipsis {
+                self.advance();
+                true
+            } else {
+                false
+            };
+
+            // Check for &reference
+            let by_ref = if self.current_token == Token::Ampersand {
+                self.advance();
+                true
+            } else {
+                false
+            };
+
+            let value = self.parse_expression(0)?;
+
+            // Check for key => value
+            if self.current_token == Token::DoubleArrow {
+                self.advance();
+                let actual_by_ref = if self.current_token == Token::Ampersand {
+                    self.advance();
+                    true
+                } else {
+                    false
+                };
+                let actual_value = self.parse_expression(0)?;
+                elements.push(ArrayElement {
+                    key: Some(value),
+                    value: actual_value,
+                    by_ref: actual_by_ref,
+                    unpack,
+                });
+            } else {
+                elements.push(ArrayElement {
+                    key: None,
+                    value,
+                    by_ref,
+                    unpack,
+                });
+            }
+
+            if self.current_token == Token::Comma {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(elements)
+    }
+
+    /// Parse a member name after -> or ?-> (can be identifier, keyword, variable, or {expr})
+    fn parse_member_name(&mut self) -> Result<Box<Expression>, ParseError> {
+        // In PHP, almost any keyword can be used as a property/method name after ->
+        if self.is_identifier_or_keyword()
+            || matches!(
+                self.current_token,
+                Token::List
+                    | Token::Var
+                    | Token::Exit
+                    | Token::Print
+                    | Token::Echo
+                    | Token::Include
+                    | Token::IncludeOnce
+                    | Token::Require
+                    | Token::RequireOnce
+                    | Token::If
+                    | Token::Else
+                    | Token::Elseif
+                    | Token::While
+                    | Token::For
+                    | Token::Foreach
+                    | Token::Switch
+                    | Token::Case
+                    | Token::Default
+                    | Token::Break
+                    | Token::Continue
+                    | Token::Return
+                    | Token::Do
+                    | Token::Try
+                    | Token::Catch
+                    | Token::Finally
+                    | Token::Throw
+                    | Token::Function
+                    | Token::Const
+                    | Token::Abstract
+                    | Token::Final
+                    | Token::Public
+                    | Token::Protected
+                    | Token::Private
+                    | Token::Interface
+                    | Token::Trait
+                    | Token::Extends
+                    | Token::Implements
+                    | Token::New
+                    | Token::Clone
+                    | Token::Instanceof
+                    | Token::Isset
+                    | Token::Unset
+                    | Token::Empty
+                    | Token::Eval
+                    | Token::Yield
+                    | Token::Global
+                    | Token::Namespace
+                    | Token::Use
+                    | Token::Goto
+                    | Token::As
+                    | Token::Declare
+                    | Token::Endfor
+                    | Token::Endforeach
+                    | Token::Endif
+                    | Token::Endwhile
+                    | Token::Endswitch
+            )
+        {
+            let prop_name = self.lexer.source_text(&self.current_span).to_string();
+            let prop_span = self.current_span;
+            self.advance();
+            Ok(Box::new(Expression::StringLiteral {
+                value: prop_name,
+                span: prop_span,
+            }))
+        } else if let Token::Variable = self.current_token {
+            // Dynamic property: $obj->$prop
+            Ok(Box::new(self.parse_prefix()?))
+        } else if let Token::BadCharacter = self.current_token {
+            // Variable variable property: $obj->$$var or $obj->${expr}
+            Ok(Box::new(self.parse_prefix()?))
+        } else if self.current_token == Token::LBrace {
+            // Complex property: $obj->{$expr}
+            self.advance();
+            let prop = Box::new(self.parse_expression(0)?);
+            self.expect(Token::RBrace)?;
+            Ok(prop)
+        } else {
+            Err(ParseError::UnexpectedToken {
+                expected: "property name".to_string(),
+                found: self.current_token.clone(),
+                span: self.current_span,
+            })
+        }
+    }
+
+    /// Check if current token is an identifier or a keyword that can be used as a name
+    fn is_identifier_or_keyword(&self) -> bool {
+        matches!(
+            self.current_token,
+            Token::String
+                | Token::Array
+                | Token::Callable
+                | Token::Static
+                | Token::Class
+                | Token::Fn
+                | Token::Match
+                | Token::Readonly
+                | Token::Enum
+        )
+    }
+
     /// Check if current token can start a type annotation
     fn is_type_token(&self) -> bool {
         matches!(
@@ -1797,6 +2501,11 @@ impl<'a> Parser<'a> {
             Token::String // For class names and built-in types (int, string, etc.)
                 | Token::Question // For nullable types (?Type)
                 | Token::NsSeparator // For fully-qualified types (\Foo\Bar)
+                | Token::Backslash // For fully-qualified types
+                | Token::Array // array type
+                | Token::Callable // callable type
+                | Token::Static // static return type
+                                // null is handled as Token::String("null") by lexer
         )
     }
 
@@ -1830,15 +2539,24 @@ impl<'a> Parser<'a> {
                 span: start_span,
             })
         } else if self.current_token == Token::Ampersand {
-            // Intersection type: Type1&Type2&Type3
-            while self.current_token == Token::Ampersand {
-                self.advance();
-                types.push(self.parse_single_type()?);
+            // Could be intersection type: Type1&Type2&Type3
+            // Or could be by-reference parameter: Type &$param
+            // Disambiguate by peeking: if next token is Variable or Ellipsis,
+            // it's a by-reference parameter
+            let next = self.peek().clone();
+            if next == Token::Variable || next == Token::Ellipsis {
+                // It's a by-reference parameter, not intersection type
+                Ok(types.into_iter().next().unwrap())
+            } else {
+                while self.current_token == Token::Ampersand {
+                    self.advance();
+                    types.push(self.parse_single_type()?);
+                }
+                Ok(Type::Intersection {
+                    types,
+                    span: start_span,
+                })
             }
-            Ok(Type::Intersection {
-                types,
-                span: start_span,
-            })
         } else {
             // Single type
             Ok(types.into_iter().next().unwrap())
@@ -1931,7 +2649,7 @@ impl<'a> Parser<'a> {
 
             // Expect endif;
             self.expect(Token::Endif)?;
-            self.expect(Token::Semicolon)?;
+            self.expect_semicolon()?;
 
             let then_branch = Box::new(Statement::Block {
                 statements: then_statements,
@@ -2228,14 +2946,17 @@ impl<'a> Parser<'a> {
             // Static closure: static function(...) { ... }
             Token::Static => {
                 self.advance();
-                // Must be followed by function keyword
                 if self.current_token == Token::Function {
+                    // Static closure: static function(...) { ... }
                     self.parse_closure_expression_static()
+                } else if self.current_token == Token::Fn {
+                    // Static arrow function: static fn(...) => expr
+                    self.parse_arrow_function_expression_static()
                 } else {
-                    Err(ParseError::UnexpectedToken {
-                        expected: "function after static".to_string(),
-                        found: self.current_token.clone(),
-                        span: self.current_span,
+                    // static:: or other usage - treat as identifier
+                    Ok(Expression::StringLiteral {
+                        value: "static".to_string(),
+                        span,
                     })
                 }
             }
@@ -2291,12 +3012,427 @@ impl<'a> Parser<'a> {
                 }
             }
 
+            // Print expression: `print expr` (returns 1)
+            Token::Print => {
+                self.advance();
+                let expr = Box::new(self.parse_expression(0)?);
+                Ok(Expression::Print { expr, span })
+            }
+
+            // Include/require expressions
+            Token::Include => {
+                self.advance();
+                let path = Box::new(self.parse_expression(0)?);
+                Ok(Expression::Include { path, span })
+            }
+            Token::IncludeOnce => {
+                self.advance();
+                let path = Box::new(self.parse_expression(0)?);
+                Ok(Expression::IncludeOnce { path, span })
+            }
+            Token::Require => {
+                self.advance();
+                let path = Box::new(self.parse_expression(0)?);
+                Ok(Expression::Require { path, span })
+            }
+            Token::RequireOnce => {
+                self.advance();
+                let path = Box::new(self.parse_expression(0)?);
+                Ok(Expression::RequireOnce { path, span })
+            }
+
+            // Eval expression: `eval(code)`
+            Token::Eval => {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let code = Box::new(self.parse_expression(0)?);
+                self.expect(Token::RParen)?;
+                Ok(Expression::Eval { code, span })
+            }
+
+            // Isset construct: `isset($var, ...)`
+            Token::Isset => {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let mut vars = Vec::new();
+                loop {
+                    vars.push(self.parse_expression(0)?);
+                    if self.current_token == Token::Comma {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(Token::RParen)?;
+                Ok(Expression::Isset { vars, span })
+            }
+
+            // Empty construct: `empty($var)`
+            Token::Empty => {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let var = Box::new(self.parse_expression(0)?);
+                self.expect(Token::RParen)?;
+                Ok(Expression::Empty { var, span })
+            }
+
+            // Exit/die construct: `exit([expr])`
+            Token::Exit => {
+                self.advance();
+                let expr = if self.current_token == Token::LParen {
+                    self.advance();
+                    if self.current_token == Token::RParen {
+                        self.advance();
+                        None
+                    } else {
+                        let e = self.parse_expression(0)?;
+                        self.expect(Token::RParen)?;
+                        Some(Box::new(e))
+                    }
+                } else {
+                    None
+                };
+                Ok(Expression::Exit { expr, span })
+            }
+
+            // List destructure: `list($a, $b) = expr`
+            Token::List => {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let mut elements = Vec::new();
+                loop {
+                    if self.current_token == Token::Comma {
+                        elements.push(None);
+                    } else if self.current_token == Token::RParen {
+                        break;
+                    } else {
+                        elements.push(Some(self.parse_expression(0)?));
+                    }
+                    if self.current_token == Token::Comma {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                self.expect(Token::RParen)?;
+                Ok(Expression::List { elements, span })
+            }
+
+            // Yield expression
+            Token::Yield => {
+                self.advance();
+                // yield from expr
+                if self.current_token == Token::String
+                    && self.lexer.source_text(&self.current_span) == "from"
+                {
+                    self.advance();
+                    let expr = Box::new(self.parse_expression(0)?);
+                    Ok(Expression::YieldFrom { expr, span })
+                } else if self.current_token == Token::Semicolon
+                    || self.current_token == Token::RParen
+                    || self.current_token == Token::RBracket
+                {
+                    Ok(Expression::Yield {
+                        key: None,
+                        value: None,
+                        span,
+                    })
+                } else {
+                    let value = self.parse_expression(0)?;
+                    if self.current_token == Token::DoubleArrow {
+                        self.advance();
+                        let actual_value = self.parse_expression(0)?;
+                        Ok(Expression::Yield {
+                            key: Some(Box::new(value)),
+                            value: Some(Box::new(actual_value)),
+                            span,
+                        })
+                    } else {
+                        Ok(Expression::Yield {
+                            key: None,
+                            value: Some(Box::new(value)),
+                            span,
+                        })
+                    }
+                }
+            }
+
+            // Magic constants
+            Token::Line => {
+                self.advance();
+                Ok(Expression::MagicConstant {
+                    kind: MagicConstantKind::Line,
+                    span,
+                })
+            }
+            Token::File => {
+                self.advance();
+                Ok(Expression::MagicConstant {
+                    kind: MagicConstantKind::File,
+                    span,
+                })
+            }
+            Token::Dir => {
+                self.advance();
+                Ok(Expression::MagicConstant {
+                    kind: MagicConstantKind::Dir,
+                    span,
+                })
+            }
+            Token::ClassC => {
+                self.advance();
+                Ok(Expression::MagicConstant {
+                    kind: MagicConstantKind::Class,
+                    span,
+                })
+            }
+            Token::TraitC => {
+                self.advance();
+                Ok(Expression::MagicConstant {
+                    kind: MagicConstantKind::Trait,
+                    span,
+                })
+            }
+            Token::MethodC => {
+                self.advance();
+                Ok(Expression::MagicConstant {
+                    kind: MagicConstantKind::Method,
+                    span,
+                })
+            }
+            Token::FuncC => {
+                self.advance();
+                Ok(Expression::MagicConstant {
+                    kind: MagicConstantKind::Function,
+                    span,
+                })
+            }
+            Token::NsC => {
+                self.advance();
+                Ok(Expression::MagicConstant {
+                    kind: MagicConstantKind::Namespace,
+                    span,
+                })
+            }
+
+            // Reference operator: &$var (used in assignments like $a =& $b)
+            Token::Ampersand => {
+                self.advance();
+                let operand = self.parse_expression(Self::PREFIX_PRECEDENCE)?;
+                Ok(Expression::UnaryOp {
+                    op: UnaryOperator::Reference,
+                    operand: Box::new(operand),
+                    span,
+                })
+            }
+
+            // Clone expression
+            Token::Clone => {
+                self.advance();
+                let object = Box::new(self.parse_expression(Self::PREFIX_PRECEDENCE)?);
+                Ok(Expression::Clone { object, span })
+            }
+
+            // New expression: `new Class(args)`
+            Token::New => {
+                self.advance();
+                let class = Box::new(self.parse_prefix()?);
+                let args = if self.current_token == Token::LParen {
+                    self.advance();
+                    let mut args = Vec::new();
+                    if self.current_token != Token::RParen {
+                        loop {
+                            args.push(self.parse_argument()?);
+                            if self.current_token == Token::Comma {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    args
+                } else {
+                    Vec::new()
+                };
+                Ok(Expression::New { class, args, span })
+            }
+
+            // Throw expression (PHP 8.0+): can appear in expressions
+            Token::Throw => {
+                self.advance();
+                let exception = Box::new(self.parse_expression(0)?);
+                Ok(Expression::ThrowExpr { exception, span })
+            }
+
+            // Backslash for fully-qualified names: \ClassName or \func()
+            Token::Backslash => {
+                // Fully-qualified name
+                let name = self.parse_qualified_name_as_expression()?;
+                // Check if it's a function call
+                if self.current_token == Token::LParen {
+                    self.advance();
+                    let mut args = Vec::new();
+                    if self.current_token != Token::RParen {
+                        loop {
+                            args.push(self.parse_argument()?);
+                            if self.current_token == Token::Comma {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    Ok(Expression::FunctionCall {
+                        name: Box::new(name),
+                        args,
+                        span,
+                    })
+                } else {
+                    Ok(name)
+                }
+            }
+
+            // Array literal: array(elements)
+            Token::Array => {
+                self.advance();
+                self.expect(Token::LParen)?;
+                let elements = self.parse_array_elements(Token::RParen)?;
+                self.expect(Token::RParen)?;
+                Ok(Expression::ArrayLiteral { elements, span })
+            }
+
+            // Short array literal: [elements]
+            Token::LBracket => {
+                self.advance();
+                let elements = self.parse_array_elements(Token::RBracket)?;
+                self.expect(Token::RBracket)?;
+                Ok(Expression::ArrayLiteral { elements, span })
+            }
+
+            // Encapsed string (double-quoted with interpolation)
+            // The lexer emits EncapsedAndWhitespace and Variable tokens for
+            // interpolated strings. We consume all parts as a StringLiteral.
+            Token::EncapsedAndWhitespace => {
+                // Consume all interpolation parts
+                loop {
+                    match &self.current_token {
+                        Token::EncapsedAndWhitespace => {
+                            self.advance();
+                        }
+                        Token::Variable => {
+                            self.advance();
+                            // Check for ->prop or [index] after variable in string
+                            if self.current_token == Token::ObjectOperator {
+                                self.advance();
+                                if let Token::String = self.current_token {
+                                    self.advance();
+                                }
+                            } else if self.current_token == Token::LBracket {
+                                self.advance();
+                                // Consume index expression
+                                while self.current_token != Token::RBracket
+                                    && self.current_token != Token::End
+                                {
+                                    self.advance();
+                                }
+                                if self.current_token == Token::RBracket {
+                                    self.advance();
+                                }
+                            }
+                        }
+                        Token::DollarOpenCurlyBraces => {
+                            self.advance();
+                            while self.current_token != Token::RBrace
+                                && self.current_token != Token::End
+                            {
+                                self.advance();
+                            }
+                            if self.current_token == Token::RBrace {
+                                self.advance();
+                            }
+                        }
+                        Token::CurlyOpen => {
+                            self.advance();
+                            // Consume until matching }
+                            let mut depth = 1;
+                            while depth > 0 && self.current_token != Token::End {
+                                if self.current_token == Token::LBrace
+                                    || self.current_token == Token::CurlyOpen
+                                {
+                                    depth += 1;
+                                } else if self.current_token == Token::RBrace {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        self.advance();
+                                        break;
+                                    }
+                                }
+                                self.advance();
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(Expression::StringLiteral {
+                    value: String::new(),
+                    span,
+                })
+            }
+
+            // Variable variable: $$var, ${expr} — `$` is tokenized as BadCharacter
+            Token::BadCharacter => {
+                let text = self.lexer.source_text(&span);
+                if text == "$" {
+                    self.advance(); // consume $
+                    if self.current_token == Token::LBrace {
+                        // ${expr}
+                        self.advance(); // consume {
+                        let _expr = self.parse_expression(0)?;
+                        self.expect(Token::RBrace)?;
+                        Ok(Expression::Variable {
+                            name: String::new(),
+                            span,
+                        })
+                    } else {
+                        // $$var or $$$var etc — parse the inner expression
+                        let _inner = self.parse_expression(Self::PREFIX_PRECEDENCE)?;
+                        Ok(Expression::Variable {
+                            name: String::new(),
+                            span,
+                        })
+                    }
+                } else {
+                    Err(ParseError::UnexpectedToken {
+                        expected: "expression".to_string(),
+                        found: token,
+                        span,
+                    })
+                }
+            }
+
             _ => Err(ParseError::UnexpectedToken {
                 expected: "expression".to_string(),
                 found: token,
                 span,
             }),
         }
+    }
+
+    /// Parse a qualified name and return as an Expression
+    fn parse_qualified_name_as_expression(&mut self) -> Result<Expression, ParseError> {
+        let start_span = self.current_span;
+        let name = self.parse_qualified_name()?;
+        let name_str = if name.fully_qualified {
+            format!("\\{}", name.parts.join("\\"))
+        } else {
+            name.parts.join("\\")
+        };
+        Ok(Expression::StringLiteral {
+            value: name_str,
+            span: start_span,
+        })
     }
 
     /// Parse closure expression: function(...) use (...) { ... }
@@ -2449,6 +3585,13 @@ impl<'a> Parser<'a> {
             attributes: Vec::new(), // TODO: Parse attributes
             span: start_span,
         })
+    }
+
+    /// Parse static arrow function expression: static fn(...) => expr
+    fn parse_arrow_function_expression_static(&mut self) -> Result<Expression, ParseError> {
+        // `static` was already consumed by the caller
+        self.parse_arrow_function_expression()
+        // TODO: mark as static
     }
 
     /// Parse an infix expression (binary operators, ternary, etc.)
@@ -2606,32 +3749,7 @@ impl<'a> Parser<'a> {
             // Object property access: $obj->prop
             Token::ObjectOperator => {
                 self.advance();
-                // Property name is either an identifier or an expression in braces
-                let property = if let Token::String = self.current_token {
-                    let prop_name = self.lexer.source_text(&self.current_span).to_string();
-                    let prop_span = self.current_span;
-                    self.advance();
-                    Box::new(Expression::StringLiteral {
-                        value: prop_name,
-                        span: prop_span,
-                    })
-                } else if let Token::Variable = self.current_token {
-                    // Dynamic property: $obj->$prop
-                    Box::new(self.parse_prefix()?)
-                } else if self.current_token == Token::LBrace {
-                    // Complex property: $obj->{$expr}
-                    self.advance();
-                    let prop = Box::new(self.parse_expression(0)?);
-                    self.expect(Token::RBrace)?;
-                    prop
-                } else {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: "property name".to_string(),
-                        found: self.current_token.clone(),
-                        span: self.current_span,
-                    });
-                };
-
+                let property = self.parse_member_name()?;
                 Ok(Expression::PropertyAccess {
                     object: Box::new(left),
                     property,
@@ -2642,35 +3760,143 @@ impl<'a> Parser<'a> {
             // Nullsafe property access: $obj?->prop
             Token::NullsafeObjectOperator => {
                 self.advance();
-                // Property name is either an identifier or an expression in braces
-                let property = if let Token::String = self.current_token {
-                    let prop_name = self.lexer.source_text(&self.current_span).to_string();
-                    let prop_span = self.current_span;
-                    self.advance();
-                    Box::new(Expression::StringLiteral {
-                        value: prop_name,
-                        span: prop_span,
-                    })
-                } else if let Token::Variable = self.current_token {
-                    // Dynamic property: $obj?->$prop
-                    Box::new(self.parse_prefix()?)
-                } else if self.current_token == Token::LBrace {
-                    // Complex property: $obj?->{$expr}
-                    self.advance();
-                    let prop = Box::new(self.parse_expression(0)?);
-                    self.expect(Token::RBrace)?;
-                    prop
-                } else {
-                    return Err(ParseError::UnexpectedToken {
-                        expected: "property name".to_string(),
-                        found: self.current_token.clone(),
-                        span: self.current_span,
-                    });
-                };
-
+                let property = self.parse_member_name()?;
                 Ok(Expression::NullsafePropertyAccess {
                     object: Box::new(left),
                     property,
+                    span,
+                })
+            }
+
+            // Static access: Class::member, Class::$prop, Class::method()
+            Token::PaamayimNekudotayim => {
+                self.advance();
+                if self.current_token == Token::Class {
+                    // ::class magic constant
+                    let prop_span = self.current_span;
+                    self.advance();
+                    Ok(Expression::StaticPropertyAccess {
+                        class: Box::new(left),
+                        property: Box::new(Expression::StringLiteral {
+                            value: "class".to_string(),
+                            span: prop_span,
+                        }),
+                        span,
+                    })
+                } else if self.current_token == Token::Variable {
+                    // Static property: Class::$prop
+                    let prop = Box::new(self.parse_prefix()?);
+                    Ok(Expression::StaticPropertyAccess {
+                        class: Box::new(left),
+                        property: prop,
+                        span,
+                    })
+                } else if let Token::String = self.current_token {
+                    // Static method/constant: Class::method() or Class::CONST
+                    let member_name = self.lexer.source_text(&self.current_span).to_string();
+                    let member_span = self.current_span;
+                    self.advance();
+
+                    if self.current_token == Token::LParen {
+                        // Static method call: Class::method(args)
+                        self.advance();
+                        let mut args = Vec::new();
+                        if self.current_token != Token::RParen {
+                            loop {
+                                args.push(self.parse_argument()?);
+                                if self.current_token == Token::Comma {
+                                    self.advance();
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                        Ok(Expression::FunctionCall {
+                            name: Box::new(Expression::StaticPropertyAccess {
+                                class: Box::new(left),
+                                property: Box::new(Expression::StringLiteral {
+                                    value: member_name,
+                                    span: member_span,
+                                }),
+                                span,
+                            }),
+                            args,
+                            span,
+                        })
+                    } else {
+                        // Static constant/property: Class::CONST
+                        Ok(Expression::StaticPropertyAccess {
+                            class: Box::new(left),
+                            property: Box::new(Expression::StringLiteral {
+                                value: member_name,
+                                span: member_span,
+                            }),
+                            span,
+                        })
+                    }
+                } else if self.current_token == Token::BadCharacter {
+                    // Dynamic static access: Class::${expr} or Class::$$var
+                    let prop = Box::new(self.parse_prefix()?);
+                    Ok(Expression::StaticPropertyAccess {
+                        class: Box::new(left),
+                        property: prop,
+                        span,
+                    })
+                } else {
+                    Err(ParseError::UnexpectedToken {
+                        expected: "static member name".to_string(),
+                        found: self.current_token.clone(),
+                        span: self.current_span,
+                    })
+                }
+            }
+
+            // Instanceof operator: expr instanceof Class
+            Token::Instanceof => {
+                self.advance();
+                let class = Box::new(self.parse_expression(precedence + 1)?);
+                Ok(Expression::Instanceof {
+                    expr: Box::new(left),
+                    class,
+                    span,
+                })
+            }
+
+            // Array access: $array[index]
+            Token::LBracket => {
+                self.advance();
+                let index = if self.current_token == Token::RBracket {
+                    None // $array[] (push syntax)
+                } else {
+                    Some(Box::new(self.parse_expression(0)?))
+                };
+                self.expect(Token::RBracket)?;
+                Ok(Expression::ArrayAccess {
+                    array: Box::new(left),
+                    index,
+                    span,
+                })
+            }
+
+            // Function call on expression: $func(), (expr)(), etc.
+            Token::LParen => {
+                self.advance();
+                let mut args = Vec::new();
+                if self.current_token != Token::RParen {
+                    loop {
+                        args.push(self.parse_argument()?);
+                        if self.current_token == Token::Comma {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+                self.expect(Token::RParen)?;
+                Ok(Expression::FunctionCall {
+                    name: Box::new(left),
+                    args,
                     span,
                 })
             }
@@ -2729,8 +3955,10 @@ impl<'a> Parser<'a> {
             Token::Pow => 19,                    // ** (right-associative, higher precedence)
             Token::Inc => 20,                    // ++ (postfix)
             Token::Dec => 20,                    // -- (postfix)
+            Token::Instanceof => 14,             // instanceof
             Token::ObjectOperator => 21,         // -> (object property access)
             Token::NullsafeObjectOperator => 21, // ?-> (nullsafe property access)
+            Token::PaamayimNekudotayim => 21,    // :: (static access)
             Token::LBracket => 21,               // [ ] (array access)
             Token::LParen => 21,                 // ( ) (function call)
             _ => 0,                              // Not an infix operator

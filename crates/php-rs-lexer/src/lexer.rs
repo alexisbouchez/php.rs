@@ -38,6 +38,9 @@ pub struct Lexer<'src> {
     /// Track state for __halt_compiler() handling
     /// 0 = not seen, 1 = seen __halt_compiler, 2 = seen (, 3 = seen ), 4 = stop after ;
     halt_compiler_state: u8,
+    /// True when entering DoubleQuotes state and the string starts with $var;
+    /// used to emit an empty EncapsedAndWhitespace prefix token exactly once.
+    dq_needs_prefix: bool,
 }
 
 impl<'src> Lexer<'src> {
@@ -52,6 +55,7 @@ impl<'src> Lexer<'src> {
             allow_short_tags: false,
             heredoc_label: None,
             halt_compiler_state: 0,
+            dq_needs_prefix: false,
         }
     }
 
@@ -66,6 +70,7 @@ impl<'src> Lexer<'src> {
             allow_short_tags: true,
             heredoc_label: None,
             halt_compiler_state: 0,
+            dq_needs_prefix: false,
         }
     }
 
@@ -324,13 +329,19 @@ impl<'src> Lexer<'src> {
                     return Some((Token::LNumber, span));
                 }
 
-                // Just "0" followed by something else (not a digit, not a base prefix)
-                // Return just the "0"
+                // Check for float: 0. or 0e
+                if next == '.' || next == 'e' || next == 'E' {
+                    // Fall through to decimal/float handling below
+                } else {
+                    // Just "0" followed by something else
+                    let span = Span::new(start_pos, self.pos, start_line, start_column);
+                    return Some((Token::LNumber, span));
+                }
+            } else {
+                // Just "0" by itself (EOF)
+                let span = Span::new(start_pos, self.pos, start_line, start_column);
+                return Some((Token::LNumber, span));
             }
-
-            // Just "0" by itself
-            let span = Span::new(start_pos, self.pos, start_line, start_column);
-            return Some((Token::LNumber, span));
         }
 
         // Decimal number (starts with 1-9)
@@ -344,9 +355,57 @@ impl<'src> Lexer<'src> {
             }
         }
 
+        // Check for decimal point (float)
+        let mut is_float = false;
+        if let Some('.') = self.peek() {
+            // Check that it's not '..' (range/concat operator)
+            if self.peek_str(2) != ".." {
+                is_float = true;
+                self.consume(); // consume '.'
+                                // Consume fractional digits
+                while let Some(ch) = self.peek() {
+                    if ch.is_ascii_digit() {
+                        self.consume();
+                    } else if ch == '_' {
+                        self.consume();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Check for scientific notation (e or E)
+        if let Some(ch) = self.peek() {
+            if ch == 'e' || ch == 'E' {
+                is_float = true;
+                self.consume(); // consume 'e' or 'E'
+                                // Optional sign
+                if let Some(sign) = self.peek() {
+                    if sign == '+' || sign == '-' {
+                        self.consume();
+                    }
+                }
+                // Consume exponent digits
+                while let Some(ch) = self.peek() {
+                    if ch.is_ascii_digit() {
+                        self.consume();
+                    } else if ch == '_' {
+                        self.consume();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
         let span = Span::new(start_pos, self.pos, start_line, start_column);
-        let token = self.detect_integer_overflow(&self.source[start_pos..self.pos]);
-        Some((token, span))
+        if is_float {
+            Some((Token::DNumber, span))
+        } else {
+            let token = self.detect_integer_overflow(&self.source[start_pos..self.pos]);
+            Some((token, span))
+        }
     }
 
     /// Detect if a number literal overflows PHP_INT_MAX and should be DNumber instead of LNumber
@@ -499,8 +558,14 @@ impl<'src> Lexer<'src> {
 
         // Check if this string needs interpolation
         if self.has_interpolation(start_pos) {
-            // Switch to ST_DOUBLE_QUOTES state and emit EncapsedAndWhitespace
+            // Consume the opening " before switching to DoubleQuotes state.
+            // This ensures scan_double_quotes_state never sees the opening quote
+            // and can treat any " it encounters as a closing quote.
+            self.consume(); // consume opening "
             self.state = State::DoubleQuotes;
+            // Set flag so scan_double_quotes_state emits empty prefix token
+            // when the string starts with a variable
+            self.dq_needs_prefix = true;
             return self.scan_double_quotes_state();
         }
 
@@ -750,15 +815,15 @@ impl<'src> Lexer<'src> {
         let start_line = self.line;
         let start_column = self.column;
 
-        // If we're at the start of the string, consume the opening quote
-        if self.peek() == Some('"') {
-            self.consume(); // "
-
-            // If the very next character is a variable, emit empty EncapsedAndWhitespace
+        // If this is the first call and the string starts with a variable,
+        // emit an empty EncapsedAndWhitespace so the parser can recognize
+        // the start of an interpolated string.
+        if self.dq_needs_prefix {
+            self.dq_needs_prefix = false;
             if self.peek() == Some('$') {
-                if let Some(next_ch) = self.source[self.pos + 1..].chars().next() {
-                    if next_ch.is_ascii_alphabetic() || next_ch == '_' {
-                        // Emit empty string part before variable
+                if self.pos + 1 < self.source.len() {
+                    let next_ch = self.source.as_bytes()[self.pos + 1];
+                    if next_ch.is_ascii_alphabetic() || next_ch == b'_' {
                         return Some((
                             Token::EncapsedAndWhitespace,
                             Span::new(start_pos, self.pos, start_line, start_column),
@@ -1543,6 +1608,15 @@ impl<'src> Lexer<'src> {
                 Span::new(start_pos, self.pos, start_line, start_column),
             ));
         }
+        if self.peek_str(2) == "?>" {
+            self.consume_bytes(2);
+            // Switch back to Initial state (HTML mode)
+            self.state = State::Initial;
+            return Some((
+                Token::CloseTag,
+                Span::new(start_pos, self.pos, start_line, start_column),
+            ));
+        }
         if self.peek_str(2) == "??" {
             self.consume_bytes(2);
             return Some((
@@ -2311,19 +2385,23 @@ mod tests {
             tokens.push((token.clone(), span.extract(source).to_string()));
         }
 
-        // Should have InlineHtml tokens, then OpenTag
+        // Should have InlineHtml tokens before OpenTag and after CloseTag
         let mut found_open_tag = false;
+        let mut found_close_tag = false;
         for (token, text) in &tokens {
             match token {
                 Token::InlineHtml => {
                     assert!(
-                        !found_open_tag,
-                        "InlineHtml should only appear before first OpenTag"
+                        !found_open_tag || found_close_tag,
+                        "InlineHtml should only appear before first OpenTag or after CloseTag"
                     );
                 }
                 Token::OpenTag => {
                     found_open_tag = true;
                     assert_eq!(text, "<?php");
+                }
+                Token::CloseTag => {
+                    found_close_tag = true;
                 }
                 _ => {}
             }
@@ -4344,9 +4422,10 @@ mod tests {
         lexer.next_token(); // Skip <?php
 
         // Should now emit multiple tokens for interpolation
+        // Opening " is consumed before entering DoubleQuotes state
         let (token, span) = lexer.next_token().expect("Should tokenize string");
         assert_eq!(token, Token::EncapsedAndWhitespace);
-        assert_eq!(span.extract(source), r#""hello "#);
+        assert_eq!(span.extract(source), "hello ");
     }
 
     // ======================================================================
@@ -4561,7 +4640,7 @@ mod tests {
         // Now implemented in task 2.3.1
         let (token1, span1) = lexer.next_token().expect("Should tokenize string part 1");
         assert_eq!(token1, Token::EncapsedAndWhitespace);
-        assert_eq!(span1.extract(source), r#""hello "#);
+        assert_eq!(span1.extract(source), "hello ");
 
         let (token2, span2) = lexer.next_token().expect("Should tokenize variable");
         assert_eq!(token2, Token::Variable);
@@ -4621,7 +4700,7 @@ mod tests {
         // Basic variable detection works, though ->prop handling is incomplete
         let (token, span) = lexer.next_token().expect("Should tokenize string");
         assert_eq!(token, Token::EncapsedAndWhitespace);
-        assert_eq!(span.extract(source), r#""hello "#);
+        assert_eq!(span.extract(source), "hello ");
 
         let (token2, span2) = lexer.next_token().expect("Should tokenize variable");
         assert_eq!(token2, Token::Variable);
@@ -4642,7 +4721,7 @@ mod tests {
         // Basic variable detection works
         let (token, span) = lexer.next_token().expect("Should tokenize string");
         assert_eq!(token, Token::EncapsedAndWhitespace);
-        assert_eq!(span.extract(source), r#""hello "#);
+        assert_eq!(span.extract(source), "hello ");
 
         let (token2, span2) = lexer.next_token().expect("Should tokenize variable");
         assert_eq!(token2, Token::Variable);
@@ -4661,7 +4740,7 @@ mod tests {
         // Now implemented: alternates between T_ENCAPSED_AND_WHITESPACE and T_VARIABLE tokens
         let (token1, span1) = lexer.next_token().expect("Token 1");
         assert_eq!(token1, Token::EncapsedAndWhitespace);
-        assert_eq!(span1.extract(source), r#""x="#);
+        assert_eq!(span1.extract(source), "x=");
 
         let (token2, span2) = lexer.next_token().expect("Token 2");
         assert_eq!(token2, Token::Variable);
@@ -4715,7 +4794,7 @@ mod tests {
         // Basic variable detection works
         let (token, span) = lexer.next_token().expect("Should tokenize string");
         assert_eq!(token, Token::EncapsedAndWhitespace);
-        assert_eq!(span.extract(source), r#""value is "#);
+        assert_eq!(span.extract(source), "value is ");
 
         let (token2, span2) = lexer.next_token().expect("Should tokenize variable");
         assert_eq!(token2, Token::Variable);
@@ -5371,12 +5450,11 @@ mod tests {
 
         lexer.next_token(); // Skip <?php
 
-        // First token should be opening of the encapsed string
-        // PHP emits a '"' token or implicit start marker
-        // We'll emit EncapsedAndWhitespace for the first part
+        // First token: EncapsedAndWhitespace for text before variable
+
         let (token1, span1) = lexer.next_token().expect("Should get first token");
         assert_eq!(token1, Token::EncapsedAndWhitespace);
-        assert_eq!(span1.extract(source), r#""hello "#);
+        assert_eq!(span1.extract(source), "hello ");
 
         // Second token should be the variable
         let (token2, span2) = lexer.next_token().expect("Should get variable token");
@@ -5405,7 +5483,7 @@ mod tests {
 
         let (token1, span1) = lexer.next_token().expect("Token 1");
         assert_eq!(token1, Token::EncapsedAndWhitespace);
-        assert_eq!(span1.extract(source), r#""x="#);
+        assert_eq!(span1.extract(source), "x=");
 
         let (token2, span2) = lexer.next_token().expect("Token 2");
         assert_eq!(token2, Token::Variable);
@@ -5457,7 +5535,7 @@ mod tests {
     fn test_double_quotes_state_variable_at_start() {
         // Test: Variable at the start of string
         // "$name is here" produces:
-        //   - EncapsedAndWhitespace: ""
+        //   - EncapsedAndWhitespace: "" (empty prefix)
         //   - Variable: $name
         //   - EncapsedAndWhitespace: " is here"
         let source = r#"<?php "$name is here""#;
@@ -5465,9 +5543,9 @@ mod tests {
 
         lexer.next_token(); // Skip <?php
 
-        let (token1, span1) = lexer.next_token().expect("Token 1");
+        // Empty EncapsedAndWhitespace prefix (opening " already consumed)
+        let (token1, _span1) = lexer.next_token().expect("Token 1");
         assert_eq!(token1, Token::EncapsedAndWhitespace);
-        assert_eq!(span1.extract(source), r#"""#);
 
         let (token2, span2) = lexer.next_token().expect("Token 2");
         assert_eq!(token2, Token::Variable);
@@ -5492,7 +5570,7 @@ mod tests {
 
         let (token1, span1) = lexer.next_token().expect("Token 1");
         assert_eq!(token1, Token::EncapsedAndWhitespace);
-        assert_eq!(span1.extract(source), r#""hello "#);
+        assert_eq!(span1.extract(source), "hello ");
 
         let (token2, span2) = lexer.next_token().expect("Token 2");
         assert_eq!(token2, Token::Variable);
@@ -5756,10 +5834,10 @@ line2"`;
 
         lexer.next_token(); // Skip <?php
 
-        // First part: opening quote + text before variable
+        // First part: text before variable (opening quote consumed before DoubleQuotes state)
         let (token1, span1) = lexer.next_token().expect("First part");
         assert_eq!(token1, Token::EncapsedAndWhitespace);
-        assert_eq!(span1.extract(source), "\"Hello\n");
+        assert_eq!(span1.extract(source), "Hello\n");
 
         // Variable
         let (token2, span2) = lexer.next_token().expect("Variable");

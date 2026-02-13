@@ -460,6 +460,7 @@ pub enum UnaryOperator {
     Not,           // !
     BitwiseNot,    // ~
     ErrorSuppress, // @
+    Reference,     // &
 }
 
 /// Cast types

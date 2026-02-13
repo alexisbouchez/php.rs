@@ -176,7 +176,8 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 3.3.8  Implement namespace, use, use function, use const
 [x] 3.3.9  Implement attributes (#[Attr], #[Attr(args)])
 [x] 3.3.10 Implement property hooks (get/set in PHP 8.4+)
-[ ] 3.3.11 Test: parse every file in php-src/tests/lang/*.phpt --FILE-- sections
+[x] 3.3.11 Test: parse every file in php-src/tests/lang/*.phpt --FILE-- sections
+         (209/211 pass = 99.1%, 2 skipped: cross-tag braces + invalid octal literal)
 
 ## 3.4 Error recovery
 [ ] 3.4.1  Implement parse error reporting with line/column
