@@ -556,9 +556,7 @@ impl DirectoryIterator {
 
     /// Get the filename of the current entry (basename only).
     pub fn get_filename(&self) -> Option<String> {
-        self.entries
-            .get(self.position)
-            .map(|e| e.filename.clone())
+        self.entries.get(self.position).map(|e| e.filename.clone())
     }
 
     /// Get the current key (integer index).
@@ -597,9 +595,7 @@ impl DirectoryIterator {
 
     /// Get the full pathname of the current entry.
     pub fn get_pathname(&self) -> Option<&str> {
-        self.entries
-            .get(self.position)
-            .map(|e| e.pathname.as_str())
+        self.entries.get(self.position).map(|e| e.pathname.as_str())
     }
 
     /// Get the total number of entries (including "." and "..").
@@ -640,12 +636,8 @@ impl RecursiveDirectoryIterator {
     pub fn new(path: &str, flag: RecursiveDirectoryIteratorFlag) -> Result<Self, String> {
         let skip_dots = flag == RecursiveDirectoryIteratorFlag::SkipDots;
 
-        let read_dir = std::fs::read_dir(path).map_err(|e| {
-            format!(
-                "RecursiveDirectoryIterator::__construct({}): {}",
-                path, e
-            )
-        })?;
+        let read_dir = std::fs::read_dir(path)
+            .map_err(|e| format!("RecursiveDirectoryIterator::__construct({}): {}", path, e))?;
 
         let sep = if path.ends_with('/') || path.ends_with('\\') {
             ""
@@ -692,9 +684,7 @@ impl RecursiveDirectoryIterator {
 
     /// Get the filename of the current entry.
     pub fn get_filename(&self) -> Option<String> {
-        self.entries
-            .get(self.position)
-            .map(|e| e.filename.clone())
+        self.entries.get(self.position).map(|e| e.filename.clone())
     }
 
     /// Get the current key (integer index).
@@ -747,9 +737,7 @@ impl RecursiveDirectoryIterator {
 
     /// Get the full pathname of the current entry.
     pub fn get_pathname(&self) -> Option<&str> {
-        self.entries
-            .get(self.position)
-            .map(|e| e.pathname.as_str())
+        self.entries.get(self.position).map(|e| e.pathname.as_str())
     }
 
     /// Get the directory path that was opened.
@@ -816,8 +804,8 @@ impl RecursiveIteratorIterator {
         mode: RecursiveIteratorMode,
         out: &mut Vec<(usize, String)>,
     ) -> Result<(), String> {
-        let read_dir = std::fs::read_dir(path)
-            .map_err(|e| format!("RecursiveIteratorIterator: {}", e))?;
+        let read_dir =
+            std::fs::read_dir(path).map_err(|e| format!("RecursiveIteratorIterator: {}", e))?;
 
         // Gather entries for this directory.
         let mut dir_entries: Vec<String> = Vec::new();
@@ -1848,7 +1836,10 @@ mod tests {
         assert!(names.contains(&"file.txt".to_string()));
         let dir_pos = names.iter().position(|n| n == "adir").unwrap();
         let file_pos = names.iter().position(|n| n == "file.txt").unwrap();
-        assert!(dir_pos < file_pos, "Directory should appear before its child");
+        assert!(
+            dir_pos < file_pos,
+            "Directory should appear before its child"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1880,7 +1871,10 @@ mod tests {
         assert!(names.contains(&"inner.txt".to_string()));
         let dir_pos = names.iter().position(|n| n == "bdir").unwrap();
         let file_pos = names.iter().position(|n| n == "inner.txt").unwrap();
-        assert!(file_pos < dir_pos, "Child should appear before its parent directory");
+        assert!(
+            file_pos < dir_pos,
+            "Child should appear before its parent directory"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1959,8 +1953,7 @@ mod tests {
         )
         .unwrap();
 
-        let rii =
-            RecursiveIteratorIterator::new(&rdi, RecursiveIteratorMode::LeavesOnly).unwrap();
+        let rii = RecursiveIteratorIterator::new(&rdi, RecursiveIteratorMode::LeavesOnly).unwrap();
 
         assert!(!rii.valid());
         assert_eq!(rii.count(), 0);
@@ -1980,8 +1973,7 @@ mod tests {
         )
         .unwrap();
 
-        let rii =
-            RecursiveIteratorIterator::new(&rdi, RecursiveIteratorMode::SelfFirst).unwrap();
+        let rii = RecursiveIteratorIterator::new(&rdi, RecursiveIteratorMode::SelfFirst).unwrap();
         assert_eq!(rii.get_mode(), RecursiveIteratorMode::SelfFirst);
 
         let _ = std::fs::remove_dir_all(&dir);

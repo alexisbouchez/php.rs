@@ -477,10 +477,7 @@ impl OptimizationPass for ConstantFoldingPass {
 
             if op0.op == opcodes::LOAD_CONST_INT
                 && op1.op == opcodes::LOAD_CONST_INT
-                && matches!(
-                    op2.op,
-                    opcodes::ADD | opcodes::SUB | opcodes::MUL
-                )
+                && matches!(op2.op, opcodes::ADD | opcodes::SUB | opcodes::MUL)
                 && op2.op1 == op0.result
                 && op2.op2 == op1.result
             {
@@ -967,8 +964,8 @@ mod tests {
                 },
                 Opcode {
                     op: opcodes::ADD,
-                    op1: 1, // r1
-                    op2: 2, // r2
+                    op1: 1,    // r1
+                    op2: 2,    // r2
                     result: 3, // -> r3
                 },
             ],

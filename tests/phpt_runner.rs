@@ -1137,7 +1137,7 @@ echo $a + $b;
                 let path = entry.path();
                 if path.is_dir() {
                     collect_phpt_files(&path, files);
-                } else if path.extension().map_or(false, |e| e == "phpt") {
+                } else if path.extension().is_some_and(|e| e == "phpt") {
                     files.push(path);
                 }
             }

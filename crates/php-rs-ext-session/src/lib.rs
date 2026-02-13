@@ -1326,10 +1326,8 @@ mod tests {
         let mut sg = SessionSuperglobal::new();
         sg.bind(&session);
 
-        let mut entries: Vec<(String, SessionValue)> = sg
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let mut entries: Vec<(String, SessionValue)> =
+            sg.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         assert_eq!(entries.len(), 2);

@@ -1092,8 +1092,8 @@ enum XPathPredicate {
 
 /// HTML5 void elements that cannot have children and do not require a closing tag.
 const HTML5_VOID_ELEMENTS: &[&str] = &[
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
-    "param", "source", "track", "wbr",
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
+    "track", "wbr",
 ];
 
 /// HTML5 raw text elements whose content is not parsed as HTML.
@@ -1101,25 +1101,60 @@ const HTML5_RAW_TEXT_ELEMENTS: &[&str] = &["script", "style"];
 
 /// Elements that implicitly close a `<p>` when opened.
 const P_CLOSING_ELEMENTS: &[&str] = &[
-    "address", "article", "aside", "blockquote", "details", "dialog", "dd",
-    "div", "dl", "dt", "fieldset", "figcaption", "figure", "footer", "form",
-    "h1", "h2", "h3", "h4", "h5", "h6", "header", "hgroup", "hr", "li",
-    "main", "nav", "ol", "p", "pre", "section", "table", "ul",
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "details",
+    "dialog",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "header",
+    "hgroup",
+    "hr",
+    "li",
+    "main",
+    "nav",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "ul",
 ];
 
 /// Returns true if `tag` is an HTML5 void element (case-insensitive).
 fn is_void_element(tag: &str) -> bool {
-    HTML5_VOID_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(tag))
+    HTML5_VOID_ELEMENTS
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(tag))
 }
 
 /// Returns true if `tag` is an HTML5 raw text element (case-insensitive).
 fn is_raw_text_element(tag: &str) -> bool {
-    HTML5_RAW_TEXT_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(tag))
+    HTML5_RAW_TEXT_ELEMENTS
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(tag))
 }
 
 /// Returns true if opening `tag` should implicitly close an open `<p>`.
 fn closes_p_element(tag: &str) -> bool {
-    P_CLOSING_ELEMENTS.iter().any(|v| v.eq_ignore_ascii_case(tag))
+    P_CLOSING_ELEMENTS
+        .iter()
+        .any(|v| v.eq_ignore_ascii_case(tag))
 }
 
 /// An HTML5 parser that produces a `DomDocument`.
@@ -1222,9 +1257,9 @@ impl<'a> Html5Parser<'a> {
         }
 
         // Find or create the root <html> element.
-        let html_idx = top_nodes.iter().position(|n| {
-            matches!(n, DomNode::Element(ref e) if e.tag_name.eq_ignore_ascii_case("html"))
-        });
+        let html_idx = top_nodes.iter().position(
+            |n| matches!(n, DomNode::Element(ref e) if e.tag_name.eq_ignore_ascii_case("html")),
+        );
 
         if let Some(idx) = html_idx {
             if let DomNode::Element(html) = top_nodes.remove(idx) {
@@ -1317,9 +1352,9 @@ impl<'a> Html5Parser<'a> {
                     "quot" => "\"".to_string(),
                     "apos" => "'".to_string(),
                     "nbsp" => "\u{00A0}".to_string(),
-                    _ if name.starts_with('#') => {
-                        self.decode_char_ref(&name[1..]).unwrap_or_else(|_| format!("&{};", name))
-                    }
+                    _ if name.starts_with('#') => self
+                        .decode_char_ref(&name[1..])
+                        .unwrap_or_else(|_| format!("&{};", name)),
                     _ => format!("&{};", name),
                 };
             }
@@ -1584,9 +1619,27 @@ impl<'a> Html5Parser<'a> {
 fn is_likely_ancestor_close(tag: &str) -> bool {
     matches!(
         tag,
-        "html" | "head" | "body" | "table" | "thead" | "tbody" | "tfoot" | "tr"
-            | "div" | "section" | "article" | "aside" | "nav" | "main" | "form"
-            | "ul" | "ol" | "dl" | "details" | "fieldset" | "figure"
+        "html"
+            | "head"
+            | "body"
+            | "table"
+            | "thead"
+            | "tbody"
+            | "tfoot"
+            | "tr"
+            | "div"
+            | "section"
+            | "article"
+            | "aside"
+            | "nav"
+            | "main"
+            | "form"
+            | "ul"
+            | "ol"
+            | "dl"
+            | "details"
+            | "fieldset"
+            | "figure"
     )
 }
 
@@ -2385,7 +2438,8 @@ mod tests {
 
     #[test]
     fn test_html5_script_raw_text() {
-        let html = r#"<html><body><script>var x = 1 < 2 && 3 > 0;</script><p>After</p></body></html>"#;
+        let html =
+            r#"<html><body><script>var x = 1 < 2 && 3 > 0;</script><p>After</p></body></html>"#;
         let doc = dom_html5_parse(html).unwrap();
         let root = doc.document_element.as_ref().unwrap();
 
@@ -2429,7 +2483,8 @@ mod tests {
     #[test]
     fn test_html5_unclosed_tags_error_recovery() {
         // Unclosed tags should be implicitly closed at EOF.
-        let html = r#"<html><body><div><p>Unclosed paragraph<p>Another paragraph</div></body></html>"#;
+        let html =
+            r#"<html><body><div><p>Unclosed paragraph<p>Another paragraph</div></body></html>"#;
         let doc = dom_html5_parse(html).unwrap();
         let root = doc.document_element.as_ref().unwrap();
 
@@ -2440,7 +2495,8 @@ mod tests {
 
     #[test]
     fn test_html5_attributes_with_various_quotes() {
-        let html = r#"<html><body><div class="double" id='single' data-x=unquoted></div></body></html>"#;
+        let html =
+            r#"<html><body><div class="double" id='single' data-x=unquoted></div></body></html>"#;
         let doc = dom_html5_parse(html).unwrap();
         let root = doc.document_element.as_ref().unwrap();
 
