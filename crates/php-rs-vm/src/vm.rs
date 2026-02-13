@@ -1751,6 +1751,23 @@ impl Vm {
             return Ok(DispatchSignal::Next);
         }
 
+        // Fiber is a built-in class (not in the classes table). Compiled as INIT_FCALL "Fiber" + DO_FCALL;
+        // return "Fiber" so NEW can create the instance, and save args for handle_new.
+        if func_name == "Fiber" {
+            if op.result_type != OperandType::Unused {
+                self.write_result(op, caller_oa_idx, Value::String("Fiber".to_string()))?;
+            }
+            if !args.is_empty() {
+                let frame = self.call_stack.last_mut().unwrap();
+                frame.call_stack_pending.push(PendingCall {
+                    name: "__ctor_args__".to_string(),
+                    args,
+                    this_source: None,
+                });
+            }
+            return Ok(DispatchSignal::Next);
+        }
+
         // If the "function" name is a class name, return it as a string value
         // (used by NEW to resolve class references compiled as INIT_FCALL + DO_FCALL)
         // The args passed here are actually constructor args — save them for the NEW/DO_FCALL that follows.
@@ -1797,6 +1814,11 @@ impl Vm {
 
         // Check if this is a Fiber method call
         if let Some(fiber_result) = self.try_fiber_method(&func_name, &args)? {
+            // Fiber::suspend popped the current frame; return Yield so the dispatch loop exits
+            // without incrementing the caller's IP (otherwise we'd advance the wrong frame).
+            if func_name == "Fiber::suspend" {
+                return Ok(DispatchSignal::Yield);
+            }
             if op.result_type != OperandType::Unused {
                 self.write_result(op, caller_oa_idx, fiber_result)?;
             }
@@ -2628,13 +2650,16 @@ impl Vm {
 
         result?;
 
-        let transfer = self
-            .fibers
-            .get(&object_id)
-            .map(|f| f.transfer_value.clone())
-            .unwrap_or(Value::Null);
+        // When the fiber terminated, return its return value; when suspended, return transfer_value.
+        let value = self.fibers.get(&object_id).map(|f| {
+            if f.status == FiberStatus::Terminated {
+                f.return_value.clone().unwrap_or(Value::Null)
+            } else {
+                f.transfer_value.clone()
+            }
+        }).unwrap_or(Value::Null);
 
-        Ok(Some(transfer))
+        Ok(Some(value))
     }
 
     /// Resume a suspended fiber.
@@ -2704,13 +2729,16 @@ impl Vm {
 
         result?;
 
-        let transfer = self
-            .fibers
-            .get(&object_id)
-            .map(|f| f.transfer_value.clone())
-            .unwrap_or(Value::Null);
+        // When the fiber terminated, return its return value; when suspended, return transfer_value.
+        let value = self.fibers.get(&object_id).map(|f| {
+            if f.status == FiberStatus::Terminated {
+                f.return_value.clone().unwrap_or(Value::Null)
+            } else {
+                f.transfer_value.clone()
+            }
+        }).unwrap_or(Value::Null);
 
-        Ok(Some(transfer))
+        Ok(Some(value))
     }
 
     /// Fiber::suspend() — save current fiber's frames and break execution.
