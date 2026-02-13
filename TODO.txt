@@ -672,39 +672,39 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 9.20.4  Test: php-src/ext/opcache/tests/
 
 ## 9.21 Remaining extensions (lower priority, implement as needed)
-[ ] ext/bcmath — arbitrary precision math
-[ ] ext/bz2 — bzip2 compression
-[ ] ext/calendar — calendar conversion functions
-[ ] ext/dba — database abstraction (dbm-style)
-[ ] ext/enchant — spell checking
-[ ] ext/exif — image metadata
-[ ] ext/ffi — Foreign Function Interface
-[ ] ext/fileinfo — file type detection (libmagic)
-[ ] ext/ftp — FTP client
-[ ] ext/gd — image manipulation
-[ ] ext/gettext — i18n message translation
-[ ] ext/gmp — GNU Multiple Precision
-[ ] ext/iconv — character set conversion
-[ ] ext/ldap — LDAP directory access
-[ ] ext/mysqli — MySQL improved
-[ ] ext/mysqlnd — MySQL native driver
-[ ] ext/odbc — ODBC database
-[ ] ext/pcntl — process control
-[ ] ext/pdo_mysql — PDO MySQL driver
-[ ] ext/pdo_pgsql — PDO PostgreSQL driver
-[ ] ext/phar — PHP Archive
-[ ] ext/posix — POSIX functions
-[ ] ext/readline — interactive shell
-[ ] ext/shmop — shared memory
-[ ] ext/snmp — SNMP protocol
-[ ] ext/soap — SOAP web services
-[ ] ext/sockets — low-level socket API
-[ ] ext/sqlite3 — SQLite3 direct API
-[ ] ext/sysvmsg, ext/sysvsem, ext/sysvshm — System V IPC
-[ ] ext/tidy — HTML tidy
-[ ] ext/xsl — XSL transformations
-[ ] ext/zip — ZIP archive
-[ ] ext/zlib — zlib compression
+[x] ext/bcmath — arbitrary precision math
+[x] ext/bz2 — bzip2 compression
+[x] ext/calendar — calendar conversion functions
+[x] ext/dba — database abstraction (dbm-style)
+[x] ext/enchant — spell checking
+[x] ext/exif — image metadata
+[x] ext/ffi — Foreign Function Interface
+[x] ext/fileinfo — file type detection (libmagic)
+[x] ext/ftp — FTP client
+[x] ext/gd — image manipulation
+[x] ext/gettext — i18n message translation
+[x] ext/gmp — GNU Multiple Precision
+[x] ext/iconv — character set conversion
+[x] ext/ldap — LDAP directory access
+[x] ext/mysqli — MySQL improved
+[x] ext/mysqlnd — MySQL native driver
+[x] ext/odbc — ODBC database
+[x] ext/pcntl — process control
+[x] ext/pdo_mysql — PDO MySQL driver
+[x] ext/pdo_pgsql — PDO PostgreSQL driver
+[x] ext/phar — PHP Archive
+[x] ext/posix — POSIX functions
+[x] ext/readline — interactive shell
+[x] ext/shmop — shared memory
+[x] ext/snmp — SNMP protocol
+[x] ext/soap — SOAP web services
+[x] ext/sockets — low-level socket API
+[x] ext/sqlite3 — SQLite3 direct API
+[x] ext/sysvmsg, ext/sysvsem, ext/sysvshm — System V IPC
+[x] ext/tidy — HTML tidy
+[x] ext/xsl — XSL transformations
+[x] ext/zip — ZIP archive
+[x] ext/zlib — zlib compression
 
 ################################################################################
 # PHASE 10: CLI SAPI (crates/php-rs-sapi-cli)
