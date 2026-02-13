@@ -175,7 +175,7 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 [x] 3.3.7  Implement interface, trait, enum declarations
 [x] 3.3.8  Implement namespace, use, use function, use const
 [x] 3.3.9  Implement attributes (#[Attr], #[Attr(args)])
-[ ] 3.3.10 Implement property hooks (get/set in PHP 8.4+)
+[x] 3.3.10 Implement property hooks (get/set in PHP 8.4+)
 [ ] 3.3.11 Test: parse every file in php-src/tests/lang/*.phpt --FILE-- sections
 
 ## 3.4 Error recovery

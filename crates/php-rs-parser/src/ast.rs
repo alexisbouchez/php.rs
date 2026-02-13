@@ -752,7 +752,8 @@ mod tests {
         let span = Span::new(0, 1, 1, 1);
         let expr = Expression::IntLiteral { value: 1, span };
 
-        let statements = [Statement::Expression {
+        let statements = [
+            Statement::Expression {
                 expr: expr.clone(),
                 span,
             },
@@ -765,7 +766,8 @@ mod tests {
                 span,
             },
             Statement::Break { depth: None, span },
-            Statement::Continue { depth: None, span }];
+            Statement::Continue { depth: None, span },
+        ];
 
         assert_eq!(statements.len(), 5);
     }
@@ -775,14 +777,16 @@ mod tests {
         // Verify all expression literal variants can be constructed
         let span = Span::new(0, 1, 1, 1);
 
-        let expressions = [Expression::IntLiteral { value: 42, span },
+        let expressions = [
+            Expression::IntLiteral { value: 42, span },
             Expression::FloatLiteral { value: 3.5, span },
             Expression::StringLiteral {
                 value: "hello".to_string(),
                 span,
             },
             Expression::BoolLiteral { value: true, span },
-            Expression::Null { span }];
+            Expression::Null { span },
+        ];
 
         assert_eq!(expressions.len(), 5);
     }
@@ -833,11 +837,13 @@ mod tests {
         use std::collections::HashSet;
         let mut set = HashSet::new();
 
-        let ops = [UnaryOperator::Plus,
+        let ops = [
+            UnaryOperator::Plus,
             UnaryOperator::Minus,
             UnaryOperator::Not,
             UnaryOperator::BitwiseNot,
-            UnaryOperator::ErrorSuppress];
+            UnaryOperator::ErrorSuppress,
+        ];
 
         for op in ops.iter() {
             assert!(set.insert(op), "Duplicate operator: {:?}", op);
@@ -850,13 +856,15 @@ mod tests {
         use std::collections::HashSet;
         let mut set = HashSet::new();
 
-        let types = [CastType::Int,
+        let types = [
+            CastType::Int,
             CastType::Float,
             CastType::String,
             CastType::Bool,
             CastType::Array,
             CastType::Object,
-            CastType::Unset];
+            CastType::Unset,
+        ];
 
         for t in types.iter() {
             assert!(set.insert(t), "Duplicate cast type: {:?}", t);
@@ -892,13 +900,15 @@ mod tests {
         use std::collections::HashSet;
         let mut set = HashSet::new();
 
-        let mods = [Modifier::Public,
+        let mods = [
+            Modifier::Public,
             Modifier::Protected,
             Modifier::Private,
             Modifier::Static,
             Modifier::Abstract,
             Modifier::Final,
-            Modifier::Readonly];
+            Modifier::Readonly,
+        ];
 
         for m in mods.iter() {
             assert!(set.insert(m), "Duplicate modifier: {:?}", m);
