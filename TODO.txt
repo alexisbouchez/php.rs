@@ -400,42 +400,42 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 ################################################################################
 
 ## 7.1 Error handling
-[ ] 7.1.1  Implement error levels: E_ERROR, E_WARNING, E_NOTICE, E_PARSE, E_DEPRECATED, etc.
-[ ] 7.1.2  Implement error_reporting() INI directive
-[ ] 7.1.3  Implement set_error_handler(), set_exception_handler()
-[ ] 7.1.4  Implement @ error suppression operator (ZEND_BEGIN_SILENCE / ZEND_END_SILENCE)
-[ ] 7.1.5  Test: error levels, custom handlers, @ operator
+[x] 7.1.1  Implement error levels: E_ERROR, E_WARNING, E_NOTICE, E_PARSE, E_DEPRECATED, etc.
+[x] 7.1.2  Implement error_reporting() INI directive
+[x] 7.1.3  Implement set_error_handler(), set_exception_handler()
+[x] 7.1.4  Implement @ error suppression operator (ZEND_BEGIN_SILENCE / ZEND_END_SILENCE)
+[x] 7.1.5  Test: error levels, custom handlers, @ operator
 
 ## 7.2 INI system
-[ ] 7.2.1  Parse php.ini format (key = value, sections, constants, expressions)
-[ ] 7.2.2  Implement ini_get(), ini_set(), ini_restore()
-[ ] 7.2.3  Implement INI_SYSTEM, INI_PERDIR, INI_USER, INI_ALL permission levels
-[ ] 7.2.4  Register core INI directives (error_reporting, display_errors, memory_limit, etc.)
-[ ] 7.2.5  Test: INI parsing and runtime modification
+[x] 7.2.1  Parse php.ini format (key = value, sections, constants, expressions)
+[x] 7.2.2  Implement ini_get(), ini_set(), ini_restore()
+[x] 7.2.3  Implement INI_SYSTEM, INI_PERDIR, INI_USER, INI_ALL permission levels
+[x] 7.2.4  Register core INI directives (error_reporting, display_errors, memory_limit, etc.)
+[x] 7.2.5  Test: INI parsing and runtime modification
 
 ## 7.3 Output system
-[ ] 7.3.1  Implement output buffering (ob_start, ob_end_flush, ob_get_contents, etc.)
-[ ] 7.3.2  Implement nested output buffers
-[ ] 7.3.3  Implement implicit_flush
-[ ] 7.3.4  Test: output buffering stacking, callback functions
+[x] 7.3.1  Implement output buffering (ob_start, ob_end_flush, ob_get_contents, etc.)
+[x] 7.3.2  Implement nested output buffers
+[x] 7.3.3  Implement implicit_flush
+[x] 7.3.4  Test: output buffering stacking, callback functions
 
 ## 7.4 Stream system
-[ ] 7.4.1  Define StreamWrapper trait: open, read, write, seek, close, stat
-[ ] 7.4.2  Implement file:// wrapper (local filesystem)
-[ ] 7.4.3  Implement php:// wrappers: stdin, stdout, stderr, input, output, memory, temp, filter
-[ ] 7.4.4  Implement stream context (stream_context_create)
-[ ] 7.4.5  Test: file I/O through stream API
+[x] 7.4.1  Define StreamWrapper trait: open, read, write, seek, close, stat
+[x] 7.4.2  Implement file:// wrapper (local filesystem)
+[x] 7.4.3  Implement php:// wrappers: stdin, stdout, stderr, input, output, memory, temp, filter
+[x] 7.4.4  Implement stream context (stream_context_create)
+[x] 7.4.5  Test: file I/O through stream API
 
 ## 7.5 Superglobals
-[ ] 7.5.1  Implement $_SERVER, $_ENV, $_GET, $_POST, $_COOKIE, $_FILES, $_REQUEST, $_SESSION
-[ ] 7.5.2  Populate from SAPI request context
-[ ] 7.5.3  Implement variables_order INI directive
-[ ] 7.5.4  Test: superglobal population and access
+[x] 7.5.1  Implement $_SERVER, $_ENV, $_GET, $_POST, $_COOKIE, $_FILES, $_REQUEST, $_SESSION
+[x] 7.5.2  Populate from SAPI request context
+[x] 7.5.3  Implement variables_order INI directive
+[x] 7.5.4  Test: superglobal population and access
 
 ## 7.6 Autoloading
-[ ] 7.6.1  Implement spl_autoload_register / spl_autoload_unregister
-[ ] 7.6.2  Implement autoload queue execution on class-not-found
-[ ] 7.6.3  Test: autoloading with real file includes
+[x] 7.6.1  Implement spl_autoload_register / spl_autoload_unregister
+[x] 7.6.2  Implement autoload queue execution on class-not-found
+[x] 7.6.3  Test: autoloading with real file includes
 
 ################################################################################
 # PHASE 8: STANDARD EXTENSION (crates/php-rs-ext-standard)
