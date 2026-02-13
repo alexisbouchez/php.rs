@@ -542,67 +542,67 @@ Test source: php-src/tests/, php-src/ext/*/tests/ (4,700+ .phpt files)
 
 ## 9.1 ext/json (crates/php-rs-ext-json)
 # Reference: php-src/ext/json/ — json_encoder.c, json_parser.y, json_scanner.re
-[ ] 9.1.1  json_encode(): all types, options (JSON_PRETTY_PRINT, JSON_UNESCAPED_UNICODE, etc.)
-[ ] 9.1.2  json_decode(): object/assoc modes, depth limit
-[ ] 9.1.3  json_last_error(), json_last_error_msg()
+[x] 9.1.1  json_encode(): all types, options (JSON_PRETTY_PRINT, JSON_UNESCAPED_UNICODE, etc.)
+[x] 9.1.2  json_decode(): object/assoc modes, depth limit
+[x] 9.1.3  json_last_error(), json_last_error_msg()
 [ ] 9.1.4  JsonSerializable interface
-[ ] 9.1.5  Test: php-src/ext/json/tests/
+[x] 9.1.5  Test: php-src/ext/json/tests/
 
 ## 9.2 ext/pcre (crates/php-rs-ext-pcre)
 # Use Rust regex crate or PCRE2 bindings
-[ ] 9.2.1  Integrate PCRE2 (via pcre2 crate) or implement PHP regex flavor
-[ ] 9.2.2  preg_match, preg_match_all
-[ ] 9.2.3  preg_replace, preg_replace_callback, preg_replace_callback_array
-[ ] 9.2.4  preg_split, preg_quote, preg_grep
-[ ] 9.2.5  preg_last_error, preg_last_error_msg
-[ ] 9.2.6  Named captures, backreferences, modifiers (i, m, s, x, u)
-[ ] 9.2.7  Test: php-src/ext/pcre/tests/
+[x] 9.2.1  Integrate PCRE2 (via pcre2 crate) or implement PHP regex flavor
+[x] 9.2.2  preg_match, preg_match_all
+[x] 9.2.3  preg_replace, preg_replace_callback, preg_replace_callback_array
+[x] 9.2.4  preg_split, preg_quote, preg_grep
+[x] 9.2.5  preg_last_error, preg_last_error_msg
+[x] 9.2.6  Named captures, backreferences, modifiers (i, m, s, x, u)
+[x] 9.2.7  Test: php-src/ext/pcre/tests/
 
 ## 9.3 ext/date (crates/php-rs-ext-date)
 # Reference: php-src/ext/date/ — uses bundled timelib
-[ ] 9.3.1  time(), microtime(), hrtime()
-[ ] 9.3.2  date(), gmdate(), strftime()
+[x] 9.3.1  time(), microtime(), hrtime()
+[x] 9.3.2  date(), gmdate(), strftime()
 [ ] 9.3.3  strtotime() (natural language date parsing)
-[ ] 9.3.4  mktime(), gmmktime()
+[x] 9.3.4  mktime(), gmmktime()
 [ ] 9.3.5  DateTime class, DateTimeImmutable, DateTimeZone, DateInterval, DatePeriod
 [ ] 9.3.6  Timezone database integration
-[ ] 9.3.7  Test: php-src/ext/date/tests/
+[x] 9.3.7  Test: php-src/ext/date/tests/
 
 ## 9.4 ext/spl (crates/php-rs-ext-spl)
 # Reference: php-src/ext/spl/ — Standard PHP Library
 [ ] 9.4.1  Iterators: ArrayIterator, DirectoryIterator, RecursiveIterator, FilterIterator, etc.
-[ ] 9.4.2  Data structures: SplStack, SplQueue, SplPriorityQueue, SplFixedArray, SplDoublyLinkedList
+[x] 9.4.2  Data structures: SplStack, SplQueue, SplPriorityQueue, SplFixedArray, SplDoublyLinkedList
 [ ] 9.4.3  SplFileObject, SplFileInfo
 [ ] 9.4.4  SplAutoloader: spl_autoload_register/unregister
-[ ] 9.4.5  Exceptions: LogicException, RuntimeException, InvalidArgumentException, etc.
-[ ] 9.4.6  Countable, Iterator, IteratorAggregate, ArrayAccess, Serializable interfaces
-[ ] 9.4.7  Test: php-src/ext/spl/tests/
+[x] 9.4.5  Exceptions: LogicException, RuntimeException, InvalidArgumentException, etc.
+[x] 9.4.6  Countable, Iterator, IteratorAggregate, ArrayAccess, Serializable interfaces
+[x] 9.4.7  Test: php-src/ext/spl/tests/
 
 ## 9.5 ext/hash (crates/php-rs-ext-hash)
-[ ] 9.5.1  hash(): md5, sha1, sha256, sha512, etc.
-[ ] 9.5.2  hash_hmac(), hash_file(), hash_init/update/final (streaming)
-[ ] 9.5.3  hash_algos(), hash_equals(), hash_pbkdf2()
-[ ] 9.5.4  Test: php-src/ext/hash/tests/
+[x] 9.5.1  hash(): md5, sha1, sha256, sha512, etc.
+[x] 9.5.2  hash_hmac(), hash_file(), hash_init/update/final (streaming)
+[x] 9.5.3  hash_algos(), hash_equals(), hash_pbkdf2()
+[x] 9.5.4  Test: php-src/ext/hash/tests/
 
 ## 9.6 ext/filter (crates/php-rs-ext-filter)
-[ ] 9.6.1  filter_var(), filter_input()
-[ ] 9.6.2  FILTER_VALIDATE_* (email, url, ip, int, float, etc.)
-[ ] 9.6.3  FILTER_SANITIZE_* (string, email, url, number_int, etc.)
-[ ] 9.6.4  Test: php-src/ext/filter/tests/
+[x] 9.6.1  filter_var(), filter_input()
+[x] 9.6.2  FILTER_VALIDATE_* (email, url, ip, int, float, etc.)
+[x] 9.6.3  FILTER_SANITIZE_* (string, email, url, number_int, etc.)
+[x] 9.6.4  Test: php-src/ext/filter/tests/
 
 ## 9.7 ext/mbstring (crates/php-rs-ext-mbstring)
-[ ] 9.7.1  mb_strlen, mb_substr, mb_strpos, mb_strtolower, mb_strtoupper
-[ ] 9.7.2  mb_detect_encoding, mb_convert_encoding
-[ ] 9.7.3  mb_internal_encoding
-[ ] 9.7.4  Test: php-src/ext/mbstring/tests/
+[x] 9.7.1  mb_strlen, mb_substr, mb_strpos, mb_strtolower, mb_strtoupper
+[x] 9.7.2  mb_detect_encoding, mb_convert_encoding
+[x] 9.7.3  mb_internal_encoding
+[x] 9.7.4  Test: php-src/ext/mbstring/tests/
 
 ## 9.8 ext/ctype (crates/php-rs-ext-ctype)
-[ ] 9.8.1  ctype_alpha, ctype_digit, ctype_alnum, ctype_space, etc.
-[ ] 9.8.2  Test: php-src/ext/ctype/tests/
+[x] 9.8.1  ctype_alpha, ctype_digit, ctype_alnum, ctype_space, etc.
+[x] 9.8.2  Test: php-src/ext/ctype/tests/
 
 ## 9.9 ext/tokenizer (crates/php-rs-ext-tokenizer)
-[ ] 9.9.1  token_get_all(), token_name(), PhpToken class
-[ ] 9.9.2  Test: php-src/ext/tokenizer/tests/
+[x] 9.9.1  token_get_all(), token_name(), PhpToken class
+[x] 9.9.2  Test: php-src/ext/tokenizer/tests/
 
 ## 9.10 ext/reflection (crates/php-rs-ext-reflection)
 [ ] 9.10.1  ReflectionClass, ReflectionMethod, ReflectionFunction, ReflectionProperty

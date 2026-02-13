@@ -9,6 +9,15 @@ members = [
     "crates/php-rs-gc",
     "crates/php-rs-runtime",
     "crates/php-rs-ext-standard",
+    "crates/php-rs-ext-json",
+    "crates/php-rs-ext-pcre",
+    "crates/php-rs-ext-date",
+    "crates/php-rs-ext-spl",
+    "crates/php-rs-ext-hash",
+    "crates/php-rs-ext-filter",
+    "crates/php-rs-ext-mbstring",
+    "crates/php-rs-ext-ctype",
+    "crates/php-rs-ext-tokenizer",
     "crates/php-rs-sapi-cli",
 ]
 
