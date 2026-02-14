@@ -1504,6 +1504,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "php-rs-compiler",
+ "php-rs-composer",
  "php-rs-runtime",
  "php-rs-vm",
 ]

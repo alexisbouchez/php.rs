@@ -14,6 +14,7 @@ path = "src/main.rs"
 php-rs-compiler = { path = "../php-rs-compiler" }
 php-rs-vm = { path = "../php-rs-vm" }
 php-rs-runtime = { path = "../php-rs-runtime" }
+php-rs-composer = { path = "../php-rs-composer" }
 libc = "0.2"
 
 [dev-dependencies]

@@ -80,6 +80,8 @@ enum CliMode {
     Stdin,
     /// Show help: php-rs -h / --help
     Help,
+    /// Composer dependency manager: php-rs composer <command> [args...]
+    Composer(Vec<String>),
 }
 
 fn parse_args(args: &[String]) -> Result<CliOptions, String> {
@@ -206,6 +208,12 @@ fn parse_args(args: &[String]) -> Result<CliOptions, String> {
             "-h" | "--help" | "-?" => {
                 mode = Some(CliMode::Help);
                 i += 1;
+            }
+            "composer" if mode.is_none() => {
+                // Collect all remaining args for composer
+                let composer_args: Vec<String> = args[i + 1..].to_vec();
+                mode = Some(CliMode::Composer(composer_args));
+                break;
             }
             arg if arg.starts_with('-') => {
                 return Err(format!("Unknown option: {}", arg));
@@ -810,6 +818,14 @@ fn main() {
             Ok(source) => execute_php(&source, &ini, "-", &["-".to_string()]),
             Err(code) => code,
         },
+        CliMode::Composer(args) => {
+            let result = php_rs_composer::cli::run(args);
+            if result.is_ok() {
+                0
+            } else {
+                1
+            }
+        }
     };
 
     process::exit(exit_code);

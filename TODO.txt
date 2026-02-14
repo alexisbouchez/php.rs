@@ -1,0 +1,105 @@
+# php-rs-composer: Composer-Compatible Dependency Manager
+
+## Phase 1: Semver — Version Parsing & Constraint Matching
+[x] 1.1  Version normalization: parse "v1.2.3", "1.2.3.0", "dev-master", "1.0-alpha1" → canonical form
+[x] 1.2  Version comparison: total ordering with stability (stable > RC > beta > alpha > dev)
+[x] 1.3  Exact constraint: "1.2.3" matches only 1.2.3
+[x] 1.4  Range constraints: ">1.0", ">=1.0", "<2.0", "<=2.0", "!=1.5"
+[x] 1.5  Wildcard constraint: "1.2.*" → >=1.2.0, <1.3.0
+[x] 1.6  Tilde constraint: "~1.2.3" → >=1.2.3, <1.3.0; "~1.2" → >=1.2.0, <2.0.0
+[x] 1.7  Caret constraint: "^1.2.3" → >=1.2.3, <2.0.0; "^0.3" → >=0.3.0, <0.4.0
+[x] 1.8  Compound constraints: AND (comma/space) and OR (||) combinators
+[x] 1.9  Stability suffixes: "1.0@dev", "dev-feature-branch", stability filtering
+[x] 1.10 Branch aliases: "dev-main as 1.0.0", DEFAULT_BRANCH_ALIAS handling
+
+## Phase 2: Package Model & JSON Handling
+[x] 2.1  Package struct: name, version, requires, require-dev, conflict, replace, provide
+[x] 2.2  Link struct: source package, target package, constraint, link type
+[x] 2.3  Autoload config: psr-0, psr-4, classmap, files
+[x] 2.4  Source/dist metadata: type, url, reference, shasum
+[x] 2.5  composer.json parsing: deserialize with serde, validate required fields
+[x] 2.6  composer.json writing: serialize with pretty-print, preserve key ordering
+[x] 2.7  composer.lock parsing: packages, packages-dev, aliases, content-hash
+[x] 2.8  composer.lock writing: generate content-hash, write deterministic JSON
+[x] 2.9  Config system: vendor-dir, cache-dir, minimum-stability, prefer-stable
+[x] 2.10 Root package loading: auto-detect version from git, extract aliases/stability flags
+
+## Phase 3: Repository System
+[x] 3.1  Repository trait: search(name, constraint) → Vec<Package>
+[x] 3.2  PlatformRepository: detect php-rs version + loaded extensions as packages
+[x] 3.3  LockRepository: load packages from existing composer.lock
+[x] 3.4  PathRepository: scan local directory for composer.json, support symlink mode
+[x] 3.5  ComposerRepository basics: fetch packages.json root, parse provider URLs
+[x] 3.6  ComposerRepository v2 API: lazy metadata loading, batch package fetching
+[x] 3.7  ComposerRepository caching: ETag/If-Modified-Since, local file cache with TTL
+[x] 3.8  Packagist default: https://repo.packagist.org as default repository
+[x] 3.9  RepositorySet: aggregate multiple repos, priority ordering, deduplication
+[x] 3.10 Repository search: search packages by name/keyword for `composer search`
+
+## Phase 4: SAT Solver — Dependency Resolution
+[x] 4.1  Literal encoding: package pool IDs as signed integers (+id = install, -id = skip)
+[x] 4.2  Rule struct: clause as Vec<i32>, rule type enum, reason tracking
+[x] 4.3  RuleSet: group rules by type (root_require, package, learned)
+[x] 4.4  RuleWatchGraph: 2-literal watching with watch node linked lists
+[x] 4.5  Decisions struct: decision map (pkg→±level), decision queue, revert/backtrack
+[x] 4.6  Pool: package registry, whatProvides(name, constraint) with caching
+[x] 4.7  PoolBuilder: incremental loading from repositories, constraint expansion
+[x] 4.8  RuleSetGenerator: create CNF rules from package requirements/conflicts/same-name
+[x] 4.9  Unit propagation: propagate() using watch graph, detect conflicts
+[x] 4.10 DPLL main loop: assertion decisions → propagate → branch → backtrack
+[x] 4.11 Conflict analysis: 1st UIP clause learning, backtrack level computation
+[x] 4.12 DefaultPolicy: prefer stable, prefer latest, handle aliases
+[x] 4.13 Transaction: convert solver decisions → install/update/remove operations
+[x] 4.14 Problem reporting: human-readable conflict explanations with reasons
+[x] 4.15 Locked package handling: prefer locked versions, allow minimal updates
+
+## Phase 5: Downloaders & Installers
+[x] 5.1  DownloadManager: route package to correct downloader by source type
+[x] 5.2  ArchiveDownloader: HTTP GET zip/tar.gz → extract to vendor/
+[x] 5.3  GitDownloader: git clone + checkout reference
+[x] 5.4  PathDownloader: symlink or copy local path packages
+[x] 5.5  Download cache: store archives in ~/.cache/composer/, check shasum
+[x] 5.6  Parallel downloads: async concurrent fetching with progress reporting
+[x] 5.7  LibraryInstaller: install package to vendor/{name}/, track in installed.json
+[x] 5.8  MetapackageInstaller: no-op install for virtual packages
+[x] 5.9  BinaryInstaller: symlink bin files to vendor/bin/
+[x] 5.10 InstallationManager: orchestrate operations in dependency order (topo sort)
+
+## Phase 6: Autoloader Generation
+[x] 6.1  PSR-4 map generation: namespace prefix → directory mapping
+[x] 6.2  PSR-0 map generation: legacy namespace mapping
+[x] 6.3  Classmap generation: scan directories, find class/interface/trait definitions
+[x] 6.4  Files autoload: list of files to require on every request
+[x] 6.5  Generate vendor/autoload.php (main entry point)
+[x] 6.6  Generate vendor/composer/autoload_psr4.php
+[x] 6.7  Generate vendor/composer/autoload_classmap.php
+[x] 6.8  Generate vendor/composer/autoload_files.php
+[x] 6.9  Generate vendor/composer/autoload_namespaces.php (PSR-0)
+[x] 6.10 Generate vendor/composer/installed.json and installed.php
+[x] 6.11 Optimized autoloader: authoritative classmap mode
+
+## Phase 7: CLI Commands
+[x] 7.1  CLI framework: clap-based command dispatch, global options (--verbose, --no-ansi, --working-dir)
+[x] 7.2  `composer init`: interactive composer.json creation
+[x] 7.3  `composer install`: read lock file or resolve, download, install, generate autoloader
+[x] 7.4  `composer update`: re-resolve all or specific packages, update lock + vendor
+[x] 7.5  `composer require`: add package to composer.json, resolve, install
+[x] 7.6  `composer remove`: remove package from composer.json, re-resolve, uninstall
+[x] 7.7  `composer dump-autoload`: regenerate autoloader without installing
+[x] 7.8  `composer show`: list installed/available packages
+[x] 7.9  `composer validate`: check composer.json for errors and warnings
+[x] 7.10 `composer search`: search Packagist by keyword
+[x] 7.11 `composer create-project`: clone + install a project template
+[x] 7.12 Progress output: download progress bars, operation summaries, timing
+
+## Phase 8: Integration & Polish
+[x] 8.1  End-to-end test: create project, require monolog/monolog, install, verify autoload
+[x] 8.2  End-to-end test: update with conflicts, verify error messages
+[x] 8.3  End-to-end test: path repository with symlinks
+[x] 8.4  Lock file determinism: same input always produces identical composer.lock
+[x] 8.5  Integration with php-rs-sapi-cli: add `composer` subcommand to existing CLI binary
+[x] 8.6  Platform detection: report php-rs version + extensions to PlatformRepository
+[x] 8.7  Auth config: read ~/.composer/auth.json for private repo tokens
+[x] 8.8  Global composer: ~/.composer/vendor for global packages
+[x] 8.9  Scripts support: run composer scripts via php-rs VM
+[x] 8.10 Plugin API: basic plugin loading (Composer plugin compatibility)
