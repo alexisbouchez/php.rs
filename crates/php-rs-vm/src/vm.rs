@@ -218,7 +218,9 @@ pub struct Vm {
     closure_bindings: HashMap<String, Vec<(String, Value)>>,
     /// Open file handles: resource_id → FileHandle.
     file_handles: HashMap<i64, php_rs_ext_standard::file::FileHandle>,
-    /// Next resource ID for file handles.
+    /// Open curl handles: resource_id → CurlHandle.
+    curl_handles: HashMap<i64, php_rs_ext_curl::CurlHandle>,
+    /// Next resource ID for file/curl handles.
     next_resource_id: i64,
     /// Execution limits and security config.
     config: VmConfig,
@@ -268,6 +270,7 @@ impl Vm {
             next_closure_id: 0,
             closure_bindings: HashMap::new(),
             file_handles: HashMap::new(),
+            curl_handles: HashMap::new(),
             next_resource_id: 1,
             config,
             execution_start: None,
@@ -11656,14 +11659,180 @@ impl Vm {
             "ftp_alloc" => Ok(Some(Value::Bool(false))),
 
             // === curl extension (35 functions) ===
-            "curl_init" => Ok(Some(Value::Long(1))),
-            "curl_close" => Ok(Some(Value::Null)),
-            "curl_copy_handle" => Ok(Some(Value::Long(2))),
-            "curl_exec" => Ok(Some(Value::Bool(false))),
-            "curl_getinfo" => Ok(Some(Value::Array(PhpArray::new()))),
-            "curl_setopt" | "curl_setopt_array" => Ok(Some(Value::Bool(true))),
-            "curl_errno" => Ok(Some(Value::Long(0))),
-            "curl_error" => Ok(Some(Value::String(String::new()))),
+            "curl_init" => {
+                let url = args.first().and_then(|v| match v {
+                    Value::Null => None,
+                    _ => Some(v.to_php_string()),
+                });
+                let handle = php_rs_ext_curl::curl_init(url.as_deref());
+                let id = self.next_resource_id;
+                self.next_resource_id += 1;
+                self.curl_handles.insert(id, handle);
+                Ok(Some(Value::Long(id)))
+            }
+            "curl_close" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                if let Some(handle) = self.curl_handles.get_mut(&id) {
+                    php_rs_ext_curl::curl_close(handle);
+                }
+                self.curl_handles.remove(&id);
+                Ok(Some(Value::Null))
+            }
+            "curl_copy_handle" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                if let Some(handle) = self.curl_handles.get(&id) {
+                    let cloned = handle.clone();
+                    let new_id = self.next_resource_id;
+                    self.next_resource_id += 1;
+                    self.curl_handles.insert(new_id, cloned);
+                    Ok(Some(Value::Long(new_id)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "curl_exec" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                if let Some(handle) = self.curl_handles.get_mut(&id) {
+                    match php_rs_ext_curl::curl_exec(handle) {
+                        php_rs_ext_curl::CurlResult::Body(body) => Ok(Some(Value::String(body))),
+                        php_rs_ext_curl::CurlResult::Bool(b) => {
+                            // When not returning transfer, output body directly
+                            if b {
+                                self.output.push_str(&handle.response_body);
+                            }
+                            Ok(Some(Value::Bool(b)))
+                        }
+                        php_rs_ext_curl::CurlResult::Error(_) => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "curl_getinfo" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                if let Some(handle) = self.curl_handles.get(&id) {
+                    let opt_val = match args.get(1) {
+                        Some(Value::String(s)) => php_rs_ext_curl::constants::from_name(s)
+                            .or_else(|| s.parse::<u32>().ok())
+                            .map(|v| v as i64),
+                        Some(v) => Some(v.to_long()),
+                        None => None,
+                    };
+                    if let Some(opt_const) = opt_val {
+                        // Specific info option requested
+                        if let Some(opt) =
+                            php_rs_ext_curl::CurlInfoOpt::from_constant(opt_const as u32)
+                        {
+                            let info = php_rs_ext_curl::curl_getinfo(handle, opt);
+                            Ok(Some(match info {
+                                php_rs_ext_curl::CurlValue::Long(v) => Value::Long(v),
+                                php_rs_ext_curl::CurlValue::Double(v) => Value::Double(v),
+                                php_rs_ext_curl::CurlValue::Str(v) => Value::String(v),
+                                php_rs_ext_curl::CurlValue::Bool(v) => Value::Bool(v),
+                                php_rs_ext_curl::CurlValue::Null => Value::Null,
+                                php_rs_ext_curl::CurlValue::Array(_) => Value::Null,
+                            }))
+                        } else {
+                            Ok(Some(Value::Bool(false)))
+                        }
+                    } else {
+                        // Return full info array
+                        let mut arr = PhpArray::new();
+                        arr.set_string(
+                            "url".into(),
+                            Value::String(handle.url.clone().unwrap_or_default()),
+                        );
+                        arr.set_string(
+                            "http_code".into(),
+                            Value::Long(handle.response_code as i64),
+                        );
+                        arr.set_string("total_time".into(), Value::Double(handle.total_time));
+                        arr.set_string(
+                            "content_type".into(),
+                            match &handle.content_type {
+                                Some(ct) => Value::String(ct.clone()),
+                                None => Value::Null,
+                            },
+                        );
+                        Ok(Some(Value::Array(arr)))
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "curl_setopt" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                // Handle both numeric and string constant names (e.g. CURLOPT_RETURNTRANSFER)
+                let opt_const = match args.get(1) {
+                    Some(Value::String(s)) => php_rs_ext_curl::constants::from_name(s)
+                        .unwrap_or_else(|| s.parse::<u32>().unwrap_or(0)),
+                    Some(v) => v.to_long() as u32,
+                    None => 0,
+                };
+                let value = args.get(2).cloned().unwrap_or(Value::Null);
+                if let Some(handle) = self.curl_handles.get_mut(&id) {
+                    if let Some(opt) = php_rs_ext_curl::CurlOpt::from_constant(opt_const) {
+                        let curl_value = value_to_curl_value(&value);
+                        Ok(Some(Value::Bool(php_rs_ext_curl::curl_setopt(
+                            handle, opt, curl_value,
+                        ))))
+                    } else {
+                        Ok(Some(Value::Bool(true)))
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "curl_setopt_array" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                let opts = args.get(1).cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref arr) = opts {
+                    if let Some(handle) = self.curl_handles.get_mut(&id) {
+                        for entry in arr.entries() {
+                            let opt_const = match &entry.0 {
+                                ArrayKey::Int(i) => *i as u32,
+                                ArrayKey::String(s) => php_rs_ext_curl::constants::from_name(s)
+                                    .unwrap_or_else(|| s.parse::<u32>().unwrap_or(0)),
+                            };
+                            if let Some(opt) = php_rs_ext_curl::CurlOpt::from_constant(opt_const) {
+                                let curl_value = value_to_curl_value(&entry.1);
+                                php_rs_ext_curl::curl_setopt(handle, opt, curl_value);
+                            }
+                        }
+                        Ok(Some(Value::Bool(true)))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "curl_errno" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                if let Some(handle) = self.curl_handles.get(&id) {
+                    Ok(Some(
+                        Value::Long(php_rs_ext_curl::curl_errno(handle) as i64),
+                    ))
+                } else {
+                    Ok(Some(Value::Long(0)))
+                }
+            }
+            "curl_error" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                if let Some(handle) = self.curl_handles.get(&id) {
+                    Ok(Some(Value::String(php_rs_ext_curl::curl_error(handle))))
+                } else {
+                    Ok(Some(Value::String(String::new())))
+                }
+            }
+            "curl_reset" => {
+                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                if self.curl_handles.contains_key(&id) {
+                    self.curl_handles
+                        .insert(id, php_rs_ext_curl::curl_init(None));
+                }
+                Ok(Some(Value::Null))
+            }
             "curl_escape" => {
                 let s = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(
@@ -11689,7 +11858,6 @@ impl Vm {
             "curl_multi_strerror" => Ok(Some(Value::Null)),
             "curl_multi_get_handles" => Ok(Some(Value::Array(PhpArray::new()))),
             "curl_pause" => Ok(Some(Value::Long(0))),
-            "curl_reset" => Ok(Some(Value::Null)),
             "curl_share_close" => Ok(Some(Value::Null)),
             "curl_share_errno" => Ok(Some(Value::Long(0))),
             "curl_share_init" => Ok(Some(Value::Long(1))),
@@ -13627,6 +13795,25 @@ fn parse_relative_time(s: &str, base: i64) -> Option<i64> {
     }
 
     None
+}
+
+/// Convert a VM Value to a curl CurlValue for use with curl_setopt.
+fn value_to_curl_value(value: &Value) -> php_rs_ext_curl::CurlValue {
+    match value {
+        Value::Bool(b) => php_rs_ext_curl::CurlValue::Bool(*b),
+        Value::Long(l) => php_rs_ext_curl::CurlValue::Long(*l),
+        Value::String(s) => php_rs_ext_curl::CurlValue::Str(s.clone()),
+        Value::Double(d) => php_rs_ext_curl::CurlValue::Long(*d as i64),
+        Value::Array(arr) => {
+            let strings: Vec<String> = arr
+                .entries()
+                .iter()
+                .map(|entry| entry.1.to_php_string())
+                .collect();
+            php_rs_ext_curl::CurlValue::Array(strings)
+        }
+        _ => php_rs_ext_curl::CurlValue::Null,
+    }
 }
 
 #[cfg(test)]

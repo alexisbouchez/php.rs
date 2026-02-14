@@ -113,4 +113,5 @@ areas for deepening correctness:
     real DEFLATE compression. All roundtrip correctly. zlib_encode/zlib_decode
     also wired up.
 
-10. NETWORK — curl_exec is a stub. Real HTTP would need reqwest or similar.
+10. NETWORK — curl_exec uses real HTTP via ureq. curl_init/setopt/exec/getinfo/errno/error/close
+    all work end-to-end with real networking. [DONE]

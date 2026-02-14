@@ -1,8 +1,9 @@
 //! PHP curl extension implementation for php.rs
 //!
 //! Provides the curl_* family of functions for HTTP client operations.
-//! This is a pure Rust implementation that stubs network calls while
-//! implementing the full API surface for compatibility.
+//! Uses ureq for real HTTP networking.
+
+use std::time::{Duration, Instant};
 
 /// Common CURLOPT_* option constants matching PHP's values.
 pub mod constants {
@@ -33,6 +34,38 @@ pub mod constants {
     pub const CURLE_COULDNT_CONNECT: u32 = 7;
     pub const CURLE_OPERATION_TIMEDOUT: u32 = 28;
     pub const CURLE_SSL_CONNECT_ERROR: u32 = 35;
+
+    /// Resolve a PHP CURL constant name to its numeric value.
+    pub fn from_name(name: &str) -> Option<u32> {
+        match name {
+            "CURLOPT_URL" => Some(CURLOPT_URL),
+            "CURLOPT_RETURNTRANSFER" => Some(CURLOPT_RETURNTRANSFER),
+            "CURLOPT_POST" => Some(CURLOPT_POST),
+            "CURLOPT_POSTFIELDS" => Some(CURLOPT_POSTFIELDS),
+            "CURLOPT_HTTPHEADER" => Some(CURLOPT_HTTPHEADER),
+            "CURLOPT_TIMEOUT" => Some(CURLOPT_TIMEOUT),
+            "CURLOPT_FOLLOWLOCATION" => Some(CURLOPT_FOLLOWLOCATION),
+            "CURLOPT_SSL_VERIFYPEER" => Some(CURLOPT_SSL_VERIFYPEER),
+            "CURLOPT_USERAGENT" => Some(CURLOPT_USERAGENT),
+            "CURLOPT_CUSTOMREQUEST" => Some(CURLOPT_CUSTOMREQUEST),
+            "CURLOPT_CONNECTTIMEOUT" => Some(CURLOPT_CONNECTTIMEOUT),
+            "CURLOPT_HEADER" => Some(CURLOPT_HEADER),
+            "CURLOPT_NOBODY" => Some(CURLOPT_NOBODY),
+            "CURLINFO_HTTP_CODE" | "CURLINFO_RESPONSE_CODE" => Some(CURLINFO_HTTP_CODE),
+            "CURLINFO_TOTAL_TIME" => Some(CURLINFO_TOTAL_TIME),
+            "CURLINFO_CONTENT_TYPE" => Some(CURLINFO_CONTENT_TYPE),
+            "CURLINFO_EFFECTIVE_URL" => Some(CURLINFO_EFFECTIVE_URL),
+            "CURLINFO_HEADER_SIZE" => Some(CURLINFO_HEADER_SIZE),
+            "CURLE_OK" => Some(CURLE_OK),
+            "CURLE_UNSUPPORTED_PROTOCOL" => Some(CURLE_UNSUPPORTED_PROTOCOL),
+            "CURLE_URL_MALFORMAT" => Some(CURLE_URL_MALFORMAT),
+            "CURLE_COULDNT_RESOLVE_HOST" => Some(CURLE_COULDNT_RESOLVE_HOST),
+            "CURLE_COULDNT_CONNECT" => Some(CURLE_COULDNT_CONNECT),
+            "CURLE_OPERATION_TIMEDOUT" => Some(CURLE_OPERATION_TIMEDOUT),
+            "CURLE_SSL_CONNECT_ERROR" => Some(CURLE_SSL_CONNECT_ERROR),
+            _ => None,
+        }
+    }
 }
 
 /// Options that can be set on a curl handle via curl_setopt.
@@ -314,12 +347,9 @@ pub fn curl_setopt(handle: &mut CurlHandle, option: CurlOpt, value: CurlValue) -
     }
 }
 
-/// Execute the curl transfer.
+/// Execute the curl transfer using real HTTP via ureq.
 ///
 /// Equivalent to PHP's `curl_exec(CurlHandle $handle): string|bool`.
-///
-/// Currently a stub: validates the URL and returns a simulated response.
-/// Real HTTP networking will be added when an HTTP client dependency is introduced.
 pub fn curl_exec(handle: &mut CurlHandle) -> CurlResult {
     // Validate URL is set
     let url = match &handle.url {
@@ -331,27 +361,134 @@ pub fn curl_exec(handle: &mut CurlHandle) -> CurlResult {
         }
     };
 
-    // Basic URL validation
-    if !url.starts_with("http://") && !url.starts_with("https://") && !url.starts_with("ftp://") {
+    // Only http:// and https:// are supported
+    if !url.starts_with("http://") && !url.starts_with("https://") {
         handle.error_no = constants::CURLE_UNSUPPORTED_PROTOCOL;
         handle.error = Some(format!("Protocol not supported: {}", url));
         return CurlResult::Error(format!("Protocol not supported: {}", url));
     }
 
-    // Stub: simulate a successful response
-    // In a real implementation, this would perform the HTTP request.
-    handle.response_code = 200;
-    handle.response_body = String::new();
-    handle.response_headers = vec![("Content-Type".to_string(), "text/html".to_string())];
-    handle.content_type = Some("text/html".to_string());
-    handle.total_time = 0.001;
-    handle.error = None;
-    handle.error_no = constants::CURLE_OK;
+    let start = Instant::now();
 
-    if handle.return_transfer {
-        CurlResult::Body(handle.response_body.clone())
+    // Build agent with configured timeouts and redirect policy
+    let mut config_builder = ureq::Agent::config_builder();
+    config_builder = config_builder.http_status_as_error(false);
+
+    if handle.timeout > 0 {
+        config_builder = config_builder.timeout_global(Some(Duration::from_secs(handle.timeout)));
+    }
+    if handle.connect_timeout > 0 {
+        config_builder =
+            config_builder.timeout_connect(Some(Duration::from_secs(handle.connect_timeout)));
+    }
+    if handle.follow_redirects {
+        config_builder = config_builder.max_redirects(10);
     } else {
-        CurlResult::Bool(true)
+        config_builder = config_builder.max_redirects(0);
+    }
+
+    let agent: ureq::Agent = config_builder.build().into();
+
+    // CURLOPT_NOBODY forces HEAD method
+    let method = if handle.nobody {
+        "HEAD"
+    } else {
+        handle.method.as_str()
+    };
+
+    // Build request, apply headers, and execute.
+    // POST/PUT/PATCH use .send() (supports body), others use .call().
+    let response_result = match method {
+        "POST" | "PUT" | "PATCH" => {
+            let mut req = match method {
+                "PUT" => agent.put(&url),
+                "PATCH" => agent.patch(&url),
+                _ => agent.post(&url),
+            };
+            if let Some(ref ua) = handle.user_agent {
+                req = req.header("User-Agent", ua.as_str());
+            }
+            for (name, value) in &handle.headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+            let body = handle.post_fields.as_deref().unwrap_or("");
+            req.send(body.as_bytes())
+        }
+        _ => {
+            let mut req = match method {
+                "HEAD" => agent.head(&url),
+                "DELETE" => agent.delete(&url),
+                "OPTIONS" => agent.options(&url),
+                _ => agent.get(&url),
+            };
+            if let Some(ref ua) = handle.user_agent {
+                req = req.header("User-Agent", ua.as_str());
+            }
+            for (name, value) in &handle.headers {
+                req = req.header(name.as_str(), value.as_str());
+            }
+            req.call()
+        }
+    };
+
+    match response_result {
+        Ok(mut response) => {
+            handle.response_code = response.status().as_u16();
+            handle.content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+
+            handle.response_headers.clear();
+
+            if handle.nobody {
+                handle.response_body = String::new();
+            } else {
+                handle.response_body = response.body_mut().read_to_string().unwrap_or_default();
+            }
+
+            handle.error = None;
+            handle.error_no = constants::CURLE_OK;
+            handle.total_time = start.elapsed().as_secs_f64();
+
+            if handle.return_transfer {
+                CurlResult::Body(handle.response_body.clone())
+            } else {
+                CurlResult::Bool(true)
+            }
+        }
+        Err(e) => {
+            handle.total_time = start.elapsed().as_secs_f64();
+            let (error_no, error_msg) = map_ureq_error(&e);
+            handle.error_no = error_no;
+            handle.error = Some(error_msg.clone());
+            handle.response_code = 0;
+            CurlResult::Error(error_msg)
+        }
+    }
+}
+
+/// Map ureq errors to CURLE_* error codes.
+fn map_ureq_error(e: &ureq::Error) -> (u32, String) {
+    match e {
+        ureq::Error::HostNotFound => (
+            constants::CURLE_COULDNT_RESOLVE_HOST,
+            format!("Could not resolve host: {}", e),
+        ),
+        ureq::Error::ConnectionFailed => (
+            constants::CURLE_COULDNT_CONNECT,
+            format!("Failed to connect: {}", e),
+        ),
+        ureq::Error::Timeout(_) => (
+            constants::CURLE_OPERATION_TIMEDOUT,
+            "Operation timed out".to_string(),
+        ),
+        ureq::Error::BadUri(_) => (
+            constants::CURLE_URL_MALFORMAT,
+            format!("URL malformed: {}", e),
+        ),
+        _ => (constants::CURLE_COULDNT_CONNECT, format!("{}", e)),
     }
 }
 
@@ -633,7 +770,35 @@ mod tests {
     }
 
     #[test]
-    fn test_curl_exec_returns_bool_by_default() {
+    fn test_curl_exec_ftp_not_supported() {
+        let mut handle = curl_init(Some("ftp://example.com"));
+        let result = curl_exec(&mut handle);
+        assert!(matches!(result, CurlResult::Error(_)));
+        assert_eq!(handle.error_no, constants::CURLE_UNSUPPORTED_PROTOCOL);
+    }
+
+    #[test]
+    fn test_curl_exec_dns_failure() {
+        let mut handle = curl_init(Some("http://this-domain-does-not-exist.invalid"));
+        let result = curl_exec(&mut handle);
+        assert!(matches!(result, CurlResult::Error(_)));
+        assert_ne!(handle.error_no, constants::CURLE_OK);
+        assert_eq!(handle.response_code, 0);
+        assert!(handle.total_time >= 0.0);
+    }
+
+    #[test]
+    fn test_curl_exec_connection_refused() {
+        let mut handle = curl_init(Some("http://127.0.0.1:1"));
+        curl_setopt(&mut handle, CurlOpt::Timeout, CurlValue::Long(2));
+        let result = curl_exec(&mut handle);
+        assert!(matches!(result, CurlResult::Error(_)));
+        assert_ne!(handle.error_no, constants::CURLE_OK);
+    }
+
+    #[test]
+    #[ignore] // requires network access
+    fn test_curl_exec_real_http_get() {
         let mut handle = curl_init(Some("http://example.com"));
         let result = curl_exec(&mut handle);
         assert_eq!(result, CurlResult::Bool(true));
@@ -641,47 +806,41 @@ mod tests {
     }
 
     #[test]
-    fn test_curl_exec_returns_body_with_return_transfer() {
+    #[ignore] // requires network access
+    fn test_curl_exec_real_http_return_transfer() {
         let mut handle = curl_init(Some("http://example.com"));
         curl_setopt(&mut handle, CurlOpt::ReturnTransfer, CurlValue::Bool(true));
         let result = curl_exec(&mut handle);
-        assert!(matches!(result, CurlResult::Body(_)));
-    }
-
-    #[test]
-    fn test_curl_getinfo_http_code() {
-        let mut handle = curl_init(Some("http://example.com"));
-        curl_exec(&mut handle);
-        let info = curl_getinfo(&handle, CurlInfoOpt::HttpCode);
-        assert_eq!(info, CurlValue::Long(200));
-    }
-
-    #[test]
-    fn test_curl_getinfo_total_time() {
-        let mut handle = curl_init(Some("http://example.com"));
-        curl_exec(&mut handle);
-        let info = curl_getinfo(&handle, CurlInfoOpt::TotalTime);
-        if let CurlValue::Double(t) = info {
-            assert!(t >= 0.0);
+        if let CurlResult::Body(body) = result {
+            assert!(!body.is_empty());
         } else {
-            panic!("Expected Double value");
+            panic!("Expected Body result");
         }
-    }
-
-    #[test]
-    fn test_curl_getinfo_content_type() {
-        let mut handle = curl_init(Some("http://example.com"));
-        curl_exec(&mut handle);
-        let info = curl_getinfo(&handle, CurlInfoOpt::ContentType);
-        assert_eq!(info, CurlValue::Str("text/html".to_string()));
+        assert_eq!(handle.response_code, 200);
     }
 
     #[test]
     fn test_curl_getinfo_effective_url() {
-        let mut handle = curl_init(Some("http://example.com"));
-        curl_exec(&mut handle);
+        let handle = curl_init(Some("http://example.com"));
         let info = curl_getinfo(&handle, CurlInfoOpt::EffectiveUrl);
         assert_eq!(info, CurlValue::Str("http://example.com".to_string()));
+    }
+
+    #[test]
+    fn test_curl_getinfo_defaults() {
+        let handle = curl_init(Some("http://example.com"));
+        assert_eq!(
+            curl_getinfo(&handle, CurlInfoOpt::HttpCode),
+            CurlValue::Long(0)
+        );
+        assert_eq!(
+            curl_getinfo(&handle, CurlInfoOpt::TotalTime),
+            CurlValue::Double(0.0)
+        );
+        assert_eq!(
+            curl_getinfo(&handle, CurlInfoOpt::ContentType),
+            CurlValue::Null
+        );
     }
 
     #[test]
@@ -707,7 +866,6 @@ mod tests {
             CurlOpt::UserAgent,
             CurlValue::Str("test".to_string()),
         );
-        curl_exec(&mut handle);
         curl_close(&mut handle);
         assert!(handle.url.is_none());
         assert!(handle.headers.is_empty());
@@ -787,21 +945,16 @@ mod tests {
     }
 
     #[test]
-    fn test_curl_multi_exec() {
+    fn test_curl_multi_exec_error_handling() {
         let mut multi = CurlMulti::new();
 
-        let mut h1 = curl_init(Some("http://example.com/1"));
+        let mut h1 = curl_init(Some("http://this-domain-does-not-exist.invalid/1"));
         curl_setopt(&mut h1, CurlOpt::ReturnTransfer, CurlValue::Bool(true));
         multi.add_handle(h1);
 
-        let mut h2 = curl_init(Some("http://example.com/2"));
-        curl_setopt(&mut h2, CurlOpt::ReturnTransfer, CurlValue::Bool(true));
-        multi.add_handle(h2);
-
         let results = multi.exec();
-        assert_eq!(results.len(), 2);
-        assert!(matches!(results[0], CurlResult::Body(_)));
-        assert!(matches!(results[1], CurlResult::Body(_)));
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], CurlResult::Error(_)));
     }
 
     #[test]
@@ -811,8 +964,8 @@ mod tests {
     }
 
     #[test]
-    fn test_full_workflow() {
-        // Simulate a typical curl workflow
+    fn test_full_workflow_setup() {
+        // Test the full curl workflow setup (options, not execution)
         let mut handle = curl_init(Some("https://api.example.com/data"));
         curl_setopt(&mut handle, CurlOpt::ReturnTransfer, CurlValue::Bool(true));
         curl_setopt(&mut handle, CurlOpt::Post, CurlValue::Bool(true));
@@ -832,14 +985,29 @@ mod tests {
         assert_eq!(handle.method, "POST");
         assert_eq!(handle.timeout, 30);
         assert!(!handle.ssl_verify_peer);
+        assert!(handle.return_transfer);
+        assert_eq!(handle.post_fields, Some("{\"key\":\"value\"}".to_string()));
+        assert_eq!(handle.headers.len(), 1);
+
+        curl_close(&mut handle);
+    }
+
+    #[test]
+    #[ignore] // requires network access
+    fn test_full_workflow_real_http() {
+        let mut handle = curl_init(Some("https://httpbin.org/post"));
+        curl_setopt(&mut handle, CurlOpt::ReturnTransfer, CurlValue::Bool(true));
+        curl_setopt(
+            &mut handle,
+            CurlOpt::PostFields,
+            CurlValue::Str("key=value".to_string()),
+        );
+        curl_setopt(&mut handle, CurlOpt::Timeout, CurlValue::Long(10));
 
         let result = curl_exec(&mut handle);
         assert!(matches!(result, CurlResult::Body(_)));
         assert_eq!(curl_errno(&handle), constants::CURLE_OK);
-        assert_eq!(curl_error(&handle), "");
-
-        let code = curl_getinfo(&handle, CurlInfoOpt::HttpCode);
-        assert_eq!(code, CurlValue::Long(200));
+        assert_eq!(handle.response_code, 200);
 
         curl_close(&mut handle);
     }

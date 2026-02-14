@@ -7,5 +7,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ureq = "3"
 
 [dev-dependencies]
