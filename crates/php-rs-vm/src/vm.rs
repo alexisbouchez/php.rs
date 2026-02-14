@@ -641,19 +641,9 @@ impl Vm {
                     let ret_val = frame.return_value;
                     self.last_return_value = ret_val.clone();
 
-                    // Write modified $this back to caller (PHP object reference semantics)
-                    if let Some((dest_type, dest_slot)) = frame.this_write_back {
-                        let oa = &self.op_arrays[frame.op_array_idx];
-                        let this_idx = oa.vars.iter().position(|v| v == "this").unwrap_or(0);
-                        let this_val = if this_idx < frame.cvs.len() {
-                            frame.cvs[this_idx].clone()
-                        } else {
-                            Value::Null
-                        };
-                        if let Some(caller) = self.call_stack.last_mut() {
-                            Self::write_to_slot(caller, dest_type, dest_slot, this_val);
-                        }
-                    }
+                    // Note: this_write_back is no longer needed because PhpObject
+                    // uses Rc<RefCell<>> — mutations through $this are automatically
+                    // visible to all references.
 
                     // Store return value in caller's result slot if specified
                     if let Some((ret_type, ret_slot)) = frame.return_dest {
@@ -813,7 +803,16 @@ impl Vm {
                 let rhs = self.read_operand(op, 2, oa_idx)?;
                 let frame = self.call_stack.last_mut().unwrap();
                 let lhs = frame.cvs[cv_idx].clone();
-                let result = apply_assign_op(op.extended_value, &lhs, &rhs);
+                // Handle ??= (Coalesce = 169) specially
+                let result = if op.extended_value == ZOpcode::Coalesce as u8 as u32 {
+                    if matches!(lhs, Value::Null) {
+                        rhs
+                    } else {
+                        lhs
+                    }
+                } else {
+                    apply_assign_op(op.extended_value, &lhs, &rhs)
+                };
                 frame.cvs[cv_idx] = result.clone();
                 if op.result_type != OperandType::Unused {
                     self.write_result(op, oa_idx, result)?;
@@ -1049,8 +1048,8 @@ impl Vm {
                         self.write_result(op, oa_idx, iter)?;
                         Ok(DispatchSignal::Next)
                     }
-                    Value::Object(o) if o.internal == crate::value::InternalState::Generator => {
-                        let obj_id = o.object_id;
+                    Value::Object(o) if o.internal() == crate::value::InternalState::Generator => {
+                        let obj_id = o.object_id();
                         // Initialize the generator
                         self.ensure_generator_initialized(obj_id)?;
                         let iter = Value::_GeneratorIterator {
@@ -1535,6 +1534,40 @@ impl Vm {
                 self.handle_fetch_static_prop(op, oa_idx)?;
                 Ok(DispatchSignal::Next)
             }
+            ZOpcode::AssignStaticProp => {
+                // Write to a class property/constant
+                // op1 = class name, op2 = prop/const name, OP_DATA follows with value
+                // extended_value: 0 = static property, 1 = instance property default, 2 = class constant
+                let raw_class = self.read_operand(op, 1, oa_idx)?.to_php_string();
+                let class_name = self.resolve_class_name(&raw_class);
+                let name = self.read_operand(op, 2, oa_idx)?.to_php_string();
+                // OP_DATA is the next opcode with the value in op1
+                let frame = self.call_stack.last_mut().unwrap();
+                let next_ip = frame.ip + 1;
+                let data_op = self.op_arrays[oa_idx].opcodes[next_ip].clone();
+                frame.ip += 1; // Skip OP_DATA
+                let val = self.read_operand(&data_op, 1, oa_idx)?;
+                if let Some(class_def) = self.classes.get_mut(&class_name) {
+                    match op.extended_value {
+                        1 => {
+                            // Instance property default
+                            class_def.default_properties.insert(name, val.clone());
+                        }
+                        2 => {
+                            // Class constant
+                            class_def.class_constants.insert(name, val.clone());
+                        }
+                        _ => {
+                            // Static property (0 or any other)
+                            class_def.static_properties.insert(name, val.clone());
+                        }
+                    }
+                }
+                if op.result_type != OperandType::Unused {
+                    self.write_result(op, oa_idx, val)?;
+                }
+                Ok(DispatchSignal::Next)
+            }
 
             // =====================================================================
             // Exception handling
@@ -1648,6 +1681,63 @@ impl Vm {
         None
     }
 
+    /// Resolve "self", "parent", "static" to the actual class name.
+    /// Returns the original name if not a special keyword or can't be resolved.
+    fn resolve_class_name(&self, name: &str) -> String {
+        match name {
+            "self" | "static" => {
+                // Find the class from the currently executing method name
+                if let Some(frame) = self.call_stack.last() {
+                    let oa = &self.op_arrays[frame.op_array_idx];
+                    if let Some(ref func_name) = oa.function_name {
+                        if let Some(class) = func_name.split("::").next() {
+                            return class.to_string();
+                        }
+                    }
+                }
+                name.to_string()
+            }
+            "parent" => {
+                // Find the parent of the currently executing class
+                if let Some(frame) = self.call_stack.last() {
+                    let oa = &self.op_arrays[frame.op_array_idx];
+                    if let Some(ref func_name) = oa.function_name {
+                        if let Some(class) = func_name.split("::").next() {
+                            if let Some(class_def) = self.classes.get(class) {
+                                if let Some(ref parent) = class_def.parent {
+                                    return parent.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+                name.to_string()
+            }
+            _ => name.to_string(),
+        }
+    }
+
+    /// Resolve a method by walking the parent chain.
+    /// Returns the op_array index if found.
+    fn resolve_method(&self, class_name: &str, method_name: &str) -> Option<usize> {
+        let mut current = class_name.to_string();
+        loop {
+            let full_name = format!("{}::{}", current, method_name);
+            if let Some(&oa_idx) = self.functions.get(&full_name) {
+                return Some(oa_idx);
+            }
+            // Walk to parent
+            if let Some(class_def) = self.classes.get(&current) {
+                if let Some(ref parent) = class_def.parent {
+                    current = parent.clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        None
+    }
+
     /// Handle DECLARE_CLASS — register a class in the class table.
     fn handle_declare_class(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let name = self.read_operand(op, 1, oa_idx)?.to_php_string();
@@ -1699,6 +1789,77 @@ impl Vm {
                 }
             }
         }
+
+        // Read class metadata (properties and constants) from the op_array
+        if let Some(metadata) = self.op_arrays[oa_idx].class_metadata.get(&name).cloned() {
+            for prop_info in &metadata.properties {
+                let default_val = match &prop_info.default {
+                    Some(Literal::String(s)) if s == "__EMPTY_ARRAY__" => {
+                        Value::Array(PhpArray::new())
+                    }
+                    Some(Literal::Null) => Value::Null,
+                    Some(Literal::Bool(b)) => Value::Bool(*b),
+                    Some(Literal::Long(n)) => Value::Long(*n),
+                    Some(Literal::Double(f)) => Value::Double(*f),
+                    Some(Literal::String(s)) => Value::String(s.clone()),
+                    None => Value::Null,
+                };
+                if prop_info.is_static {
+                    class_def.static_properties.insert(prop_info.name.clone(), default_val);
+                } else {
+                    class_def.default_properties.insert(prop_info.name.clone(), default_val);
+                }
+            }
+            for (const_name, lit) in &metadata.constants {
+                let val = match lit {
+                    Literal::Null => Value::Null,
+                    Literal::Bool(b) => Value::Bool(*b),
+                    Literal::Long(n) => Value::Long(*n),
+                    Literal::Double(f) => Value::Double(*f),
+                    Literal::String(s) if s == "__EMPTY_ARRAY__" => {
+                        Value::Array(PhpArray::new())
+                    }
+                    Literal::String(s) => Value::String(s.clone()),
+                };
+                class_def.class_constants.insert(const_name.clone(), val);
+            }
+        }
+
+        // Inherit from parent class (methods, constants, properties)
+        if let Some(ref parent_name) = class_def.parent.clone() {
+            if let Some(parent_def) = self.classes.get(parent_name).cloned() {
+                // Copy parent methods that aren't overridden
+                for (method_name, &oa_idx) in &parent_def.methods {
+                    if !class_def.methods.contains_key(method_name) {
+                        class_def.methods.insert(method_name.clone(), oa_idx);
+                        // Also register in global functions table
+                        let full_name = format!("{}::{}", name, method_name);
+                        self.functions.insert(full_name, oa_idx);
+                    }
+                }
+                // Copy parent constants that aren't overridden
+                for (const_name, val) in &parent_def.class_constants {
+                    if !class_def.class_constants.contains_key(const_name) {
+                        class_def.class_constants.insert(const_name.clone(), val.clone());
+                    }
+                }
+                // Copy parent default properties that aren't overridden
+                for (prop_name, val) in &parent_def.default_properties {
+                    if !class_def.default_properties.contains_key(prop_name) {
+                        class_def.default_properties.insert(prop_name.clone(), val.clone());
+                    }
+                }
+                // Copy parent static properties that aren't overridden
+                for (prop_name, val) in &parent_def.static_properties {
+                    if !class_def.static_properties.contains_key(prop_name) {
+                        class_def.static_properties.insert(prop_name.clone(), val.clone());
+                    }
+                }
+            }
+        }
+
+        // Add `class` pseudo-constant (ClassName::class)
+        class_def.class_constants.insert("class".to_string(), Value::String(name.clone()));
 
         self.classes.insert(name, class_def);
         Ok(())
@@ -1797,16 +1958,18 @@ impl Vm {
     fn handle_new(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let raw_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
         // Strip leading backslash from fully-qualified class names
-        let class_name = raw_name.strip_prefix('\\').unwrap_or(&raw_name).to_string();
+        let stripped = raw_name.strip_prefix('\\').unwrap_or(&raw_name).to_string();
+        // Resolve self/parent/static
+        let class_name = self.resolve_class_name(&stripped);
 
         // Special handling for Fiber
         if class_name == "Fiber" {
-            let mut obj = PhpObject::new("Fiber".to_string());
-            obj.object_id = self.next_object_id;
+            let obj = PhpObject::new("Fiber".to_string());
+            obj.set_object_id(self.next_object_id);
             self.next_object_id += 1;
-            obj.internal = crate::value::InternalState::Fiber;
+            obj.set_internal(crate::value::InternalState::Fiber);
 
-            let obj_id = obj.object_id;
+            let obj_id = obj.object_id();
             let obj_val = Value::Object(obj);
             self.write_result(op, oa_idx, obj_val)?;
 
@@ -1857,14 +2020,14 @@ impl Vm {
             self.try_autoload_class(&class_name);
         }
 
-        let mut obj = PhpObject::new(class_name.clone());
-        obj.object_id = self.next_object_id;
+        let obj = PhpObject::new(class_name.clone());
+        obj.set_object_id(self.next_object_id);
         self.next_object_id += 1;
 
         // Copy default properties from class definition
         if let Some(class_def) = self.classes.get(&class_name) {
             for (prop, val) in &class_def.default_properties {
-                obj.properties.insert(prop.clone(), val.clone());
+                obj.set_property(prop.clone(), val.clone());
             }
         }
 
@@ -1919,7 +2082,7 @@ impl Vm {
         let prop_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
 
         let val = match obj {
-            Value::Object(ref o) => o.get_property(&prop_name).cloned().unwrap_or(Value::Null),
+            Value::Object(ref o) => o.get_property(&prop_name).unwrap_or(Value::Null),
             _ => Value::Null,
         };
         self.write_result(op, oa_idx, val)?;
@@ -1945,8 +2108,8 @@ impl Vm {
             Value::Null
         };
 
-        let frame = self.call_stack.last_mut().unwrap();
-        if let Value::Object(ref mut obj) = frame.cvs[obj_cv] {
+        let frame = self.call_stack.last().unwrap();
+        if let Value::Object(ref obj) = frame.cvs[obj_cv] {
             obj.set_property(prop_name, val);
         }
 
@@ -1961,7 +2124,7 @@ impl Vm {
         let method_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
 
         let class_name = match &obj {
-            Value::Object(o) => o.class_name.clone(),
+            Value::Object(o) => o.class_name(),
             _ => {
                 return Err(VmError::TypeError(
                     "Call to a member function on a non-object".to_string(),
@@ -1984,7 +2147,8 @@ impl Vm {
     /// Handle INIT_STATIC_METHOD_CALL — prepare to call Class::method().
     fn handle_init_static_method_call(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let raw = self.read_operand(op, 1, oa_idx)?.to_php_string();
-        let class_name = raw.strip_prefix('\\').unwrap_or(&raw).to_string();
+        let raw = raw.strip_prefix('\\').unwrap_or(&raw).to_string();
+        let class_name = self.resolve_class_name(&raw);
         let method_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
 
         // Try autoloading if the class isn't found
@@ -2005,7 +2169,8 @@ impl Vm {
     /// Handle FETCH_CLASS_CONSTANT — read Class::CONST.
     fn handle_fetch_class_constant(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let raw = self.read_operand(op, 1, oa_idx)?.to_php_string();
-        let class_name = raw.strip_prefix('\\').unwrap_or(&raw).to_string();
+        let raw = raw.strip_prefix('\\').unwrap_or(&raw).to_string();
+        let class_name = self.resolve_class_name(&raw);
         let const_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
 
         // Try autoloading if the class isn't found
@@ -2031,7 +2196,7 @@ impl Vm {
 
         let result = match obj {
             Value::Object(ref o) => {
-                o.class_name == class_name || self.is_subclass(&o.class_name, &class_name)
+                o.class_name() == class_name || self.is_subclass(&o.class_name(), &class_name)
             }
             _ => false,
         };
@@ -2095,7 +2260,7 @@ impl Vm {
     /// Used for internal callbacks like JsonSerializable::jsonSerialize().
     fn call_method_sync(&mut self, obj: &Value, method_name: &str) -> VmResult<Value> {
         let class_name = match obj {
-            Value::Object(ref o) => o.class_name.clone(),
+            Value::Object(ref o) => o.class_name(),
             _ => return Err(VmError::TypeError("Not an object".to_string())),
         };
         let method_key = format!("{}::{}", class_name, method_name);
@@ -2172,14 +2337,28 @@ impl Vm {
     /// Handle FETCH_STATIC_PROP_* — read/write static properties.
     fn handle_fetch_static_prop(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let prop_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
-        let class_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
+        let raw_class = self.read_operand(op, 2, oa_idx)?.to_php_string();
+        let class_name = self.resolve_class_name(&raw_class);
 
-        let val = self
-            .classes
-            .get(&class_name)
-            .and_then(|c| c.static_properties.get(&prop_name))
-            .cloned()
-            .unwrap_or(Value::Null);
+        // Walk parent chain to find the static property
+        let val = {
+            let mut current = class_name.clone();
+            let mut found = None;
+            loop {
+                if let Some(class_def) = self.classes.get(&current) {
+                    if let Some(v) = class_def.static_properties.get(&prop_name) {
+                        found = Some(v.clone());
+                        break;
+                    }
+                    if let Some(ref parent) = class_def.parent {
+                        current = parent.clone();
+                        continue;
+                    }
+                }
+                break;
+            }
+            found.unwrap_or(Value::Null)
+        };
 
         self.write_result(op, oa_idx, val)?;
         Ok(())
@@ -2214,8 +2393,12 @@ impl Vm {
                     return Ok(DispatchSignal::Next);
                 }
 
-                match std::fs::read_to_string(&path) {
-                    Ok(contents) => {
+                match std::fs::read(&path) {
+                    Ok(bytes) => {
+                        // PHP files may use ISO-8859-1 or other non-UTF-8 encodings;
+                        // convert lossily so we can still parse them.
+                        let contents = String::from_utf8(bytes)
+                            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                         self.included_files.insert(path.clone());
                         (contents, Some(path))
                     }
@@ -2311,9 +2494,9 @@ impl Vm {
                     }
                 } {
                     if let Value::Object(ref o) = obj_val {
-                        if o.internal == crate::value::InternalState::Fiber {
+                        if o.internal() == crate::value::InternalState::Fiber {
                             let callback_name = args[0].to_php_string();
-                            if let Some(fiber_state) = self.fibers.get_mut(&o.object_id) {
+                            if let Some(fiber_state) = self.fibers.get_mut(&o.object_id()) {
                                 fiber_state.callback_name = callback_name;
                             }
                         }
@@ -2376,6 +2559,25 @@ impl Vm {
             }
         }
 
+        // Handle Closure::bind() and Closure::fromCallable()
+        if func_name == "Closure::bind" || func_name == "Closure::bindTo" {
+            // Closure::bind($closure, $newThis, $newScope = "static")
+            // For the Composer use case, just return the original closure
+            let closure_val = args.first().cloned().unwrap_or(Value::Null);
+            if op.result_type != OperandType::Unused {
+                self.write_result(op, caller_oa_idx, closure_val)?;
+            }
+            return Ok(DispatchSignal::Next);
+        }
+        if func_name == "Closure::fromCallable" {
+            // Closure::fromCallable($callable) — return the callable as-is
+            let callable = args.first().cloned().unwrap_or(Value::Null);
+            if op.result_type != OperandType::Unused {
+                self.write_result(op, caller_oa_idx, callable)?;
+            }
+            return Ok(DispatchSignal::Next);
+        }
+
         // Check if this is a Generator method call
         if let Some(gen_result) = self.try_generator_method(&func_name, &args)? {
             if op.result_type != OperandType::Unused {
@@ -2397,8 +2599,17 @@ impl Vm {
             return Ok(DispatchSignal::Next);
         }
 
-        // Look up user-defined function
-        let func_oa_idx = self.functions.get(&func_name).copied();
+        // Look up user-defined function (with parent chain fallback for methods)
+        let func_oa_idx = self.functions.get(&func_name).copied().or_else(|| {
+            // If it's a method call (contains ::), try parent chain resolution
+            if let Some(sep) = func_name.find("::") {
+                let class = &func_name[..sep];
+                let method = &func_name[sep + 2..];
+                self.resolve_method(class, method)
+            } else {
+                None
+            }
+        });
         if let Some(oa_idx) = func_oa_idx {
             // Check if this is a generator function
             if self.op_arrays[oa_idx].is_generator {
@@ -2502,11 +2713,11 @@ impl Vm {
         }
 
         // Create the Generator object
-        let mut obj = PhpObject::new("Generator".to_string());
-        obj.object_id = self.next_object_id;
+        let obj = PhpObject::new("Generator".to_string());
+        obj.set_object_id(self.next_object_id);
         self.next_object_id += 1;
-        obj.internal = InternalState::Generator;
-        let obj_id = obj.object_id;
+        obj.set_internal(InternalState::Generator);
+        let obj_id = obj.object_id();
 
         // Create GeneratorState with the saved frame
         // ip=1 to skip past the GeneratorCreate opcode
@@ -2838,8 +3049,8 @@ impl Vm {
 
                     Ok(DispatchSignal::Yield)
                 }
-                Value::Object(ref o) if o.internal == InternalState::Generator => {
-                    let inner_id = o.object_id;
+                Value::Object(ref o) if o.internal() == InternalState::Generator => {
+                    let inner_id = o.object_id();
                     self.ensure_generator_initialized(inner_id)?;
 
                     let inner_status = self
@@ -2916,8 +3127,8 @@ impl Vm {
             if class != "Generator" {
                 // Check if $this (first arg) is a Generator
                 if let Some(Value::Object(ref o)) = args.first() {
-                    if o.internal == InternalState::Generator {
-                        (method, o.object_id)
+                    if o.internal() == InternalState::Generator {
+                        (method, o.object_id())
                     } else {
                         return Ok(None);
                     }
@@ -2926,8 +3137,8 @@ impl Vm {
                 }
             } else {
                 if let Some(Value::Object(ref o)) = args.first() {
-                    if o.internal == InternalState::Generator {
-                        (method, o.object_id)
+                    if o.internal() == InternalState::Generator {
+                        (method, o.object_id())
                     } else {
                         return Ok(None);
                     }
@@ -3076,8 +3287,8 @@ impl Vm {
             let method = parts[1];
             if class != "Fiber" {
                 if let Some(Value::Object(ref o)) = args.first() {
-                    if o.internal == InternalState::Fiber {
-                        (method, o.object_id)
+                    if o.internal() == InternalState::Fiber {
+                        (method, o.object_id())
                     } else {
                         return Ok(None);
                     }
@@ -3086,8 +3297,8 @@ impl Vm {
                 }
             } else {
                 if let Some(Value::Object(ref o)) = args.first() {
-                    if o.internal == InternalState::Fiber {
-                        (method, o.object_id)
+                    if o.internal() == InternalState::Fiber {
+                        (method, o.object_id())
                     } else {
                         return Ok(None);
                     }
@@ -3508,9 +3719,23 @@ impl Vm {
             "get_class" => {
                 let v = args.first().cloned().unwrap_or(Value::Null);
                 match v {
-                    Value::Object(ref o) => Ok(Some(Value::String(o.class_name.clone()))),
+                    Value::Object(ref o) => Ok(Some(Value::String(o.class_name()))),
                     _ => Ok(Some(Value::Bool(false))),
                 }
+            }
+            "get_debug_type" => {
+                let v = args.first().cloned().unwrap_or(Value::Null);
+                let t = match v {
+                    Value::Null => "null".to_string(),
+                    Value::Bool(_) => "bool".to_string(),
+                    Value::Long(_) => "int".to_string(),
+                    Value::Double(_) => "float".to_string(),
+                    Value::String(_) => "string".to_string(),
+                    Value::Array(_) => "array".to_string(),
+                    Value::Object(ref o) => o.class_name(),
+                    _ => "unknown".to_string(),
+                };
+                Ok(Some(Value::String(t)))
             }
             "is_object" => {
                 let v = args.first().cloned().unwrap_or(Value::Null);
@@ -3520,7 +3745,7 @@ impl Vm {
                 let obj = args.first().cloned().unwrap_or(Value::Null);
                 let prop = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let exists = match obj {
-                    Value::Object(ref o) => o.properties.contains_key(&prop),
+                    Value::Object(ref o) => o.has_property(&prop),
                     _ => false,
                 };
                 Ok(Some(Value::Bool(exists)))
@@ -3542,7 +3767,7 @@ impl Vm {
                 let obj_or_class = args.first().cloned().unwrap_or(Value::Null);
                 let method = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let class_name = match obj_or_class {
-                    Value::Object(ref o) => o.class_name.clone(),
+                    Value::Object(ref o) => o.class_name(),
                     Value::String(s) => s,
                     _ => String::new(),
                 };
@@ -4062,7 +4287,7 @@ impl Vm {
 
                 // Check if object implements JsonSerializable
                 let val_to_encode = if let Value::Object(ref o) = val {
-                    if self.implements_interface(&o.class_name, "JsonSerializable") {
+                    if self.implements_interface(&o.class_name(), "JsonSerializable") {
                         // Call jsonSerialize() method synchronously
                         match self.call_method_sync(&val, "jsonSerialize") {
                             Ok(result) => result,
@@ -4130,7 +4355,7 @@ impl Vm {
             "get_parent_class" => {
                 let v = args.first().cloned().unwrap_or(Value::Null);
                 let cn = match &v {
-                    Value::Object(o) => o.class_name.clone(),
+                    Value::Object(o) => o.class_name(),
                     Value::String(s) => s.clone(),
                     _ => return Ok(Some(Value::Bool(false))),
                 };
@@ -4143,7 +4368,7 @@ impl Vm {
                 let obj = args.first().cloned().unwrap_or(Value::Null);
                 let target = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let cn = match &obj {
-                    Value::Object(o) => o.class_name.clone(),
+                    Value::Object(o) => o.class_name(),
                     Value::String(s) => s.clone(),
                     _ => return Ok(Some(Value::Bool(false))),
                 };
@@ -4166,7 +4391,7 @@ impl Vm {
                 let obj = args.first().cloned().unwrap_or(Value::Null);
                 let target = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let cn = match &obj {
-                    Value::Object(o) => o.class_name.clone(),
+                    Value::Object(o) => o.class_name(),
                     Value::String(s) => s.clone(),
                     _ => return Ok(Some(Value::Bool(false))),
                 };
@@ -4590,22 +4815,6 @@ impl Vm {
                     Some(sv) => Ok(Some(serializable_to_value(&sv))),
                     None => Ok(Some(Value::Bool(false))),
                 }
-            }
-            "get_debug_type" => {
-                let v = args.first().cloned().unwrap_or(Value::Null);
-                Ok(Some(Value::String(
-                    match v {
-                        Value::Null => "null",
-                        Value::Bool(_) => "bool",
-                        Value::Long(_) => "int",
-                        Value::Double(_) => "float",
-                        Value::String(_) => "string",
-                        Value::Array(_) => "array",
-                        Value::Object(_) => "object",
-                        Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => "unknown",
-                    }
-                    .to_string(),
-                )))
             }
             "time" => {
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -5458,7 +5667,7 @@ impl Vm {
                 let obj = args.first().cloned().unwrap_or(Value::Null);
                 let mut arr = PhpArray::new();
                 if let Value::Object(ref o) = obj {
-                    for (name, val) in &o.properties {
+                    for (name, val) in &o.properties() {
                         arr.set_string(name.clone(), val.clone());
                     }
                 }
@@ -8277,7 +8486,7 @@ impl Vm {
                         let class_part = arr.get_int(0).unwrap_or(&Value::Null).clone();
                         let method_part = arr.get_int(1).unwrap_or(&Value::Null).to_php_string();
                         let (class_name, this_val) = match &class_part {
-                            Value::Object(o) => (o.class_name.clone(), Some(class_part.clone())),
+                            Value::Object(o) => (o.class_name(), Some(class_part.clone())),
                             Value::String(s) => (s.clone(), None),
                             _ => ("unknown".to_string(), None),
                         };
@@ -8298,8 +8507,21 @@ impl Vm {
                 Ok(Some(Value::Bool(true)))
             }
             "spl_autoload_unregister" => {
-                let callback = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                self.autoload_callbacks.retain(|(n, _)| n != &callback);
+                let raw = args.first().cloned().unwrap_or(Value::Null);
+                let callback_name = match &raw {
+                    Value::Array(arr) => {
+                        // [ClassName, 'methodName'] or [$obj, 'methodName']
+                        let class = arr.get_int(0)
+                            .map(|v: &Value| v.to_php_string())
+                            .unwrap_or_default();
+                        let method = arr.get_int(1)
+                            .map(|v: &Value| v.to_php_string())
+                            .unwrap_or_default();
+                        format!("{}::{}", class, method)
+                    }
+                    _ => raw.to_php_string(),
+                };
+                self.autoload_callbacks.retain(|(n, _)| n != &callback_name);
                 Ok(Some(Value::Bool(true)))
             }
             "spl_autoload_functions" => {
@@ -9713,7 +9935,7 @@ impl Vm {
             "get_mangled_object_vars" => {
                 if let Some(Value::Object(obj)) = args.first() {
                     let mut arr = PhpArray::new();
-                    for (k, v) in &obj.properties {
+                    for (k, v) in &obj.properties() {
                         arr.set_string(k.clone(), v.clone());
                     }
                     Ok(Some(Value::Array(arr)))
@@ -13182,8 +13404,8 @@ impl Vm {
             }
             Value::Object(o) => {
                 // Encode public properties as a JSON object
-                let mut entries: Vec<(String, JsonValue)> = o
-                    .properties
+                let props_map = o.properties();
+                let mut entries: Vec<(String, JsonValue)> = props_map
                     .iter()
                     .map(|(k, v)| (k.clone(), Self::value_to_json(v)))
                     .collect();
@@ -13219,10 +13441,9 @@ impl Vm {
                     Value::Array(arr)
                 } else {
                     // Return as stdClass object
-                    let mut obj = PhpObject::new("stdClass".to_string());
+                    let obj = PhpObject::new("stdClass".to_string());
                     for (k, v) in entries {
-                        obj.properties
-                            .insert(k.clone(), Self::json_to_value(v, assoc));
+                        obj.set_property(k.clone(), Self::json_to_value(v, assoc));
                     }
                     Value::Object(obj)
                 }
@@ -13271,11 +13492,12 @@ impl Vm {
                 self.output.push_str(&format!(
                     "{}object({})#{} ({}) {{\n",
                     indent,
-                    o.class_name,
-                    o.object_id,
-                    o.properties.len()
+                    o.class_name(),
+                    o.object_id(),
+                    o.properties_count()
                 ));
-                let mut props: Vec<_> = o.properties.iter().collect();
+                let props_map = o.properties();
+                let mut props: Vec<_> = props_map.iter().collect();
                 props.sort_by_key(|(k, _)| (*k).clone());
                 for (name, val) in props {
                     self.output
@@ -13315,9 +13537,10 @@ impl Vm {
                 s
             }
             Value::Object(o) => {
-                let mut s = format!("{} Object\n", o.class_name);
+                let mut s = format!("{} Object\n", o.class_name());
                 s.push_str(&format!("{}(\n", indent));
-                let mut props: Vec<_> = o.properties.iter().collect();
+                let props_map = o.properties();
+                let mut props: Vec<_> = props_map.iter().collect();
                 props.sort_by_key(|(k, _)| (*k).clone());
                 for (name, val) in props {
                     let val_str = self.print_r_string(val, depth + 1);
@@ -13355,7 +13578,7 @@ impl Vm {
                 s
             }
             Value::Object(o) => {
-                format!("(object) array(/* {} properties */)", o.properties.len())
+                format!("(object) array(/* {} properties */)", o.properties_count())
             }
             Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => "NULL".to_string(),
         }

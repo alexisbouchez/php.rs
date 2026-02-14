@@ -3,8 +3,10 @@
 //! High-level representation for correctness-first development.
 //! Can be optimized to use the 16-byte ZVal layout from php-rs-types later.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+use std::rc::Rc;
 
 use php_rs_compiler::op::OperandType;
 
@@ -144,7 +146,7 @@ impl Value {
             Value::Object(o) => {
                 // PHP: if __toString is defined, call it; otherwise error
                 // For now, return class name as placeholder
-                format!("{} Object", o.class_name)
+                format!("{} Object", o.class_name())
             }
             Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => String::new(),
         }
@@ -476,7 +478,7 @@ impl Value {
                     Value::Array(_) => self.clone(),
                     Value::Object(o) => {
                         let mut arr = PhpArray::new();
-                        for (k, v) in &o.properties {
+                        for (k, v) in &o.properties() {
                             arr.set_string(k.clone(), v.clone());
                         }
                         Value::Array(arr)
@@ -493,20 +495,20 @@ impl Value {
                 match self {
                     Value::Object(_) => self.clone(),
                     Value::Array(a) => {
-                        let mut obj = PhpObject::new("stdClass".to_string());
+                        let obj = PhpObject::new("stdClass".to_string());
                         for (key, val) in a.entries() {
                             let key_str = match key {
                                 ArrayKey::Int(n) => n.to_string(),
                                 ArrayKey::String(s) => s.clone(),
                             };
-                            obj.properties.insert(key_str, val.clone());
+                            obj.set_property(key_str, val.clone());
                         }
                         Value::Object(obj)
                     }
                     Value::Null => Value::Object(PhpObject::new("stdClass".to_string())),
                     _ => {
-                        let mut obj = PhpObject::new("stdClass".to_string());
-                        obj.properties.insert("scalar".to_string(), self.clone());
+                        let obj = PhpObject::new("stdClass".to_string());
+                        obj.set_property("scalar".to_string(), self.clone());
                         Value::Object(obj)
                     }
                 }
@@ -641,36 +643,83 @@ pub struct FiberFrame {
 // PhpObject — simplified object for VM execution
 // =============================================================================
 
-/// A PHP object instance.
+/// Internal data for a PHP object instance.
+#[derive(Debug)]
+struct PhpObjectData {
+    /// The class name this object is an instance of.
+    class_name: String,
+    /// Instance properties (name → value).
+    properties: HashMap<String, Value>,
+    /// Object ID (unique per-request, monotonically increasing).
+    object_id: u64,
+    /// Internal state: marks whether this is a Generator or Fiber object.
+    internal: InternalState,
+}
+
+/// A PHP object instance with reference semantics.
+///
+/// Cloning a PhpObject clones the Rc (shared reference), so multiple
+/// variables pointing to the same object share state — matching PHP's
+/// object reference semantics.
 #[derive(Debug, Clone)]
 pub struct PhpObject {
-    /// The class name this object is an instance of.
-    pub class_name: String,
-    /// Instance properties (name → value).
-    pub properties: HashMap<String, Value>,
-    /// Object ID (unique per-request, monotonically increasing).
-    pub object_id: u64,
-    /// Internal state: marks whether this is a Generator or Fiber object.
-    pub internal: InternalState,
+    inner: Rc<RefCell<PhpObjectData>>,
 }
 
 impl PhpObject {
     pub fn new(class_name: String) -> Self {
-        // Object IDs will be assigned by the VM when creating objects
         Self {
-            class_name,
-            properties: HashMap::new(),
-            object_id: 0,
-            internal: InternalState::None,
+            inner: Rc::new(RefCell::new(PhpObjectData {
+                class_name,
+                properties: HashMap::new(),
+                object_id: 0,
+                internal: InternalState::None,
+            })),
         }
     }
 
-    pub fn get_property(&self, name: &str) -> Option<&Value> {
-        self.properties.get(name)
+    pub fn class_name(&self) -> String {
+        self.inner.borrow().class_name.clone()
     }
 
-    pub fn set_property(&mut self, name: String, value: Value) {
-        self.properties.insert(name, value);
+    pub fn object_id(&self) -> u64 {
+        self.inner.borrow().object_id
+    }
+
+    pub fn set_object_id(&self, id: u64) {
+        self.inner.borrow_mut().object_id = id;
+    }
+
+    pub fn internal(&self) -> InternalState {
+        self.inner.borrow().internal.clone()
+    }
+
+    pub fn set_internal(&self, state: InternalState) {
+        self.inner.borrow_mut().internal = state;
+    }
+
+    pub fn get_property(&self, name: &str) -> Option<Value> {
+        self.inner.borrow().properties.get(name).cloned()
+    }
+
+    pub fn set_property(&self, name: String, value: Value) {
+        self.inner.borrow_mut().properties.insert(name, value);
+    }
+
+    pub fn has_property(&self, name: &str) -> bool {
+        self.inner.borrow().properties.contains_key(name)
+    }
+
+    pub fn properties(&self) -> HashMap<String, Value> {
+        self.inner.borrow().properties.clone()
+    }
+
+    pub fn properties_count(&self) -> usize {
+        self.inner.borrow().properties.len()
+    }
+
+    pub fn remove_property(&self, name: &str) {
+        self.inner.borrow_mut().properties.remove(name);
     }
 }
 
