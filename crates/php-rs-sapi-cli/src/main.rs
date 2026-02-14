@@ -471,6 +471,7 @@ fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]
 }
 
 /// Execute PHP and return (exit_code, stdout). Used by tests to assert on output.
+#[cfg(test)]
 fn execute_php_capture(
     source: &str,
     ini: &IniSystem,

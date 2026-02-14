@@ -4,6 +4,7 @@ pub mod init;
 pub mod install;
 pub mod remove;
 pub mod require;
+pub mod run_script;
 pub mod search;
 pub mod show;
 pub mod update;

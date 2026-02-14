@@ -99,6 +99,17 @@ pub enum ComposerCommand {
         /// Search query
         query: Vec<String>,
     },
+
+    /// Run a script defined in composer.json
+    #[command(name = "run-script", alias = "run")]
+    RunScript {
+        /// Script name to run (omit to list all scripts)
+        script: Option<String>,
+
+        /// Additional arguments passed to the script
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 /// Run the Composer CLI from raw command-line arguments.
@@ -106,10 +117,50 @@ pub enum ComposerCommand {
 pub fn run(args: Vec<String>) -> Result<(), String> {
     // Prepend "composer" so clap sees a proper argv[0]
     let mut full_args = vec!["composer".to_string()];
-    full_args.extend(args);
+    full_args.extend(args.clone());
 
-    let cli = Cli::try_parse_from(full_args).map_err(|e| e.to_string())?;
-    run_cli(cli)
+    match Cli::try_parse_from(full_args) {
+        Ok(cli) => run_cli(cli),
+        Err(e) => {
+            // If clap doesn't recognize the subcommand, try running it as a script.
+            // Real Composer allows `composer dev` as shorthand for `composer run-script dev`.
+            if !args.is_empty() && !args[0].starts_with('-') {
+                let script_name = &args[0];
+                // Extract global flags that appear before the script name
+                let working_dir = args
+                    .iter()
+                    .position(|a| a == "-d" || a == "--working-dir")
+                    .and_then(|i| args.get(i + 1))
+                    .map(|d| std::path::PathBuf::from(d));
+                let dir = working_dir
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+                let config = Config::new(&dir);
+
+                // Check if this script actually exists in composer.json before trying
+                if script_exists(&config, script_name) {
+                    let extra_args: Vec<String> = args[1..]
+                        .iter()
+                        .filter(|a| *a != "-d" && *a != "--working-dir" && *a != "-v" && *a != "--verbose")
+                        .cloned()
+                        .collect();
+                    return crate::commands::run_script::execute(&config, script_name, &extra_args);
+                }
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Check if a script name exists in composer.json.
+fn script_exists(config: &Config, name: &str) -> bool {
+    let json_path = config.composer_json_path();
+    let json_file = crate::json::JsonFile::new(&json_path);
+    let Ok(root) = json_file.read() else {
+        return false;
+    };
+    root.get("scripts")
+        .and_then(|s| s.get(name))
+        .is_some()
 }
 
 /// Run the Composer CLI from a parsed Cli struct.
@@ -153,5 +204,9 @@ pub fn run_cli(args: Cli) -> Result<(), String> {
             let q = query.join(" ");
             crate::commands::search::execute(&config, &q)
         }
+        ComposerCommand::RunScript { script, args } => match script {
+            Some(name) => crate::commands::run_script::execute(&config, &name, &args),
+            None => crate::commands::run_script::list_scripts(&config),
+        },
     }
 }
