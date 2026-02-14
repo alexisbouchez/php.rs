@@ -74,8 +74,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-authors = ["php.rs contributors"]
-license = "MIT OR Apache-2.0"
+authors = ["Alexis Bouchez"]
+license = "MIT"
 repository = "https://github.com/php/php-rs"
 
 [workspace.dependencies]
