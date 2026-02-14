@@ -199,9 +199,7 @@ fn extract_quoted_string(s: &str) -> Option<String> {
 
 fn is_valid_func_name(name: &str) -> bool {
     !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_')
+        && name.chars().all(|c| c.is_alphanumeric() || c == '_')
         && name
             .chars()
             .next()

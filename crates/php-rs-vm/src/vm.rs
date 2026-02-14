@@ -1902,6 +1902,52 @@ impl Vm {
         Ok(self.last_return_value.clone())
     }
 
+    /// Invoke a user-defined callback (function or closure) synchronously.
+    /// Returns the callback's return value. Used by call_user_func, array_map, etc.
+    fn invoke_user_callback(&mut self, func_name: &str, args: Vec<Value>) -> VmResult<Value> {
+        // Try builtin first
+        if let Some(result) = self.call_builtin(func_name, &args)? {
+            return Ok(result);
+        }
+        // Look up user-defined function (or closure like {closure}#N)
+        let oa_idx = self
+            .functions
+            .get(func_name)
+            .copied()
+            .ok_or_else(|| VmError::UndefinedFunction(func_name.to_string()))?;
+
+        let saved_depth = self.call_stack.len();
+
+        let func_oa = &self.op_arrays[oa_idx];
+        let mut frame = Frame::new(func_oa);
+        frame.op_array_idx = oa_idx;
+        frame.args = args.clone();
+
+        // Bind parameters to CVs
+        let num_params = func_oa.arg_info.len().min(args.len());
+        for i in 0..num_params {
+            if i < frame.cvs.len() {
+                frame.cvs[i] = args[i].clone();
+            }
+        }
+
+        // Apply closure bindings (captured `use` variables)
+        if let Some(bindings) = self.closure_bindings.get(func_name).cloned() {
+            for (var_name, val) in &bindings {
+                if let Some(cv_idx) = func_oa.vars.iter().position(|v| v == var_name) {
+                    if cv_idx < frame.cvs.len() {
+                        frame.cvs[cv_idx] = val.clone();
+                    }
+                }
+            }
+        }
+
+        self.call_stack.push(frame);
+        self.dispatch_loop_until(saved_depth)?;
+
+        Ok(self.last_return_value.clone())
+    }
+
     /// Handle FETCH_STATIC_PROP_* — read/write static properties.
     fn handle_fetch_static_prop(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let prop_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
@@ -3876,15 +3922,8 @@ impl Vm {
             "call_user_func" => {
                 let func_name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let func_args: Vec<Value> = args.get(1..).unwrap_or(&[]).to_vec();
-                // Try built-in first, then user-defined
-                match self.call_builtin(&func_name, &func_args) {
-                    Ok(Some(v)) => Ok(Some(v)),
-                    _ => {
-                        // User-defined function call would go through the main exec loop
-                        // For now, return false if not a built-in
-                        Ok(Some(Value::Bool(false)))
-                    }
-                }
+                let result = self.invoke_user_callback(&func_name, func_args)?;
+                Ok(Some(result))
             }
             "call_user_func_array" => {
                 let func_name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -3894,10 +3933,8 @@ impl Vm {
                 } else {
                     vec![]
                 };
-                match self.call_builtin(&func_name, &func_args) {
-                    Ok(Some(v)) => Ok(Some(v)),
-                    _ => Ok(Some(Value::Bool(false))),
-                }
+                let result = self.invoke_user_callback(&func_name, func_args)?;
+                Ok(Some(result))
             }
             "header" | "header_remove" => Ok(Some(Value::Null)),
             "headers_sent" => Ok(Some(Value::Bool(false))),
@@ -4084,10 +4121,14 @@ impl Vm {
                                     for (key, val) in arr.entries() {
                                         let s = val.to_php_string();
                                         if r.is_match(&s) {
-                                            let replaced = r.replace_all(&s, rr.as_str()).to_string();
+                                            let replaced =
+                                                r.replace_all(&s, rr.as_str()).to_string();
                                             match key {
-                                                ArrayKey::Int(i) => result.set_int(*i, Value::String(replaced)),
-                                                ArrayKey::String(k) => result.set_string(k.clone(), Value::String(replaced)),
+                                                ArrayKey::Int(i) => {
+                                                    result.set_int(*i, Value::String(replaced))
+                                                }
+                                                ArrayKey::String(k) => result
+                                                    .set_string(k.clone(), Value::String(replaced)),
                                             }
                                         }
                                     }
@@ -4476,25 +4517,43 @@ impl Vm {
             }
             "decoct" => {
                 let n = args.first().cloned().unwrap_or(Value::Null).to_long();
-                Ok(Some(Value::String(php_rs_ext_standard::math::php_decoct(n))))
+                Ok(Some(Value::String(php_rs_ext_standard::math::php_decoct(
+                    n,
+                ))))
             }
             "dechex" => {
                 let n = args.first().cloned().unwrap_or(Value::Null).to_long();
-                Ok(Some(Value::String(php_rs_ext_standard::math::php_dechex(n))))
+                Ok(Some(Value::String(php_rs_ext_standard::math::php_dechex(
+                    n,
+                ))))
             }
             "decbin" => {
                 let n = args.first().cloned().unwrap_or(Value::Null).to_long();
-                Ok(Some(Value::String(php_rs_ext_standard::math::php_decbin(n))))
+                Ok(Some(Value::String(php_rs_ext_standard::math::php_decbin(
+                    n,
+                ))))
             }
             "rand" | "mt_rand" => {
                 let min = args.first().cloned().unwrap_or(Value::Long(0)).to_long();
-                let max = args.get(1).cloned().unwrap_or(Value::Long(i32::MAX as i64)).to_long();
-                Ok(Some(Value::Long(php_rs_ext_standard::math::php_rand(min, max))))
+                let max = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Long(i32::MAX as i64))
+                    .to_long();
+                Ok(Some(Value::Long(php_rs_ext_standard::math::php_rand(
+                    min, max,
+                ))))
             }
             "random_int" => {
                 let min = args.first().cloned().unwrap_or(Value::Long(0)).to_long();
-                let max = args.get(1).cloned().unwrap_or(Value::Long(i64::MAX)).to_long();
-                Ok(Some(Value::Long(php_rs_ext_standard::math::php_rand(min, max))))
+                let max = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Long(i64::MAX))
+                    .to_long();
+                Ok(Some(Value::Long(php_rs_ext_standard::math::php_rand(
+                    min, max,
+                ))))
             }
             "getrandmax" | "mt_getrandmax" => Ok(Some(Value::Long(i32::MAX as i64))),
             "is_nan" => {
@@ -4623,7 +4682,11 @@ impl Vm {
                 let start = args.get(2).cloned().unwrap_or(Value::Long(0)).to_long();
                 let length = args.get(3).map(|v| v.to_long());
                 let slen = string.len() as i64;
-                let start_idx = if start < 0 { (slen + start).max(0) as usize } else { start.min(slen) as usize };
+                let start_idx = if start < 0 {
+                    (slen + start).max(0) as usize
+                } else {
+                    start.min(slen) as usize
+                };
                 let end_idx = match length {
                     Some(l) if l < 0 => (slen + l).max(0) as usize,
                     Some(l) => (start_idx + l as usize).min(string.len()),
@@ -4667,7 +4730,11 @@ impl Vm {
             "wordwrap" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let width = args.get(1).cloned().unwrap_or(Value::Long(75)).to_long() as usize;
-                let brk = args.get(2).cloned().unwrap_or(Value::String("\n".to_string())).to_php_string();
+                let brk = args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or(Value::String("\n".to_string()))
+                    .to_php_string();
                 let cut = args.get(3).is_some_and(|v| v.to_bool());
                 Ok(Some(Value::String(
                     php_rs_ext_standard::strings::php_wordwrap(&s, width, &brk, cut),
@@ -4676,7 +4743,11 @@ impl Vm {
             "chunk_split" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let chunklen = args.get(1).cloned().unwrap_or(Value::Long(76)).to_long() as usize;
-                let end = args.get(2).cloned().unwrap_or(Value::String("\r\n".to_string())).to_php_string();
+                let end = args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or(Value::String("\r\n".to_string()))
+                    .to_php_string();
                 Ok(Some(Value::String(
                     php_rs_ext_standard::strings::php_chunk_split(&s, chunklen, &end),
                 )))
@@ -4702,7 +4773,9 @@ impl Vm {
                     result.push((hi << 4) | lo);
                     i += 2;
                 }
-                Ok(Some(Value::String(String::from_utf8_lossy(&result).to_string())))
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&result).to_string(),
+                )))
             }
             "bin2hex" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -4711,7 +4784,12 @@ impl Vm {
             }
             "str_split" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                let length = args.get(1).cloned().unwrap_or(Value::Long(1)).to_long().max(1) as usize;
+                let length = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Long(1))
+                    .to_long()
+                    .max(1) as usize;
                 let parts = php_rs_ext_standard::strings::php_str_split(&s, length);
                 let mut arr = PhpArray::new();
                 for part in parts {
@@ -4723,7 +4801,9 @@ impl Vm {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let format = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
                 match format {
-                    0 => Ok(Some(Value::Long(php_rs_ext_standard::strings::php_str_word_count(&s) as i64))),
+                    0 => Ok(Some(Value::Long(
+                        php_rs_ext_standard::strings::php_str_word_count(&s) as i64,
+                    ))),
                     1 => {
                         let mut arr = PhpArray::new();
                         for word in s.split_whitespace() {
@@ -4771,7 +4851,11 @@ impl Vm {
             }
             "str_getcsv" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                let sep = args.get(1).cloned().unwrap_or(Value::String(",".to_string())).to_php_string();
+                let sep = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::String(",".to_string()))
+                    .to_php_string();
                 let sep_char = sep.chars().next().unwrap_or(',');
                 let mut arr = PhpArray::new();
                 // Simple CSV split (doesn't handle quotes fully)
@@ -4805,7 +4889,9 @@ impl Vm {
                 let b2 = s2.as_bytes();
                 let min_len = b1.len().min(b2.len());
                 for i in 0..min_len {
-                    if b1[i] == b2[i] { count += 1; }
+                    if b1[i] == b2[i] {
+                        count += 1;
+                    }
                 }
                 Ok(Some(Value::Long(count)))
             }
@@ -4819,11 +4905,11 @@ impl Vm {
                 let mut code = String::new();
                 code.push(first);
                 let encode = |c: char| match c {
-                    'B'|'F'|'P'|'V' => '1',
-                    'C'|'G'|'J'|'K'|'Q'|'S'|'X'|'Z' => '2',
-                    'D'|'T' => '3',
+                    'B' | 'F' | 'P' | 'V' => '1',
+                    'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => '2',
+                    'D' | 'T' => '3',
                     'L' => '4',
-                    'M'|'N' => '5',
+                    'M' | 'N' => '5',
                     'R' => '6',
                     _ => '0',
                 };
@@ -4832,18 +4918,26 @@ impl Vm {
                     let coded = encode(c);
                     if coded != '0' && coded != last {
                         code.push(coded);
-                        if code.len() == 4 { break; }
+                        if code.len() == 4 {
+                            break;
+                        }
                     }
                     last = coded;
                 }
-                while code.len() < 4 { code.push('0'); }
+                while code.len() < 4 {
+                    code.push('0');
+                }
                 Ok(Some(Value::String(code)))
             }
             "metaphone" => {
                 // Very basic metaphone - just return first letters
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let s = s.to_uppercase();
-                let result: String = s.chars().filter(|c| c.is_ascii_alphabetic()).take(6).collect();
+                let result: String = s
+                    .chars()
+                    .filter(|c| c.is_ascii_alphabetic())
+                    .take(6)
+                    .collect();
                 Ok(Some(Value::String(result)))
             }
             "levenshtein" => {
@@ -4854,12 +4948,18 @@ impl Vm {
                 let m = b1.len();
                 let n = b2.len();
                 let mut d = vec![vec![0usize; n + 1]; m + 1];
-                for i in 0..=m { d[i][0] = i; }
-                for j in 0..=n { d[0][j] = j; }
+                for i in 0..=m {
+                    d[i][0] = i;
+                }
+                for j in 0..=n {
+                    d[0][j] = j;
+                }
                 for i in 1..=m {
                     for j in 1..=n {
-                        let cost = if b1[i-1] == b2[j-1] { 0 } else { 1 };
-                        d[i][j] = (d[i-1][j] + 1).min(d[i][j-1] + 1).min(d[i-1][j-1] + cost);
+                        let cost = if b1[i - 1] == b2[j - 1] { 0 } else { 1 };
+                        d[i][j] = (d[i - 1][j] + 1)
+                            .min(d[i][j - 1] + 1)
+                            .min(d[i - 1][j - 1] + cost);
                     }
                 }
                 Ok(Some(Value::Long(d[m][n] as i64)))
@@ -4871,7 +4971,11 @@ impl Vm {
                 let length = args.get(3).map(|v| v.to_long() as usize);
                 let case_insensitive = args.get(4).is_some_and(|v| v.to_bool());
                 let slen = main_str.len() as i64;
-                let start = if offset < 0 { (slen + offset).max(0) as usize } else { offset as usize };
+                let start = if offset < 0 {
+                    (slen + offset).max(0) as usize
+                } else {
+                    offset as usize
+                };
                 if start > main_str.len() {
                     return Ok(Some(Value::Bool(false)));
                 }
@@ -4884,7 +4988,9 @@ impl Vm {
                     None => &str2,
                 };
                 if case_insensitive {
-                    Ok(Some(Value::Long(sub.to_lowercase().cmp(&cmp_str.to_lowercase()) as i64)))
+                    Ok(Some(Value::Long(
+                        sub.to_lowercase().cmp(&cmp_str.to_lowercase()) as i64,
+                    )))
                 } else {
                     Ok(Some(Value::Long(sub.cmp(cmp_str) as i64)))
                 }
@@ -4903,13 +5009,33 @@ impl Vm {
                 Ok(Some(Value::Long(a.cmp(b) as i64)))
             }
             "strcasecmp" => {
-                let s1 = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
-                let s2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                let s1 = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_lowercase();
+                let s2 = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_lowercase();
                 Ok(Some(Value::Long(s1.cmp(&s2) as i64)))
             }
             "strncasecmp" => {
-                let s1 = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
-                let s2 = args.get(1).cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                let s1 = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_lowercase();
+                let s2 = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_lowercase();
                 let n = args.get(2).cloned().unwrap_or(Value::Long(0)).to_long() as usize;
                 let a = &s1[..n.min(s1.len())];
                 let b = &s2[..n.min(s2.len())];
@@ -4918,10 +5044,20 @@ impl Vm {
             "number_format" => {
                 let num = args.first().cloned().unwrap_or(Value::Null).to_double();
                 let decimals = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long() as usize;
-                let dec_point = args.get(2).cloned().unwrap_or(Value::String(".".to_string())).to_php_string();
-                let thousands = args.get(3).cloned().unwrap_or(Value::String(",".to_string())).to_php_string();
+                let dec_point = args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or(Value::String(".".to_string()))
+                    .to_php_string();
+                let thousands = args
+                    .get(3)
+                    .cloned()
+                    .unwrap_or(Value::String(",".to_string()))
+                    .to_php_string();
                 Ok(Some(Value::String(
-                    php_rs_ext_standard::strings::php_number_format(num, decimals, &dec_point, &thousands),
+                    php_rs_ext_standard::strings::php_number_format(
+                        num, decimals, &dec_point, &thousands,
+                    ),
                 )))
             }
 
@@ -4942,7 +5078,10 @@ impl Vm {
                 let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 match self.constants.get(&name) {
                     Some(v) => Ok(Some(v.clone())),
-                    None => Err(VmError::FatalError(format!("Undefined constant \"{}\"", name))),
+                    None => Err(VmError::FatalError(format!(
+                        "Undefined constant \"{}\"",
+                        name
+                    ))),
                 }
             }
             "func_get_args" => {
@@ -5023,7 +5162,8 @@ impl Vm {
             }
             "extension_loaded" => {
                 let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                let loaded = matches!(name.as_str(),
+                let loaded = matches!(
+                    name.as_str(),
                     "standard" | "Core" | "json" | "pcre" | "date" | "ctype" | "mbstring" | "SPL"
                 );
                 Ok(Some(Value::Bool(loaded)))
@@ -5074,7 +5214,8 @@ impl Vm {
                     return Err(VmError::FatalError(msg));
                 }
                 // E_USER_WARNING(512), E_USER_NOTICE(1024) — just print
-                self.output.push_str(&format!("\nWarning: {} in Unknown on line 0\n", msg));
+                self.output
+                    .push_str(&format!("\nWarning: {} in Unknown on line 0\n", msg));
                 Ok(Some(Value::Bool(true)))
             }
             "set_error_handler" => {
@@ -5090,11 +5231,38 @@ impl Vm {
             // ══════════════════════════════════════════════════════════════
             "array_filter" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
-                // Without callback: filter falsy values
+                let callback = args.get(1).cloned();
+                let flag = args.get(2).map(|v| v.to_long()).unwrap_or(0);
                 if let Value::Array(ref a) = arr {
+                    let entries: Vec<_> = a.entries().iter().cloned().collect();
                     let mut result = PhpArray::new();
-                    for (key, val) in a.entries() {
-                        if val.to_bool() {
+                    for (key, val) in &entries {
+                        let keep = if let Some(ref cb) = callback {
+                            let cb_name = cb.to_php_string();
+                            let cb_args = match flag {
+                                2 => {
+                                    // ARRAY_FILTER_USE_KEY
+                                    let k = match key {
+                                        ArrayKey::Int(n) => Value::Long(*n),
+                                        ArrayKey::String(s) => Value::String(s.clone()),
+                                    };
+                                    vec![k]
+                                }
+                                1 => {
+                                    // ARRAY_FILTER_USE_BOTH
+                                    let k = match key {
+                                        ArrayKey::Int(n) => Value::Long(*n),
+                                        ArrayKey::String(s) => Value::String(s.clone()),
+                                    };
+                                    vec![val.clone(), k]
+                                }
+                                _ => vec![val.clone()],
+                            };
+                            self.invoke_user_callback(&cb_name, cb_args)?.to_bool()
+                        } else {
+                            val.to_bool()
+                        };
+                        if keep {
                             match key {
                                 ArrayKey::Int(n) => result.set_int(*n, val.clone()),
                                 ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
@@ -5112,7 +5280,11 @@ impl Vm {
                 let strict = args.get(2).is_some_and(|v| v.to_bool());
                 if let Value::Array(ref a) = haystack {
                     for (key, val) in a.entries() {
-                        let found = if strict { needle.strict_eq(val) } else { needle.loose_eq(val) };
+                        let found = if strict {
+                            needle.strict_eq(val)
+                        } else {
+                            needle.loose_eq(val)
+                        };
                         if found {
                             return Ok(Some(match key {
                                 ArrayKey::Int(n) => Value::Long(*n),
@@ -5141,7 +5313,9 @@ impl Vm {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
                 let count = if let Value::Array(ref a) = arr {
                     a.len() + args.len() - 1
-                } else { 0 };
+                } else {
+                    0
+                };
                 Ok(Some(Value::Long(count as i64)))
             }
             "array_splice" => {
@@ -5152,7 +5326,11 @@ impl Vm {
                 if let Value::Array(ref a) = arr {
                     let entries = a.entries();
                     let len = entries.len() as i64;
-                    let start = if offset < 0 { (len + offset).max(0) as usize } else { offset as usize };
+                    let start = if offset < 0 {
+                        (len + offset).max(0) as usize
+                    } else {
+                        offset as usize
+                    };
                     let end = match length {
                         Some(l) if l < 0 => (len + l).max(0) as usize,
                         Some(l) => (start + l as usize).min(entries.len()),
@@ -5215,7 +5393,12 @@ impl Vm {
             }
             "array_chunk" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
-                let size = args.get(1).cloned().unwrap_or(Value::Long(1)).to_long().max(1) as usize;
+                let size = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Long(1))
+                    .to_long()
+                    .max(1) as usize;
                 let preserve_keys = args.get(2).is_some_and(|v| v.to_bool());
                 if let Value::Array(ref a) = arr {
                     let mut result = PhpArray::new();
@@ -5241,7 +5424,12 @@ impl Vm {
             }
             "array_fill" => {
                 let start = args.first().cloned().unwrap_or(Value::Long(0)).to_long();
-                let num = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long().max(0);
+                let num = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Long(0))
+                    .to_long()
+                    .max(0);
                 let value = args.get(2).cloned().unwrap_or(Value::Null);
                 let mut arr = PhpArray::new();
                 for i in 0..num {
@@ -5338,7 +5526,10 @@ impl Vm {
                 if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
                     let mut result = PhpArray::new();
                     for (key, val) in a1.entries() {
-                        let found = a2.entries().iter().any(|(k, v)| k == key && val.loose_eq(v));
+                        let found = a2
+                            .entries()
+                            .iter()
+                            .any(|(k, v)| k == key && val.loose_eq(v));
                         if !found {
                             match key {
                                 ArrayKey::Int(n) => result.set_int(*n, val.clone()),
@@ -5387,13 +5578,19 @@ impl Vm {
             }
             "array_rand" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
-                let num = args.get(1).cloned().unwrap_or(Value::Long(1)).to_long().max(1);
+                let num = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Long(1))
+                    .to_long()
+                    .max(1);
                 if let Value::Array(ref a) = arr {
                     if a.is_empty() {
                         return Ok(Some(Value::Null));
                     }
                     if num == 1 {
-                        let idx = php_rs_ext_standard::math::php_rand(0, a.len() as i64 - 1) as usize;
+                        let idx =
+                            php_rs_ext_standard::math::php_rand(0, a.len() as i64 - 1) as usize;
                         let (key, _) = &a.entries()[idx];
                         Ok(Some(match key {
                             ArrayKey::Int(n) => Value::Long(*n),
@@ -5421,9 +5618,16 @@ impl Vm {
                 }
             }
             "array_reduce" => {
-                // Without callback support, just return the initial value
-                let initial = args.get(2).cloned().unwrap_or(Value::Null);
-                Ok(Some(initial))
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let callback = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let mut carry = args.get(2).cloned().unwrap_or(Value::Null);
+                if let Value::Array(ref a) = arr {
+                    let entries: Vec<_> = a.entries().iter().cloned().collect();
+                    for (_key, val) in &entries {
+                        carry = self.invoke_user_callback(&callback, vec![carry, val.clone()])?;
+                    }
+                }
+                Ok(Some(carry))
             }
             "array_replace" => {
                 let mut result = PhpArray::new();
@@ -5477,7 +5681,23 @@ impl Vm {
                 Ok(Some(Value::Bool(exists)))
             }
             "array_walk" => {
-                // Without callback support, just return true
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let callback = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let extra = args.get(2).cloned();
+                if let Value::Array(ref a) = arr {
+                    let entries: Vec<_> = a.entries().iter().cloned().collect();
+                    for (key, val) in &entries {
+                        let k = match key {
+                            ArrayKey::Int(n) => Value::Long(*n),
+                            ArrayKey::String(s) => Value::String(s.clone()),
+                        };
+                        let mut cb_args = vec![val.clone(), k];
+                        if let Some(ref e) = extra {
+                            cb_args.push(e.clone());
+                        }
+                        self.invoke_user_callback(&callback, cb_args)?;
+                    }
+                }
                 Ok(Some(Value::Bool(true)))
             }
             "compact" => {
@@ -5497,8 +5717,69 @@ impl Vm {
                 Ok(Some(Value::Bool(true)))
             }
             "usort" | "uasort" | "uksort" => {
-                // Can't invoke callbacks from call_builtin; return true
-                Ok(Some(Value::Bool(true)))
+                let sort_type = name.to_string();
+                let arr = args.first().cloned().unwrap_or(Value::Null);
+                let callback = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                if let Value::Array(ref a) = arr {
+                    let mut entries: Vec<(ArrayKey, Value)> = a.entries().iter().cloned().collect();
+                    // Insertion sort to allow callback invocation between comparisons
+                    let len = entries.len();
+                    for i in 1..len {
+                        let mut j = i;
+                        while j > 0 {
+                            let (a_val, b_val) = match sort_type.as_str() {
+                                "uksort" => {
+                                    let ka = match &entries[j - 1].0 {
+                                        ArrayKey::Int(n) => Value::Long(*n),
+                                        ArrayKey::String(s) => Value::String(s.clone()),
+                                    };
+                                    let kb = match &entries[j].0 {
+                                        ArrayKey::Int(n) => Value::Long(*n),
+                                        ArrayKey::String(s) => Value::String(s.clone()),
+                                    };
+                                    (ka, kb)
+                                }
+                                _ => (entries[j - 1].1.clone(), entries[j].1.clone()),
+                            };
+                            let cmp = self
+                                .invoke_user_callback(&callback, vec![a_val, b_val])?
+                                .to_long();
+                            if cmp > 0 {
+                                entries.swap(j - 1, j);
+                                j -= 1;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                    let mut result = PhpArray::new();
+                    match sort_type.as_str() {
+                        "usort" => {
+                            // usort: re-index with 0..n
+                            for (_key, val) in entries {
+                                result.push(val);
+                            }
+                        }
+                        _ => {
+                            // uasort/uksort: preserve keys
+                            for (key, val) in entries {
+                                match key {
+                                    ArrayKey::Int(n) => result.set_int(n, val),
+                                    ArrayKey::String(s) => result.set_string(s, val),
+                                }
+                            }
+                        }
+                    }
+                    // Write sorted array back to caller's variable
+                    if let Some(caller) = self.call_stack.last_mut() {
+                        if !caller.args.is_empty() {
+                            caller.args[0] = Value::Array(result);
+                        }
+                    }
+                    Ok(Some(Value::Bool(true)))
+                } else {
+                    Ok(Some(Value::Bool(true)))
+                }
             }
             "array_is_list" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
@@ -5509,9 +5790,27 @@ impl Vm {
                 }
             }
             "array_map" => {
-                // With null callback: identity. Otherwise, stub returns input.
+                let callback = args.first().cloned().unwrap_or(Value::Null);
                 let arr = args.get(1).cloned().unwrap_or(Value::Null);
-                Ok(Some(arr))
+                if let Value::Array(ref a) = arr {
+                    let entries: Vec<_> = a.entries().iter().cloned().collect();
+                    let mut result = PhpArray::new();
+                    if callback == Value::Null {
+                        // null callback = identity
+                        return Ok(Some(arr.clone()));
+                    }
+                    let cb_name = callback.to_php_string();
+                    for (key, val) in &entries {
+                        let mapped = self.invoke_user_callback(&cb_name, vec![val.clone()])?;
+                        match key {
+                            ArrayKey::Int(n) => result.set_int(*n, mapped),
+                            ArrayKey::String(s) => result.set_string(s.clone(), mapped),
+                        }
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
             }
             "current" | "pos" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
@@ -5605,9 +5904,9 @@ impl Vm {
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
-            "sys_get_temp_dir" => {
-                Ok(Some(Value::String(php_rs_ext_standard::file::php_sys_get_temp_dir())))
-            }
+            "sys_get_temp_dir" => Ok(Some(Value::String(
+                php_rs_ext_standard::file::php_sys_get_temp_dir(),
+            ))),
             "filesize" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
@@ -5621,7 +5920,13 @@ impl Vm {
                 self.check_open_basedir(&p)?;
                 match std::fs::metadata(&p) {
                     Ok(m) => {
-                        let t = if m.is_file() { "file" } else if m.is_dir() { "dir" } else { "unknown" };
+                        let t = if m.is_file() {
+                            "file"
+                        } else if m.is_dir() {
+                            "dir"
+                        } else {
+                            "unknown"
+                        };
                         Ok(Some(Value::String(t.to_string())))
                     }
                     Err(_) => Ok(Some(Value::Bool(false))),
@@ -5640,7 +5945,8 @@ impl Vm {
                 self.check_open_basedir(&p)?;
                 match std::fs::metadata(&p) {
                     Ok(m) => {
-                        let t = m.accessed()
+                        let t = m
+                            .accessed()
                             .ok()
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|d| d.as_secs() as i64)
@@ -5655,7 +5961,8 @@ impl Vm {
                 self.check_open_basedir(&p)?;
                 match std::fs::metadata(&p) {
                     Ok(m) => {
-                        let t = m.created()
+                        let t = m
+                            .created()
                             .ok()
                             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                             .map(|d| d.as_secs() as i64)
@@ -5674,7 +5981,7 @@ impl Vm {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
                 Ok(Some(Value::Bool(
-                    std::fs::OpenOptions::new().write(true).open(&p).is_ok()
+                    std::fs::OpenOptions::new().write(true).open(&p).is_ok(),
                 )))
             }
             "is_executable" => {
@@ -5698,10 +6005,10 @@ impl Vm {
                 let option = args.get(1).map(|v| v.to_long());
                 let info = php_rs_ext_standard::file::php_pathinfo(&p);
                 match option {
-                    Some(1) => Ok(Some(Value::String(info.dirname))),   // PATHINFO_DIRNAME
-                    Some(2) => Ok(Some(Value::String(info.basename))),  // PATHINFO_BASENAME
+                    Some(1) => Ok(Some(Value::String(info.dirname))), // PATHINFO_DIRNAME
+                    Some(2) => Ok(Some(Value::String(info.basename))), // PATHINFO_BASENAME
                     Some(4) => Ok(Some(Value::String(info.extension))), // PATHINFO_EXTENSION
-                    Some(8) => Ok(Some(Value::String(info.filename))),  // PATHINFO_FILENAME
+                    Some(8) => Ok(Some(Value::String(info.filename))), // PATHINFO_FILENAME
                     _ => {
                         let mut arr = PhpArray::new();
                         arr.set_string("dirname".to_string(), Value::String(info.dirname));
@@ -5712,12 +6019,10 @@ impl Vm {
                     }
                 }
             }
-            "getcwd" => {
-                match std::env::current_dir() {
-                    Ok(p) => Ok(Some(Value::String(p.to_string_lossy().to_string()))),
-                    Err(_) => Ok(Some(Value::Bool(false))),
-                }
-            }
+            "getcwd" => match std::env::current_dir() {
+                Ok(p) => Ok(Some(Value::String(p.to_string_lossy().to_string()))),
+                Err(_) => Ok(Some(Value::Bool(false))),
+            },
             "chdir" => {
                 let path = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::Bool(std::env::set_current_dir(&path).is_ok())))
@@ -5747,10 +6052,12 @@ impl Vm {
                 let pattern = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let mut arr = PhpArray::new();
                 // Extract directory part
-                let dir = std::path::Path::new(&pattern).parent()
+                let dir = std::path::Path::new(&pattern)
+                    .parent()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|| ".".to_string());
-                let file_pattern = std::path::Path::new(&pattern).file_name()
+                let file_pattern = std::path::Path::new(&pattern)
+                    .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -5779,9 +6086,11 @@ impl Vm {
             }
             "is_link" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(std::fs::symlink_metadata(&p)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false))))
+                Ok(Some(Value::Bool(
+                    std::fs::symlink_metadata(&p)
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false),
+                )))
             }
             "touch" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -5801,31 +6110,45 @@ impl Vm {
             }
             "ctype_alpha" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_alphabetic()))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphabetic()),
+                )))
             }
             "ctype_alnum" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric()),
+                )))
             }
             "ctype_lower" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase()))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase()),
+                )))
             }
             "ctype_upper" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase()))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_uppercase()),
+                )))
             }
             "ctype_space" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_whitespace()))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_whitespace()),
+                )))
             }
             "ctype_punct" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_punctuation()))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_punctuation()),
+                )))
             }
             "ctype_xdigit" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit()),
+                )))
             }
             "array_pop" => {
                 // Can't mutate the original, return last element
@@ -5845,7 +6168,10 @@ impl Vm {
                 if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
                     let mut result = PhpArray::new();
                     for (key, val) in a1.entries() {
-                        let found = a2.entries().iter().any(|(k, v)| k == key && val.loose_eq(v));
+                        let found = a2
+                            .entries()
+                            .iter()
+                            .any(|(k, v)| k == key && val.loose_eq(v));
                         if found {
                             match key {
                                 ArrayKey::Int(n) => result.set_int(*n, val.clone()),
@@ -5895,7 +6221,10 @@ impl Vm {
                 let min = args.get(1).map(|v| v.to_long()).unwrap_or(0);
                 let max = args.get(2).map(|v| v.to_long()).unwrap_or(0);
                 if min > max {
-                    return Err(VmError::FatalError("clamp(): Argument #2 ($min) cannot be greater than argument #3 ($max)".into()));
+                    return Err(VmError::FatalError(
+                        "clamp(): Argument #2 ($min) cannot be greater than argument #3 ($max)"
+                            .into(),
+                    ));
                 }
                 Ok(Some(Value::Long(val.clamp(min, max))))
             }
@@ -5921,14 +6250,38 @@ impl Vm {
                 while i < chars.len() {
                     if chars[i] == '\\' && i + 1 < chars.len() {
                         match chars[i + 1] {
-                            'n' => { result.push('\n'); i += 2; }
-                            'r' => { result.push('\r'); i += 2; }
-                            't' => { result.push('\t'); i += 2; }
-                            'v' => { result.push('\x0B'); i += 2; }
-                            'a' => { result.push('\x07'); i += 2; }
-                            'f' => { result.push('\x0C'); i += 2; }
-                            '\\' => { result.push('\\'); i += 2; }
-                            _ => { result.push(chars[i + 1]); i += 2; }
+                            'n' => {
+                                result.push('\n');
+                                i += 2;
+                            }
+                            'r' => {
+                                result.push('\r');
+                                i += 2;
+                            }
+                            't' => {
+                                result.push('\t');
+                                i += 2;
+                            }
+                            'v' => {
+                                result.push('\x0B');
+                                i += 2;
+                            }
+                            'a' => {
+                                result.push('\x07');
+                                i += 2;
+                            }
+                            'f' => {
+                                result.push('\x0C');
+                                i += 2;
+                            }
+                            '\\' => {
+                                result.push('\\');
+                                i += 2;
+                            }
+                            _ => {
+                                result.push(chars[i + 1]);
+                                i += 2;
+                            }
                         }
                     } else {
                         result.push(chars[i]);
@@ -5990,13 +6343,16 @@ impl Vm {
                     let to = args.get(2).map(|v| v.to_php_string()).unwrap_or_default();
                     let from_chars: Vec<char> = from.chars().collect();
                     let to_chars: Vec<char> = to.chars().collect();
-                    let result: String = s.chars().map(|c| {
-                        if let Some(pos) = from_chars.iter().position(|&fc| fc == c) {
-                            to_chars.get(pos).copied().unwrap_or(c)
-                        } else {
-                            c
-                        }
-                    }).collect();
+                    let result: String = s
+                        .chars()
+                        .map(|c| {
+                            if let Some(pos) = from_chars.iter().position(|&fc| fc == c) {
+                                to_chars.get(pos).copied().unwrap_or(c)
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
                     Ok(Some(Value::String(result)))
                 }
             }
@@ -6041,11 +6397,15 @@ impl Vm {
                         let bytes = a.as_bytes();
                         while i < bytes.len() {
                             if bytes[i] == b'<' {
-                                if let Some(end) = a[i+1..].find('>') {
-                                    tags.push(a[i+1..i+1+end].to_lowercase());
+                                if let Some(end) = a[i + 1..].find('>') {
+                                    tags.push(a[i + 1..i + 1 + end].to_lowercase());
                                     i = i + 1 + end + 1;
-                                } else { break; }
-                            } else { i += 1; }
+                                } else {
+                                    break;
+                                }
+                            } else {
+                                i += 1;
+                            }
                         }
                         tags
                     }
@@ -6139,24 +6499,71 @@ impl Vm {
                 match component {
                     -1 => {
                         let mut arr = PhpArray::new();
-                        if !scheme.is_empty() { arr.set_string("scheme".into(), Value::String(scheme)); }
-                        if !host.is_empty() { arr.set_string("host".into(), Value::String(host)); }
-                        if let Some(p) = port { arr.set_string("port".into(), Value::Long(p)); }
-                        if !user.is_empty() { arr.set_string("user".into(), Value::String(user)); }
-                        if !pass.is_empty() { arr.set_string("pass".into(), Value::String(pass)); }
-                        if !path.is_empty() { arr.set_string("path".into(), Value::String(path)); }
-                        if !query.is_empty() { arr.set_string("query".into(), Value::String(query)); }
-                        if !fragment.is_empty() { arr.set_string("fragment".into(), Value::String(fragment)); }
+                        if !scheme.is_empty() {
+                            arr.set_string("scheme".into(), Value::String(scheme));
+                        }
+                        if !host.is_empty() {
+                            arr.set_string("host".into(), Value::String(host));
+                        }
+                        if let Some(p) = port {
+                            arr.set_string("port".into(), Value::Long(p));
+                        }
+                        if !user.is_empty() {
+                            arr.set_string("user".into(), Value::String(user));
+                        }
+                        if !pass.is_empty() {
+                            arr.set_string("pass".into(), Value::String(pass));
+                        }
+                        if !path.is_empty() {
+                            arr.set_string("path".into(), Value::String(path));
+                        }
+                        if !query.is_empty() {
+                            arr.set_string("query".into(), Value::String(query));
+                        }
+                        if !fragment.is_empty() {
+                            arr.set_string("fragment".into(), Value::String(fragment));
+                        }
                         Ok(Some(Value::Array(arr)))
                     }
-                    0 => Ok(Some(if scheme.is_empty() { Value::Null } else { Value::String(scheme) })), // PHP_URL_SCHEME
-                    1 => Ok(Some(if host.is_empty() { Value::Null } else { Value::String(host) })), // PHP_URL_HOST
-                    2 => Ok(Some(match port { Some(p) => Value::Long(p), None => Value::Null })), // PHP_URL_PORT
-                    5 => Ok(Some(if user.is_empty() { Value::Null } else { Value::String(user) })), // PHP_URL_USER
-                    6 => Ok(Some(if pass.is_empty() { Value::Null } else { Value::String(pass) })), // PHP_URL_PASS
-                    3 => Ok(Some(if path.is_empty() { Value::Null } else { Value::String(path) })), // PHP_URL_PATH
-                    4 => Ok(Some(if query.is_empty() { Value::Null } else { Value::String(query) })), // PHP_URL_QUERY
-                    7 => Ok(Some(if fragment.is_empty() { Value::Null } else { Value::String(fragment) })), // PHP_URL_FRAGMENT
+                    0 => Ok(Some(if scheme.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(scheme)
+                    })), // PHP_URL_SCHEME
+                    1 => Ok(Some(if host.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(host)
+                    })), // PHP_URL_HOST
+                    2 => Ok(Some(match port {
+                        Some(p) => Value::Long(p),
+                        None => Value::Null,
+                    })), // PHP_URL_PORT
+                    5 => Ok(Some(if user.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(user)
+                    })), // PHP_URL_USER
+                    6 => Ok(Some(if pass.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(pass)
+                    })), // PHP_URL_PASS
+                    3 => Ok(Some(if path.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(path)
+                    })), // PHP_URL_PATH
+                    4 => Ok(Some(if query.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(query)
+                    })), // PHP_URL_QUERY
+                    7 => Ok(Some(if fragment.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(fragment)
+                    })), // PHP_URL_FRAGMENT
                     _ => Ok(Some(Value::Bool(false))),
                 }
             }
@@ -6164,7 +6571,9 @@ impl Vm {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let mut arr = PhpArray::new();
                 for pair in s.split('&') {
-                    if pair.is_empty() { continue; }
+                    if pair.is_empty() {
+                        continue;
+                    }
                     let mut parts = pair.splitn(2, '=');
                     let key = parts.next().unwrap_or("");
                     let val = parts.next().unwrap_or("");
@@ -6177,14 +6586,21 @@ impl Vm {
             "http_build_query" => {
                 let data = args.first().cloned().unwrap_or(Value::Null);
                 if let Value::Array(ref arr) = data {
-                    let sep = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "&".into());
-                    let parts: Vec<String> = arr.entries().iter().map(|(k, v)| {
-                        let key = match k {
-                            ArrayKey::String(s) => s.clone(),
-                            ArrayKey::Int(n) => n.to_string(),
-                        };
-                        format!("{}={}", key, v.to_php_string())
-                    }).collect();
+                    let sep = args
+                        .get(1)
+                        .map(|v| v.to_php_string())
+                        .unwrap_or_else(|| "&".into());
+                    let parts: Vec<String> = arr
+                        .entries()
+                        .iter()
+                        .map(|(k, v)| {
+                            let key = match k {
+                                ArrayKey::String(s) => s.clone(),
+                                ArrayKey::Int(n) => n.to_string(),
+                            };
+                            format!("{}={}", key, v.to_php_string())
+                        })
+                        .collect();
                     Ok(Some(Value::String(parts.join(&sep))))
                 } else {
                     Ok(Some(Value::String(String::new())))
@@ -6196,7 +6612,13 @@ impl Vm {
                 let op = args.get(2).map(|v| v.to_php_string());
                 let cmp = version_cmp(&v1, &v2);
                 match op {
-                    None => Ok(Some(Value::Long(if cmp < 0 { -1 } else if cmp > 0 { 1 } else { 0 }))),
+                    None => Ok(Some(Value::Long(if cmp < 0 {
+                        -1
+                    } else if cmp > 0 {
+                        1
+                    } else {
+                        0
+                    }))),
                     Some(op) => {
                         let result = match op.as_str() {
                             "<" | "lt" => cmp < 0,
@@ -6235,51 +6657,85 @@ impl Vm {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let mut result = Vec::new();
                 for line in s.lines() {
-                    if line.is_empty() { continue; }
+                    if line.is_empty() {
+                        continue;
+                    }
                     let n = (line.as_bytes()[0] as i32 - 32) & 0x3F;
-                    if n == 0 { break; }
-                    let data: Vec<u8> = line.bytes().skip(1).map(|b| b.wrapping_sub(32) & 0x3F).collect();
+                    if n == 0 {
+                        break;
+                    }
+                    let data: Vec<u8> = line
+                        .bytes()
+                        .skip(1)
+                        .map(|b| b.wrapping_sub(32) & 0x3F)
+                        .collect();
                     let mut i = 0;
                     let mut written = 0;
                     while i + 3 < data.len() && written < n {
                         result.push((data[i] << 2 | data[i + 1] >> 4) as u8);
                         written += 1;
-                        if written < n { result.push((data[i + 1] << 4 | data[i + 2] >> 2) as u8); written += 1; }
-                        if written < n { result.push((data[i + 2] << 6 | data[i + 3]) as u8); written += 1; }
+                        if written < n {
+                            result.push((data[i + 1] << 4 | data[i + 2] >> 2) as u8);
+                            written += 1;
+                        }
+                        if written < n {
+                            result.push((data[i + 2] << 6 | data[i + 3]) as u8);
+                            written += 1;
+                        }
                         i += 4;
                     }
                 }
-                Ok(Some(Value::String(String::from_utf8_lossy(&result).to_string())))
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&result).to_string(),
+                )))
             }
             "count_chars" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let mode = args.get(1).map(|v| v.to_long()).unwrap_or(0);
                 let mut counts = [0i64; 256];
-                for b in s.bytes() { counts[b as usize] += 1; }
+                for b in s.bytes() {
+                    counts[b as usize] += 1;
+                }
                 match mode {
                     0 => {
                         let mut arr = PhpArray::new();
-                        for (i, &c) in counts.iter().enumerate() { arr.set_int(i as i64, Value::Long(c)); }
+                        for (i, &c) in counts.iter().enumerate() {
+                            arr.set_int(i as i64, Value::Long(c));
+                        }
                         Ok(Some(Value::Array(arr)))
                     }
                     1 => {
                         let mut arr = PhpArray::new();
-                        for (i, &c) in counts.iter().enumerate() { if c > 0 { arr.set_int(i as i64, Value::Long(c)); } }
+                        for (i, &c) in counts.iter().enumerate() {
+                            if c > 0 {
+                                arr.set_int(i as i64, Value::Long(c));
+                            }
+                        }
                         Ok(Some(Value::Array(arr)))
                     }
                     2 => {
                         let mut arr = PhpArray::new();
-                        for (i, &c) in counts.iter().enumerate() { if c == 0 { arr.set_int(i as i64, Value::Long(0)); } }
+                        for (i, &c) in counts.iter().enumerate() {
+                            if c == 0 {
+                                arr.set_int(i as i64, Value::Long(0));
+                            }
+                        }
                         Ok(Some(Value::Array(arr)))
                     }
                     3 => {
-                        let mut unique: Vec<u8> = (0..=255u8).filter(|&b| counts[b as usize] > 0).collect();
+                        let mut unique: Vec<u8> =
+                            (0..=255u8).filter(|&b| counts[b as usize] > 0).collect();
                         unique.sort();
-                        Ok(Some(Value::String(String::from_utf8_lossy(&unique).to_string())))
+                        Ok(Some(Value::String(
+                            String::from_utf8_lossy(&unique).to_string(),
+                        )))
                     }
                     4 => {
-                        let unused: Vec<u8> = (0..=255u8).filter(|&b| counts[b as usize] == 0).collect();
-                        Ok(Some(Value::String(String::from_utf8_lossy(&unused).to_string())))
+                        let unused: Vec<u8> =
+                            (0..=255u8).filter(|&b| counts[b as usize] == 0).collect();
+                        Ok(Some(Value::String(
+                            String::from_utf8_lossy(&unused).to_string(),
+                        )))
                     }
                     _ => Ok(Some(Value::Bool(false))),
                 }
@@ -6287,7 +6743,9 @@ impl Vm {
             "str_decrement" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 if s.is_empty() {
-                    return Err(VmError::FatalError("str_decrement(): Argument #1 ($string) must not be empty".into()));
+                    return Err(VmError::FatalError(
+                        "str_decrement(): Argument #1 ($string) must not be empty".into(),
+                    ));
                 }
                 let mut chars: Vec<char> = s.chars().collect();
                 let mut i = chars.len() - 1;
@@ -6297,21 +6755,36 @@ impl Vm {
                         break;
                     } else if chars[i] == '0' {
                         chars[i] = '9';
-                        if i == 0 { if chars.len() > 1 { chars.remove(0); } break; }
+                        if i == 0 {
+                            if chars.len() > 1 {
+                                chars.remove(0);
+                            }
+                            break;
+                        }
                         i -= 1;
                     } else if chars[i].is_ascii_lowercase() && chars[i] > 'a' {
                         chars[i] = (chars[i] as u8 - 1) as char;
                         break;
                     } else if chars[i] == 'a' {
                         chars[i] = 'z';
-                        if i == 0 { if chars.len() > 1 { chars.remove(0); } break; }
+                        if i == 0 {
+                            if chars.len() > 1 {
+                                chars.remove(0);
+                            }
+                            break;
+                        }
                         i -= 1;
                     } else if chars[i].is_ascii_uppercase() && chars[i] > 'A' {
                         chars[i] = (chars[i] as u8 - 1) as char;
                         break;
                     } else if chars[i] == 'A' {
                         chars[i] = 'Z';
-                        if i == 0 { if chars.len() > 1 { chars.remove(0); } break; }
+                        if i == 0 {
+                            if chars.len() > 1 {
+                                chars.remove(0);
+                            }
+                            break;
+                        }
                         i -= 1;
                     } else {
                         break;
@@ -6325,7 +6798,8 @@ impl Vm {
             }
             "html_entity_decode" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                let result = s.replace("&amp;", "&")
+                let result = s
+                    .replace("&amp;", "&")
                     .replace("&lt;", "<")
                     .replace("&gt;", ">")
                     .replace("&quot;", "\"")
@@ -6335,7 +6809,8 @@ impl Vm {
             }
             "htmlentities" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                let result = s.replace('&', "&amp;")
+                let result = s
+                    .replace('&', "&amp;")
                     .replace('<', "&lt;")
                     .replace('>', "&gt;")
                     .replace('"', "&quot;")
@@ -6351,7 +6826,10 @@ impl Vm {
             // === Type/Inspection functions ===
             "is_scalar" => {
                 let val = args.first().unwrap_or(&Value::Null);
-                let result = matches!(val, Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::String(_));
+                let result = matches!(
+                    val,
+                    Value::Bool(_) | Value::Long(_) | Value::Double(_) | Value::String(_)
+                );
                 Ok(Some(Value::Bool(result)))
             }
             "is_countable" => {
@@ -6376,7 +6854,11 @@ impl Vm {
                     for (key, val) in a.entries() {
                         match key {
                             ArrayKey::String(s) => {
-                                let new_key = if case == 0 { s.to_lowercase() } else { s.to_uppercase() };
+                                let new_key = if case == 0 {
+                                    s.to_lowercase()
+                                } else {
+                                    s.to_uppercase()
+                                };
                                 result.set_string(new_key, val.clone());
                             }
                             ArrayKey::Int(n) => result.set_int(*n, val.clone()),
@@ -6390,19 +6872,26 @@ impl Vm {
             "shuffle" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
                 if let Value::Array(ref a) = arr {
-                    let mut values: Vec<Value> = a.entries().iter().map(|(_, v)| v.clone()).collect();
+                    let mut values: Vec<Value> =
+                        a.entries().iter().map(|(_, v)| v.clone()).collect();
                     // Simple Fisher-Yates shuffle using basic random
                     use std::time::SystemTime;
-                    let seed = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default().subsec_nanos() as usize;
+                    let seed = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos() as usize;
                     let mut rng = seed;
                     for i in (1..values.len()).rev() {
-                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        rng = rng
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
                         let j = rng % (i + 1);
                         values.swap(i, j);
                     }
                     let mut result = PhpArray::new();
-                    for v in values { result.push(v); }
+                    for v in values {
+                        result.push(v);
+                    }
                     Ok(Some(Value::Array(result)))
                 } else {
                     Ok(Some(Value::Bool(false)))
@@ -6429,7 +6918,12 @@ impl Vm {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
                 if let Value::Array(ref a) = arr {
                     let mut entries: Vec<(ArrayKey, Value)> = a.entries().to_vec();
-                    entries.sort_by(|a, b| nat_cmp(&a.1.to_php_string().to_lowercase(), &b.1.to_php_string().to_lowercase()));
+                    entries.sort_by(|a, b| {
+                        nat_cmp(
+                            &a.1.to_php_string().to_lowercase(),
+                            &b.1.to_php_string().to_lowercase(),
+                        )
+                    });
                     let mut result = PhpArray::new();
                     for (k, v) in entries {
                         match k {
@@ -6449,7 +6943,12 @@ impl Vm {
             "array_first" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
                 if let Value::Array(ref a) = arr {
-                    Ok(Some(a.entries().first().map(|(_, v)| v.clone()).unwrap_or(Value::Null)))
+                    Ok(Some(
+                        a.entries()
+                            .first()
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::Null),
+                    ))
                 } else {
                     Ok(Some(Value::Null))
                 }
@@ -6457,7 +6956,12 @@ impl Vm {
             "array_last" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
                 if let Value::Array(ref a) = arr {
-                    Ok(Some(a.entries().last().map(|(_, v)| v.clone()).unwrap_or(Value::Null)))
+                    Ok(Some(
+                        a.entries()
+                            .last()
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::Null),
+                    ))
                 } else {
                     Ok(Some(Value::Null))
                 }
@@ -6479,8 +6983,14 @@ impl Vm {
             }
             "array_replace_recursive" => {
                 // Simplified: same as array_replace for now
-                if args.is_empty() { return Ok(Some(Value::Array(PhpArray::new()))); }
-                let mut result = if let Value::Array(ref a) = args[0] { a.clone() } else { PhpArray::new() };
+                if args.is_empty() {
+                    return Ok(Some(Value::Array(PhpArray::new())));
+                }
+                let mut result = if let Value::Array(ref a) = args[0] {
+                    a.clone()
+                } else {
+                    PhpArray::new()
+                };
                 for arg in args.iter().skip(1) {
                     if let Value::Array(ref a) = arg {
                         for (key, val) in a.entries() {
@@ -6497,7 +7007,10 @@ impl Vm {
             // === Remaining zend_core ===
             "enum_exists" => {
                 let name = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                Ok(Some(Value::Bool(self.classes.contains_key(&name) || self.classes.contains_key(&name.to_lowercase()))))
+                Ok(Some(Value::Bool(
+                    self.classes.contains_key(&name)
+                        || self.classes.contains_key(&name.to_lowercase()),
+                )))
             }
             "get_declared_classes" => {
                 let mut arr = PhpArray::new();
@@ -6510,19 +7023,25 @@ impl Vm {
                 // Simplified: return empty for now since we don't distinguish
                 Ok(Some(Value::Array(PhpArray::new())))
             }
-            "get_declared_traits" => {
-                Ok(Some(Value::Array(PhpArray::new())))
-            }
+            "get_declared_traits" => Ok(Some(Value::Array(PhpArray::new()))),
             "debug_backtrace" => {
                 let mut arr = PhpArray::new();
                 for frame in self.call_stack.iter().rev() {
                     let mut entry = PhpArray::new();
                     let oa = &self.op_arrays[frame.op_array_idx];
-                    entry.set_string("function".into(), Value::String(oa.function_name.clone().unwrap_or_default()));
-                    entry.set_string("file".into(), Value::String(oa.filename.clone().unwrap_or_default()));
+                    entry.set_string(
+                        "function".into(),
+                        Value::String(oa.function_name.clone().unwrap_or_default()),
+                    );
+                    entry.set_string(
+                        "file".into(),
+                        Value::String(oa.filename.clone().unwrap_or_default()),
+                    );
                     entry.set_string("line".into(), Value::Long(0));
                     let mut fargs = PhpArray::new();
-                    for arg in &frame.args { fargs.push(arg.clone()); }
+                    for arg in &frame.args {
+                        fargs.push(arg.clone());
+                    }
                     entry.set_string("args".into(), Value::Array(fargs));
                     arr.push(Value::Array(entry));
                 }
@@ -6553,15 +7072,21 @@ impl Vm {
             // === Finish ctype ===
             "ctype_print" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                Ok(Some(Value::Bool(!s.is_empty() && s.bytes().all(|b| b >= 0x20 && b <= 0x7E))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.bytes().all(|b| b >= 0x20 && b <= 0x7E),
+                )))
             }
             "ctype_graph" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                Ok(Some(Value::Bool(!s.is_empty() && s.bytes().all(|b| b > 0x20 && b <= 0x7E))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.bytes().all(|b| b > 0x20 && b <= 0x7E),
+                )))
             }
             "ctype_cntrl" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                Ok(Some(Value::Bool(!s.is_empty() && s.bytes().all(|b| b < 0x20 || b == 0x7F))))
+                Ok(Some(Value::Bool(
+                    !s.is_empty() && s.bytes().all(|b| b < 0x20 || b == 0x7F),
+                )))
             }
 
             // === Finish random ===
@@ -6572,39 +7097,41 @@ impl Vm {
             "random_bytes" => {
                 let len = args.first().map(|v| v.to_long()).unwrap_or(0) as usize;
                 use std::time::SystemTime;
-                let mut rng = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default().subsec_nanos() as u64;
+                let mut rng = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as u64;
                 let mut bytes = Vec::with_capacity(len);
                 for _ in 0..len {
-                    rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
                     bytes.push((rng >> 33) as u8);
                 }
-                Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&bytes).to_string(),
+                )))
             }
             "lcg_value" => {
                 use std::time::SystemTime;
-                let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default().subsec_nanos() as f64;
+                let t = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos() as f64;
                 Ok(Some(Value::Double((t % 1000000.0) / 1000000.0)))
             }
 
             // === Misc standard ===
-            "memory_get_usage" | "memory_get_peak_usage" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "memory_get_usage" | "memory_get_peak_usage" => Ok(Some(Value::Long(0))),
             "memory_reset_peak_usage" => Ok(Some(Value::Null)),
-            "getmypid" => {
-                Ok(Some(Value::Long(std::process::id() as i64)))
-            }
-            "getmyuid" | "getmygid" | "getmyinode" | "getlastmod" => {
-                Ok(Some(Value::Long(0)))
-            }
-            "gethostname" => {
-                Ok(Some(Value::String("localhost".into())))
-            }
+            "getmypid" => Ok(Some(Value::Long(std::process::id() as i64))),
+            "getmyuid" | "getmygid" | "getmyinode" | "getlastmod" => Ok(Some(Value::Long(0))),
+            "gethostname" => Ok(Some(Value::String("localhost".into()))),
             "gettimeofday" => {
                 use std::time::SystemTime;
-                let dur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+                let dur = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
                 let return_float = args.first().map(|v| v.to_bool()).unwrap_or(false);
                 if return_float {
                     Ok(Some(Value::Double(dur.as_secs_f64())))
@@ -6619,7 +7146,9 @@ impl Vm {
             }
             "hrtime" => {
                 use std::time::SystemTime;
-                let dur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
+                let dur = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
                 let as_number = args.first().map(|v| v.to_bool()).unwrap_or(false);
                 if as_number {
                     Ok(Some(Value::Long(dur.as_nanos() as i64)))
@@ -6645,29 +7174,17 @@ impl Vm {
                 arr.set_string("ru_stime.tv_usec".into(), Value::Long(0));
                 Ok(Some(Value::Array(arr)))
             }
-            "php_ini_loaded_file" | "php_ini_scanned_files" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "ini_get" | "ini_set" | "ini_alter" | "ini_restore" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "ini_get_all" => {
-                Ok(Some(Value::Array(PhpArray::new())))
-            }
-            "get_cfg_var" | "get_include_path" | "set_include_path" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "php_ini_loaded_file" | "php_ini_scanned_files" => Ok(Some(Value::Bool(false))),
+            "ini_get" | "ini_set" | "ini_alter" | "ini_restore" => Ok(Some(Value::Bool(false))),
+            "ini_get_all" => Ok(Some(Value::Array(PhpArray::new()))),
+            "get_cfg_var" | "get_include_path" | "set_include_path" => Ok(Some(Value::Bool(false))),
             "error_log" => {
                 let msg = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 eprintln!("{}", msg);
                 Ok(Some(Value::Bool(true)))
             }
-            "error_clear_last" | "error_get_last" => {
-                Ok(Some(Value::Null))
-            }
-            "setlocale" => {
-                Ok(Some(Value::String("C".into())))
-            }
+            "error_clear_last" | "error_get_last" => Ok(Some(Value::Null)),
+            "setlocale" => Ok(Some(Value::String("C".into()))),
             "localeconv" => {
                 let mut arr = PhpArray::new();
                 arr.set_string("decimal_point".into(), Value::String(".".into()));
@@ -6676,9 +7193,7 @@ impl Vm {
                 arr.set_string("currency_symbol".into(), Value::String(String::new()));
                 Ok(Some(Value::Array(arr)))
             }
-            "setcookie" | "setrawcookie" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "setcookie" | "setrawcookie" => Ok(Some(Value::Bool(false))),
             "ip2long" => {
                 let ip = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let parts: Vec<&str> = ip.split('.').collect();
@@ -6688,7 +7203,9 @@ impl Vm {
                     let c = parts[2].parse::<u32>().unwrap_or(0);
                     let d = parts[3].parse::<u32>().unwrap_or(0);
                     if a <= 255 && b <= 255 && c <= 255 && d <= 255 {
-                        Ok(Some(Value::Long(((a << 24) | (b << 16) | (c << 8) | d) as i64)))
+                        Ok(Some(Value::Long(
+                            ((a << 24) | (b << 16) | (c << 8) | d) as i64,
+                        )))
                     } else {
                         Ok(Some(Value::Bool(false)))
                     }
@@ -6698,13 +7215,22 @@ impl Vm {
             }
             "long2ip" => {
                 let n = args.first().map(|v| v.to_long()).unwrap_or(0) as u32;
-                Ok(Some(Value::String(format!("{}.{}.{}.{}", n >> 24, (n >> 16) & 0xFF, (n >> 8) & 0xFF, n & 0xFF))))
+                Ok(Some(Value::String(format!(
+                    "{}.{}.{}.{}",
+                    n >> 24,
+                    (n >> 16) & 0xFF,
+                    (n >> 8) & 0xFF,
+                    n & 0xFF
+                ))))
             }
             "inet_ntop" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let bytes = s.as_bytes();
                 if bytes.len() == 4 {
-                    Ok(Some(Value::String(format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3]))))
+                    Ok(Some(Value::String(format!(
+                        "{}.{}.{}.{}",
+                        bytes[0], bytes[1], bytes[2], bytes[3]
+                    ))))
                 } else {
                     Ok(Some(Value::Bool(false)))
                 }
@@ -6715,7 +7241,9 @@ impl Vm {
                 if parts.len() == 4 {
                     let bytes: Vec<u8> = parts.iter().filter_map(|p| p.parse().ok()).collect();
                     if bytes.len() == 4 {
-                        Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+                        Ok(Some(Value::String(
+                            String::from_utf8_lossy(&bytes).to_string(),
+                        )))
                     } else {
                         Ok(Some(Value::Bool(false)))
                     }
@@ -6730,7 +7258,10 @@ impl Vm {
                 use std::time::SystemTime;
                 let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let timestamp = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
-                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
                 });
                 Ok(Some(Value::String(php_date_format(&format, timestamp))))
             }
@@ -6738,7 +7269,10 @@ impl Vm {
                 use std::time::SystemTime;
                 let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let timestamp = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
-                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
                 });
                 Ok(Some(Value::String(php_date_format(&format, timestamp))))
             }
@@ -6768,7 +7302,10 @@ impl Vm {
                 use std::time::SystemTime;
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let base = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
-                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
                 });
                 match parse_relative_time(&s, base) {
                     Some(ts) => Ok(Some(Value::Long(ts))),
@@ -6779,14 +7316,21 @@ impl Vm {
                 let month = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let day = args.get(1).map(|v| v.to_long()).unwrap_or(0);
                 let year = args.get(2).map(|v| v.to_long()).unwrap_or(0);
-                let valid = month >= 1 && month <= 12 && day >= 1 && year >= 1 && year <= 32767
+                let valid = month >= 1
+                    && month <= 12
+                    && day >= 1
+                    && year >= 1
+                    && year <= 32767
                     && day <= days_in_month(year, month);
                 Ok(Some(Value::Bool(valid)))
             }
             "getdate" => {
                 use std::time::SystemTime;
                 let ts = args.first().map(|v| v.to_long()).unwrap_or_else(|| {
-                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
                 });
                 let (year, month, day, hour, min, sec, wday, yday) = timestamp_to_parts(ts);
                 let mut arr = PhpArray::new();
@@ -6806,7 +7350,10 @@ impl Vm {
             "localtime" => {
                 use std::time::SystemTime;
                 let ts = args.first().map(|v| v.to_long()).unwrap_or_else(|| {
-                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
                 });
                 let assoc = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
                 let (year, month, day, hour, min, sec, wday, yday) = timestamp_to_parts(ts);
@@ -6840,7 +7387,10 @@ impl Vm {
                 use std::time::SystemTime;
                 let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let ts = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
-                    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
                 });
                 let (year, month, day, hour, min, sec, wday, yday) = timestamp_to_parts(ts);
                 let result = match format.chars().next() {
@@ -6875,7 +7425,11 @@ impl Vm {
                 let len = args.get(2).map(|v| v.to_long());
                 let chars: Vec<char> = s.chars().collect();
                 let total = chars.len() as i64;
-                let start = if start < 0 { (total + start).max(0) as usize } else { start as usize };
+                let start = if start < 0 {
+                    (total + start).max(0) as usize
+                } else {
+                    start as usize
+                };
                 let end = match len {
                     Some(l) if l < 0 => (total + l).max(start as i64) as usize,
                     Some(l) => (start + l as usize).min(chars.len()),
@@ -6884,7 +7438,9 @@ impl Vm {
                 if start >= chars.len() {
                     Ok(Some(Value::String(String::new())))
                 } else {
-                    Ok(Some(Value::String(chars[start..end.min(chars.len())].iter().collect())))
+                    Ok(Some(Value::String(
+                        chars[start..end.min(chars.len())].iter().collect(),
+                    )))
                 }
             }
             "mb_strpos" => {
@@ -6934,9 +7490,7 @@ impl Vm {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 Ok(Some(Value::String(s.to_uppercase())))
             }
-            "mb_detect_encoding" => {
-                Ok(Some(Value::String("UTF-8".into())))
-            }
+            "mb_detect_encoding" => Ok(Some(Value::String("UTF-8".into()))),
             "mb_internal_encoding" => {
                 if args.is_empty() {
                     Ok(Some(Value::String("UTF-8".into())))
@@ -7021,9 +7575,10 @@ impl Vm {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let mode = args.get(1).map(|v| v.to_long()).unwrap_or(0);
                 match mode {
-                    0 => Ok(Some(Value::String(s.to_uppercase()))),  // MB_CASE_UPPER
-                    1 => Ok(Some(Value::String(s.to_lowercase()))),  // MB_CASE_LOWER
-                    2 => {  // MB_CASE_TITLE
+                    0 => Ok(Some(Value::String(s.to_uppercase()))), // MB_CASE_UPPER
+                    1 => Ok(Some(Value::String(s.to_lowercase()))), // MB_CASE_LOWER
+                    2 => {
+                        // MB_CASE_TITLE
                         let mut result = String::new();
                         let mut cap_next = true;
                         for ch in s.chars() {
@@ -7032,7 +7587,9 @@ impl Vm {
                                 cap_next = false;
                             } else {
                                 result.push(ch);
-                                if ch.is_whitespace() { cap_next = true; }
+                                if ch.is_whitespace() {
+                                    cap_next = true;
+                                }
                             }
                         }
                         Ok(Some(Value::String(result)))
@@ -7045,38 +7602,32 @@ impl Vm {
             "hash" => {
                 let algo = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
-                match algo.as_str() {
-                    "md5" => Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(&data)))),
-                    "sha1" => Ok(Some(Value::String(php_rs_ext_standard::strings::php_sha1(&data)))),
-                    "crc32" => {
-                        let crc = crc32_compute(data.as_bytes());
-                        Ok(Some(Value::String(format!("{:08x}", crc))))
-                    }
-                    _ => Ok(Some(Value::Bool(false))),
+                match php_rs_ext_hash::php_hash(&algo, &data) {
+                    Some(result) => Ok(Some(Value::String(result))),
+                    None => Ok(Some(Value::Bool(false))),
                 }
             }
             "hash_hmac" => {
-                // Simplified HMAC: not cryptographically correct but functional
                 let algo = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let key = args.get(2).map(|v| v.to_php_string()).unwrap_or_default();
-                let combined = format!("{}{}", key, data);
-                match algo.as_str() {
-                    "md5" => Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(&combined)))),
-                    "sha1" => Ok(Some(Value::String(php_rs_ext_standard::strings::php_sha1(&combined)))),
-                    _ => Ok(Some(Value::Bool(false))),
+                match php_rs_ext_hash::php_hash_hmac(&algo, &data, &key) {
+                    Some(result) => Ok(Some(Value::String(result))),
+                    None => Ok(Some(Value::Bool(false))),
                 }
             }
             "hash_equals" => {
                 let known = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let user = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
-                Ok(Some(Value::Bool(known == user)))
+                Ok(Some(Value::Bool(php_rs_ext_hash::php_hash_equals(
+                    &known, &user,
+                ))))
             }
             "hash_algos" => {
                 let mut arr = PhpArray::new();
-                arr.push(Value::String("md5".into()));
-                arr.push(Value::String("sha1".into()));
-                arr.push(Value::String("crc32".into()));
+                for algo in php_rs_ext_hash::php_hash_algos() {
+                    arr.push(Value::String(algo.to_string()));
+                }
                 Ok(Some(Value::Array(arr)))
             }
 
@@ -7085,68 +7636,94 @@ impl Vm {
                 let val = args.first().cloned().unwrap_or(Value::Null);
                 let filter = args.get(1).map(|v| v.to_long()).unwrap_or(516); // FILTER_DEFAULT
                 match filter {
-                    258 => { // FILTER_VALIDATE_INT
+                    258 => {
+                        // FILTER_VALIDATE_INT
                         match &val {
                             Value::Long(n) => Ok(Some(Value::Long(*n))),
-                            Value::String(s) => {
-                                match s.trim().parse::<i64>() {
-                                    Ok(n) => Ok(Some(Value::Long(n))),
-                                    Err(_) => Ok(Some(Value::Bool(false))),
-                                }
-                            }
+                            Value::String(s) => match s.trim().parse::<i64>() {
+                                Ok(n) => Ok(Some(Value::Long(n))),
+                                Err(_) => Ok(Some(Value::Bool(false))),
+                            },
                             _ => Ok(Some(Value::Bool(false))),
                         }
                     }
-                    259 => { // FILTER_VALIDATE_FLOAT
+                    259 => {
+                        // FILTER_VALIDATE_FLOAT
                         match &val {
                             Value::Double(n) => Ok(Some(Value::Double(*n))),
                             Value::Long(n) => Ok(Some(Value::Double(*n as f64))),
-                            Value::String(s) => {
-                                match s.trim().parse::<f64>() {
-                                    Ok(n) => Ok(Some(Value::Double(n))),
-                                    Err(_) => Ok(Some(Value::Bool(false))),
-                                }
-                            }
+                            Value::String(s) => match s.trim().parse::<f64>() {
+                                Ok(n) => Ok(Some(Value::Double(n))),
+                                Err(_) => Ok(Some(Value::Bool(false))),
+                            },
                             _ => Ok(Some(Value::Bool(false))),
                         }
                     }
-                    274 => { // FILTER_VALIDATE_EMAIL
+                    274 => {
+                        // FILTER_VALIDATE_EMAIL
                         let s = val.to_php_string();
-                        let valid = s.contains('@') && s.len() > 3 && !s.starts_with('@') && !s.ends_with('@');
-                        if valid { Ok(Some(Value::String(s))) } else { Ok(Some(Value::Bool(false))) }
+                        let valid = s.contains('@')
+                            && s.len() > 3
+                            && !s.starts_with('@')
+                            && !s.ends_with('@');
+                        if valid {
+                            Ok(Some(Value::String(s)))
+                        } else {
+                            Ok(Some(Value::Bool(false)))
+                        }
                     }
-                    275 => { // FILTER_VALIDATE_URL
+                    275 => {
+                        // FILTER_VALIDATE_URL
                         let s = val.to_php_string();
-                        let valid = s.starts_with("http://") || s.starts_with("https://") || s.starts_with("ftp://");
-                        if valid { Ok(Some(Value::String(s))) } else { Ok(Some(Value::Bool(false))) }
+                        let valid = s.starts_with("http://")
+                            || s.starts_with("https://")
+                            || s.starts_with("ftp://");
+                        if valid {
+                            Ok(Some(Value::String(s)))
+                        } else {
+                            Ok(Some(Value::Bool(false)))
+                        }
                     }
-                    277 => { // FILTER_VALIDATE_IP
+                    277 => {
+                        // FILTER_VALIDATE_IP
                         let s = val.to_php_string();
                         let parts: Vec<&str> = s.split('.').collect();
-                        let valid = parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok());
-                        if valid { Ok(Some(Value::String(s))) } else { Ok(Some(Value::Bool(false))) }
+                        let valid =
+                            parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok());
+                        if valid {
+                            Ok(Some(Value::String(s)))
+                        } else {
+                            Ok(Some(Value::Bool(false)))
+                        }
                     }
-                    278 => { // FILTER_VALIDATE_BOOLEAN
+                    278 => {
+                        // FILTER_VALIDATE_BOOLEAN
                         match val.to_php_string().to_lowercase().as_str() {
                             "true" | "on" | "yes" | "1" => Ok(Some(Value::Bool(true))),
                             "false" | "off" | "no" | "0" | "" => Ok(Some(Value::Bool(false))),
                             _ => Ok(Some(Value::Null)),
                         }
                     }
-                    521 => { // FILTER_SANITIZE_STRING (deprecated but common)
+                    521 => {
+                        // FILTER_SANITIZE_STRING (deprecated but common)
                         let s = val.to_php_string();
-                        let cleaned: String = s.chars().filter(|c| *c != '<' && *c != '>').collect();
+                        let cleaned: String =
+                            s.chars().filter(|c| *c != '<' && *c != '>').collect();
                         Ok(Some(Value::String(cleaned)))
                     }
-                    513 => { // FILTER_SANITIZE_ENCODED
+                    513 => {
+                        // FILTER_SANITIZE_ENCODED
                         let s = val.to_php_string();
-                        let encoded: String = s.chars().map(|c| {
-                            if c.is_ascii_alphanumeric() || "-._~".contains(c) {
-                                c.to_string()
-                            } else {
-                                format!("%{:02X}", c as u32)
-                            }
-                        }).collect();
+                        let encoded: String = s
+                            .chars()
+                            .map(|c| {
+                                if c.is_ascii_alphanumeric() || "-._~".contains(c) {
+                                    c.to_string()
+                                } else {
+                                    format!("%{:02X}", c as u32)
+                                }
+                            })
+                            .collect();
                         Ok(Some(Value::String(encoded)))
                     }
                     _ => Ok(Some(val)), // FILTER_DEFAULT or unknown
@@ -7159,7 +7736,25 @@ impl Vm {
             "filter_has_var" => Ok(Some(Value::Bool(false))),
             "filter_list" => {
                 let mut arr = PhpArray::new();
-                for name in &["int", "boolean", "float", "validate_regexp", "validate_url", "validate_email", "validate_ip", "string", "stripped", "encoded", "special_chars", "unsafe_raw", "email", "url", "number_int", "number_float", "callback"] {
+                for name in &[
+                    "int",
+                    "boolean",
+                    "float",
+                    "validate_regexp",
+                    "validate_url",
+                    "validate_email",
+                    "validate_ip",
+                    "string",
+                    "stripped",
+                    "encoded",
+                    "special_chars",
+                    "unsafe_raw",
+                    "email",
+                    "url",
+                    "number_int",
+                    "number_float",
+                    "callback",
+                ] {
                     arr.push(Value::String(name.to_string()));
                 }
                 Ok(Some(Value::Array(arr)))
@@ -7167,12 +7762,20 @@ impl Vm {
             "filter_id" => {
                 let name = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let id = match name.as_str() {
-                    "int" => 257, "boolean" => 258, "float" => 259,
-                    "validate_url" => 273, "validate_email" => 274, "validate_ip" => 275,
+                    "int" => 257,
+                    "boolean" => 258,
+                    "float" => 259,
+                    "validate_url" => 273,
+                    "validate_email" => 274,
+                    "validate_ip" => 275,
                     "string" | "stripped" => 513,
                     _ => 0,
                 };
-                if id > 0 { Ok(Some(Value::Long(id))) } else { Ok(Some(Value::Bool(false))) }
+                if id > 0 {
+                    Ok(Some(Value::Long(id)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
             }
 
             // === bcmath extension ===
@@ -7181,21 +7784,33 @@ impl Vm {
                 let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
                 let result = a.parse::<f64>().unwrap_or(0.0) + b.parse::<f64>().unwrap_or(0.0);
-                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+                Ok(Some(Value::String(format!(
+                    "{:.prec$}",
+                    result,
+                    prec = scale
+                ))))
             }
             "bcsub" => {
                 let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
                 let result = a.parse::<f64>().unwrap_or(0.0) - b.parse::<f64>().unwrap_or(0.0);
-                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+                Ok(Some(Value::String(format!(
+                    "{:.prec$}",
+                    result,
+                    prec = scale
+                ))))
             }
             "bcmul" => {
                 let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
                 let result = a.parse::<f64>().unwrap_or(0.0) * b.parse::<f64>().unwrap_or(0.0);
-                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+                Ok(Some(Value::String(format!(
+                    "{:.prec$}",
+                    result,
+                    prec = scale
+                ))))
             }
             "bcdiv" => {
                 let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
@@ -7206,7 +7821,11 @@ impl Vm {
                     return Err(VmError::FatalError("Division by zero".into()));
                 }
                 let result = a.parse::<f64>().unwrap_or(0.0) / bv;
-                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+                Ok(Some(Value::String(format!(
+                    "{:.prec$}",
+                    result,
+                    prec = scale
+                ))))
             }
             "bcmod" => {
                 let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
@@ -7217,27 +7836,48 @@ impl Vm {
                     return Err(VmError::FatalError("Division by zero".into()));
                 }
                 let result = a.parse::<f64>().unwrap_or(0.0) % bv;
-                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+                Ok(Some(Value::String(format!(
+                    "{:.prec$}",
+                    result,
+                    prec = scale
+                ))))
             }
             "bcpow" => {
                 let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let scale = args.get(2).map(|v| v.to_long()).unwrap_or(0) as usize;
-                let result = a.parse::<f64>().unwrap_or(0.0).powf(b.parse::<f64>().unwrap_or(0.0));
-                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+                let result = a
+                    .parse::<f64>()
+                    .unwrap_or(0.0)
+                    .powf(b.parse::<f64>().unwrap_or(0.0));
+                Ok(Some(Value::String(format!(
+                    "{:.prec$}",
+                    result,
+                    prec = scale
+                ))))
             }
             "bccomp" => {
                 let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let av = a.parse::<f64>().unwrap_or(0.0);
                 let bv = b.parse::<f64>().unwrap_or(0.0);
-                Ok(Some(Value::Long(if av < bv { -1 } else if av > bv { 1 } else { 0 })))
+                Ok(Some(Value::Long(if av < bv {
+                    -1
+                } else if av > bv {
+                    1
+                } else {
+                    0
+                })))
             }
             "bcsqrt" => {
                 let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let scale = args.get(1).map(|v| v.to_long()).unwrap_or(0) as usize;
                 let result = a.parse::<f64>().unwrap_or(0.0).sqrt();
-                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale))))
+                Ok(Some(Value::String(format!(
+                    "{:.prec$}",
+                    result,
+                    prec = scale
+                ))))
             }
             "bcscale" => {
                 // Stub: return/set scale
@@ -7248,9 +7888,24 @@ impl Vm {
                 }
             }
             "bcpowmod" => {
-                let base = args.first().map(|v| v.to_php_string()).unwrap_or_default().parse::<i64>().unwrap_or(0);
-                let exp = args.get(1).map(|v| v.to_php_string()).unwrap_or_default().parse::<i64>().unwrap_or(0);
-                let modulus = args.get(2).map(|v| v.to_php_string()).unwrap_or_default().parse::<i64>().unwrap_or(1);
+                let base = args
+                    .first()
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default()
+                    .parse::<i64>()
+                    .unwrap_or(0);
+                let exp = args
+                    .get(1)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default()
+                    .parse::<i64>()
+                    .unwrap_or(0);
+                let modulus = args
+                    .get(2)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default()
+                    .parse::<i64>()
+                    .unwrap_or(1);
                 if modulus == 0 {
                     return Err(VmError::FatalError("Division by zero".into()));
                 }
@@ -7258,7 +7913,9 @@ impl Vm {
                 let mut b = base % modulus;
                 let mut e = exp;
                 while e > 0 {
-                    if e % 2 == 1 { result = result * b % modulus; }
+                    if e % 2 == 1 {
+                        result = result * b % modulus;
+                    }
                     e /= 2;
                     b = b * b % modulus;
                 }
@@ -7280,7 +7937,11 @@ impl Vm {
                 let f = a.parse::<f64>().unwrap_or(0.0);
                 let factor = 10f64.powi(scale as i32);
                 let result = (f * factor).round() / factor;
-                Ok(Some(Value::String(format!("{:.prec$}", result, prec = scale as usize))))
+                Ok(Some(Value::String(format!(
+                    "{:.prec$}",
+                    result,
+                    prec = scale as usize
+                ))))
             }
 
             // === spl extension ===
@@ -7294,9 +7955,7 @@ impl Vm {
                 // Return a unique identifier
                 Ok(Some(Value::Long(0)))
             }
-            "spl_object_hash" => {
-                Ok(Some(Value::String("0000000000000000".into())))
-            }
+            "spl_object_hash" => Ok(Some(Value::String("0000000000000000".into()))),
             "iterator_to_array" => {
                 let val = args.first().cloned().unwrap_or(Value::Null);
                 if let Value::Array(a) = val {
@@ -7331,7 +7990,10 @@ impl Vm {
             "password_verify" => {
                 let password = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let hash = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
-                let expected = format!("$2y$10${}", php_rs_ext_standard::strings::php_md5(&password));
+                let expected = format!(
+                    "$2y$10${}",
+                    php_rs_ext_standard::strings::php_md5(&password)
+                );
                 Ok(Some(Value::Bool(hash == expected)))
             }
             "password_needs_rehash" => Ok(Some(Value::Bool(false))),
@@ -7352,7 +8014,10 @@ impl Vm {
             "time_nanosleep" => {
                 let secs = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let nsecs = args.get(1).map(|v| v.to_long()).unwrap_or(0);
-                std::thread::sleep(std::time::Duration::new(secs.max(0) as u64, nsecs.max(0) as u32));
+                std::thread::sleep(std::time::Duration::new(
+                    secs.max(0) as u64,
+                    nsecs.max(0) as u32,
+                ));
                 Ok(Some(Value::Bool(true)))
             }
             "time_sleep_until" => {
@@ -7362,15 +8027,25 @@ impl Vm {
             "uniqid" => {
                 use std::time::SystemTime;
                 let prefix = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                let dur = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-                let id = format!("{}{:08x}{:05x}", prefix, dur.as_secs() as u32, dur.subsec_micros());
+                let dur = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let id = format!(
+                    "{}{:08x}{:05x}",
+                    prefix,
+                    dur.as_secs() as u32,
+                    dur.subsec_micros()
+                );
                 Ok(Some(Value::String(id)))
             }
 
             // === FILE I/O: fopen/fclose/fread/fwrite family ===
             "fopen" => {
                 let filename = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                let mode = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "r".into());
+                let mode = args
+                    .get(1)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| "r".into());
                 match php_rs_ext_standard::file::FileHandle::open(&filename, &mode) {
                     Ok(handle) => {
                         let id = self.next_resource_id;
@@ -7394,7 +8069,9 @@ impl Vm {
                 let length = args.get(1).map(|v| v.to_long()).unwrap_or(0) as usize;
                 if let Some(handle) = self.file_handles.get_mut(&id) {
                     match handle.read(length) {
-                        Ok(data) => Ok(Some(Value::String(String::from_utf8_lossy(&data).to_string()))),
+                        Ok(data) => Ok(Some(Value::String(
+                            String::from_utf8_lossy(&data).to_string(),
+                        ))),
                         Err(_) => Ok(Some(Value::Bool(false))),
                     }
                 } else {
@@ -7504,7 +8181,9 @@ impl Vm {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if let Some(handle) = self.file_handles.get_mut(&id) {
                     match handle.read(1) {
-                        Ok(data) if !data.is_empty() => Ok(Some(Value::String(String::from_utf8_lossy(&data).to_string()))),
+                        Ok(data) if !data.is_empty() => Ok(Some(Value::String(
+                            String::from_utf8_lossy(&data).to_string(),
+                        ))),
                         _ => Ok(Some(Value::Bool(false))),
                     }
                 } else {
@@ -7513,7 +8192,10 @@ impl Vm {
             }
             "fgetcsv" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
-                let separator = args.get(2).map(|v| v.to_php_string()).unwrap_or_else(|| ",".into());
+                let separator = args
+                    .get(2)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| ",".into());
                 let sep = separator.chars().next().unwrap_or(',');
                 if let Some(handle) = self.file_handles.get_mut(&id) {
                     match handle.gets() {
@@ -7534,16 +8216,25 @@ impl Vm {
             "fputcsv" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let fields = args.get(1).cloned().unwrap_or(Value::Null);
-                let separator = args.get(2).map(|v| v.to_php_string()).unwrap_or_else(|| ",".into());
-                if let (Some(handle), Value::Array(ref arr)) = (self.file_handles.get_mut(&id), &fields) {
-                    let line: Vec<String> = arr.entries().iter().map(|(_, v)| {
-                        let s = v.to_php_string();
-                        if s.contains(&separator) || s.contains('"') || s.contains('\n') {
-                            format!("\"{}\"", s.replace('"', "\"\""))
-                        } else {
-                            s
-                        }
-                    }).collect();
+                let separator = args
+                    .get(2)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| ",".into());
+                if let (Some(handle), Value::Array(ref arr)) =
+                    (self.file_handles.get_mut(&id), &fields)
+                {
+                    let line: Vec<String> = arr
+                        .entries()
+                        .iter()
+                        .map(|(_, v)| {
+                            let s = v.to_php_string();
+                            if s.contains(&separator) || s.contains('"') || s.contains('\n') {
+                                format!("\"{}\"", s.replace('"', "\"\""))
+                            } else {
+                                s
+                            }
+                        })
+                        .collect();
                     let csv_line = format!("{}\n", line.join(&separator));
                     match handle.write(csv_line.as_bytes()) {
                         Ok(n) => Ok(Some(Value::Long(n as i64))),
@@ -7574,7 +8265,10 @@ impl Vm {
             "fstat" => {
                 // Stub: return basic stat array
                 let mut arr = PhpArray::new();
-                for key in &["dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "atime", "mtime", "ctime", "blksize", "blocks"] {
+                for key in &[
+                    "dev", "ino", "mode", "nlink", "uid", "gid", "rdev", "size", "atime", "mtime",
+                    "ctime", "blksize", "blocks",
+                ] {
                     arr.set_string(key.to_string(), Value::Long(0));
                 }
                 Ok(Some(Value::Array(arr)))
@@ -7593,17 +8287,15 @@ impl Vm {
             "tmpfile" => {
                 let dir = php_rs_ext_standard::file::php_sys_get_temp_dir();
                 match php_rs_ext_standard::file::php_tempnam(&dir, "php") {
-                    Ok(path) => {
-                        match php_rs_ext_standard::file::FileHandle::open(&path, "w+") {
-                            Ok(handle) => {
-                                let id = self.next_resource_id;
-                                self.next_resource_id += 1;
-                                self.file_handles.insert(id, handle);
-                                Ok(Some(Value::Long(id)))
-                            }
-                            Err(_) => Ok(Some(Value::Bool(false))),
+                    Ok(path) => match php_rs_ext_standard::file::FileHandle::open(&path, "w+") {
+                        Ok(handle) => {
+                            let id = self.next_resource_id;
+                            self.next_resource_id += 1;
+                            self.file_handles.insert(id, handle);
+                            Ok(Some(Value::Long(id)))
                         }
-                    }
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    },
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
@@ -7641,9 +8333,12 @@ impl Vm {
                         arr.set_string("gid".into(), Value::Long(0));
                         arr.set_string("rdev".into(), Value::Long(0));
                         arr.set_string("size".into(), Value::Long(size));
-                        let mtime = m.modified().ok()
+                        let mtime = m
+                            .modified()
+                            .ok()
                             .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64).unwrap_or(0);
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
                         arr.set_string("atime".into(), Value::Long(mtime));
                         arr.set_string("mtime".into(), Value::Long(mtime));
                         arr.set_string("ctime".into(), Value::Long(mtime));
@@ -7679,9 +8374,7 @@ impl Vm {
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
-            "fileowner" | "filegroup" | "fileinode" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "fileowner" | "filegroup" | "fileinode" => Ok(Some(Value::Long(0))),
             "linkinfo" => {
                 let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 match std::fs::symlink_metadata(&path) {
@@ -7733,32 +8426,35 @@ impl Vm {
                 // Simple glob-style matching
                 Ok(Some(Value::Bool(simple_fnmatch(&pattern, &string))))
             }
-            "disk_free_space" | "diskfreespace" => {
-                Ok(Some(Value::Double(0.0)))
-            }
-            "disk_total_space" => {
-                Ok(Some(Value::Double(0.0)))
-            }
+            "disk_free_space" | "diskfreespace" => Ok(Some(Value::Double(0.0))),
+            "disk_total_space" => Ok(Some(Value::Double(0.0))),
 
             // === Directory functions ===
             "opendir" => {
                 let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 match std::fs::read_dir(&path) {
                     Ok(entries) => {
-                        let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+                        let names: Vec<String> = entries
+                            .flatten()
+                            .map(|e| e.file_name().to_string_lossy().to_string())
+                            .collect();
                         let id = self.next_resource_id;
                         self.next_resource_id += 1;
                         // Store directory entries as a special "file handle" with the data pre-read
                         // We'll use a string buffer approach: join names with newlines
                         let data = names.join("\n");
-                        if let Ok(handle) = php_rs_ext_standard::file::FileHandle::open("/dev/null", "r") {
+                        if let Ok(handle) =
+                            php_rs_ext_standard::file::FileHandle::open("/dev/null", "r")
+                        {
                             // Actually, let's use a different approach: store entries in a temp vec
                             // For simplicity, store the dir listing in the output temporarily
                             let _ = handle;
                         }
                         // Simpler approach: store as serialized string in constants
-                        self.constants.insert(format!("__dir_entries_{}", id), Value::String(data));
-                        self.constants.insert(format!("__dir_pos_{}", id), Value::Long(0));
+                        self.constants
+                            .insert(format!("__dir_entries_{}", id), Value::String(data));
+                        self.constants
+                            .insert(format!("__dir_pos_{}", id), Value::Long(0));
                         Ok(Some(Value::Long(id)))
                     }
                     Err(_) => Ok(Some(Value::Bool(false))),
@@ -7768,11 +8464,17 @@ impl Vm {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let entries_key = format!("__dir_entries_{}", id);
                 let pos_key = format!("__dir_pos_{}", id);
-                if let Some(Value::String(ref entries)) = self.constants.get(&entries_key).cloned() {
+                if let Some(Value::String(ref entries)) = self.constants.get(&entries_key).cloned()
+                {
                     let names: Vec<&str> = entries.split('\n').collect();
-                    let pos = self.constants.get(&pos_key).map(|v| v.to_long()).unwrap_or(0) as usize;
+                    let pos = self
+                        .constants
+                        .get(&pos_key)
+                        .map(|v| v.to_long())
+                        .unwrap_or(0) as usize;
                     if pos < names.len() {
-                        self.constants.insert(pos_key, Value::Long((pos + 1) as i64));
+                        self.constants
+                            .insert(pos_key, Value::Long((pos + 1) as i64));
                         Ok(Some(Value::String(names[pos].to_string())))
                     } else {
                         Ok(Some(Value::Bool(false)))
@@ -7789,19 +8491,16 @@ impl Vm {
             }
             "rewinddir" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
-                self.constants.insert(format!("__dir_pos_{}", id), Value::Long(0));
+                self.constants
+                    .insert(format!("__dir_pos_{}", id), Value::Long(0));
                 Ok(Some(Value::Null))
             }
             "dir" => {
                 // Returns an object, stub as false
                 Ok(Some(Value::Bool(false)))
             }
-            "chown" | "chgrp" | "lchown" | "lchgrp" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "chroot" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "chown" | "chgrp" | "lchown" | "lchgrp" => Ok(Some(Value::Bool(false))),
+            "chroot" => Ok(Some(Value::Bool(false))),
 
             // === String functions ===
             "strnatcmp" => {
@@ -7812,7 +8511,9 @@ impl Vm {
             "strnatcasecmp" => {
                 let a = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let b = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
-                Ok(Some(Value::Long(nat_cmp(&a.to_lowercase(), &b.to_lowercase()) as i64)))
+                Ok(Some(Value::Long(
+                    nat_cmp(&a.to_lowercase(), &b.to_lowercase()) as i64,
+                )))
             }
             "sscanf" => {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
@@ -7828,27 +8529,44 @@ impl Vm {
                         match f_bytes[fi] {
                             b'd' => {
                                 let start = si;
-                                if si < s_bytes.len() && (s_bytes[si] == b'-' || s_bytes[si] == b'+') { si += 1; }
-                                while si < s_bytes.len() && s_bytes[si].is_ascii_digit() { si += 1; }
+                                if si < s_bytes.len()
+                                    && (s_bytes[si] == b'-' || s_bytes[si] == b'+')
+                                {
+                                    si += 1;
+                                }
+                                while si < s_bytes.len() && s_bytes[si].is_ascii_digit() {
+                                    si += 1;
+                                }
                                 let num_str = &s[start..si];
                                 result.push(Value::Long(num_str.parse().unwrap_or(0)));
                             }
                             b's' => {
                                 let start = si;
-                                while si < s_bytes.len() && !s_bytes[si].is_ascii_whitespace() { si += 1; }
+                                while si < s_bytes.len() && !s_bytes[si].is_ascii_whitespace() {
+                                    si += 1;
+                                }
                                 result.push(Value::String(s[start..si].to_string()));
                             }
                             b'f' => {
                                 let start = si;
-                                while si < s_bytes.len() && (s_bytes[si].is_ascii_digit() || s_bytes[si] == b'.' || s_bytes[si] == b'-') { si += 1; }
+                                while si < s_bytes.len()
+                                    && (s_bytes[si].is_ascii_digit()
+                                        || s_bytes[si] == b'.'
+                                        || s_bytes[si] == b'-')
+                                {
+                                    si += 1;
+                                }
                                 let num_str = &s[start..si];
                                 result.push(Value::Double(num_str.parse().unwrap_or(0.0)));
                             }
                             b'c' => {
-                                result.push(Value::String(s[si..si+1].to_string()));
+                                result.push(Value::String(s[si..si + 1].to_string()));
                                 si += 1;
                             }
-                            _ => { fi += 1; continue; }
+                            _ => {
+                                fi += 1;
+                                continue;
+                            }
                         }
                         fi += 1;
                     } else if f_bytes[fi] == s_bytes[si] {
@@ -7868,7 +8586,16 @@ impl Vm {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let format = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let fmt_args: Vec<Value> = args.iter().skip(2).cloned().collect();
-                let formatted = php_rs_ext_standard::strings::php_sprintf(&format, &fmt_args.iter().map(|v| v.to_php_string()).collect::<Vec<_>>().iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                let formatted = php_rs_ext_standard::strings::php_sprintf(
+                    &format,
+                    &fmt_args
+                        .iter()
+                        .map(|v| v.to_php_string())
+                        .collect::<Vec<_>>()
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>(),
+                );
                 if let Some(handle) = self.file_handles.get_mut(&id) {
                     match handle.write(formatted.as_bytes()) {
                         Ok(n) => Ok(Some(Value::Long(n as i64))),
@@ -7881,9 +8608,17 @@ impl Vm {
             "vprintf" => {
                 let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let arr_args = if let Some(Value::Array(ref a)) = args.get(1) {
-                    a.entries().iter().map(|(_, v)| v.to_php_string()).collect::<Vec<_>>()
-                } else { vec![] };
-                let formatted = php_rs_ext_standard::strings::php_sprintf(&format, &arr_args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                    a.entries()
+                        .iter()
+                        .map(|(_, v)| v.to_php_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                let formatted = php_rs_ext_standard::strings::php_sprintf(
+                    &format,
+                    &arr_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                );
                 let len = formatted.len();
                 self.output.push_str(&formatted);
                 Ok(Some(Value::Long(len as i64)))
@@ -7891,18 +8626,34 @@ impl Vm {
             "vsprintf" => {
                 let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let arr_args = if let Some(Value::Array(ref a)) = args.get(1) {
-                    a.entries().iter().map(|(_, v)| v.to_php_string()).collect::<Vec<_>>()
-                } else { vec![] };
-                let formatted = php_rs_ext_standard::strings::php_sprintf(&format, &arr_args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                    a.entries()
+                        .iter()
+                        .map(|(_, v)| v.to_php_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                let formatted = php_rs_ext_standard::strings::php_sprintf(
+                    &format,
+                    &arr_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                );
                 Ok(Some(Value::String(formatted)))
             }
             "vfprintf" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let format = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let arr_args = if let Some(Value::Array(ref a)) = args.get(2) {
-                    a.entries().iter().map(|(_, v)| v.to_php_string()).collect::<Vec<_>>()
-                } else { vec![] };
-                let formatted = php_rs_ext_standard::strings::php_sprintf(&format, &arr_args.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+                    a.entries()
+                        .iter()
+                        .map(|(_, v)| v.to_php_string())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![]
+                };
+                let formatted = php_rs_ext_standard::strings::php_sprintf(
+                    &format,
+                    &arr_args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                );
                 if let Some(handle) = self.file_handles.get_mut(&id) {
                     match handle.write(formatted.as_bytes()) {
                         Ok(n) => Ok(Some(Value::Long(n as i64))),
@@ -7931,14 +8682,18 @@ impl Vm {
             "md5_file" => {
                 let filename = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 match std::fs::read_to_string(&filename) {
-                    Ok(contents) => Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(&contents)))),
+                    Ok(contents) => Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(
+                        &contents,
+                    )))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
             "sha1_file" => {
                 let filename = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 match std::fs::read_to_string(&filename) {
-                    Ok(contents) => Ok(Some(Value::String(php_rs_ext_standard::strings::php_sha1(&contents)))),
+                    Ok(contents) => Ok(Some(Value::String(
+                        php_rs_ext_standard::strings::php_sha1(&contents),
+                    ))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
@@ -7956,10 +8711,16 @@ impl Vm {
             }
 
             // === Array callback functions (stub without actual callback) ===
-            "array_diff_uassoc" | "array_diff_ukey"
-            | "array_intersect_uassoc" | "array_intersect_ukey"
-            | "array_udiff" | "array_udiff_assoc" | "array_udiff_uassoc"
-            | "array_uintersect" | "array_uintersect_assoc" | "array_uintersect_uassoc" => {
+            "array_diff_uassoc"
+            | "array_diff_ukey"
+            | "array_intersect_uassoc"
+            | "array_intersect_ukey"
+            | "array_udiff"
+            | "array_udiff_assoc"
+            | "array_udiff_uassoc"
+            | "array_uintersect"
+            | "array_uintersect_assoc"
+            | "array_uintersect_uassoc" => {
                 // These require user callback comparison. Fall back to regular diff/intersect.
                 let arr1 = args.first().cloned().unwrap_or(Value::Null);
                 let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
@@ -7990,21 +8751,11 @@ impl Vm {
                 // Simplified stub
                 Ok(Some(Value::Bool(true)))
             }
-            "ob_get_contents" => {
-                Ok(Some(Value::String(self.output.clone())))
-            }
-            "ob_get_length" => {
-                Ok(Some(Value::Long(self.output.len() as i64)))
-            }
-            "ob_get_level" => {
-                Ok(Some(Value::Long(0)))
-            }
-            "ob_end_clean" | "ob_clean" => {
-                Ok(Some(Value::Bool(true)))
-            }
-            "ob_end_flush" | "ob_flush" => {
-                Ok(Some(Value::Bool(true)))
-            }
+            "ob_get_contents" => Ok(Some(Value::String(self.output.clone()))),
+            "ob_get_length" => Ok(Some(Value::Long(self.output.len() as i64))),
+            "ob_get_level" => Ok(Some(Value::Long(0))),
+            "ob_end_clean" | "ob_clean" => Ok(Some(Value::Bool(true))),
+            "ob_end_flush" | "ob_flush" => Ok(Some(Value::Bool(true))),
             "ob_get_clean" => {
                 let contents = self.output.clone();
                 Ok(Some(Value::String(contents)))
@@ -8013,9 +8764,7 @@ impl Vm {
                 let contents = self.output.clone();
                 Ok(Some(Value::String(contents)))
             }
-            "ob_get_status" => {
-                Ok(Some(Value::Array(PhpArray::new())))
-            }
+            "ob_get_status" => Ok(Some(Value::Array(PhpArray::new()))),
             "ob_implicit_flush" => Ok(Some(Value::Null)),
             "ob_list_handlers" => Ok(Some(Value::Array(PhpArray::new()))),
             "output_add_rewrite_var" => Ok(Some(Value::Bool(true))),
@@ -8025,9 +8774,15 @@ impl Vm {
             // === Execution functions ===
             "exec" => {
                 let cmd = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::process::Command::new("sh").arg("-c").arg(&cmd).output() {
+                match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                {
                     Ok(output) => {
-                        let stdout = String::from_utf8_lossy(&output.stdout).trim_end().to_string();
+                        let stdout = String::from_utf8_lossy(&output.stdout)
+                            .trim_end()
+                            .to_string();
                         let last_line = stdout.lines().last().unwrap_or("").to_string();
                         Ok(Some(Value::String(last_line)))
                     }
@@ -8036,14 +8791,24 @@ impl Vm {
             }
             "shell_exec" => {
                 let cmd = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::process::Command::new("sh").arg("-c").arg(&cmd).output() {
-                    Ok(output) => Ok(Some(Value::String(String::from_utf8_lossy(&output.stdout).to_string()))),
+                match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                {
+                    Ok(output) => Ok(Some(Value::String(
+                        String::from_utf8_lossy(&output.stdout).to_string(),
+                    ))),
                     Err(_) => Ok(Some(Value::Null)),
                 }
             }
             "system" => {
                 let cmd = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::process::Command::new("sh").arg("-c").arg(&cmd).output() {
+                match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                {
                     Ok(output) => {
                         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                         self.output.push_str(&stdout);
@@ -8055,9 +8820,14 @@ impl Vm {
             }
             "passthru" => {
                 let cmd = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::process::Command::new("sh").arg("-c").arg(&cmd).output() {
+                match std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                {
                     Ok(output) => {
-                        self.output.push_str(&String::from_utf8_lossy(&output.stdout));
+                        self.output
+                            .push_str(&String::from_utf8_lossy(&output.stdout));
                         Ok(Some(Value::Null))
                     }
                     Err(_) => Ok(Some(Value::Bool(false))),
@@ -8065,7 +8835,10 @@ impl Vm {
             }
             "escapeshellarg" => {
                 let arg = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                Ok(Some(Value::String(format!("'{}'", arg.replace('\'', "'\\''")))))
+                Ok(Some(Value::String(format!(
+                    "'{}'",
+                    arg.replace('\'', "'\\''")
+                ))))
             }
             "escapeshellcmd" => {
                 let cmd = args.first().map(|v| v.to_php_string()).unwrap_or_default();
@@ -8091,14 +8864,18 @@ impl Vm {
             "assert" => {
                 let val = args.first().map(|v| v.to_bool()).unwrap_or(true);
                 if !val {
-                    self.output.push_str("Warning: assert(): Assertion failed\n");
+                    self.output
+                        .push_str("Warning: assert(): Assertion failed\n");
                 }
                 Ok(Some(Value::Bool(val)))
             }
             "assert_options" => Ok(Some(Value::Long(1))),
             "crypt" => {
                 let str_val = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                let salt = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "xx".into());
+                let salt = args
+                    .get(1)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| "xx".into());
                 // Simplified: just hash with md5 prefix
                 let hash = php_rs_ext_standard::strings::php_md5(&format!("{}{}", salt, str_val));
                 Ok(Some(Value::String(format!("${}", hash))))
@@ -8123,12 +8900,8 @@ impl Vm {
                     Ok(Some(Value::Bool(false)))
                 }
             }
-            "prev" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "forward_static_call" | "forward_static_call_array" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "prev" => Ok(Some(Value::Bool(false))),
+            "forward_static_call" | "forward_static_call_array" => Ok(Some(Value::Bool(false))),
             "get_html_translation_table" => {
                 let mut arr = PhpArray::new();
                 arr.set_string("&".into(), Value::String("&amp;".into()));
@@ -8140,12 +8913,10 @@ impl Vm {
             "highlight_file" | "highlight_string" | "show_source" | "php_strip_whitespace" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "get_browser" | "get_meta_tags" | "get_headers" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "get_current_user" => {
-                Ok(Some(Value::String(std::env::var("USER").unwrap_or_else(|_| "nobody".into()))))
-            }
+            "get_browser" | "get_meta_tags" | "get_headers" => Ok(Some(Value::Bool(false))),
+            "get_current_user" => Ok(Some(Value::String(
+                std::env::var("USER").unwrap_or_else(|_| "nobody".into()),
+            ))),
             "connection_status" => Ok(Some(Value::Long(0))),
             "connection_aborted" => Ok(Some(Value::Long(0))),
             "is_uploaded_file" | "move_uploaded_file" => Ok(Some(Value::Bool(false))),
@@ -8182,7 +8953,11 @@ impl Vm {
                     "icmp" => 1,
                     _ => -1,
                 };
-                if proto >= 0 { Ok(Some(Value::Long(proto))) } else { Ok(Some(Value::Bool(false))) }
+                if proto >= 0 {
+                    Ok(Some(Value::Long(proto)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
             }
             "getprotobynumber" => {
                 let num = args.first().map(|v| v.to_long()).unwrap_or(-1);
@@ -8192,34 +8967,59 @@ impl Vm {
                     1 => "icmp",
                     _ => "",
                 };
-                if name.is_empty() { Ok(Some(Value::Bool(false))) } else { Ok(Some(Value::String(name.into()))) }
+                if name.is_empty() {
+                    Ok(Some(Value::Bool(false)))
+                } else {
+                    Ok(Some(Value::String(name.into())))
+                }
             }
             "getservbyname" => {
                 let name = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let port = match name.as_str() {
-                    "http" => 80, "https" => 443, "ftp" => 21, "ssh" => 22,
-                    "smtp" => 25, "pop3" => 110, "imap" => 143, "dns" => 53,
+                    "http" => 80,
+                    "https" => 443,
+                    "ftp" => 21,
+                    "ssh" => 22,
+                    "smtp" => 25,
+                    "pop3" => 110,
+                    "imap" => 143,
+                    "dns" => 53,
                     _ => 0,
                 };
-                if port > 0 { Ok(Some(Value::Long(port))) } else { Ok(Some(Value::Bool(false))) }
+                if port > 0 {
+                    Ok(Some(Value::Long(port)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
             }
             "getservbyport" => {
                 let port = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let name = match port {
-                    80 => "http", 443 => "https", 21 => "ftp", 22 => "ssh",
-                    25 => "smtp", 110 => "pop3", 143 => "imap", 53 => "dns",
+                    80 => "http",
+                    443 => "https",
+                    21 => "ftp",
+                    22 => "ssh",
+                    25 => "smtp",
+                    110 => "pop3",
+                    143 => "imap",
+                    53 => "dns",
                     _ => "",
                 };
-                if name.is_empty() { Ok(Some(Value::Bool(false))) } else { Ok(Some(Value::String(name.into()))) }
+                if name.is_empty() {
+                    Ok(Some(Value::Bool(false)))
+                } else {
+                    Ok(Some(Value::String(name.into())))
+                }
             }
             "checkdnsrr" | "dns_check_record" => Ok(Some(Value::Bool(false))),
             "dns_get_mx" | "getmxrr" => Ok(Some(Value::Bool(false))),
             "dns_get_record" => Ok(Some(Value::Array(PhpArray::new()))),
             "net_get_interfaces" => Ok(Some(Value::Array(PhpArray::new()))),
             "fsockopen" | "pfsockopen" => Ok(Some(Value::Bool(false))),
-            "set_file_buffer" | "socket_set_blocking" | "socket_set_timeout" | "socket_get_status" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "set_file_buffer"
+            | "socket_set_blocking"
+            | "socket_set_timeout"
+            | "socket_get_status" => Ok(Some(Value::Bool(false))),
             "pack" => {
                 let format = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let mut result = Vec::new();
@@ -8227,22 +9027,48 @@ impl Vm {
                 for ch in format.chars() {
                     let val = args.get(arg_idx).map(|v| v.to_long()).unwrap_or(0);
                     match ch {
-                        'C' | 'c' => { result.push(val as u8); arg_idx += 1; }
-                        'n' => { result.extend_from_slice(&(val as u16).to_be_bytes()); arg_idx += 1; }
-                        'v' => { result.extend_from_slice(&(val as u16).to_le_bytes()); arg_idx += 1; }
-                        'N' => { result.extend_from_slice(&(val as u32).to_be_bytes()); arg_idx += 1; }
-                        'V' => { result.extend_from_slice(&(val as u32).to_le_bytes()); arg_idx += 1; }
-                        'J' => { result.extend_from_slice(&(val as u64).to_be_bytes()); arg_idx += 1; }
-                        'P' => { result.extend_from_slice(&(val as u64).to_le_bytes()); arg_idx += 1; }
+                        'C' | 'c' => {
+                            result.push(val as u8);
+                            arg_idx += 1;
+                        }
+                        'n' => {
+                            result.extend_from_slice(&(val as u16).to_be_bytes());
+                            arg_idx += 1;
+                        }
+                        'v' => {
+                            result.extend_from_slice(&(val as u16).to_le_bytes());
+                            arg_idx += 1;
+                        }
+                        'N' => {
+                            result.extend_from_slice(&(val as u32).to_be_bytes());
+                            arg_idx += 1;
+                        }
+                        'V' => {
+                            result.extend_from_slice(&(val as u32).to_le_bytes());
+                            arg_idx += 1;
+                        }
+                        'J' => {
+                            result.extend_from_slice(&(val as u64).to_be_bytes());
+                            arg_idx += 1;
+                        }
+                        'P' => {
+                            result.extend_from_slice(&(val as u64).to_le_bytes());
+                            arg_idx += 1;
+                        }
                         'A' | 'a' => {
-                            let s = args.get(arg_idx).map(|v| v.to_php_string()).unwrap_or_default();
+                            let s = args
+                                .get(arg_idx)
+                                .map(|v| v.to_php_string())
+                                .unwrap_or_default();
                             result.extend_from_slice(s.as_bytes());
                             arg_idx += 1;
                         }
                         _ => {}
                     }
                 }
-                Ok(Some(Value::String(String::from_utf8_lossy(&result).to_string())))
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&result).to_string(),
+                )))
             }
             "unpack" => {
                 // Simplified unpack
@@ -8263,7 +9089,7 @@ impl Vm {
                         }
                         'n' => {
                             if offset + 2 <= bytes.len() {
-                                let val = u16::from_be_bytes([bytes[offset], bytes[offset+1]]);
+                                let val = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
                                 arr.set_int(field_num, Value::Long(val as i64));
                                 offset += 2;
                                 field_num += 1;
@@ -8271,7 +9097,12 @@ impl Vm {
                         }
                         'N' => {
                             if offset + 4 <= bytes.len() {
-                                let val = u32::from_be_bytes([bytes[offset], bytes[offset+1], bytes[offset+2], bytes[offset+3]]);
+                                let val = u32::from_be_bytes([
+                                    bytes[offset],
+                                    bytes[offset + 1],
+                                    bytes[offset + 2],
+                                    bytes[offset + 3],
+                                ]);
                                 arr.set_int(field_num, Value::Long(val as i64));
                                 offset += 4;
                                 field_num += 1;
@@ -8286,11 +9117,11 @@ impl Vm {
                 let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let s = s.trim();
                 let (num_part, suffix) = if s.ends_with('G') || s.ends_with('g') {
-                    (&s[..s.len()-1], 1024*1024*1024i64)
+                    (&s[..s.len() - 1], 1024 * 1024 * 1024i64)
                 } else if s.ends_with('M') || s.ends_with('m') {
-                    (&s[..s.len()-1], 1024*1024i64)
+                    (&s[..s.len() - 1], 1024 * 1024i64)
                 } else if s.ends_with('K') || s.ends_with('k') {
-                    (&s[..s.len()-1], 1024i64)
+                    (&s[..s.len() - 1], 1024i64)
                 } else {
                     (s, 1i64)
                 };
@@ -8300,7 +9131,8 @@ impl Vm {
             "config_get_hash" => Ok(Some(Value::String(String::new()))),
             "request_parse_body" => Ok(Some(Value::Array(PhpArray::new()))),
             "phpinfo" => {
-                self.output.push_str("phpinfo()\nPHP Version => php-rs 0.1.0\n");
+                self.output
+                    .push_str("phpinfo()\nPHP Version => php-rs 0.1.0\n");
                 Ok(Some(Value::Bool(true)))
             }
             "phpcredits" => {
@@ -8314,9 +9146,7 @@ impl Vm {
                 }
                 Ok(Some(Value::Null))
             }
-            "register_tick_function" | "unregister_tick_function" => {
-                Ok(Some(Value::Bool(true)))
-            }
+            "register_tick_function" | "unregister_tick_function" => Ok(Some(Value::Bool(true))),
             "openlog" | "closelog" => Ok(Some(Value::Bool(true))),
             "syslog" => {
                 let msg = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
@@ -8327,8 +9157,11 @@ impl Vm {
             "image_type_to_mime_type" => {
                 let t = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let mime = match t {
-                    1 => "image/gif", 2 => "image/jpeg", 3 => "image/png",
-                    6 => "image/bmp", 18 => "image/webp",
+                    1 => "image/gif",
+                    2 => "image/jpeg",
+                    3 => "image/png",
+                    6 => "image/bmp",
+                    18 => "image/webp",
                     _ => "application/octet-stream",
                 };
                 Ok(Some(Value::String(mime.into())))
@@ -8336,11 +9169,18 @@ impl Vm {
             "image_type_to_extension" => {
                 let t = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let ext = match t {
-                    1 => ".gif", 2 => ".jpeg", 3 => ".png",
-                    6 => ".bmp", 18 => ".webp",
+                    1 => ".gif",
+                    2 => ".jpeg",
+                    3 => ".png",
+                    6 => ".bmp",
+                    18 => ".webp",
                     _ => "",
                 };
-                if ext.is_empty() { Ok(Some(Value::Bool(false))) } else { Ok(Some(Value::String(ext.into()))) }
+                if ext.is_empty() {
+                    Ok(Some(Value::Bool(false)))
+                } else {
+                    Ok(Some(Value::String(ext.into())))
+                }
             }
             "getimagesize" | "getimagesizefromstring" | "iptcparse" | "iptcembed" => {
                 Ok(Some(Value::Bool(false)))
@@ -8354,28 +9194,36 @@ impl Vm {
                 let proj = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 // Simplified ftok
                 let mut hash: i64 = 0;
-                for b in path.bytes() { hash = hash.wrapping_mul(31).wrapping_add(b as i64); }
-                if let Some(c) = proj.bytes().next() { hash ^= (c as i64) << 24; }
+                for b in path.bytes() {
+                    hash = hash.wrapping_mul(31).wrapping_add(b as i64);
+                }
+                if let Some(c) = proj.bytes().next() {
+                    hash ^= (c as i64) << 24;
+                }
                 Ok(Some(Value::Long(hash)))
             }
 
             // === Stream functions (stubs) ===
-            "stream_context_create" | "stream_context_get_default" | "stream_context_set_default" => {
+            "stream_context_create"
+            | "stream_context_get_default"
+            | "stream_context_set_default" => {
                 Ok(Some(Value::Long(0))) // Return fake resource
             }
             "stream_context_get_options" | "stream_context_get_params" => {
                 Ok(Some(Value::Array(PhpArray::new())))
             }
-            "stream_context_set_option" | "stream_context_set_options" | "stream_context_set_params" => {
-                Ok(Some(Value::Bool(true)))
-            }
+            "stream_context_set_option"
+            | "stream_context_set_options"
+            | "stream_context_set_params" => Ok(Some(Value::Bool(true))),
             "stream_get_contents" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if let Some(handle) = self.file_handles.get_mut(&id) {
                     let mut result = String::new();
                     loop {
                         match handle.read(8192) {
-                            Ok(data) if !data.is_empty() => result.push_str(&String::from_utf8_lossy(&data)),
+                            Ok(data) if !data.is_empty() => {
+                                result.push_str(&String::from_utf8_lossy(&data))
+                            }
                             _ => break,
                         }
                     }
@@ -8388,7 +9236,9 @@ impl Vm {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if let Some(handle) = self.file_handles.get_mut(&id) {
                     match handle.gets() {
-                        Ok(Some(line)) => Ok(Some(Value::String(line.trim_end_matches('\n').to_string()))),
+                        Ok(Some(line)) => {
+                            Ok(Some(Value::String(line.trim_end_matches('\n').to_string())))
+                        }
                         _ => Ok(Some(Value::Bool(false))),
                     }
                 } else {
@@ -8425,27 +9275,36 @@ impl Vm {
                     Ok(Some(Value::Bool(false)))
                 }
             }
-            "stream_filter_append" | "stream_filter_prepend" | "stream_filter_register" | "stream_filter_remove" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "stream_register_wrapper" | "stream_wrapper_register" | "stream_wrapper_restore" | "stream_wrapper_unregister" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "stream_socket_client" | "stream_socket_server" | "stream_socket_accept"
-            | "stream_socket_get_name" | "stream_socket_pair" | "stream_socket_recvfrom"
-            | "stream_socket_sendto" | "stream_socket_shutdown" | "stream_socket_enable_crypto" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "stream_bucket_append" | "stream_bucket_make_writeable" | "stream_bucket_new" | "stream_bucket_prepend" => {
-                Ok(Some(Value::Null))
-            }
+            "stream_filter_append"
+            | "stream_filter_prepend"
+            | "stream_filter_register"
+            | "stream_filter_remove" => Ok(Some(Value::Bool(false))),
+            "stream_register_wrapper"
+            | "stream_wrapper_register"
+            | "stream_wrapper_restore"
+            | "stream_wrapper_unregister" => Ok(Some(Value::Bool(false))),
+            "stream_socket_client"
+            | "stream_socket_server"
+            | "stream_socket_accept"
+            | "stream_socket_get_name"
+            | "stream_socket_pair"
+            | "stream_socket_recvfrom"
+            | "stream_socket_sendto"
+            | "stream_socket_shutdown"
+            | "stream_socket_enable_crypto" => Ok(Some(Value::Bool(false))),
+            "stream_bucket_append"
+            | "stream_bucket_make_writeable"
+            | "stream_bucket_new"
+            | "stream_bucket_prepend" => Ok(Some(Value::Null)),
 
             // === Windows-specific stubs ===
-            "sapi_windows_cp_conv" | "sapi_windows_cp_get" | "sapi_windows_cp_is_utf8"
-            | "sapi_windows_cp_set" | "sapi_windows_generate_ctrl_event"
-            | "sapi_windows_set_ctrl_handler" | "sapi_windows_vt100_support" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "sapi_windows_cp_conv"
+            | "sapi_windows_cp_get"
+            | "sapi_windows_cp_is_utf8"
+            | "sapi_windows_cp_set"
+            | "sapi_windows_generate_ctrl_event"
+            | "sapi_windows_set_ctrl_handler"
+            | "sapi_windows_vt100_support" => Ok(Some(Value::Bool(false))),
 
             // === Batch: Finish zend_core (13 missing) ===
             "trait_exists" => {
@@ -8467,7 +9326,23 @@ impl Vm {
             }
             "get_loaded_extensions" => {
                 let mut arr = PhpArray::new();
-                for ext in &["Core", "standard", "json", "pcre", "ctype", "filter", "hash", "mbstring", "date", "spl", "random", "bcmath", "session", "tokenizer", "Reflection"] {
+                for ext in &[
+                    "Core",
+                    "standard",
+                    "json",
+                    "pcre",
+                    "ctype",
+                    "filter",
+                    "hash",
+                    "mbstring",
+                    "date",
+                    "spl",
+                    "random",
+                    "bcmath",
+                    "session",
+                    "tokenizer",
+                    "Reflection",
+                ] {
                     arr.push(Value::String(ext.to_string()));
                 }
                 Ok(Some(Value::Array(arr)))
@@ -8476,9 +9351,7 @@ impl Vm {
                 // Return false for unknown extensions
                 Ok(Some(Value::Bool(false)))
             }
-            "get_error_handler" | "get_exception_handler" => {
-                Ok(Some(Value::Null))
-            }
+            "get_error_handler" | "get_exception_handler" => Ok(Some(Value::Null)),
             "get_mangled_object_vars" => {
                 if let Some(Value::Object(obj)) = args.first() {
                     let mut arr = PhpArray::new();
@@ -8495,15 +9368,9 @@ impl Vm {
                 let val = args.first().cloned().unwrap_or(Value::Null);
                 Ok(Some(Value::Long(val.to_long())))
             }
-            "get_resource_type" => {
-                Ok(Some(Value::String("Unknown".to_string())))
-            }
-            "get_resources" => {
-                Ok(Some(Value::Array(PhpArray::new())))
-            }
-            "zend_thread_id" => {
-                Ok(Some(Value::Long(1)))
-            }
+            "get_resource_type" => Ok(Some(Value::String("Unknown".to_string()))),
+            "get_resources" => Ok(Some(Value::Array(PhpArray::new()))),
+            "zend_thread_id" => Ok(Some(Value::Long(1))),
             "clone" => {
                 // clone is handled by the compiler/VM opcode, not call_builtin
                 let val = args.first().cloned().unwrap_or(Value::Null);
@@ -8550,18 +9417,45 @@ impl Vm {
             }
             "spl_classes" => {
                 let mut arr = PhpArray::new();
-                for cls in &["AppendIterator", "ArrayIterator", "ArrayObject", "CachingIterator",
-                    "CallbackFilterIterator", "DirectoryIterator", "EmptyIterator",
-                    "FilesystemIterator", "FilterIterator", "GlobIterator",
-                    "InfiniteIterator", "IteratorIterator", "LimitIterator",
-                    "MultipleIterator", "NoRewindIterator", "ParentIterator",
-                    "RecursiveArrayIterator", "RecursiveCachingIterator",
-                    "RecursiveCallbackFilterIterator", "RecursiveDirectoryIterator",
-                    "RecursiveFilterIterator", "RecursiveIteratorIterator",
-                    "RecursiveRegexIterator", "RecursiveTreeIterator", "RegexIterator",
-                    "SplDoublyLinkedList", "SplFileInfo", "SplFileObject", "SplFixedArray",
-                    "SplHeap", "SplMaxHeap", "SplMinHeap", "SplObjectStorage",
-                    "SplPriorityQueue", "SplQueue", "SplStack", "SplTempFileObject"] {
+                for cls in &[
+                    "AppendIterator",
+                    "ArrayIterator",
+                    "ArrayObject",
+                    "CachingIterator",
+                    "CallbackFilterIterator",
+                    "DirectoryIterator",
+                    "EmptyIterator",
+                    "FilesystemIterator",
+                    "FilterIterator",
+                    "GlobIterator",
+                    "InfiniteIterator",
+                    "IteratorIterator",
+                    "LimitIterator",
+                    "MultipleIterator",
+                    "NoRewindIterator",
+                    "ParentIterator",
+                    "RecursiveArrayIterator",
+                    "RecursiveCachingIterator",
+                    "RecursiveCallbackFilterIterator",
+                    "RecursiveDirectoryIterator",
+                    "RecursiveFilterIterator",
+                    "RecursiveIteratorIterator",
+                    "RecursiveRegexIterator",
+                    "RecursiveTreeIterator",
+                    "RegexIterator",
+                    "SplDoublyLinkedList",
+                    "SplFileInfo",
+                    "SplFileObject",
+                    "SplFixedArray",
+                    "SplHeap",
+                    "SplMaxHeap",
+                    "SplMinHeap",
+                    "SplObjectStorage",
+                    "SplPriorityQueue",
+                    "SplQueue",
+                    "SplStack",
+                    "SplTempFileObject",
+                ] {
                     arr.set_string(cls.to_string(), Value::String(cls.to_string()));
                 }
                 Ok(Some(Value::Array(arr)))
@@ -8591,46 +9485,59 @@ impl Vm {
 
             // === Finish hash (16 missing) ===
             "hash_file" => {
-                let algo = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                let algo = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_lowercase();
                 let filename = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let raw = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
                 if let Ok(data) = std::fs::read(&filename) {
                     let s = String::from_utf8_lossy(&data);
-                    let hash_result = match algo.as_str() {
-                        "sha1" => php_rs_ext_standard::strings::php_sha1(&s),
-                        _ => php_rs_ext_standard::strings::php_md5(&s),
-                    };
-                    if raw {
-                        let bytes: Vec<u8> = (0..hash_result.len())
-                            .step_by(2)
-                            .filter_map(|i| u8::from_str_radix(&hash_result[i..i+2], 16).ok())
-                            .collect();
-                        Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
-                    } else {
-                        Ok(Some(Value::String(hash_result)))
+                    match php_rs_ext_hash::php_hash(&algo, &s) {
+                        Some(hash_result) => {
+                            if raw {
+                                let bytes: Vec<u8> = (0..hash_result.len())
+                                    .step_by(2)
+                                    .filter_map(|i| {
+                                        u8::from_str_radix(&hash_result[i..i + 2], 16).ok()
+                                    })
+                                    .collect();
+                                Ok(Some(Value::String(
+                                    String::from_utf8_lossy(&bytes).to_string(),
+                                )))
+                            } else {
+                                Ok(Some(Value::String(hash_result)))
+                            }
+                        }
+                        None => Ok(Some(Value::Bool(false))),
                     }
                 } else {
                     Ok(Some(Value::Bool(false)))
                 }
             }
             "hash_hmac_file" => {
-                let algo = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let algo = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_lowercase();
                 let filename = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let key = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
                 if let Ok(data) = std::fs::read_to_string(&filename) {
-                    let combined = format!("{}{}", key, data);
-                    let result = match algo.to_lowercase().as_str() {
-                        "sha1" => php_rs_ext_standard::strings::php_sha1(&combined),
-                        _ => php_rs_ext_standard::strings::php_md5(&combined),
-                    };
-                    Ok(Some(Value::String(result)))
+                    match php_rs_ext_hash::php_hash_hmac(&algo, &data, &key) {
+                        Some(result) => Ok(Some(Value::String(result))),
+                        None => Ok(Some(Value::Bool(false))),
+                    }
                 } else {
                     Ok(Some(Value::Bool(false)))
                 }
             }
             "hash_hmac_algos" => {
                 let mut arr = PhpArray::new();
-                for algo in &["md5", "sha1", "sha256", "sha384", "sha512"] {
+                for algo in php_rs_ext_hash::php_hash_algos() {
                     arr.push(Value::String(algo.to_string()));
                 }
                 Ok(Some(Value::Array(arr)))
@@ -8644,10 +9551,17 @@ impl Vm {
             }
             "hash_final" => {
                 // Without real context tracking, return empty hash
-                Ok(Some(Value::String("d41d8cd98f00b204e9800998ecf8427e".to_string())))
+                Ok(Some(Value::String(
+                    "d41d8cd98f00b204e9800998ecf8427e".to_string(),
+                )))
             }
             "hash_pbkdf2" => {
-                let algo = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                let algo = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_lowercase();
                 let password = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let salt = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
                 let iterations = args.get(3).map(|v| v.to_long()).unwrap_or(1000);
@@ -8669,23 +9583,42 @@ impl Vm {
                 Ok(Some(Value::String(result)))
             }
             "hash_hkdf" => {
-                let algo = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_lowercase();
+                let algo = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_lowercase();
                 let ikm = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let length = args.get(2).map(|v| v.to_long()).unwrap_or(0);
-                let _info = args.get(3).cloned().unwrap_or(Value::String(String::new())).to_php_string();
-                let salt = args.get(4).cloned().unwrap_or(Value::String(String::new())).to_php_string();
+                let _info = args
+                    .get(3)
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()))
+                    .to_php_string();
+                let salt = args
+                    .get(4)
+                    .cloned()
+                    .unwrap_or(Value::String(String::new()))
+                    .to_php_string();
                 let combined = format!("{}{}", salt, ikm);
                 let result = match algo.as_str() {
                     "sha1" => php_rs_ext_standard::strings::php_sha1(&combined),
                     _ => php_rs_ext_standard::strings::php_md5(&combined),
                 };
-                let out_len = if length > 0 { length as usize } else { result.len() / 2 };
+                let out_len = if length > 0 {
+                    length as usize
+                } else {
+                    result.len() / 2
+                };
                 let bytes: Vec<u8> = (0..result.len())
                     .step_by(2)
-                    .filter_map(|i| u8::from_str_radix(&result[i..i+2], 16).ok())
+                    .filter_map(|i| u8::from_str_radix(&result[i..i + 2], 16).ok())
                     .take(out_len)
                     .collect();
-                Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&bytes).to_string(),
+                )))
             }
             "mhash" => {
                 let hash_id = args.first().map(|v| v.to_long()).unwrap_or(0);
@@ -8696,19 +9629,19 @@ impl Vm {
                 };
                 let bytes: Vec<u8> = (0..hex.len())
                     .step_by(2)
-                    .filter_map(|i| u8::from_str_radix(&hex[i..i+2], 16).ok())
+                    .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
                     .collect();
-                Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&bytes).to_string(),
+                )))
             }
-            "mhash_count" => {
-                Ok(Some(Value::Long(33)))
-            }
+            "mhash_count" => Ok(Some(Value::Long(33))),
             "mhash_get_block_size" => {
                 let hash_id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let size = match hash_id {
-                    0 => 16,  // MD5
-                    1 => 20,  // SHA1
-                    2 => 32,  // SHA256
+                    0 => 16, // MD5
+                    1 => 20, // SHA1
+                    2 => 32, // SHA256
                     _ => 16,
                 };
                 Ok(Some(Value::Long(size)))
@@ -8732,16 +9665,16 @@ impl Vm {
                 let key = php_rs_ext_standard::strings::php_md5(&format!("{}{}", salt, password));
                 let bytes: Vec<u8> = (0..key.len())
                     .step_by(2)
-                    .filter_map(|i| u8::from_str_radix(&key[i..i+2], 16).ok())
+                    .filter_map(|i| u8::from_str_radix(&key[i..i + 2], 16).ok())
                     .take(length as usize)
                     .collect();
-                Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&bytes).to_string(),
+                )))
             }
 
             // === Date extension completion (36 missing) ===
-            "date_default_timezone_get" => {
-                Ok(Some(Value::String("UTC".to_string())))
-            }
+            "date_default_timezone_get" => Ok(Some(Value::String("UTC".to_string()))),
             "date_default_timezone_set" => {
                 // Accept but ignore - we always use UTC
                 Ok(Some(Value::Bool(true)))
@@ -8752,7 +9685,10 @@ impl Vm {
             }
             "date_format" => {
                 // date_format(object, format) - stub
-                let format = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "Y-m-d H:i:s".to_string());
+                let format = args
+                    .get(1)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| "Y-m-d H:i:s".to_string());
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -8764,12 +9700,30 @@ impl Vm {
                 let mut arr = PhpArray::new();
                 // Basic parsing - try to extract Y-m-d H:i:s
                 let parts: Vec<&str> = date_str.split(|c: char| !c.is_ascii_digit()).collect();
-                let year = parts.first().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                let month = parts.get(1).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                let day = parts.get(2).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                let hour = parts.get(3).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                let minute = parts.get(4).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                let second = parts.get(5).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let year = parts
+                    .first()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let month = parts
+                    .get(1)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let day = parts
+                    .get(2)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let hour = parts
+                    .get(3)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let minute = parts
+                    .get(4)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
+                let second = parts
+                    .get(5)
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .unwrap_or(0);
                 arr.set_string("year".into(), Value::Long(year));
                 arr.set_string("month".into(), Value::Long(month));
                 arr.set_string("day".into(), Value::Long(day));
@@ -8790,12 +9744,30 @@ impl Vm {
                 let date_str = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let mut arr = PhpArray::new();
                 let parts: Vec<&str> = date_str.split(|c: char| !c.is_ascii_digit()).collect();
-                arr.set_string("year".into(), Value::Long(parts.first().and_then(|s| s.parse().ok()).unwrap_or(0)));
-                arr.set_string("month".into(), Value::Long(parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0)));
-                arr.set_string("day".into(), Value::Long(parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0)));
-                arr.set_string("hour".into(), Value::Long(parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0)));
-                arr.set_string("minute".into(), Value::Long(parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0)));
-                arr.set_string("second".into(), Value::Long(parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0)));
+                arr.set_string(
+                    "year".into(),
+                    Value::Long(parts.first().and_then(|s| s.parse().ok()).unwrap_or(0)),
+                );
+                arr.set_string(
+                    "month".into(),
+                    Value::Long(parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0)),
+                );
+                arr.set_string(
+                    "day".into(),
+                    Value::Long(parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0)),
+                );
+                arr.set_string(
+                    "hour".into(),
+                    Value::Long(parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(0)),
+                );
+                arr.set_string(
+                    "minute".into(),
+                    Value::Long(parts.get(4).and_then(|s| s.parse().ok()).unwrap_or(0)),
+                );
+                arr.set_string(
+                    "second".into(),
+                    Value::Long(parts.get(5).and_then(|s| s.parse().ok()).unwrap_or(0)),
+                );
                 arr.set_string("fraction".into(), Value::Double(0.0));
                 arr.set_string("warning_count".into(), Value::Long(0));
                 arr.set_string("warnings".into(), Value::Array(PhpArray::new()));
@@ -8822,9 +9794,7 @@ impl Vm {
                 arr.set_string("invert".into(), Value::Long(0));
                 Ok(Some(Value::Array(arr)))
             }
-            "date_offset_get" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "date_offset_get" => Ok(Some(Value::Long(0))),
             "date_get_last_errors" => {
                 let mut arr = PhpArray::new();
                 arr.set_string("warning_count".into(), Value::Long(0));
@@ -8833,9 +9803,7 @@ impl Vm {
                 arr.set_string("errors".into(), Value::Array(PhpArray::new()));
                 Ok(Some(Value::Array(arr)))
             }
-            "date_interval_create_from_date_string" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "date_interval_create_from_date_string" => Ok(Some(Value::Bool(false))),
             "date_interval_format" => {
                 let format = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 Ok(Some(Value::String(format)))
@@ -8853,9 +9821,7 @@ impl Vm {
                 arr.set_string("astronomical_twilight_end".into(), Value::Long(0));
                 Ok(Some(Value::Array(arr)))
             }
-            "date_sunrise" | "date_sunset" => {
-                Ok(Some(Value::Double(0.0)))
-            }
+            "date_sunrise" | "date_sunset" => Ok(Some(Value::Double(0.0))),
             "date_timestamp_get" => {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -8867,36 +9833,32 @@ impl Vm {
                 let obj = args.first().cloned().unwrap_or(Value::Null);
                 Ok(Some(obj))
             }
-            "date_timezone_get" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "timezone_abbreviations_list" => {
-                Ok(Some(Value::Array(PhpArray::new())))
-            }
+            "date_timezone_get" => Ok(Some(Value::Bool(false))),
+            "timezone_abbreviations_list" => Ok(Some(Value::Array(PhpArray::new()))),
             "timezone_identifiers_list" => {
                 let mut arr = PhpArray::new();
-                for tz in &["UTC", "America/New_York", "America/Chicago", "America/Denver",
-                    "America/Los_Angeles", "Europe/London", "Europe/Paris", "Europe/Berlin",
-                    "Asia/Tokyo", "Asia/Shanghai", "Australia/Sydney"] {
+                for tz in &[
+                    "UTC",
+                    "America/New_York",
+                    "America/Chicago",
+                    "America/Denver",
+                    "America/Los_Angeles",
+                    "Europe/London",
+                    "Europe/Paris",
+                    "Europe/Berlin",
+                    "Asia/Tokyo",
+                    "Asia/Shanghai",
+                    "Australia/Sydney",
+                ] {
                     arr.push(Value::String(tz.to_string()));
                 }
                 Ok(Some(Value::Array(arr)))
             }
-            "timezone_location_get" | "timezone_name_from_abbr" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "timezone_name_get" => {
-                Ok(Some(Value::String("UTC".to_string())))
-            }
-            "timezone_offset_get" => {
-                Ok(Some(Value::Long(0)))
-            }
-            "timezone_open" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "timezone_transitions_get" | "timezone_version_get" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "timezone_location_get" | "timezone_name_from_abbr" => Ok(Some(Value::Bool(false))),
+            "timezone_name_get" => Ok(Some(Value::String("UTC".to_string()))),
+            "timezone_offset_get" => Ok(Some(Value::Long(0))),
+            "timezone_open" => Ok(Some(Value::Bool(false))),
+            "timezone_transitions_get" | "timezone_version_get" => Ok(Some(Value::Bool(false))),
 
             // === iconv extension (10 functions) ===
             "iconv" => {
@@ -8907,7 +9869,10 @@ impl Vm {
                 Ok(Some(Value::String(str_val)))
             }
             "iconv_get_encoding" => {
-                let t = args.first().map(|v| v.to_php_string()).unwrap_or_else(|| "all".to_string());
+                let t = args
+                    .first()
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| "all".to_string());
                 match t.as_str() {
                     "all" => {
                         let mut arr = PhpArray::new();
@@ -8919,9 +9884,7 @@ impl Vm {
                     _ => Ok(Some(Value::String("UTF-8".into()))),
                 }
             }
-            "iconv_set_encoding" => {
-                Ok(Some(Value::Bool(true)))
-            }
+            "iconv_set_encoding" => Ok(Some(Value::Bool(true))),
             "iconv_strlen" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::Long(s.chars().count() as i64)))
@@ -8963,7 +9926,11 @@ impl Vm {
                 let length = args.get(2).map(|v| v.to_long());
                 let chars: Vec<char> = s.chars().collect();
                 let len = chars.len() as i64;
-                let start = if offset < 0 { (len + offset).max(0) as usize } else { offset.min(len) as usize };
+                let start = if offset < 0 {
+                    (len + offset).max(0) as usize
+                } else {
+                    offset.min(len) as usize
+                };
                 let end = match length {
                     Some(l) if l < 0 => (len + l).max(start as i64) as usize,
                     Some(l) => (start as i64 + l).min(len) as usize,
@@ -8995,7 +9962,8 @@ impl Vm {
             }
 
             // === Gettext extension (10 functions) ===
-            "gettext" | "_" | "dcgettext" | "dcngettext" | "dgettext" | "dngettext" | "ngettext" => {
+            "gettext" | "_" | "dcgettext" | "dcngettext" | "dgettext" | "dngettext"
+            | "ngettext" => {
                 // Return the message itself (no translation)
                 let msg = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(msg)))
@@ -9102,14 +10070,23 @@ impl Vm {
                 let month = m + 3 - 12 * (m / 10);
                 let year = 100 * b + d - 4800 + m / 10;
                 let mut arr = PhpArray::new();
-                arr.set_string("date".into(), Value::String(format!("{}/{}/{}", month, day, year)));
+                arr.set_string(
+                    "date".into(),
+                    Value::String(format!("{}/{}/{}", month, day, year)),
+                );
                 arr.set_string("month".into(), Value::Long(month));
                 arr.set_string("day".into(), Value::Long(day));
                 arr.set_string("year".into(), Value::Long(year));
                 arr.set_string("dow".into(), Value::Long((jd + 1) % 7));
-                arr.set_string("abbrevdayname".into(), Value::String(weekday_name((jd + 1) % 7)[..3].to_string()));
+                arr.set_string(
+                    "abbrevdayname".into(),
+                    Value::String(weekday_name((jd + 1) % 7)[..3].to_string()),
+                );
                 arr.set_string("dayname".into(), Value::String(weekday_name((jd + 1) % 7)));
-                arr.set_string("abbrevmonth".into(), Value::String(month_name(month)[..3].to_string()));
+                arr.set_string(
+                    "abbrevmonth".into(),
+                    Value::String(month_name(month)[..3].to_string()),
+                );
                 arr.set_string("monthname".into(), Value::String(month_name(month)));
                 Ok(Some(Value::Array(arr)))
             }
@@ -9134,7 +10111,11 @@ impl Vm {
                 let m = (5 * e + 2) / 153;
                 let month = m + 3 - 12 * (m / 10);
                 let full = month_name(month);
-                if mode == 4 { Ok(Some(Value::String(full[..3].to_string()))) } else { Ok(Some(Value::String(full))) }
+                if mode == 4 {
+                    Ok(Some(Value::String(full[..3].to_string())))
+                } else {
+                    Ok(Some(Value::String(full)))
+                }
             }
             "unixtojd" => {
                 let ts = args.first().map(|v| v.to_long()).unwrap_or_else(|| {
@@ -9189,9 +10170,7 @@ impl Vm {
                 // Stub — return 0
                 Ok(Some(Value::Long(0)))
             }
-            "jdtofrench" | "jdtojewish" => {
-                Ok(Some(Value::String("0/0/0".to_string())))
-            }
+            "jdtofrench" | "jdtojewish" => Ok(Some(Value::String("0/0/0".to_string()))),
 
             // === mbstring completion (50 missing) ===
             "mb_chr" => {
@@ -9237,11 +10216,20 @@ impl Vm {
                 }
             }
             "mb_encoding_aliases" => {
-                let enc = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_uppercase();
+                let enc = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_uppercase();
                 let mut arr = PhpArray::new();
                 match enc.as_str() {
-                    "UTF-8" => { arr.push(Value::String("utf8".into())); }
-                    "ASCII" => { arr.push(Value::String("us-ascii".into())); }
+                    "UTF-8" => {
+                        arr.push(Value::String("utf8".into()));
+                    }
+                    "ASCII" => {
+                        arr.push(Value::String("us-ascii".into()));
+                    }
                     _ => {}
                 }
                 Ok(Some(Value::Array(arr)))
@@ -9252,28 +10240,22 @@ impl Vm {
                 let _string = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::Bool(false)))
             }
-            "mb_ereg_match" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "mb_ereg_match" => Ok(Some(Value::Bool(false))),
             "mb_ereg_replace" | "mb_ereg_replace_callback" => {
-                let s = args.get(2).cloned().unwrap_or(args.get(1).cloned().unwrap_or(Value::Null)).to_php_string();
+                let s = args
+                    .get(2)
+                    .cloned()
+                    .unwrap_or(args.get(1).cloned().unwrap_or(Value::Null))
+                    .to_php_string();
                 Ok(Some(Value::String(s)))
             }
-            "mb_ereg_search" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "mb_ereg_search_getpos" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "mb_ereg_search" => Ok(Some(Value::Bool(false))),
+            "mb_ereg_search_getpos" => Ok(Some(Value::Long(0))),
             "mb_ereg_search_getregs" | "mb_ereg_search_regs" | "mb_ereg_search_pos" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "mb_ereg_search_init" => {
-                Ok(Some(Value::Bool(true)))
-            }
-            "mb_eregi" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "mb_ereg_search_init" => Ok(Some(Value::Bool(true))),
+            "mb_eregi" => Ok(Some(Value::Bool(false))),
             "mb_eregi_replace" => {
                 let s = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(s)))
@@ -9294,7 +10276,24 @@ impl Vm {
             }
             "mb_list_encodings" => {
                 let mut arr = PhpArray::new();
-                for enc in &["UTF-8", "ASCII", "ISO-8859-1", "ISO-8859-15", "UTF-16", "UTF-16BE", "UTF-16LE", "UTF-32", "UTF-32BE", "UTF-32LE", "EUC-JP", "SJIS", "ISO-2022-JP", "GB18030", "BIG-5", "EUC-KR"] {
+                for enc in &[
+                    "UTF-8",
+                    "ASCII",
+                    "ISO-8859-1",
+                    "ISO-8859-15",
+                    "UTF-16",
+                    "UTF-16BE",
+                    "UTF-16LE",
+                    "UTF-32",
+                    "UTF-32BE",
+                    "UTF-32LE",
+                    "EUC-JP",
+                    "SJIS",
+                    "ISO-2022-JP",
+                    "GB18030",
+                    "BIG-5",
+                    "EUC-KR",
+                ] {
                     arr.push(Value::String(enc.to_string()));
                 }
                 Ok(Some(Value::Array(arr)))
@@ -9316,7 +10315,12 @@ impl Vm {
                 Ok(Some(Value::Bool(true)))
             }
             "mb_preferred_mime_name" => {
-                let enc = args.first().cloned().unwrap_or(Value::Null).to_php_string().to_uppercase();
+                let enc = args
+                    .first()
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string()
+                    .to_uppercase();
                 let name = match enc.as_str() {
                     "UTF-8" | "UTF8" => "UTF-8",
                     "ISO-8859-1" | "LATIN1" => "ISO-8859-1",
@@ -9331,20 +10335,19 @@ impl Vm {
                     Ok(Some(Value::Bool(true)))
                 }
             }
-            "mb_regex_set_options" => {
-                Ok(Some(Value::String("msr".into())))
-            }
+            "mb_regex_set_options" => Ok(Some(Value::String("msr".into()))),
             "mb_scrub" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(s)))
             }
-            "mb_send_mail" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "mb_send_mail" => Ok(Some(Value::Bool(false))),
             "mb_str_pad" => {
                 let input = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let length = args.get(1).map(|v| v.to_long()).unwrap_or(0) as usize;
-                let pad = args.get(2).map(|v| v.to_php_string()).unwrap_or_else(|| " ".to_string());
+                let pad = args
+                    .get(2)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| " ".to_string());
                 let pad_type = args.get(3).map(|v| v.to_long()).unwrap_or(1); // STR_PAD_RIGHT
                 let cur_len = input.chars().count();
                 if cur_len >= length {
@@ -9358,12 +10361,16 @@ impl Vm {
                 let pad_str: String = pad_chars.iter().cycle().take(diff).collect();
                 match pad_type {
                     0 => Ok(Some(Value::String(format!("{}{}", pad_str, input)))), // STR_PAD_LEFT (note: PHP constant is actually 0)
-                    2 => { // STR_PAD_BOTH
+                    2 => {
+                        // STR_PAD_BOTH
                         let left = diff / 2;
                         let right = diff - left;
                         let left_str: String = pad_chars.iter().cycle().take(left).collect();
                         let right_str: String = pad_chars.iter().cycle().take(right).collect();
-                        Ok(Some(Value::String(format!("{}{}{}", left_str, input, right_str))))
+                        Ok(Some(Value::String(format!(
+                            "{}{}{}",
+                            left_str, input, right_str
+                        ))))
                     }
                     _ => Ok(Some(Value::String(format!("{}{}", input, pad_str)))), // STR_PAD_RIGHT
                 }
@@ -9389,8 +10396,12 @@ impl Vm {
                 let length = args.get(2).map(|v| v.to_long() as usize);
                 let bytes = s.as_bytes();
                 let start = start.min(bytes.len());
-                let end = length.map(|l| (start + l).min(bytes.len())).unwrap_or(bytes.len());
-                Ok(Some(Value::String(String::from_utf8_lossy(&bytes[start..end]).to_string())))
+                let end = length
+                    .map(|l| (start + l).min(bytes.len()))
+                    .unwrap_or(bytes.len());
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&bytes[start..end]).to_string(),
+                )))
             }
             "mb_strimwidth" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -9403,7 +10414,11 @@ impl Vm {
                     return Ok(Some(Value::String(chars[start..].iter().collect())));
                 }
                 let marker_len = trim_marker.chars().count();
-                let take = if width > marker_len { width - marker_len } else { 0 };
+                let take = if width > marker_len {
+                    width - marker_len
+                } else {
+                    0
+                };
                 let trimmed: String = chars[start..start + take].iter().collect();
                 Ok(Some(Value::String(format!("{}{}", trimmed, trim_marker))))
             }
@@ -9433,25 +10448,27 @@ impl Vm {
             // === Posix extension (41 functions) ===
             "posix_getpid" => Ok(Some(Value::Long(std::process::id() as i64))),
             "posix_getppid" => Ok(Some(Value::Long(1))),
-            "posix_getuid" | "posix_geteuid" => {
-                Ok(Some(Value::Long(0)))
-            }
-            "posix_getgid" | "posix_getegid" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "posix_getuid" | "posix_geteuid" => Ok(Some(Value::Long(0))),
+            "posix_getgid" | "posix_getegid" => Ok(Some(Value::Long(0))),
             "posix_getpgid" | "posix_getpgrp" | "posix_getsid" => {
                 Ok(Some(Value::Long(std::process::id() as i64)))
             }
-            "posix_getlogin" => {
-                Ok(Some(Value::String(std::env::var("USER").unwrap_or_else(|_| "root".into()))))
-            }
+            "posix_getlogin" => Ok(Some(Value::String(
+                std::env::var("USER").unwrap_or_else(|_| "root".into()),
+            ))),
             "posix_uname" => {
                 let mut arr = PhpArray::new();
-                arr.set_string("sysname".into(), Value::String(std::env::consts::OS.to_string()));
+                arr.set_string(
+                    "sysname".into(),
+                    Value::String(std::env::consts::OS.to_string()),
+                );
                 arr.set_string("nodename".into(), Value::String("localhost".into()));
                 arr.set_string("release".into(), Value::String("1.0.0".into()));
                 arr.set_string("version".into(), Value::String("1".into()));
-                arr.set_string("machine".into(), Value::String(std::env::consts::ARCH.to_string()));
+                arr.set_string(
+                    "machine".into(),
+                    Value::String(std::env::consts::ARCH.to_string()),
+                );
                 Ok(Some(Value::Array(arr)))
             }
             "posix_times" => {
@@ -9467,34 +10484,25 @@ impl Vm {
                 let _fd = args.first().map(|v| v.to_long()).unwrap_or(0);
                 Ok(Some(Value::Bool(false)))
             }
-            "posix_ttyname" => {
-                Ok(Some(Value::String("/dev/tty".into())))
-            }
-            "posix_ctermid" => {
-                Ok(Some(Value::String("/dev/tty".into())))
-            }
-            "posix_getcwd" => {
-                Ok(Some(Value::String(std::env::current_dir().unwrap_or_default().to_string_lossy().to_string())))
-            }
-            "posix_mkfifo" | "posix_mknod" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "posix_ttyname" => Ok(Some(Value::String("/dev/tty".into()))),
+            "posix_ctermid" => Ok(Some(Value::String("/dev/tty".into()))),
+            "posix_getcwd" => Ok(Some(Value::String(
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            ))),
+            "posix_mkfifo" | "posix_mknod" => Ok(Some(Value::Bool(false))),
             "posix_setpgid" | "posix_setsid" | "posix_setuid" | "posix_setgid"
-            | "posix_seteuid" | "posix_setegid" | "posix_setrlimit" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "posix_kill" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            | "posix_seteuid" | "posix_setegid" | "posix_setrlimit" => Ok(Some(Value::Bool(false))),
+            "posix_kill" => Ok(Some(Value::Bool(false))),
             "posix_getrlimit" => {
                 let mut arr = PhpArray::new();
                 arr.set_string("soft core".into(), Value::Long(-1));
                 arr.set_string("hard core".into(), Value::Long(-1));
                 Ok(Some(Value::Array(arr)))
             }
-            "posix_get_last_error" | "posix_errno" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "posix_get_last_error" | "posix_errno" => Ok(Some(Value::Long(0))),
             "posix_strerror" => {
                 let errno = args.first().map(|v| v.to_long()).unwrap_or(0);
                 Ok(Some(Value::String(format!("Error {}", errno))))
@@ -9505,9 +10513,7 @@ impl Vm {
             }
             "posix_getpwnam" | "posix_getpwuid" | "posix_getgrnam" | "posix_getgrgid"
             | "posix_getgroups" | "posix_initgroups" | "posix_fpathconf" | "posix_pathconf"
-            | "posix_sysconf" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            | "posix_sysconf" => Ok(Some(Value::Bool(false))),
 
             // === Session extension (23 functions) — stubs ===
             "session_start" => Ok(Some(Value::Bool(true))),
@@ -9520,9 +10526,7 @@ impl Vm {
                     Ok(Some(Value::String(String::new())))
                 }
             }
-            "session_name" => {
-                Ok(Some(Value::String("PHPSESSID".into())))
-            }
+            "session_name" => Ok(Some(Value::String("PHPSESSID".into()))),
             "session_status" => {
                 Ok(Some(Value::Long(1))) // PHP_SESSION_NONE
             }
@@ -9577,9 +10581,7 @@ impl Vm {
             "pcntl_wifexited" | "pcntl_wifstopped" | "pcntl_wifsignaled" | "pcntl_wifcontinued" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "pcntl_wexitstatus" | "pcntl_wtermsig" | "pcntl_wstopsig" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "pcntl_wexitstatus" | "pcntl_wtermsig" | "pcntl_wstopsig" => Ok(Some(Value::Long(0))),
             "pcntl_exec" => Ok(Some(Value::Bool(false))),
             "pcntl_alarm" => Ok(Some(Value::Long(0))),
             "pcntl_get_last_error" | "pcntl_errno" => Ok(Some(Value::Long(0))),
@@ -9591,7 +10593,9 @@ impl Vm {
                 if args.is_empty() {
                     Ok(Some(Value::Bool(false)))
                 } else {
-                    Ok(Some(Value::Bool(args.first().map(|v| v.to_bool()).unwrap_or(false))))
+                    Ok(Some(Value::Bool(
+                        args.first().map(|v| v.to_bool()).unwrap_or(false),
+                    )))
                 }
             }
             "pcntl_unshare" | "pcntl_setns" => Ok(Some(Value::Bool(false))),
@@ -9613,9 +10617,9 @@ impl Vm {
                 };
                 Ok(Some(Value::Long(n)))
             }
-            "gmp_intval" | "gmp_export" => {
-                Ok(Some(Value::Long(args.first().map(|v| v.to_long()).unwrap_or(0))))
-            }
+            "gmp_intval" | "gmp_export" => Ok(Some(Value::Long(
+                args.first().map(|v| v.to_long()).unwrap_or(0),
+            ))),
             "gmp_strval" => {
                 let n = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let base = args.get(1).map(|v| v.to_long()).unwrap_or(10);
@@ -9645,19 +10649,25 @@ impl Vm {
             "gmp_div_q" | "gmp_div" => {
                 let a = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(1);
-                if b == 0 { return Ok(Some(Value::Bool(false))); }
+                if b == 0 {
+                    return Ok(Some(Value::Bool(false)));
+                }
                 Ok(Some(Value::Long(a / b)))
             }
             "gmp_div_r" => {
                 let a = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(1);
-                if b == 0 { return Ok(Some(Value::Bool(false))); }
+                if b == 0 {
+                    return Ok(Some(Value::Bool(false)));
+                }
                 Ok(Some(Value::Long(a % b)))
             }
             "gmp_div_qr" => {
                 let a = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(1);
-                if b == 0 { return Ok(Some(Value::Bool(false))); }
+                if b == 0 {
+                    return Ok(Some(Value::Bool(false)));
+                }
                 let mut arr = PhpArray::new();
                 arr.push(Value::Long(a / b));
                 arr.push(Value::Long(a % b));
@@ -9666,25 +10676,36 @@ impl Vm {
             "gmp_mod" => {
                 let a = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(1);
-                if b == 0 { return Ok(Some(Value::Bool(false))); }
+                if b == 0 {
+                    return Ok(Some(Value::Bool(false)));
+                }
                 Ok(Some(Value::Long(((a % b) + b) % b)))
             }
             "gmp_divexact" => {
                 let a = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(1);
-                if b == 0 { return Ok(Some(Value::Bool(false))); }
+                if b == 0 {
+                    return Ok(Some(Value::Bool(false)));
+                }
                 Ok(Some(Value::Long(a / b)))
             }
-            "gmp_neg" => {
-                Ok(Some(Value::Long(-args.first().map(|v| v.to_long()).unwrap_or(0))))
-            }
-            "gmp_abs" => {
-                Ok(Some(Value::Long(args.first().map(|v| v.to_long()).unwrap_or(0).abs())))
-            }
+            "gmp_neg" => Ok(Some(Value::Long(
+                -args.first().map(|v| v.to_long()).unwrap_or(0),
+            ))),
+            "gmp_abs" => Ok(Some(Value::Long(
+                args.first().map(|v| v.to_long()).unwrap_or(0).abs(),
+            ))),
             "gmp_fact" => {
-                let n = args.first().map(|v| v.to_long()).unwrap_or(0).max(0).min(20);
+                let n = args
+                    .first()
+                    .map(|v| v.to_long())
+                    .unwrap_or(0)
+                    .max(0)
+                    .min(20);
                 let mut result: i64 = 1;
-                for i in 2..=n { result = result.saturating_mul(i); }
+                for i in 2..=n {
+                    result = result.saturating_mul(i);
+                }
                 Ok(Some(Value::Long(result)))
             }
             "gmp_sqrt" => {
@@ -9708,12 +10729,16 @@ impl Vm {
                 let base = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let exp = args.get(1).map(|v| v.to_long()).unwrap_or(0);
                 let modulus = args.get(2).map(|v| v.to_long()).unwrap_or(1);
-                if modulus == 0 { return Ok(Some(Value::Bool(false))); }
+                if modulus == 0 {
+                    return Ok(Some(Value::Bool(false)));
+                }
                 let mut result: i64 = 1;
                 let mut b = base % modulus;
                 let mut e = exp;
                 while e > 0 {
-                    if e % 2 == 1 { result = (result * b) % modulus; }
+                    if e % 2 == 1 {
+                        result = (result * b) % modulus;
+                    }
                     e /= 2;
                     b = (b * b) % modulus;
                 }
@@ -9722,7 +10747,11 @@ impl Vm {
             "gmp_gcd" => {
                 let mut a = args.first().map(|v| v.to_long()).unwrap_or(0).abs();
                 let mut b = args.get(1).map(|v| v.to_long()).unwrap_or(0).abs();
-                while b != 0 { let t = b; b = a % b; a = t; }
+                while b != 0 {
+                    let t = b;
+                    b = a % b;
+                    a = t;
+                }
                 Ok(Some(Value::Long(a)))
             }
             "gmp_gcdext" => {
@@ -9730,7 +10759,9 @@ impl Vm {
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(0);
                 // Extended GCD
                 fn ext_gcd(a: i64, b: i64) -> (i64, i64, i64) {
-                    if a == 0 { return (b, 0, 1); }
+                    if a == 0 {
+                        return (b, 0, 1);
+                    }
                     let (g, x1, y1) = ext_gcd(b % a, a);
                     (g, y1 - (b / a) * x1, x1)
                 }
@@ -9744,9 +10775,16 @@ impl Vm {
             "gmp_lcm" => {
                 let mut a = args.first().map(|v| v.to_long()).unwrap_or(0).abs();
                 let mut b = args.get(1).map(|v| v.to_long()).unwrap_or(0).abs();
-                if a == 0 || b == 0 { return Ok(Some(Value::Long(0))); }
-                let orig_a = a; let orig_b = b;
-                while b != 0 { let t = b; b = a % b; a = t; }
+                if a == 0 || b == 0 {
+                    return Ok(Some(Value::Long(0)));
+                }
+                let orig_a = a;
+                let orig_b = b;
+                while b != 0 {
+                    let t = b;
+                    b = a % b;
+                    a = t;
+                }
                 Ok(Some(Value::Long((orig_a / a) * orig_b)))
             }
             "gmp_invert" => {
@@ -9754,31 +10792,49 @@ impl Vm {
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(1);
                 // Simple modular inverse
                 for i in 1..b.abs() {
-                    if (a * i) % b == 1 { return Ok(Some(Value::Long(i))); }
+                    if (a * i) % b == 1 {
+                        return Ok(Some(Value::Long(i)));
+                    }
                 }
                 Ok(Some(Value::Bool(false)))
             }
-            "gmp_jacobi" | "gmp_legendre" | "gmp_kronecker" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "gmp_jacobi" | "gmp_legendre" | "gmp_kronecker" => Ok(Some(Value::Long(0))),
             "gmp_cmp" | "gmp_sign" => {
                 let a = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(0);
                 if name == "gmp_sign" {
-                    Ok(Some(Value::Long(if a > 0 { 1 } else if a < 0 { -1 } else { 0 })))
+                    Ok(Some(Value::Long(if a > 0 {
+                        1
+                    } else if a < 0 {
+                        -1
+                    } else {
+                        0
+                    })))
                 } else {
-                    Ok(Some(Value::Long(if a > b { 1 } else if a < b { -1 } else { 0 })))
+                    Ok(Some(Value::Long(if a > b {
+                        1
+                    } else if a < b {
+                        -1
+                    } else {
+                        0
+                    })))
                 }
             }
             "gmp_random_bits" => {
                 let bits = args.first().map(|v| v.to_long()).unwrap_or(32).min(62);
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i64;
                 Ok(Some(Value::Long(ts & ((1i64 << bits) - 1))))
             }
             "gmp_random_range" => {
                 let min = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let max = args.get(1).map(|v| v.to_long()).unwrap_or(100);
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as i64;
                 let range = (max - min + 1).max(1);
                 Ok(Some(Value::Long(min + (ts.abs() % range))))
             }
@@ -9798,12 +10854,10 @@ impl Vm {
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(0);
                 Ok(Some(Value::Long(a ^ b)))
             }
-            "gmp_com" => {
-                Ok(Some(Value::Long(!args.first().map(|v| v.to_long()).unwrap_or(0))))
-            }
-            "gmp_setbit" | "gmp_clrbit" => {
-                Ok(Some(Value::Null))
-            }
+            "gmp_com" => Ok(Some(Value::Long(
+                !args.first().map(|v| v.to_long()).unwrap_or(0),
+            ))),
+            "gmp_setbit" | "gmp_clrbit" => Ok(Some(Value::Null)),
             "gmp_testbit" => {
                 let a = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let bit = args.get(1).map(|v| v.to_long()).unwrap_or(0) as u32;
@@ -9820,9 +10874,9 @@ impl Vm {
                 }
                 Ok(Some(Value::Long(-1)))
             }
-            "gmp_popcount" => {
-                Ok(Some(Value::Long(args.first().map(|v| v.to_long()).unwrap_or(0).count_ones() as i64)))
-            }
+            "gmp_popcount" => Ok(Some(Value::Long(
+                args.first().map(|v| v.to_long()).unwrap_or(0).count_ones() as i64,
+            ))),
             "gmp_hamdist" => {
                 let a = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let b = args.get(1).map(|v| v.to_long()).unwrap_or(0);
@@ -9830,41 +10884,66 @@ impl Vm {
             }
             "gmp_nextprime" => {
                 let mut n = args.first().map(|v| v.to_long()).unwrap_or(0) + 1;
-                if n < 2 { n = 2; }
+                if n < 2 {
+                    n = 2;
+                }
                 loop {
                     let mut is_prime = n >= 2;
                     let mut d = 2i64;
-                    while d * d <= n { if n % d == 0 { is_prime = false; break; } d += 1; }
-                    if is_prime { return Ok(Some(Value::Long(n))); }
+                    while d * d <= n {
+                        if n % d == 0 {
+                            is_prime = false;
+                            break;
+                        }
+                        d += 1;
+                    }
+                    if is_prime {
+                        return Ok(Some(Value::Long(n)));
+                    }
                     n += 1;
                 }
             }
             "gmp_perfect_square" => {
                 let n = args.first().map(|v| v.to_long()).unwrap_or(0);
-                if n < 0 { return Ok(Some(Value::Bool(false))); }
+                if n < 0 {
+                    return Ok(Some(Value::Bool(false)));
+                }
                 let s = (n as f64).sqrt() as i64;
                 Ok(Some(Value::Bool(s * s == n)))
             }
             "gmp_perfect_power" => {
                 let n = args.first().map(|v| v.to_long()).unwrap_or(0).abs();
-                if n <= 1 { return Ok(Some(Value::Bool(true))); }
+                if n <= 1 {
+                    return Ok(Some(Value::Bool(true)));
+                }
                 for b in 2..=63 {
                     let root = (n as f64).powf(1.0 / b as f64).round() as i64;
-                    if root.checked_pow(b).map_or(false, |p| p == n) { return Ok(Some(Value::Bool(true))); }
+                    if root.checked_pow(b).map_or(false, |p| p == n) {
+                        return Ok(Some(Value::Bool(true)));
+                    }
                 }
                 Ok(Some(Value::Bool(false)))
             }
             "gmp_prob_prime" => {
                 let n = args.first().map(|v| v.to_long()).unwrap_or(0);
-                if n < 2 { return Ok(Some(Value::Long(0))); }
+                if n < 2 {
+                    return Ok(Some(Value::Long(0)));
+                }
                 let mut d = 2i64;
-                while d * d <= n { if n % d == 0 { return Ok(Some(Value::Long(0))); } d += 1; }
+                while d * d <= n {
+                    if n % d == 0 {
+                        return Ok(Some(Value::Long(0)));
+                    }
+                    d += 1;
+                }
                 Ok(Some(Value::Long(2))) // 2 = definitely prime
             }
             "gmp_binomial" => {
                 let n = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let k = args.get(1).map(|v| v.to_long()).unwrap_or(0);
-                if k < 0 || k > n { return Ok(Some(Value::Long(0))); }
+                if k < 0 || k > n {
+                    return Ok(Some(Value::Long(0)));
+                }
                 let k = k.min(n - k);
                 let mut result: i64 = 1;
                 for i in 0..k {
@@ -9872,32 +10951,27 @@ impl Vm {
                 }
                 Ok(Some(Value::Long(result)))
             }
-            "gmp_import" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "gmp_import" => Ok(Some(Value::Long(0))),
 
             // === XML extension (22 functions) — stubs ===
-            "xml_parser_create" | "xml_parser_create_ns" => {
-                Ok(Some(Value::Long(1)))
-            }
-            "xml_parser_free" | "xml_parser_set_option" | "xml_set_element_handler"
-            | "xml_set_character_data_handler" | "xml_set_processing_instruction_handler"
-            | "xml_set_default_handler" | "xml_set_unparsed_entity_decl_handler"
-            | "xml_set_notation_decl_handler" | "xml_set_external_entity_ref_handler"
-            | "xml_set_start_namespace_decl_handler" | "xml_set_end_namespace_decl_handler"
-            | "xml_set_object" => {
-                Ok(Some(Value::Bool(true)))
-            }
-            "xml_parse" | "xml_parse_into_struct" => {
-                Ok(Some(Value::Long(1)))
-            }
-            "xml_parser_get_option" => {
-                Ok(Some(Value::String(String::new())))
-            }
-            "xml_get_current_byte_index" | "xml_get_current_column_number"
-            | "xml_get_current_line_number" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "xml_parser_create" | "xml_parser_create_ns" => Ok(Some(Value::Long(1))),
+            "xml_parser_free"
+            | "xml_parser_set_option"
+            | "xml_set_element_handler"
+            | "xml_set_character_data_handler"
+            | "xml_set_processing_instruction_handler"
+            | "xml_set_default_handler"
+            | "xml_set_unparsed_entity_decl_handler"
+            | "xml_set_notation_decl_handler"
+            | "xml_set_external_entity_ref_handler"
+            | "xml_set_start_namespace_decl_handler"
+            | "xml_set_end_namespace_decl_handler"
+            | "xml_set_object" => Ok(Some(Value::Bool(true))),
+            "xml_parse" | "xml_parse_into_struct" => Ok(Some(Value::Long(1))),
+            "xml_parser_get_option" => Ok(Some(Value::String(String::new()))),
+            "xml_get_current_byte_index"
+            | "xml_get_current_column_number"
+            | "xml_get_current_line_number" => Ok(Some(Value::Long(0))),
             "xml_get_error_code" => Ok(Some(Value::Long(0))),
             "xml_error_string" => Ok(Some(Value::String("No error".into()))),
 
@@ -9951,9 +11025,7 @@ impl Vm {
                 };
                 Ok(Some(Value::String(mime.to_string())))
             }
-            "finfo_buffer" => {
-                Ok(Some(Value::String("text/plain".to_string())))
-            }
+            "finfo_buffer" => Ok(Some(Value::String("text/plain".to_string()))),
 
             // === simplexml (3 functions) ===
             "simplexml_import_dom" | "simplexml_load_file" | "simplexml_load_string" => {
@@ -9961,28 +11033,48 @@ impl Vm {
             }
 
             // === XMLWriter (42 functions) — stubs ===
-            "xmlwriter_end_attribute" | "xmlwriter_end_cdata" | "xmlwriter_end_comment"
-            | "xmlwriter_end_document" | "xmlwriter_end_dtd" | "xmlwriter_end_dtd_attlist"
-            | "xmlwriter_end_dtd_element" | "xmlwriter_end_dtd_entity"
-            | "xmlwriter_end_element" | "xmlwriter_end_pi" | "xmlwriter_flush"
-            | "xmlwriter_full_end_element" | "xmlwriter_open_memory"
-            | "xmlwriter_open_uri" | "xmlwriter_output_memory"
-            | "xmlwriter_set_indent" | "xmlwriter_set_indent_string"
-            | "xmlwriter_start_attribute" | "xmlwriter_start_attribute_ns"
-            | "xmlwriter_start_cdata" | "xmlwriter_start_comment"
-            | "xmlwriter_start_document" | "xmlwriter_start_dtd"
-            | "xmlwriter_start_dtd_attlist" | "xmlwriter_start_dtd_element"
-            | "xmlwriter_start_dtd_entity" | "xmlwriter_start_element"
-            | "xmlwriter_start_element_ns" | "xmlwriter_start_pi"
-            | "xmlwriter_text" | "xmlwriter_write_attribute"
-            | "xmlwriter_write_attribute_ns" | "xmlwriter_write_cdata"
-            | "xmlwriter_write_comment" | "xmlwriter_write_dtd"
-            | "xmlwriter_write_dtd_attlist" | "xmlwriter_write_dtd_element"
-            | "xmlwriter_write_dtd_entity" | "xmlwriter_write_element"
-            | "xmlwriter_write_element_ns" | "xmlwriter_write_pi"
-            | "xmlwriter_write_raw" => {
-                Ok(Some(Value::Bool(true)))
-            }
+            "xmlwriter_end_attribute"
+            | "xmlwriter_end_cdata"
+            | "xmlwriter_end_comment"
+            | "xmlwriter_end_document"
+            | "xmlwriter_end_dtd"
+            | "xmlwriter_end_dtd_attlist"
+            | "xmlwriter_end_dtd_element"
+            | "xmlwriter_end_dtd_entity"
+            | "xmlwriter_end_element"
+            | "xmlwriter_end_pi"
+            | "xmlwriter_flush"
+            | "xmlwriter_full_end_element"
+            | "xmlwriter_open_memory"
+            | "xmlwriter_open_uri"
+            | "xmlwriter_output_memory"
+            | "xmlwriter_set_indent"
+            | "xmlwriter_set_indent_string"
+            | "xmlwriter_start_attribute"
+            | "xmlwriter_start_attribute_ns"
+            | "xmlwriter_start_cdata"
+            | "xmlwriter_start_comment"
+            | "xmlwriter_start_document"
+            | "xmlwriter_start_dtd"
+            | "xmlwriter_start_dtd_attlist"
+            | "xmlwriter_start_dtd_element"
+            | "xmlwriter_start_dtd_entity"
+            | "xmlwriter_start_element"
+            | "xmlwriter_start_element_ns"
+            | "xmlwriter_start_pi"
+            | "xmlwriter_text"
+            | "xmlwriter_write_attribute"
+            | "xmlwriter_write_attribute_ns"
+            | "xmlwriter_write_cdata"
+            | "xmlwriter_write_comment"
+            | "xmlwriter_write_dtd"
+            | "xmlwriter_write_dtd_attlist"
+            | "xmlwriter_write_dtd_element"
+            | "xmlwriter_write_dtd_entity"
+            | "xmlwriter_write_element"
+            | "xmlwriter_write_element_ns"
+            | "xmlwriter_write_pi"
+            | "xmlwriter_write_raw" => Ok(Some(Value::Bool(true))),
 
             // === readline (13 functions) — stubs ===
             "readline" => {
@@ -9992,37 +11084,58 @@ impl Vm {
                 }
                 Ok(Some(Value::String(String::new())))
             }
-            "readline_add_history" | "readline_clear_history" | "readline_write_history"
-            | "readline_read_history" => {
-                Ok(Some(Value::Bool(true)))
-            }
-            "readline_info" => {
-                Ok(Some(Value::String(String::new())))
-            }
+            "readline_add_history"
+            | "readline_clear_history"
+            | "readline_write_history"
+            | "readline_read_history" => Ok(Some(Value::Bool(true))),
+            "readline_info" => Ok(Some(Value::String(String::new()))),
             "readline_completion_function" => Ok(Some(Value::Bool(true))),
-            "readline_callback_handler_install" | "readline_callback_handler_remove"
-            | "readline_callback_read_char" | "readline_on_new_line"
-            | "readline_redisplay" => {
-                Ok(Some(Value::Bool(true)))
-            }
-            "readline_list_history" => {
-                Ok(Some(Value::Array(PhpArray::new())))
-            }
+            "readline_callback_handler_install"
+            | "readline_callback_handler_remove"
+            | "readline_callback_read_char"
+            | "readline_on_new_line"
+            | "readline_redisplay" => Ok(Some(Value::Bool(true))),
+            "readline_list_history" => Ok(Some(Value::Array(PhpArray::new()))),
 
             // === Exif (4 functions) ===
             "exif_imagetype" => {
                 let filename = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 if let Ok(data) = std::fs::read(&filename) {
                     if data.len() >= 3 {
-                        let img_type = if data.starts_with(&[0xFF, 0xD8, 0xFF]) { 2 } // JPEG
-                        else if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) { 3 } // PNG
-                        else if data.starts_with(&[0x47, 0x49, 0x46]) { 1 } // GIF
-                        else if data.starts_with(&[0x42, 0x4D]) { 6 } // BMP
-                        else if data.starts_with(b"RIFF") { 18 } // WEBP
-                        else { 0 };
-                        if img_type > 0 { Ok(Some(Value::Long(img_type))) } else { Ok(Some(Value::Bool(false))) }
-                    } else { Ok(Some(Value::Bool(false))) }
-                } else { Ok(Some(Value::Bool(false))) }
+                        let img_type = if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+                            2
+                        }
+                        // JPEG
+                        else if data.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+                            3
+                        }
+                        // PNG
+                        else if data.starts_with(&[0x47, 0x49, 0x46]) {
+                            1
+                        }
+                        // GIF
+                        else if data.starts_with(&[0x42, 0x4D]) {
+                            6
+                        }
+                        // BMP
+                        else if data.starts_with(b"RIFF") {
+                            18
+                        }
+                        // WEBP
+                        else {
+                            0
+                        };
+                        if img_type > 0 {
+                            Ok(Some(Value::Long(img_type)))
+                        } else {
+                            Ok(Some(Value::Bool(false)))
+                        }
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
             }
             "exif_read_data" | "exif_thumbnail" => Ok(Some(Value::Bool(false))),
             "exif_tagname" => Ok(Some(Value::String(String::new()))),
@@ -10030,15 +11143,54 @@ impl Vm {
             // === zlib (30 functions) — stubs ===
             "gzcompress" => {
                 let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(data)))
+                let level = args.get(1).map(|v| v.to_long() as i32).unwrap_or(-1);
+                let compressed = php_rs_ext_zlib::gzcompress(data.as_bytes(), level);
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&compressed).to_string(),
+                )))
             }
-            "gzuncompress" | "gzdecode" | "gzinflate" => {
+            "gzuncompress" => {
                 let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(data)))
+                match php_rs_ext_zlib::gzuncompress(data.as_bytes()) {
+                    Ok(result) => Ok(Some(Value::String(
+                        String::from_utf8_lossy(&result).to_string(),
+                    ))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
             }
-            "gzencode" | "gzdeflate" => {
+            "gzdecode" => {
                 let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(data)))
+                match php_rs_ext_zlib::gzdecode(data.as_bytes()) {
+                    Ok(result) => Ok(Some(Value::String(
+                        String::from_utf8_lossy(&result).to_string(),
+                    ))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "gzinflate" => {
+                let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                match php_rs_ext_zlib::gzinflate(data.as_bytes()) {
+                    Ok(result) => Ok(Some(Value::String(
+                        String::from_utf8_lossy(&result).to_string(),
+                    ))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "gzencode" => {
+                let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let level = args.get(1).map(|v| v.to_long() as i32).unwrap_or(-1);
+                let encoded = php_rs_ext_zlib::gzencode(data.as_bytes(), level);
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&encoded).to_string(),
+                )))
+            }
+            "gzdeflate" => {
+                let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let level = args.get(1).map(|v| v.to_long() as i32).unwrap_or(-1);
+                let deflated = php_rs_ext_zlib::gzdeflate(data.as_bytes(), level);
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&deflated).to_string(),
+                )))
             }
             "gzopen" => Ok(Some(Value::Bool(false))),
             "gzclose" | "gzeof" | "gzrewind" => Ok(Some(Value::Bool(false))),
@@ -10055,9 +11207,28 @@ impl Vm {
             "inflate_add" | "inflate_get_read_len" | "inflate_get_status" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "zlib_encode" | "zlib_decode" => {
+            "zlib_encode" => {
                 let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(data)))
+                let encoding = args
+                    .get(1)
+                    .map(|v| v.to_long() as i32)
+                    .unwrap_or(php_rs_ext_zlib::ZLIB_ENCODING_DEFLATE);
+                let level = args.get(2).map(|v| v.to_long() as i32).unwrap_or(-1);
+                match php_rs_ext_zlib::zlib_encode(data.as_bytes(), encoding, level) {
+                    Ok(result) => Ok(Some(Value::String(
+                        String::from_utf8_lossy(&result).to_string(),
+                    ))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "zlib_decode" => {
+                let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                match php_rs_ext_zlib::zlib_decode(data.as_bytes()) {
+                    Ok(result) => Ok(Some(Value::String(
+                        String::from_utf8_lossy(&result).to_string(),
+                    ))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
             }
             "zlib_get_coding_type" => Ok(Some(Value::Bool(false))),
             "ob_gzhandler" => {
@@ -10068,7 +11239,9 @@ impl Vm {
             // === zip (10 functions) — stubs ===
             "zip_open" | "zip_close" | "zip_read" | "zip_entry_open" | "zip_entry_close"
             | "zip_entry_read" => Ok(Some(Value::Bool(false))),
-            "zip_entry_name" | "zip_entry_compressionmethod" => Ok(Some(Value::String(String::new()))),
+            "zip_entry_name" | "zip_entry_compressionmethod" => {
+                Ok(Some(Value::String(String::new())))
+            }
             "zip_entry_filesize" | "zip_entry_compressedsize" => Ok(Some(Value::Long(0))),
 
             // === shmop (6 functions) — stubs ===
@@ -10079,10 +11252,13 @@ impl Vm {
             "shmop_size" => Ok(Some(Value::Long(0))),
 
             // === sysv* (18 functions) — stubs ===
-            "sem_get" | "sem_acquire" | "sem_release" | "sem_remove" => Ok(Some(Value::Bool(false))),
+            "sem_get" | "sem_acquire" | "sem_release" | "sem_remove" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "shm_attach" => Ok(Some(Value::Bool(false))),
-            "shm_detach" | "shm_remove" | "shm_put_var" | "shm_has_var"
-            | "shm_remove_var" => Ok(Some(Value::Bool(false))),
+            "shm_detach" | "shm_remove" | "shm_put_var" | "shm_has_var" | "shm_remove_var" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "shm_get_var" => Ok(Some(Value::Bool(false))),
             "msg_get_queue" => Ok(Some(Value::Bool(false))),
             "msg_send" | "msg_receive" | "msg_remove_queue" | "msg_set_queue"
@@ -10092,42 +11268,63 @@ impl Vm {
             // === tidy (24 functions) — stubs ===
             "tidy_access_count" | "tidy_config_count" | "tidy_error_count"
             | "tidy_warning_count" => Ok(Some(Value::Long(0))),
-            "tidy_clean_repair" | "tidy_diagnose" | "tidy_is_xhtml"
-            | "tidy_is_xml" => Ok(Some(Value::Bool(false))),
-            "tidy_get_body" | "tidy_get_head" | "tidy_get_html"
-            | "tidy_get_root" => Ok(Some(Value::Null)),
+            "tidy_clean_repair" | "tidy_diagnose" | "tidy_is_xhtml" | "tidy_is_xml" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "tidy_get_body" | "tidy_get_head" | "tidy_get_html" | "tidy_get_root" => {
+                Ok(Some(Value::Null))
+            }
             "tidy_get_output" | "tidy_get_error_buffer" => Ok(Some(Value::String(String::new()))),
             "tidy_get_html_ver" => Ok(Some(Value::Long(0))),
             "tidy_get_opt_doc" => Ok(Some(Value::String(String::new()))),
             "tidy_get_release" => Ok(Some(Value::String("0.0.0".into()))),
             "tidy_get_status" => Ok(Some(Value::Long(0))),
             "tidy_getopt" => Ok(Some(Value::Bool(false))),
-            "tidy_parse_file" | "tidy_parse_string" | "tidy_repair_file"
-            | "tidy_repair_string" => Ok(Some(Value::Bool(false))),
+            "tidy_parse_file" | "tidy_parse_string" | "tidy_repair_file" | "tidy_repair_string" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "tidy_reset_config" | "tidy_save_config" => Ok(Some(Value::Bool(false))),
             "tidy_set_encoding" => Ok(Some(Value::Bool(true))),
 
             // === snmp (24 functions) — stubs ===
-            "snmpget" | "snmpgetnext" | "snmpset" | "snmpwalk" | "snmpwalkoid"
-            | "snmp_get_quick_print" | "snmp_get_valueretrieval"
-            | "snmp_read_mib" | "snmp_set_enum_print" | "snmp_set_oid_numeric_print"
-            | "snmp_set_oid_output_format" | "snmp_set_quick_print"
-            | "snmp_set_valueretrieval" | "snmp2_get" | "snmp2_getnext"
-            | "snmp2_real_walk" | "snmp2_set" | "snmp2_walk"
-            | "snmp3_get" | "snmp3_getnext" | "snmp3_real_walk"
-            | "snmp3_set" | "snmp3_walk" | "snmprealwalk" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "snmpget"
+            | "snmpgetnext"
+            | "snmpset"
+            | "snmpwalk"
+            | "snmpwalkoid"
+            | "snmp_get_quick_print"
+            | "snmp_get_valueretrieval"
+            | "snmp_read_mib"
+            | "snmp_set_enum_print"
+            | "snmp_set_oid_numeric_print"
+            | "snmp_set_oid_output_format"
+            | "snmp_set_quick_print"
+            | "snmp_set_valueretrieval"
+            | "snmp2_get"
+            | "snmp2_getnext"
+            | "snmp2_real_walk"
+            | "snmp2_set"
+            | "snmp2_walk"
+            | "snmp3_get"
+            | "snmp3_getnext"
+            | "snmp3_real_walk"
+            | "snmp3_set"
+            | "snmp3_walk"
+            | "snmprealwalk" => Ok(Some(Value::Bool(false))),
 
             // === sockets (40 functions) — stubs ===
             "socket_create" | "socket_create_pair" | "socket_create_listen" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "socket_accept" | "socket_bind" | "socket_connect" | "socket_listen"
-            | "socket_shutdown" | "socket_close" | "socket_set_block"
-            | "socket_set_nonblock" | "socket_set_option" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "socket_accept"
+            | "socket_bind"
+            | "socket_connect"
+            | "socket_listen"
+            | "socket_shutdown"
+            | "socket_close"
+            | "socket_set_block"
+            | "socket_set_nonblock"
+            | "socket_set_option" => Ok(Some(Value::Bool(false))),
             "socket_read" | "socket_recv" | "socket_recvfrom" | "socket_recvmsg" => {
                 Ok(Some(Value::Bool(false)))
             }
@@ -10140,9 +11337,7 @@ impl Vm {
             "socket_getpeername" | "socket_getsockname" => Ok(Some(Value::Bool(false))),
             "socket_last_error" => Ok(Some(Value::Long(0))),
             "socket_clear_error" => Ok(Some(Value::Null)),
-            "socket_strerror" => {
-                Ok(Some(Value::String("Success".into())))
-            }
+            "socket_strerror" => Ok(Some(Value::String("Success".into()))),
             "socket_import_stream" | "socket_export_stream" => Ok(Some(Value::Bool(false))),
             "socket_cmsg_space" => Ok(Some(Value::Long(0))),
             "socket_addrinfo_lookup" => Ok(Some(Value::Array(PhpArray::new()))),
@@ -10151,10 +11346,11 @@ impl Vm {
             "socket_atmark" => Ok(Some(Value::Bool(false))),
 
             // === opcache (8 functions) — stubs ===
-            "opcache_compile_file" | "opcache_invalidate" | "opcache_is_script_cached"
-            | "opcache_is_script_cached_in_file_cache" | "opcache_reset" => {
-                Ok(Some(Value::Bool(true)))
-            }
+            "opcache_compile_file"
+            | "opcache_invalidate"
+            | "opcache_is_script_cached"
+            | "opcache_is_script_cached_in_file_cache"
+            | "opcache_reset" => Ok(Some(Value::Bool(true))),
             "opcache_get_configuration" | "opcache_get_status" => {
                 Ok(Some(Value::Array(PhpArray::new())))
             }
@@ -10167,7 +11363,10 @@ impl Vm {
                 let filename = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let process_sections = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
                 if let Ok(content) = std::fs::read_to_string(&filename) {
-                    Ok(Some(Value::Array(parse_ini_to_array(&content, process_sections))))
+                    Ok(Some(Value::Array(parse_ini_to_array(
+                        &content,
+                        process_sections,
+                    ))))
                 } else {
                     Ok(Some(Value::Bool(false)))
                 }
@@ -10183,10 +11382,14 @@ impl Vm {
                 // Deprecated in PHP 8.1, return formatted date string
                 let format = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let ts = args.get(1).map(|v| v.to_long()).unwrap_or_else(|| {
-                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64
                 });
                 let (year, month, day, hour, min, sec, _wday, _yday) = timestamp_to_parts(ts);
-                let result = format.replace("%Y", &format!("{:04}", year))
+                let result = format
+                    .replace("%Y", &format!("{:04}", year))
                     .replace("%m", &format!("{:02}", month))
                     .replace("%d", &format!("{:02}", day))
                     .replace("%H", &format!("{:02}", hour))
@@ -10208,14 +11411,18 @@ impl Vm {
             }
             "mb_lcfirst" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                if s.is_empty() { return Ok(Some(Value::String(s))); }
+                if s.is_empty() {
+                    return Ok(Some(Value::String(s)));
+                }
                 let mut chars = s.chars();
                 let first = chars.next().unwrap().to_lowercase().to_string();
                 Ok(Some(Value::String(format!("{}{}", first, chars.as_str()))))
             }
             "mb_ucfirst" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                if s.is_empty() { return Ok(Some(Value::String(s))); }
+                if s.is_empty() {
+                    return Ok(Some(Value::String(s)));
+                }
                 let mut chars = s.chars();
                 let first = chars.next().unwrap().to_uppercase().to_string();
                 Ok(Some(Value::String(format!("{}{}", first, chars.as_str()))))
@@ -10226,7 +11433,10 @@ impl Vm {
                 match chars {
                     Some(c) => {
                         let chars: Vec<char> = c.chars().collect();
-                        Ok(Some(Value::String(s.trim_start_matches(|ch: char| chars.contains(&ch)).to_string())))
+                        Ok(Some(Value::String(
+                            s.trim_start_matches(|ch: char| chars.contains(&ch))
+                                .to_string(),
+                        )))
                     }
                     None => Ok(Some(Value::String(s.trim_start().to_string()))),
                 }
@@ -10237,7 +11447,10 @@ impl Vm {
                 match chars {
                     Some(c) => {
                         let chars: Vec<char> = c.chars().collect();
-                        Ok(Some(Value::String(s.trim_end_matches(|ch: char| chars.contains(&ch)).to_string())))
+                        Ok(Some(Value::String(
+                            s.trim_end_matches(|ch: char| chars.contains(&ch))
+                                .to_string(),
+                        )))
                     }
                     None => Ok(Some(Value::String(s.trim_end().to_string()))),
                 }
@@ -10248,7 +11461,9 @@ impl Vm {
                 match chars {
                     Some(c) => {
                         let chars: Vec<char> = c.chars().collect();
-                        Ok(Some(Value::String(s.trim_matches(|ch: char| chars.contains(&ch)).to_string())))
+                        Ok(Some(Value::String(
+                            s.trim_matches(|ch: char| chars.contains(&ch)).to_string(),
+                        )))
                     }
                     None => Ok(Some(Value::String(s.trim().to_string()))),
                 }
@@ -10277,21 +11492,30 @@ impl Vm {
             }
             "mb_strwidth" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                let width: usize = s.chars().map(|c| {
-                    let cp = c as u32;
-                    if cp >= 0x1100 && (
-                        (cp <= 0x115f) || cp == 0x2329 || cp == 0x232a ||
-                        (cp >= 0x2e80 && cp <= 0xa4cf && cp != 0x303f) ||
-                        (cp >= 0xac00 && cp <= 0xd7a3) ||
-                        (cp >= 0xf900 && cp <= 0xfaff) ||
-                        (cp >= 0xfe10 && cp <= 0xfe19) ||
-                        (cp >= 0xfe30 && cp <= 0xfe6f) ||
-                        (cp >= 0xff01 && cp <= 0xff60) ||
-                        (cp >= 0xffe0 && cp <= 0xffe6) ||
-                        (cp >= 0x20000 && cp <= 0x2fffd) ||
-                        (cp >= 0x30000 && cp <= 0x3fffd)
-                    ) { 2 } else { 1 }
-                }).sum();
+                let width: usize = s
+                    .chars()
+                    .map(|c| {
+                        let cp = c as u32;
+                        if cp >= 0x1100
+                            && ((cp <= 0x115f)
+                                || cp == 0x2329
+                                || cp == 0x232a
+                                || (cp >= 0x2e80 && cp <= 0xa4cf && cp != 0x303f)
+                                || (cp >= 0xac00 && cp <= 0xd7a3)
+                                || (cp >= 0xf900 && cp <= 0xfaff)
+                                || (cp >= 0xfe10 && cp <= 0xfe19)
+                                || (cp >= 0xfe30 && cp <= 0xfe6f)
+                                || (cp >= 0xff01 && cp <= 0xff60)
+                                || (cp >= 0xffe0 && cp <= 0xffe6)
+                                || (cp >= 0x20000 && cp <= 0x2fffd)
+                                || (cp >= 0x30000 && cp <= 0x3fffd))
+                        {
+                            2
+                        } else {
+                            1
+                        }
+                    })
+                    .sum();
                 Ok(Some(Value::Long(width as i64)))
             }
             "mb_substitute_character" => {
@@ -10334,9 +11558,9 @@ impl Vm {
             "tidy_get_config" => Ok(Some(Value::Array(PhpArray::new()))),
 
             // === Finish sockets (3 missing) ===
-            "socket_wsaprotocol_info_export" | "socket_wsaprotocol_info_import" | "socket_wsaprotocol_info_release" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "socket_wsaprotocol_info_export"
+            | "socket_wsaprotocol_info_import"
+            | "socket_wsaprotocol_info_release" => Ok(Some(Value::Bool(false))),
 
             // === DBA extension (15 functions) ===
             "dba_open" | "dba_popen" => Ok(Some(Value::Bool(false))),
@@ -10382,13 +11606,26 @@ impl Vm {
             "enchant_broker_init" => Ok(Some(Value::Long(1))),
             "enchant_broker_free" | "enchant_broker_free_dict" => Ok(Some(Value::Bool(true))),
             "enchant_broker_dict_exists" => Ok(Some(Value::Bool(false))),
-            "enchant_broker_request_dict" | "enchant_broker_request_pwl_dict" => Ok(Some(Value::Bool(false))),
-            "enchant_broker_describe" | "enchant_broker_list_dicts" => Ok(Some(Value::Array(PhpArray::new()))),
-            "enchant_broker_get_error" | "enchant_broker_get_dict_path" => Ok(Some(Value::String(String::new()))),
-            "enchant_broker_set_dict_path" | "enchant_broker_set_ordering" => Ok(Some(Value::Bool(true))),
-            "enchant_dict_check" | "enchant_dict_is_added" | "enchant_dict_is_in_session" => Ok(Some(Value::Bool(false))),
+            "enchant_broker_request_dict" | "enchant_broker_request_pwl_dict" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "enchant_broker_describe" | "enchant_broker_list_dicts" => {
+                Ok(Some(Value::Array(PhpArray::new())))
+            }
+            "enchant_broker_get_error" | "enchant_broker_get_dict_path" => {
+                Ok(Some(Value::String(String::new())))
+            }
+            "enchant_broker_set_dict_path" | "enchant_broker_set_ordering" => {
+                Ok(Some(Value::Bool(true)))
+            }
+            "enchant_dict_check" | "enchant_dict_is_added" | "enchant_dict_is_in_session" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "enchant_dict_suggest" => Ok(Some(Value::Array(PhpArray::new()))),
-            "enchant_dict_add" | "enchant_dict_add_to_personal" | "enchant_dict_add_to_session" | "enchant_dict_delete" => Ok(Some(Value::Null)),
+            "enchant_dict_add"
+            | "enchant_dict_add_to_personal"
+            | "enchant_dict_add_to_session"
+            | "enchant_dict_delete" => Ok(Some(Value::Null)),
             "enchant_dict_describe" => Ok(Some(Value::Array(PhpArray::new()))),
             "enchant_dict_get_error" => Ok(Some(Value::String(String::new()))),
             "enchant_dict_quick_check" => Ok(Some(Value::Bool(true))),
@@ -10404,12 +11641,18 @@ impl Vm {
             "ftp_systype" => Ok(Some(Value::String("UNIX".into()))),
             "ftp_pasv" | "ftp_set_option" => Ok(Some(Value::Bool(true))),
             "ftp_get_option" => Ok(Some(Value::Long(0))),
-            "ftp_get" | "ftp_fget" | "ftp_put" | "ftp_fput" | "ftp_append" => Ok(Some(Value::Bool(false))),
-            "ftp_delete" | "ftp_site" | "ftp_exec" | "ftp_rename" | "ftp_chmod" => Ok(Some(Value::Bool(false))),
+            "ftp_get" | "ftp_fget" | "ftp_put" | "ftp_fput" | "ftp_append" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "ftp_delete" | "ftp_site" | "ftp_exec" | "ftp_rename" | "ftp_chmod" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "ftp_size" => Ok(Some(Value::Long(-1))),
             "ftp_mdtm" => Ok(Some(Value::Long(-1))),
             "ftp_raw" => Ok(Some(Value::Array(PhpArray::new()))),
-            "ftp_nb_get" | "ftp_nb_fget" | "ftp_nb_put" | "ftp_nb_fput" | "ftp_nb_continue" => Ok(Some(Value::Long(0))),
+            "ftp_nb_get" | "ftp_nb_fget" | "ftp_nb_put" | "ftp_nb_fput" | "ftp_nb_continue" => {
+                Ok(Some(Value::Long(0)))
+            }
             "ftp_alloc" => Ok(Some(Value::Bool(false))),
 
             // === curl extension (35 functions) ===
@@ -10423,11 +11666,15 @@ impl Vm {
             "curl_error" => Ok(Some(Value::String(String::new()))),
             "curl_escape" => {
                 let s = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_rawurlencode(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_rawurlencode(&s),
+                )))
             }
             "curl_unescape" => {
                 let s = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_rawurldecode(&s))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_rawurldecode(&s),
+                )))
             }
             "curl_file_create" => Ok(Some(Value::Null)),
             "curl_multi_init" => Ok(Some(Value::Long(1))),
@@ -10461,23 +11708,50 @@ impl Vm {
 
             // === com_dotnet (32 functions) — stubs ===
             "com_create_guid" => {
-                let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-                Ok(Some(Value::String(format!("{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
-                    (ts >> 96) as u32, (ts >> 80) as u16, (ts >> 64) as u16,
-                    (ts >> 48) as u16, ts as u64 & 0xFFFFFFFFFFFF))))
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                Ok(Some(Value::String(format!(
+                    "{{{:08X}-{:04X}-{:04X}-{:04X}-{:012X}}}",
+                    (ts >> 96) as u32,
+                    (ts >> 80) as u16,
+                    (ts >> 64) as u16,
+                    (ts >> 48) as u16,
+                    ts as u64 & 0xFFFFFFFFFFFF
+                ))))
             }
-            "com_event_sink" | "com_get_active_object" | "com_load_typelib" | "com_message_pump" | "com_print_typeinfo" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "variant_abs" | "variant_add" | "variant_and" | "variant_cast" | "variant_cat"
-            | "variant_cmp" | "variant_date_from_timestamp" | "variant_date_to_timestamp"
-            | "variant_div" | "variant_eqv" | "variant_fix" | "variant_get_type"
-            | "variant_idiv" | "variant_imp" | "variant_int" | "variant_mod"
-            | "variant_mul" | "variant_neg" | "variant_not" | "variant_or"
-            | "variant_pow" | "variant_round" | "variant_set" | "variant_set_type"
-            | "variant_sub" | "variant_xor" => {
-                Ok(Some(Value::Null))
-            }
+            "com_event_sink"
+            | "com_get_active_object"
+            | "com_load_typelib"
+            | "com_message_pump"
+            | "com_print_typeinfo" => Ok(Some(Value::Bool(false))),
+            "variant_abs"
+            | "variant_add"
+            | "variant_and"
+            | "variant_cast"
+            | "variant_cat"
+            | "variant_cmp"
+            | "variant_date_from_timestamp"
+            | "variant_date_to_timestamp"
+            | "variant_div"
+            | "variant_eqv"
+            | "variant_fix"
+            | "variant_get_type"
+            | "variant_idiv"
+            | "variant_imp"
+            | "variant_int"
+            | "variant_mod"
+            | "variant_mul"
+            | "variant_neg"
+            | "variant_not"
+            | "variant_or"
+            | "variant_pow"
+            | "variant_round"
+            | "variant_set"
+            | "variant_set_type"
+            | "variant_sub"
+            | "variant_xor" => Ok(Some(Value::Null)),
 
             // === OpenSSL (66 functions) — stubs ===
             "openssl_cipher_iv_length" | "openssl_cipher_key_length" => Ok(Some(Value::Long(16))),
@@ -10490,44 +11764,74 @@ impl Vm {
             }
             "openssl_get_cert_locations" => {
                 let mut arr = PhpArray::new();
-                arr.set_string("default_cert_file".into(), Value::String("/etc/ssl/certs/ca-certificates.crt".into()));
-                arr.set_string("default_cert_dir".into(), Value::String("/etc/ssl/certs".into()));
+                arr.set_string(
+                    "default_cert_file".into(),
+                    Value::String("/etc/ssl/certs/ca-certificates.crt".into()),
+                );
+                arr.set_string(
+                    "default_cert_dir".into(),
+                    Value::String("/etc/ssl/certs".into()),
+                );
                 Ok(Some(Value::Array(arr)))
             }
-            "openssl_open" | "openssl_seal" | "openssl_sign" | "openssl_verify" => Ok(Some(Value::Bool(false))),
-            "openssl_pkey_derive" | "openssl_pkey_export" | "openssl_pkey_export_to_file" => Ok(Some(Value::Bool(false))),
+            "openssl_open" | "openssl_seal" | "openssl_sign" | "openssl_verify" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "openssl_pkey_derive" | "openssl_pkey_export" | "openssl_pkey_export_to_file" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "openssl_pkey_free" => Ok(Some(Value::Null)),
-            "openssl_pkey_get_details" | "openssl_pkey_get_private" | "openssl_pkey_get_public" | "openssl_pkey_new" => {
+            "openssl_pkey_get_details"
+            | "openssl_pkey_get_private"
+            | "openssl_pkey_get_public"
+            | "openssl_pkey_new" => Ok(Some(Value::Bool(false))),
+            "openssl_pkcs7_decrypt"
+            | "openssl_pkcs7_encrypt"
+            | "openssl_pkcs7_read"
+            | "openssl_pkcs7_sign"
+            | "openssl_pkcs7_verify" => Ok(Some(Value::Bool(false))),
+            "openssl_pkcs12_export" | "openssl_pkcs12_export_to_file" | "openssl_pkcs12_read" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "openssl_pkcs7_decrypt" | "openssl_pkcs7_encrypt" | "openssl_pkcs7_read" | "openssl_pkcs7_sign" | "openssl_pkcs7_verify" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "openssl_pkcs12_export" | "openssl_pkcs12_export_to_file" | "openssl_pkcs12_read" => Ok(Some(Value::Bool(false))),
-            "openssl_cms_decrypt" | "openssl_cms_encrypt" | "openssl_cms_read" | "openssl_cms_sign" | "openssl_cms_verify" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "openssl_csr_export" | "openssl_csr_export_to_file" | "openssl_csr_get_public_key"
-            | "openssl_csr_get_subject" | "openssl_csr_new" | "openssl_csr_sign" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "openssl_cms_decrypt"
+            | "openssl_cms_encrypt"
+            | "openssl_cms_read"
+            | "openssl_cms_sign"
+            | "openssl_cms_verify" => Ok(Some(Value::Bool(false))),
+            "openssl_csr_export"
+            | "openssl_csr_export_to_file"
+            | "openssl_csr_get_public_key"
+            | "openssl_csr_get_subject"
+            | "openssl_csr_new"
+            | "openssl_csr_sign" => Ok(Some(Value::Bool(false))),
             "openssl_dh_compute_key" => Ok(Some(Value::Bool(false))),
             "openssl_pbkdf2" => Ok(Some(Value::Bool(false))),
-            "openssl_private_decrypt" | "openssl_private_encrypt" | "openssl_public_decrypt" | "openssl_public_encrypt" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "openssl_private_decrypt"
+            | "openssl_private_encrypt"
+            | "openssl_public_decrypt"
+            | "openssl_public_encrypt" => Ok(Some(Value::Bool(false))),
             "openssl_random_pseudo_bytes" => {
                 let length = args.first().map(|v| v.to_long()).unwrap_or(16) as usize;
-                let bytes: Vec<u8> = (0..length).map(|i| {
-                    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
-                    ((ts >> (i % 16)) & 0xFF) as u8
-                }).collect();
-                Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+                let bytes: Vec<u8> = (0..length)
+                    .map(|i| {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos();
+                        ((ts >> (i % 16)) & 0xFF) as u8
+                    })
+                    .collect();
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&bytes).to_string(),
+                )))
             }
-            "openssl_spki_export" | "openssl_spki_export_challenge" | "openssl_spki_new" | "openssl_spki_verify" => {
+            "openssl_spki_export"
+            | "openssl_spki_export_challenge"
+            | "openssl_spki_new"
+            | "openssl_spki_verify" => Ok(Some(Value::Bool(false))),
+            "openssl_x509_check_private_key" | "openssl_x509_checkpurpose" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "openssl_x509_check_private_key" | "openssl_x509_checkpurpose" => Ok(Some(Value::Bool(false))),
             "openssl_x509_export" | "openssl_x509_export_to_file" => Ok(Some(Value::Bool(false))),
             "openssl_x509_fingerprint" => Ok(Some(Value::String(String::new()))),
             "openssl_x509_free" => Ok(Some(Value::Null)),
@@ -10542,84 +11846,154 @@ impl Vm {
             "ldap_free_result" => Ok(Some(Value::Bool(true))),
             "ldap_count_entries" => Ok(Some(Value::Long(0))),
             "ldap_first_entry" | "ldap_next_entry" => Ok(Some(Value::Bool(false))),
-            "ldap_get_entries" | "ldap_get_attributes" | "ldap_get_values" | "ldap_get_values_len" => {
-                Ok(Some(Value::Array(PhpArray::new())))
+            "ldap_get_entries"
+            | "ldap_get_attributes"
+            | "ldap_get_values"
+            | "ldap_get_values_len" => Ok(Some(Value::Array(PhpArray::new()))),
+            "ldap_get_dn" | "ldap_first_attribute" | "ldap_next_attribute" => {
+                Ok(Some(Value::String(String::new())))
             }
-            "ldap_get_dn" | "ldap_first_attribute" | "ldap_next_attribute" => Ok(Some(Value::String(String::new()))),
             "ldap_dn2ufn" | "ldap_explode_dn" => Ok(Some(Value::Bool(false))),
-            "ldap_add" | "ldap_add_ext" | "ldap_modify" | "ldap_modify_ext" | "ldap_mod_add" | "ldap_mod_add_ext"
-            | "ldap_mod_del" | "ldap_mod_del_ext" | "ldap_mod_replace" | "ldap_mod_replace_ext"
-            | "ldap_modify_batch" | "ldap_delete" | "ldap_delete_ext" | "ldap_rename" | "ldap_rename_ext" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "ldap_add"
+            | "ldap_add_ext"
+            | "ldap_modify"
+            | "ldap_modify_ext"
+            | "ldap_mod_add"
+            | "ldap_mod_add_ext"
+            | "ldap_mod_del"
+            | "ldap_mod_del_ext"
+            | "ldap_mod_replace"
+            | "ldap_mod_replace_ext"
+            | "ldap_modify_batch"
+            | "ldap_delete"
+            | "ldap_delete_ext"
+            | "ldap_rename"
+            | "ldap_rename_ext" => Ok(Some(Value::Bool(false))),
             "ldap_compare" => Ok(Some(Value::Long(-1))),
             "ldap_errno" => Ok(Some(Value::Long(0))),
             "ldap_error" => Ok(Some(Value::String("Success".into()))),
             "ldap_err2str" => Ok(Some(Value::String("Success".into()))),
             "ldap_set_option" | "ldap_get_option" => Ok(Some(Value::Bool(false))),
-            "ldap_control_paged_result" | "ldap_control_paged_result_response" => Ok(Some(Value::Bool(false))),
-            "ldap_parse_exop" | "ldap_parse_reference" | "ldap_parse_result" => Ok(Some(Value::Bool(false))),
+            "ldap_control_paged_result" | "ldap_control_paged_result_response" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "ldap_parse_exop" | "ldap_parse_reference" | "ldap_parse_result" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "ldap_start_tls" => Ok(Some(Value::Bool(false))),
             "ldap_sort" => Ok(Some(Value::Bool(false))),
             "ldap_set_rebind_proc" => Ok(Some(Value::Bool(true))),
-            "ldap_exop" | "ldap_exop_passwd" | "ldap_exop_refresh" | "ldap_exop_whoami" => Ok(Some(Value::Bool(false))),
+            "ldap_exop" | "ldap_exop_passwd" | "ldap_exop_refresh" | "ldap_exop_whoami" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "ldap_8859_to_t61" | "ldap_t61_to_8859" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(s)))
             }
 
             // === mysqli (106 functions) — stubs ===
-            "mysqli_connect" | "mysqli_init" | "mysqli_real_connect" => Ok(Some(Value::Bool(false))),
-            "mysqli_close" | "mysqli_kill" | "mysqli_ping" => Ok(Some(Value::Bool(false))),
-            "mysqli_query" | "mysqli_real_query" | "mysqli_multi_query" | "mysqli_next_result"
-            | "mysqli_more_results" | "mysqli_store_result" | "mysqli_use_result" => Ok(Some(Value::Bool(false))),
-            "mysqli_prepare" | "mysqli_stmt_init" => Ok(Some(Value::Bool(false))),
-            "mysqli_stmt_prepare" | "mysqli_stmt_bind_param" | "mysqli_stmt_bind_result"
-            | "mysqli_stmt_execute" | "mysqli_stmt_fetch" | "mysqli_stmt_close"
-            | "mysqli_stmt_reset" | "mysqli_stmt_free_result" | "mysqli_stmt_send_long_data"
-            | "mysqli_stmt_store_result" | "mysqli_stmt_get_result"
-            | "mysqli_stmt_data_seek" | "mysqli_stmt_more_results" | "mysqli_stmt_next_result" => {
+            "mysqli_connect" | "mysqli_init" | "mysqli_real_connect" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "mysqli_stmt_affected_rows" | "mysqli_stmt_insert_id" | "mysqli_stmt_num_rows"
-            | "mysqli_stmt_param_count" | "mysqli_stmt_field_count" | "mysqli_stmt_errno" => {
-                Ok(Some(Value::Long(0)))
-            }
+            "mysqli_close" | "mysqli_kill" | "mysqli_ping" => Ok(Some(Value::Bool(false))),
+            "mysqli_query"
+            | "mysqli_real_query"
+            | "mysqli_multi_query"
+            | "mysqli_next_result"
+            | "mysqli_more_results"
+            | "mysqli_store_result"
+            | "mysqli_use_result" => Ok(Some(Value::Bool(false))),
+            "mysqli_prepare" | "mysqli_stmt_init" => Ok(Some(Value::Bool(false))),
+            "mysqli_stmt_prepare"
+            | "mysqli_stmt_bind_param"
+            | "mysqli_stmt_bind_result"
+            | "mysqli_stmt_execute"
+            | "mysqli_stmt_fetch"
+            | "mysqli_stmt_close"
+            | "mysqli_stmt_reset"
+            | "mysqli_stmt_free_result"
+            | "mysqli_stmt_send_long_data"
+            | "mysqli_stmt_store_result"
+            | "mysqli_stmt_get_result"
+            | "mysqli_stmt_data_seek"
+            | "mysqli_stmt_more_results"
+            | "mysqli_stmt_next_result" => Ok(Some(Value::Bool(false))),
+            "mysqli_stmt_affected_rows"
+            | "mysqli_stmt_insert_id"
+            | "mysqli_stmt_num_rows"
+            | "mysqli_stmt_param_count"
+            | "mysqli_stmt_field_count"
+            | "mysqli_stmt_errno" => Ok(Some(Value::Long(0))),
             "mysqli_stmt_error" | "mysqli_stmt_sqlstate" => Ok(Some(Value::String(String::new()))),
-            "mysqli_stmt_error_list" | "mysqli_stmt_result_metadata" | "mysqli_stmt_attr_get"
+            "mysqli_stmt_error_list"
+            | "mysqli_stmt_result_metadata"
+            | "mysqli_stmt_attr_get"
             | "mysqli_stmt_attr_set" => Ok(Some(Value::Bool(false))),
-            "mysqli_affected_rows" | "mysqli_insert_id" | "mysqli_num_rows" | "mysqli_num_fields"
-            | "mysqli_field_count" | "mysqli_thread_id" => Ok(Some(Value::Long(0))),
+            "mysqli_affected_rows"
+            | "mysqli_insert_id"
+            | "mysqli_num_rows"
+            | "mysqli_num_fields"
+            | "mysqli_field_count"
+            | "mysqli_thread_id" => Ok(Some(Value::Long(0))),
             "mysqli_errno" => Ok(Some(Value::Long(0))),
-            "mysqli_error" | "mysqli_sqlstate" | "mysqli_info" | "mysqli_stat"
-            | "mysqli_get_host_info" | "mysqli_get_proto_info" | "mysqli_get_server_info"
-            | "mysqli_character_set_name" | "mysqli_get_client_info" => {
-                Ok(Some(Value::String(String::new())))
-            }
+            "mysqli_error"
+            | "mysqli_sqlstate"
+            | "mysqli_info"
+            | "mysqli_stat"
+            | "mysqli_get_host_info"
+            | "mysqli_get_proto_info"
+            | "mysqli_get_server_info"
+            | "mysqli_character_set_name"
+            | "mysqli_get_client_info" => Ok(Some(Value::String(String::new()))),
             "mysqli_error_list" => Ok(Some(Value::Array(PhpArray::new()))),
             "mysqli_connect_errno" => Ok(Some(Value::Long(0))),
             "mysqli_connect_error" => Ok(Some(Value::Null)),
-            "mysqli_autocommit" | "mysqli_begin_transaction" | "mysqli_commit" | "mysqli_rollback"
-            | "mysqli_savepoint" | "mysqli_release_savepoint" => Ok(Some(Value::Bool(false))),
-            "mysqli_select_db" | "mysqli_set_charset" | "mysqli_options" | "mysqli_ssl_set"
-            | "mysqli_change_user" | "mysqli_dump_debug_info" | "mysqli_refresh" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "mysqli_fetch_array" | "mysqli_fetch_assoc" | "mysqli_fetch_row"
-            | "mysqli_fetch_object" | "mysqli_fetch_column" => Ok(Some(Value::Bool(false))),
+            "mysqli_autocommit"
+            | "mysqli_begin_transaction"
+            | "mysqli_commit"
+            | "mysqli_rollback"
+            | "mysqli_savepoint"
+            | "mysqli_release_savepoint" => Ok(Some(Value::Bool(false))),
+            "mysqli_select_db"
+            | "mysqli_set_charset"
+            | "mysqli_options"
+            | "mysqli_ssl_set"
+            | "mysqli_change_user"
+            | "mysqli_dump_debug_info"
+            | "mysqli_refresh" => Ok(Some(Value::Bool(false))),
+            "mysqli_fetch_array"
+            | "mysqli_fetch_assoc"
+            | "mysqli_fetch_row"
+            | "mysqli_fetch_object"
+            | "mysqli_fetch_column" => Ok(Some(Value::Bool(false))),
             "mysqli_fetch_all" => Ok(Some(Value::Array(PhpArray::new()))),
             "mysqli_fetch_field" | "mysqli_fetch_field_direct" => Ok(Some(Value::Bool(false))),
-            "mysqli_fetch_fields" | "mysqli_fetch_lengths" => Ok(Some(Value::Array(PhpArray::new()))),
+            "mysqli_fetch_fields" | "mysqli_fetch_lengths" => {
+                Ok(Some(Value::Array(PhpArray::new())))
+            }
             "mysqli_data_seek" | "mysqli_field_seek" => Ok(Some(Value::Bool(false))),
             "mysqli_free_result" => Ok(Some(Value::Null)),
-            "mysqli_get_connection_stats" | "mysqli_get_client_stats" => Ok(Some(Value::Array(PhpArray::new()))),
+            "mysqli_get_connection_stats" | "mysqli_get_client_stats" => {
+                Ok(Some(Value::Array(PhpArray::new())))
+            }
             "mysqli_get_charset" => Ok(Some(Value::Bool(false))),
-            "mysqli_get_client_version" | "mysqli_get_server_version" | "mysqli_warning_count"
+            "mysqli_get_client_version"
+            | "mysqli_get_server_version"
+            | "mysqli_warning_count"
             | "mysqli_field_tell" => Ok(Some(Value::Long(0))),
             "mysqli_get_links_stats" => Ok(Some(Value::Array(PhpArray::new()))),
             "mysqli_escape_string" | "mysqli_real_escape_string" => {
-                let s = args.get(1).cloned().unwrap_or(args.first().cloned().unwrap_or(Value::Null)).to_php_string();
-                Ok(Some(Value::String(s.replace('\\', "\\\\").replace('\'', "\\'").replace('"', "\\\"").replace('\0', "\\0"))))
+                let s = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(args.first().cloned().unwrap_or(Value::Null))
+                    .to_php_string();
+                Ok(Some(Value::String(
+                    s.replace('\\', "\\\\")
+                        .replace('\'', "\\'")
+                        .replace('"', "\\\"")
+                        .replace('\0', "\\0"),
+                )))
             }
             "mysqli_debug" => Ok(Some(Value::Bool(true))),
             "mysqli_execute" | "mysqli_execute_query" => Ok(Some(Value::Bool(false))),
@@ -10628,39 +12002,64 @@ impl Vm {
             // === pgsql (124 functions) — stubs ===
             "pg_connect" | "pg_pconnect" | "pg_connect_poll" => Ok(Some(Value::Bool(false))),
             "pg_close" => Ok(Some(Value::Bool(true))),
-            "pg_connection_status" | "pg_connection_busy" | "pg_connection_reset" => Ok(Some(Value::Long(0))),
-            "pg_dbname" | "pg_host" | "pg_port" | "pg_options" => Ok(Some(Value::String(String::new()))),
+            "pg_connection_status" | "pg_connection_busy" | "pg_connection_reset" => {
+                Ok(Some(Value::Long(0)))
+            }
+            "pg_dbname" | "pg_host" | "pg_port" | "pg_options" => {
+                Ok(Some(Value::String(String::new())))
+            }
             "pg_parameter_status" | "pg_version" => Ok(Some(Value::String(String::new()))),
             "pg_ping" => Ok(Some(Value::Bool(false))),
-            "pg_query" | "pg_query_params" | "pg_prepare" | "pg_execute" | "pg_send_query"
-            | "pg_send_query_params" | "pg_send_prepare" | "pg_send_execute" => Ok(Some(Value::Bool(false))),
+            "pg_query"
+            | "pg_query_params"
+            | "pg_prepare"
+            | "pg_execute"
+            | "pg_send_query"
+            | "pg_send_query_params"
+            | "pg_send_prepare"
+            | "pg_send_execute" => Ok(Some(Value::Bool(false))),
             "pg_result_status" | "pg_result_error_field" => Ok(Some(Value::Long(0))),
             "pg_result_error" | "pg_last_error" => Ok(Some(Value::String(String::new()))),
-            "pg_num_rows" | "pg_num_fields" | "pg_affected_rows" | "pg_last_oid" | "pg_field_num" => Ok(Some(Value::Long(0))),
-            "pg_fetch_result" | "pg_fetch_row" | "pg_fetch_assoc" | "pg_fetch_array"
-            | "pg_fetch_object" | "pg_fetch_all" | "pg_fetch_all_columns" => Ok(Some(Value::Bool(false))),
+            "pg_num_rows" | "pg_num_fields" | "pg_affected_rows" | "pg_last_oid"
+            | "pg_field_num" => Ok(Some(Value::Long(0))),
+            "pg_fetch_result"
+            | "pg_fetch_row"
+            | "pg_fetch_assoc"
+            | "pg_fetch_array"
+            | "pg_fetch_object"
+            | "pg_fetch_all"
+            | "pg_fetch_all_columns" => Ok(Some(Value::Bool(false))),
             "pg_result_seek" | "pg_field_is_null" => Ok(Some(Value::Bool(false))),
             "pg_field_name" | "pg_field_type" | "pg_field_type_oid" | "pg_field_size"
             | "pg_field_prtlen" | "pg_field_table" => Ok(Some(Value::String(String::new()))),
             "pg_free_result" => Ok(Some(Value::Bool(true))),
             "pg_last_notice" => Ok(Some(Value::String(String::new()))),
-            "pg_end_copy" | "pg_put_line" | "pg_copy_from" | "pg_copy_to"
-            | "pg_cancel_query" => Ok(Some(Value::Bool(false))),
-            "pg_escape_string" | "pg_escape_literal" | "pg_escape_identifier" | "pg_escape_bytea"
+            "pg_end_copy" | "pg_put_line" | "pg_copy_from" | "pg_copy_to" | "pg_cancel_query" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "pg_escape_string"
+            | "pg_escape_literal"
+            | "pg_escape_identifier"
+            | "pg_escape_bytea"
             | "pg_unescape_bytea" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(s)))
             }
-            "pg_get_result" | "pg_result_memory_size" | "pg_change_password" => Ok(Some(Value::Bool(false))),
-            "pg_get_notify" | "pg_get_pid" | "pg_consume_input" | "pg_flush" => Ok(Some(Value::Bool(false))),
-            "pg_meta_data" | "pg_convert" | "pg_insert" | "pg_update" | "pg_delete" | "pg_select" => {
+            "pg_get_result" | "pg_result_memory_size" | "pg_change_password" => {
                 Ok(Some(Value::Bool(false)))
             }
+            "pg_get_notify" | "pg_get_pid" | "pg_consume_input" | "pg_flush" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "pg_meta_data" | "pg_convert" | "pg_insert" | "pg_update" | "pg_delete"
+            | "pg_select" => Ok(Some(Value::Bool(false))),
             "pg_lo_create" | "pg_lo_open" | "pg_lo_close" | "pg_lo_read" | "pg_lo_write"
             | "pg_lo_read_all" | "pg_lo_import" | "pg_lo_export" | "pg_lo_seek" | "pg_lo_tell"
             | "pg_lo_truncate" | "pg_lo_unlink" => Ok(Some(Value::Bool(false))),
             "pg_trace" | "pg_untrace" => Ok(Some(Value::Bool(false))),
-            "pg_client_encoding" | "pg_set_client_encoding" => Ok(Some(Value::String("UTF8".into()))),
+            "pg_client_encoding" | "pg_set_client_encoding" => {
+                Ok(Some(Value::String("UTF8".into())))
+            }
             "pg_set_error_verbosity" => Ok(Some(Value::Long(0))),
             "pg_set_error_context_visibility" => Ok(Some(Value::Long(0))),
             "pg_socket" => Ok(Some(Value::Bool(false))),
@@ -10669,9 +12068,15 @@ impl Vm {
             // === ODBC (48 functions) — stubs ===
             "odbc_connect" | "odbc_pconnect" => Ok(Some(Value::Bool(false))),
             "odbc_close" | "odbc_close_all" => Ok(Some(Value::Null)),
-            "odbc_exec" | "odbc_do" | "odbc_prepare" | "odbc_execute" => Ok(Some(Value::Bool(false))),
-            "odbc_cursor" | "odbc_error" | "odbc_errormsg" => Ok(Some(Value::String(String::new()))),
-            "odbc_fetch_array" | "odbc_fetch_object" | "odbc_fetch_row" | "odbc_fetch_into" => Ok(Some(Value::Bool(false))),
+            "odbc_exec" | "odbc_do" | "odbc_prepare" | "odbc_execute" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "odbc_cursor" | "odbc_error" | "odbc_errormsg" => {
+                Ok(Some(Value::String(String::new())))
+            }
+            "odbc_fetch_array" | "odbc_fetch_object" | "odbc_fetch_row" | "odbc_fetch_into" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "odbc_result" => Ok(Some(Value::Bool(false))),
             "odbc_result_all" => Ok(Some(Value::Long(0))),
             "odbc_num_fields" | "odbc_num_rows" | "odbc_field_len" | "odbc_field_scale"
@@ -10680,55 +12085,115 @@ impl Vm {
             "odbc_free_result" | "odbc_next_result" => Ok(Some(Value::Bool(true))),
             "odbc_autocommit" | "odbc_commit" | "odbc_rollback" | "odbc_setoption"
             | "odbc_binmode" | "odbc_longreadlen" => Ok(Some(Value::Bool(false))),
-            "odbc_tables" | "odbc_columns" | "odbc_columnprivileges" | "odbc_procedurecolumns"
-            | "odbc_procedures" | "odbc_foreignkeys" | "odbc_primarykeys"
-            | "odbc_specialcolumns" | "odbc_statistics" | "odbc_tableprivileges"
+            "odbc_tables"
+            | "odbc_columns"
+            | "odbc_columnprivileges"
+            | "odbc_procedurecolumns"
+            | "odbc_procedures"
+            | "odbc_foreignkeys"
+            | "odbc_primarykeys"
+            | "odbc_specialcolumns"
+            | "odbc_statistics"
+            | "odbc_tableprivileges"
             | "odbc_gettypeinfo" => Ok(Some(Value::Bool(false))),
             "odbc_data_source" => Ok(Some(Value::Bool(false))),
-            "odbc_connection_string_is_quoted" | "odbc_connection_string_should_quote" => Ok(Some(Value::Bool(false))),
+            "odbc_connection_string_is_quoted" | "odbc_connection_string_should_quote" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "odbc_connection_string_quote" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(format!("{{{}}}", s))))
             }
 
             // === GD (108 functions) — stubs ===
-            "imagecreate" | "imagecreatetruecolor" | "imagecreatefromstring" => Ok(Some(Value::Bool(false))),
-            "imagecreatefrompng" | "imagecreatefromjpeg" | "imagecreatefromgif"
-            | "imagecreatefromwebp" | "imagecreatefromavif" | "imagecreatefrombmp"
-            | "imagecreatefromgd" | "imagecreatefromgd2" | "imagecreatefromgd2part"
-            | "imagecreatefromwbmp" | "imagecreatefromxbm" | "imagecreatefromxpm"
+            "imagecreate" | "imagecreatetruecolor" | "imagecreatefromstring" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "imagecreatefrompng"
+            | "imagecreatefromjpeg"
+            | "imagecreatefromgif"
+            | "imagecreatefromwebp"
+            | "imagecreatefromavif"
+            | "imagecreatefrombmp"
+            | "imagecreatefromgd"
+            | "imagecreatefromgd2"
+            | "imagecreatefromgd2part"
+            | "imagecreatefromwbmp"
+            | "imagecreatefromxbm"
+            | "imagecreatefromxpm"
             | "imagecreatefromtga" => Ok(Some(Value::Bool(false))),
             "imagedestroy" => Ok(Some(Value::Bool(true))),
-            "imagepng" | "imagejpeg" | "imagegif" | "imagewebp" | "imageavif"
-            | "imagebmp" | "imagewbmp" | "imagegd" | "imagegd2" | "imagexbm" => Ok(Some(Value::Bool(false))),
+            "imagepng" | "imagejpeg" | "imagegif" | "imagewebp" | "imageavif" | "imagebmp"
+            | "imagewbmp" | "imagegd" | "imagegd2" | "imagexbm" => Ok(Some(Value::Bool(false))),
             "imagesx" | "imagesy" => Ok(Some(Value::Long(0))),
-            "imagecolorallocate" | "imagecolorallocatealpha" | "imagecolordeallocate"
-            | "imagecolorat" | "imagecolorset" | "imagecolorsforindex"
-            | "imagecolorclosest" | "imagecolorclosestalpha" | "imagecolorclosesthwb"
-            | "imagecolorexact" | "imagecolorexactalpha" | "imagecolormatch"
-            | "imagecolorresolve" | "imagecolorresolvealpha" | "imagecolorstotal"
+            "imagecolorallocate"
+            | "imagecolorallocatealpha"
+            | "imagecolordeallocate"
+            | "imagecolorat"
+            | "imagecolorset"
+            | "imagecolorsforindex"
+            | "imagecolorclosest"
+            | "imagecolorclosestalpha"
+            | "imagecolorclosesthwb"
+            | "imagecolorexact"
+            | "imagecolorexactalpha"
+            | "imagecolormatch"
+            | "imagecolorresolve"
+            | "imagecolorresolvealpha"
+            | "imagecolorstotal"
             | "imagecolortransparent" => Ok(Some(Value::Long(0))),
-            "imagesetpixel" | "imageline" | "imagedashedline" | "imagerectangle"
-            | "imagefilledrectangle" | "imageellipse" | "imagefilledellipse"
-            | "imagearc" | "imagefilledarc" | "imagefilledpolygon" | "imagepolygon"
-            | "imageopenpolygon" | "imagefill" | "imagefilltoborder" => Ok(Some(Value::Bool(true))),
-            "imagestring" | "imagestringup" | "imagechar" | "imagecharup" => Ok(Some(Value::Bool(true))),
-            "imagettftext" | "imagefttext" | "imagettfbbox" | "imageftbbox" => Ok(Some(Value::Bool(false))),
+            "imagesetpixel"
+            | "imageline"
+            | "imagedashedline"
+            | "imagerectangle"
+            | "imagefilledrectangle"
+            | "imageellipse"
+            | "imagefilledellipse"
+            | "imagearc"
+            | "imagefilledarc"
+            | "imagefilledpolygon"
+            | "imagepolygon"
+            | "imageopenpolygon"
+            | "imagefill"
+            | "imagefilltoborder" => Ok(Some(Value::Bool(true))),
+            "imagestring" | "imagestringup" | "imagechar" | "imagecharup" => {
+                Ok(Some(Value::Bool(true)))
+            }
+            "imagettftext" | "imagefttext" | "imagettfbbox" | "imageftbbox" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "imagefontwidth" | "imagefontheight" => Ok(Some(Value::Long(8))),
             "imageloadfont" => Ok(Some(Value::Long(0))),
             "imagecopy" | "imagecopymerge" | "imagecopymergegray" | "imagecopyresized"
             | "imagecopyresampled" => Ok(Some(Value::Bool(true))),
-            "imagerotate" | "imagescale" | "imagecrop" | "imagecropauto" => Ok(Some(Value::Bool(false))),
-            "imageflip" | "imagesetthickness" | "imagesetbrush" | "imagesetstyle"
-            | "imagesettile" | "imagesetinterpolation" | "imagesetclip"
-            | "imagegetclip" | "imagelayereffect" | "imageantialias"
-            | "imageinterlace" | "imagetruecolortopalette" | "imagepalettetotruecolor"
-            | "imagepalettecopy" | "imagecolorsettotal" | "imageresolution"
-            | "imagegammacorrect" | "imageconvolution" | "imagefilter"
-            | "imageaffine" | "imageaffinematrixconcat" | "imageaffinematrixget"
-            | "imagealphablending" | "imagesavealpha" | "imageistruecolor" => {
+            "imagerotate" | "imagescale" | "imagecrop" | "imagecropauto" => {
                 Ok(Some(Value::Bool(false)))
             }
+            "imageflip"
+            | "imagesetthickness"
+            | "imagesetbrush"
+            | "imagesetstyle"
+            | "imagesettile"
+            | "imagesetinterpolation"
+            | "imagesetclip"
+            | "imagegetclip"
+            | "imagelayereffect"
+            | "imageantialias"
+            | "imageinterlace"
+            | "imagetruecolortopalette"
+            | "imagepalettetotruecolor"
+            | "imagepalettecopy"
+            | "imagecolorsettotal"
+            | "imageresolution"
+            | "imagegammacorrect"
+            | "imageconvolution"
+            | "imagefilter"
+            | "imageaffine"
+            | "imageaffinematrixconcat"
+            | "imageaffinematrixget"
+            | "imagealphablending"
+            | "imagesavealpha"
+            | "imageistruecolor" => Ok(Some(Value::Bool(false))),
             "imagetypes" => Ok(Some(Value::Long(0))),
 
             // === sodium (110 functions) — stubs ===
@@ -10740,19 +12205,28 @@ impl Vm {
             }
             "sodium_hex2bin" => {
                 let hex = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                let bytes: Vec<u8> = (0..hex.len()).step_by(2)
-                    .filter_map(|i| u8::from_str_radix(&hex[i..i.min(hex.len()).max(i+2)], 16).ok())
+                let bytes: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| {
+                        u8::from_str_radix(&hex[i..i.min(hex.len()).max(i + 2)], 16).ok()
+                    })
                     .collect();
-                Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string())))
+                Ok(Some(Value::String(
+                    String::from_utf8_lossy(&bytes).to_string(),
+                )))
             }
             "sodium_bin2base64" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(php_rs_ext_standard::strings::php_base64_encode(s.as_bytes()))))
+                Ok(Some(Value::String(
+                    php_rs_ext_standard::strings::php_base64_encode(s.as_bytes()),
+                )))
             }
             "sodium_base642bin" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 match php_rs_ext_standard::strings::php_base64_decode(&s) {
-                    Some(bytes) => Ok(Some(Value::String(String::from_utf8_lossy(&bytes).to_string()))),
+                    Some(bytes) => Ok(Some(Value::String(
+                        String::from_utf8_lossy(&bytes).to_string(),
+                    ))),
                     None => Ok(Some(Value::Bool(false))),
                 }
             }
@@ -10761,7 +12235,9 @@ impl Vm {
                 let b = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::Long(a.cmp(&b) as i64)))
             }
-            "sodium_memzero" | "sodium_increment" | "sodium_add" | "sodium_sub" => Ok(Some(Value::Null)),
+            "sodium_memzero" | "sodium_increment" | "sodium_add" | "sodium_sub" => {
+                Ok(Some(Value::Null))
+            }
             "sodium_pad" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(s)))
@@ -10770,73 +12246,111 @@ impl Vm {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(s)))
             }
-            "sodium_crypto_aead_aes256gcm_decrypt" | "sodium_crypto_aead_aes256gcm_encrypt"
+            "sodium_crypto_aead_aes256gcm_decrypt"
+            | "sodium_crypto_aead_aes256gcm_encrypt"
             | "sodium_crypto_aead_aes256gcm_keygen"
-            | "sodium_crypto_aead_chacha20poly1305_decrypt" | "sodium_crypto_aead_chacha20poly1305_encrypt"
+            | "sodium_crypto_aead_chacha20poly1305_decrypt"
+            | "sodium_crypto_aead_chacha20poly1305_encrypt"
             | "sodium_crypto_aead_chacha20poly1305_keygen"
-            | "sodium_crypto_aead_chacha20poly1305_ietf_decrypt" | "sodium_crypto_aead_chacha20poly1305_ietf_encrypt"
+            | "sodium_crypto_aead_chacha20poly1305_ietf_decrypt"
+            | "sodium_crypto_aead_chacha20poly1305_ietf_encrypt"
             | "sodium_crypto_aead_chacha20poly1305_ietf_keygen"
-            | "sodium_crypto_aead_xchacha20poly1305_ietf_decrypt" | "sodium_crypto_aead_xchacha20poly1305_ietf_encrypt"
+            | "sodium_crypto_aead_xchacha20poly1305_ietf_decrypt"
+            | "sodium_crypto_aead_xchacha20poly1305_ietf_encrypt"
             | "sodium_crypto_aead_xchacha20poly1305_ietf_keygen" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_auth" | "sodium_crypto_auth_keygen" => Ok(Some(Value::String(String::new()))),
+            "sodium_crypto_auth" | "sodium_crypto_auth_keygen" => {
+                Ok(Some(Value::String(String::new())))
+            }
             "sodium_crypto_auth_verify" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_box" | "sodium_crypto_box_open" | "sodium_crypto_box_keypair"
-            | "sodium_crypto_box_seed_keypair" | "sodium_crypto_box_publickey"
-            | "sodium_crypto_box_secretkey" | "sodium_crypto_box_publickey_from_secretkey"
+            "sodium_crypto_box"
+            | "sodium_crypto_box_open"
+            | "sodium_crypto_box_keypair"
+            | "sodium_crypto_box_seed_keypair"
+            | "sodium_crypto_box_publickey"
+            | "sodium_crypto_box_secretkey"
+            | "sodium_crypto_box_publickey_from_secretkey"
             | "sodium_crypto_box_keypair_from_secretkey_and_publickey"
-            | "sodium_crypto_box_seal" | "sodium_crypto_box_seal_open" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_core_ristretto255_add" | "sodium_crypto_core_ristretto255_from_hash"
-            | "sodium_crypto_core_ristretto255_is_valid_point" | "sodium_crypto_core_ristretto255_random"
-            | "sodium_crypto_core_ristretto255_scalar_add" | "sodium_crypto_core_ristretto255_scalar_complement"
-            | "sodium_crypto_core_ristretto255_scalar_invert" | "sodium_crypto_core_ristretto255_scalar_negate"
-            | "sodium_crypto_core_ristretto255_scalar_random" | "sodium_crypto_core_ristretto255_scalar_reduce"
-            | "sodium_crypto_core_ristretto255_scalar_sub" | "sodium_crypto_core_ristretto255_sub"
-            | "sodium_crypto_scalarmult_ristretto255" | "sodium_crypto_scalarmult_ristretto255_base" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "sodium_crypto_generichash" | "sodium_crypto_generichash_keygen" | "sodium_crypto_shorthash"
+            | "sodium_crypto_box_seal"
+            | "sodium_crypto_box_seal_open" => Ok(Some(Value::Bool(false))),
+            "sodium_crypto_core_ristretto255_add"
+            | "sodium_crypto_core_ristretto255_from_hash"
+            | "sodium_crypto_core_ristretto255_is_valid_point"
+            | "sodium_crypto_core_ristretto255_random"
+            | "sodium_crypto_core_ristretto255_scalar_add"
+            | "sodium_crypto_core_ristretto255_scalar_complement"
+            | "sodium_crypto_core_ristretto255_scalar_invert"
+            | "sodium_crypto_core_ristretto255_scalar_negate"
+            | "sodium_crypto_core_ristretto255_scalar_random"
+            | "sodium_crypto_core_ristretto255_scalar_reduce"
+            | "sodium_crypto_core_ristretto255_scalar_sub"
+            | "sodium_crypto_core_ristretto255_sub"
+            | "sodium_crypto_scalarmult_ristretto255"
+            | "sodium_crypto_scalarmult_ristretto255_base" => Ok(Some(Value::Bool(false))),
+            "sodium_crypto_generichash"
+            | "sodium_crypto_generichash_keygen"
+            | "sodium_crypto_shorthash"
             | "sodium_crypto_shorthash_keygen" => Ok(Some(Value::String(String::new()))),
-            "sodium_crypto_generichash_init" | "sodium_crypto_generichash_update"
+            "sodium_crypto_generichash_init"
+            | "sodium_crypto_generichash_update"
             | "sodium_crypto_generichash_final" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_kdf_keygen" | "sodium_crypto_kdf_derive_from_key" => Ok(Some(Value::String(String::new()))),
-            "sodium_crypto_kx_keypair" | "sodium_crypto_kx_seed_keypair"
-            | "sodium_crypto_kx_publickey" | "sodium_crypto_kx_secretkey"
-            | "sodium_crypto_kx_client_session_keys" | "sodium_crypto_kx_server_session_keys" => {
-                Ok(Some(Value::Bool(false)))
+            "sodium_crypto_kdf_keygen" | "sodium_crypto_kdf_derive_from_key" => {
+                Ok(Some(Value::String(String::new())))
             }
+            "sodium_crypto_kx_keypair"
+            | "sodium_crypto_kx_seed_keypair"
+            | "sodium_crypto_kx_publickey"
+            | "sodium_crypto_kx_secretkey"
+            | "sodium_crypto_kx_client_session_keys"
+            | "sodium_crypto_kx_server_session_keys" => Ok(Some(Value::Bool(false))),
             "sodium_crypto_pwhash" | "sodium_crypto_pwhash_str" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_pwhash_str_verify" | "sodium_crypto_pwhash_str_needs_rehash" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_pwhash_scryptsalsa208sha256" | "sodium_crypto_pwhash_scryptsalsa208sha256_str"
-            | "sodium_crypto_pwhash_scryptsalsa208sha256_str_verify" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_scalarmult" | "sodium_crypto_scalarmult_base" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_secretbox" | "sodium_crypto_secretbox_keygen" | "sodium_crypto_secretbox_open" => {
+            "sodium_crypto_pwhash_str_verify" | "sodium_crypto_pwhash_str_needs_rehash" => {
                 Ok(Some(Value::Bool(false)))
             }
+            "sodium_crypto_pwhash_scryptsalsa208sha256"
+            | "sodium_crypto_pwhash_scryptsalsa208sha256_str"
+            | "sodium_crypto_pwhash_scryptsalsa208sha256_str_verify" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "sodium_crypto_scalarmult" | "sodium_crypto_scalarmult_base" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            "sodium_crypto_secretbox"
+            | "sodium_crypto_secretbox_keygen"
+            | "sodium_crypto_secretbox_open" => Ok(Some(Value::Bool(false))),
             "sodium_crypto_secretstream_xchacha20poly1305_init_push"
             | "sodium_crypto_secretstream_xchacha20poly1305_push"
             | "sodium_crypto_secretstream_xchacha20poly1305_init_pull"
             | "sodium_crypto_secretstream_xchacha20poly1305_pull"
             | "sodium_crypto_secretstream_xchacha20poly1305_rekey"
             | "sodium_crypto_secretstream_xchacha20poly1305_keygen" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_sign" | "sodium_crypto_sign_open" | "sodium_crypto_sign_detached"
-            | "sodium_crypto_sign_verify_detached" | "sodium_crypto_sign_keypair"
-            | "sodium_crypto_sign_seed_keypair" | "sodium_crypto_sign_publickey"
-            | "sodium_crypto_sign_secretkey" | "sodium_crypto_sign_publickey_from_secretkey"
-            | "sodium_crypto_sign_ed25519_pk_to_curve25519" | "sodium_crypto_sign_ed25519_sk_to_curve25519" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "sodium_crypto_stream" | "sodium_crypto_stream_keygen" | "sodium_crypto_stream_xor"
-            | "sodium_crypto_stream_xchacha20" | "sodium_crypto_stream_xchacha20_keygen"
-            | "sodium_crypto_stream_xchacha20_xor" | "sodium_crypto_stream_xchacha20_xor_ic" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "sodium_crypto_sign"
+            | "sodium_crypto_sign_open"
+            | "sodium_crypto_sign_detached"
+            | "sodium_crypto_sign_verify_detached"
+            | "sodium_crypto_sign_keypair"
+            | "sodium_crypto_sign_seed_keypair"
+            | "sodium_crypto_sign_publickey"
+            | "sodium_crypto_sign_secretkey"
+            | "sodium_crypto_sign_publickey_from_secretkey"
+            | "sodium_crypto_sign_ed25519_pk_to_curve25519"
+            | "sodium_crypto_sign_ed25519_sk_to_curve25519" => Ok(Some(Value::Bool(false))),
+            "sodium_crypto_stream"
+            | "sodium_crypto_stream_keygen"
+            | "sodium_crypto_stream_xor"
+            | "sodium_crypto_stream_xchacha20"
+            | "sodium_crypto_stream_xchacha20_keygen"
+            | "sodium_crypto_stream_xchacha20_xor"
+            | "sodium_crypto_stream_xchacha20_xor_ic" => Ok(Some(Value::Bool(false))),
 
             // === Finishing touches: remaining missing functions ===
             "curl_share_init_persistent" => Ok(Some(Value::Long(1))),
             "enchant_dict_remove" | "enchant_dict_remove_from_session" => Ok(Some(Value::Null)),
             "gd_info" => {
                 let mut arr = PhpArray::new();
-                arr.set_string("GD Version".into(), Value::String("bundled (2.1.0 compatible)".into()));
+                arr.set_string(
+                    "GD Version".into(),
+                    Value::String("bundled (2.1.0 compatible)".into()),
+                );
                 arr.set_string("FreeType Support".into(), Value::Bool(false));
                 arr.set_string("GIF Read Support".into(), Value::Bool(true));
                 arr.set_string("GIF Create Support".into(), Value::Bool(true));
@@ -10849,20 +12363,28 @@ impl Vm {
                 arr.set_string("BMP Support".into(), Value::Bool(false));
                 arr.set_string("AVIF Support".into(), Value::Bool(false));
                 arr.set_string("TGA Read Support".into(), Value::Bool(false));
-                arr.set_string("JIS-mapped Japanese Font Support".into(), Value::Bool(false));
+                arr.set_string(
+                    "JIS-mapped Japanese Font Support".into(),
+                    Value::Bool(false),
+                );
                 Ok(Some(Value::Array(arr)))
             }
             "imagegetinterpolation" => Ok(Some(Value::Long(0))),
             "imagegrabscreen" | "imagegrabwindow" => Ok(Some(Value::Bool(false))),
-            "ldap_connect_wallet" | "ldap_count_references" | "ldap_exop_sync"
-            | "ldap_first_reference" | "ldap_next_reference" => Ok(Some(Value::Bool(false))),
+            "ldap_connect_wallet"
+            | "ldap_count_references"
+            | "ldap_exop_sync"
+            | "ldap_first_reference"
+            | "ldap_next_reference" => Ok(Some(Value::Bool(false))),
             "ldap_escape" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(s)))
             }
             "mysqli_get_warnings" | "mysqli_stmt_get_warnings" => Ok(Some(Value::Bool(false))),
             "mysqli_poll" => Ok(Some(Value::Long(0))),
-            "mysqli_reap_async_query" | "mysqli_report" | "mysqli_set_opt" => Ok(Some(Value::Bool(false))),
+            "mysqli_reap_async_query" | "mysqli_report" | "mysqli_set_opt" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "odbc_field_precision" => Ok(Some(Value::Long(0))),
             "openssl_get_privatekey" | "openssl_get_publickey" => Ok(Some(Value::Bool(false))),
             "openssl_password_hash" | "openssl_password_verify" => Ok(Some(Value::Bool(false))),
@@ -10877,31 +12399,55 @@ impl Vm {
             "pg_fieldnum" | "pg_fieldprtlen" | "pg_fieldsize" => Ok(Some(Value::Long(0))),
             "pg_freeresult" => Ok(Some(Value::Bool(true))),
             "pg_getlastoid" => Ok(Some(Value::Long(0))),
-            "pg_loclose" | "pg_locreate" | "pg_loexport" | "pg_loimport"
-            | "pg_loopen" | "pg_loread" | "pg_loreadall" => Ok(Some(Value::Bool(false))),
+            "pg_loclose" | "pg_locreate" | "pg_loexport" | "pg_loimport" | "pg_loopen"
+            | "pg_loread" | "pg_loreadall" => Ok(Some(Value::Bool(false))),
             // sodium extras
-            "sodium_crypto_aead_aegis128l_decrypt" | "sodium_crypto_aead_aegis128l_encrypt"
-            | "sodium_crypto_aead_aegis128l_keygen" | "sodium_crypto_aead_aegis256_decrypt"
-            | "sodium_crypto_aead_aegis256_encrypt" | "sodium_crypto_aead_aegis256_keygen" => {
+            "sodium_crypto_aead_aegis128l_decrypt"
+            | "sodium_crypto_aead_aegis128l_encrypt"
+            | "sodium_crypto_aead_aegis128l_keygen"
+            | "sodium_crypto_aead_aegis256_decrypt"
+            | "sodium_crypto_aead_aegis256_encrypt"
+            | "sodium_crypto_aead_aegis256_keygen" => Ok(Some(Value::Bool(false))),
+            "sodium_crypto_core_ristretto255_scalar_mul" => Ok(Some(Value::Bool(false))),
+            "sodium_crypto_sign_keypair_from_secretkey_and_publickey" => {
                 Ok(Some(Value::Bool(false)))
             }
-            "sodium_crypto_core_ristretto255_scalar_mul" => Ok(Some(Value::Bool(false))),
-            "sodium_crypto_sign_keypair_from_secretkey_and_publickey" => Ok(Some(Value::Bool(false))),
             // zlib remaining
             "readgzfile" => Ok(Some(Value::Long(0))),
 
             // === intl extension (187 functions) — stubs ===
-            "collator_asort" | "collator_compare" | "collator_create"
-            | "collator_get_attribute" | "collator_get_error_code" | "collator_get_error_message"
-            | "collator_get_locale" | "collator_get_sort_key" | "collator_get_strength"
-            | "collator_set_attribute" | "collator_set_strength" | "collator_sort"
+            "collator_asort"
+            | "collator_compare"
+            | "collator_create"
+            | "collator_get_attribute"
+            | "collator_get_error_code"
+            | "collator_get_error_message"
+            | "collator_get_locale"
+            | "collator_get_sort_key"
+            | "collator_get_strength"
+            | "collator_set_attribute"
+            | "collator_set_strength"
+            | "collator_sort"
             | "collator_sort_with_sort_keys" => Ok(Some(Value::Bool(false))),
-            "datefmt_create" | "datefmt_format" | "datefmt_format_object" | "datefmt_get_calendar"
-            | "datefmt_get_calendar_object" | "datefmt_get_datetype" | "datefmt_get_error_code"
-            | "datefmt_get_error_message" | "datefmt_get_locale" | "datefmt_get_pattern"
-            | "datefmt_get_timetype" | "datefmt_get_timezone" | "datefmt_get_timezone_id"
-            | "datefmt_is_lenient" | "datefmt_localtime" | "datefmt_parse"
-            | "datefmt_set_calendar" | "datefmt_set_lenient" | "datefmt_set_pattern"
+            "datefmt_create"
+            | "datefmt_format"
+            | "datefmt_format_object"
+            | "datefmt_get_calendar"
+            | "datefmt_get_calendar_object"
+            | "datefmt_get_datetype"
+            | "datefmt_get_error_code"
+            | "datefmt_get_error_message"
+            | "datefmt_get_locale"
+            | "datefmt_get_pattern"
+            | "datefmt_get_timetype"
+            | "datefmt_get_timezone"
+            | "datefmt_get_timezone_id"
+            | "datefmt_is_lenient"
+            | "datefmt_localtime"
+            | "datefmt_parse"
+            | "datefmt_set_calendar"
+            | "datefmt_set_lenient"
+            | "datefmt_set_pattern"
             | "datefmt_set_timezone" => Ok(Some(Value::Bool(false))),
             "grapheme_extract" | "grapheme_stripos" | "grapheme_stristr" | "grapheme_strlen"
             | "grapheme_strpos" | "grapheme_strripos" | "grapheme_strrpos" | "grapheme_strstr"
@@ -10917,69 +12463,138 @@ impl Vm {
             "intl_get_error_code" => Ok(Some(Value::Long(0))),
             "intl_get_error_message" => Ok(Some(Value::String("U_ZERO_ERROR".into()))),
             "intl_is_failure" => Ok(Some(Value::Bool(false))),
-            "intlcal_add" | "intlcal_after" | "intlcal_before" | "intlcal_clear"
-            | "intlcal_create_instance" | "intlcal_equals" | "intlcal_field_difference"
-            | "intlcal_from_date_time" | "intlcal_get" | "intlcal_get_actual_maximum"
-            | "intlcal_get_actual_minimum" | "intlcal_get_available_locales"
-            | "intlcal_get_day_of_week_type" | "intlcal_get_error_code"
-            | "intlcal_get_error_message" | "intlcal_get_first_day_of_week"
-            | "intlcal_get_greatest_minimum" | "intlcal_get_keyword_values_for_locale"
-            | "intlcal_get_least_maximum" | "intlcal_get_locale" | "intlcal_get_maximum"
-            | "intlcal_get_minimal_days_in_first_week" | "intlcal_get_minimum"
-            | "intlcal_get_now" | "intlcal_get_repeated_wall_time_option"
-            | "intlcal_get_skipped_wall_time_option" | "intlcal_get_time"
-            | "intlcal_get_time_zone" | "intlcal_get_type" | "intlcal_get_weekend_transition"
-            | "intlcal_in_daylight_time" | "intlcal_is_equivalent_to" | "intlcal_is_lenient"
-            | "intlcal_is_set" | "intlcal_is_weekend" | "intlcal_roll"
-            | "intlcal_set" | "intlcal_set_first_day_of_week"
-            | "intlcal_set_lenient" | "intlcal_set_minimal_days_in_first_week"
-            | "intlcal_set_repeated_wall_time_option" | "intlcal_set_skipped_wall_time_option"
-            | "intlcal_set_time" | "intlcal_set_time_zone" | "intlcal_to_date_time" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "intlgregcal_create_instance" | "intlgregcal_get_gregorian_change"
-            | "intlgregcal_is_leap_year" | "intlgregcal_set_gregorian_change" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "intltz_count_equivalent_ids" | "intltz_create_default" | "intltz_create_enumeration"
-            | "intltz_create_time_zone" | "intltz_create_time_zone_id_enumeration"
-            | "intltz_from_date_time_zone" | "intltz_get_canonical_id"
-            | "intltz_get_display_name" | "intltz_get_dst_savings"
-            | "intltz_get_equivalent_id" | "intltz_get_error_code"
-            | "intltz_get_error_message" | "intltz_get_gmt" | "intltz_get_id"
-            | "intltz_get_id_for_windows_id" | "intltz_get_offset"
-            | "intltz_get_raw_offset" | "intltz_get_region"
-            | "intltz_get_tz_data_version" | "intltz_get_unknown"
-            | "intltz_get_windows_id" | "intltz_has_same_rules"
-            | "intltz_to_date_time_zone" | "intltz_use_daylight_time" => {
-                Ok(Some(Value::Bool(false)))
-            }
-            "locale_accept_from_http" | "locale_canonicalize" | "locale_compose"
-            | "locale_filter_matches" | "locale_get_all_variants" | "locale_get_default"
-            | "locale_get_display_language" | "locale_get_display_name"
-            | "locale_get_display_region" | "locale_get_display_script"
-            | "locale_get_display_variant" | "locale_get_keywords"
-            | "locale_get_primary_language" | "locale_get_region"
-            | "locale_get_script" | "locale_lookup" | "locale_parse"
+            "intlcal_add"
+            | "intlcal_after"
+            | "intlcal_before"
+            | "intlcal_clear"
+            | "intlcal_create_instance"
+            | "intlcal_equals"
+            | "intlcal_field_difference"
+            | "intlcal_from_date_time"
+            | "intlcal_get"
+            | "intlcal_get_actual_maximum"
+            | "intlcal_get_actual_minimum"
+            | "intlcal_get_available_locales"
+            | "intlcal_get_day_of_week_type"
+            | "intlcal_get_error_code"
+            | "intlcal_get_error_message"
+            | "intlcal_get_first_day_of_week"
+            | "intlcal_get_greatest_minimum"
+            | "intlcal_get_keyword_values_for_locale"
+            | "intlcal_get_least_maximum"
+            | "intlcal_get_locale"
+            | "intlcal_get_maximum"
+            | "intlcal_get_minimal_days_in_first_week"
+            | "intlcal_get_minimum"
+            | "intlcal_get_now"
+            | "intlcal_get_repeated_wall_time_option"
+            | "intlcal_get_skipped_wall_time_option"
+            | "intlcal_get_time"
+            | "intlcal_get_time_zone"
+            | "intlcal_get_type"
+            | "intlcal_get_weekend_transition"
+            | "intlcal_in_daylight_time"
+            | "intlcal_is_equivalent_to"
+            | "intlcal_is_lenient"
+            | "intlcal_is_set"
+            | "intlcal_is_weekend"
+            | "intlcal_roll"
+            | "intlcal_set"
+            | "intlcal_set_first_day_of_week"
+            | "intlcal_set_lenient"
+            | "intlcal_set_minimal_days_in_first_week"
+            | "intlcal_set_repeated_wall_time_option"
+            | "intlcal_set_skipped_wall_time_option"
+            | "intlcal_set_time"
+            | "intlcal_set_time_zone"
+            | "intlcal_to_date_time" => Ok(Some(Value::Bool(false))),
+            "intlgregcal_create_instance"
+            | "intlgregcal_get_gregorian_change"
+            | "intlgregcal_is_leap_year"
+            | "intlgregcal_set_gregorian_change" => Ok(Some(Value::Bool(false))),
+            "intltz_count_equivalent_ids"
+            | "intltz_create_default"
+            | "intltz_create_enumeration"
+            | "intltz_create_time_zone"
+            | "intltz_create_time_zone_id_enumeration"
+            | "intltz_from_date_time_zone"
+            | "intltz_get_canonical_id"
+            | "intltz_get_display_name"
+            | "intltz_get_dst_savings"
+            | "intltz_get_equivalent_id"
+            | "intltz_get_error_code"
+            | "intltz_get_error_message"
+            | "intltz_get_gmt"
+            | "intltz_get_id"
+            | "intltz_get_id_for_windows_id"
+            | "intltz_get_offset"
+            | "intltz_get_raw_offset"
+            | "intltz_get_region"
+            | "intltz_get_tz_data_version"
+            | "intltz_get_unknown"
+            | "intltz_get_windows_id"
+            | "intltz_has_same_rules"
+            | "intltz_to_date_time_zone"
+            | "intltz_use_daylight_time" => Ok(Some(Value::Bool(false))),
+            "locale_accept_from_http"
+            | "locale_canonicalize"
+            | "locale_compose"
+            | "locale_filter_matches"
+            | "locale_get_all_variants"
+            | "locale_get_default"
+            | "locale_get_display_language"
+            | "locale_get_display_name"
+            | "locale_get_display_region"
+            | "locale_get_display_script"
+            | "locale_get_display_variant"
+            | "locale_get_keywords"
+            | "locale_get_primary_language"
+            | "locale_get_region"
+            | "locale_get_script"
+            | "locale_lookup"
+            | "locale_parse"
             | "locale_set_default" => Ok(Some(Value::Bool(false))),
-            "msgfmt_create" | "msgfmt_format" | "msgfmt_format_message"
-            | "msgfmt_get_error_code" | "msgfmt_get_error_message" | "msgfmt_get_locale"
-            | "msgfmt_get_pattern" | "msgfmt_parse" | "msgfmt_parse_message"
+            "msgfmt_create"
+            | "msgfmt_format"
+            | "msgfmt_format_message"
+            | "msgfmt_get_error_code"
+            | "msgfmt_get_error_message"
+            | "msgfmt_get_locale"
+            | "msgfmt_get_pattern"
+            | "msgfmt_parse"
+            | "msgfmt_parse_message"
             | "msgfmt_set_pattern" => Ok(Some(Value::Bool(false))),
-            "normalizer_get_raw_decomposition" | "normalizer_is_normalized"
+            "normalizer_get_raw_decomposition"
+            | "normalizer_is_normalized"
             | "normalizer_normalize" => Ok(Some(Value::Bool(false))),
-            "numfmt_create" | "numfmt_format" | "numfmt_format_currency"
-            | "numfmt_get_attribute" | "numfmt_get_error_code" | "numfmt_get_error_message"
-            | "numfmt_get_locale" | "numfmt_get_pattern" | "numfmt_get_symbol"
-            | "numfmt_get_text_attribute" | "numfmt_parse" | "numfmt_parse_currency"
-            | "numfmt_set_attribute" | "numfmt_set_pattern" | "numfmt_set_symbol"
+            "numfmt_create"
+            | "numfmt_format"
+            | "numfmt_format_currency"
+            | "numfmt_get_attribute"
+            | "numfmt_get_error_code"
+            | "numfmt_get_error_message"
+            | "numfmt_get_locale"
+            | "numfmt_get_pattern"
+            | "numfmt_get_symbol"
+            | "numfmt_get_text_attribute"
+            | "numfmt_parse"
+            | "numfmt_parse_currency"
+            | "numfmt_set_attribute"
+            | "numfmt_set_pattern"
+            | "numfmt_set_symbol"
             | "numfmt_set_text_attribute" => Ok(Some(Value::Bool(false))),
-            "resourcebundle_count" | "resourcebundle_create" | "resourcebundle_get"
-            | "resourcebundle_get_error_code" | "resourcebundle_get_error_message"
+            "resourcebundle_count"
+            | "resourcebundle_create"
+            | "resourcebundle_get"
+            | "resourcebundle_get_error_code"
+            | "resourcebundle_get_error_message"
             | "resourcebundle_locales" => Ok(Some(Value::Bool(false))),
-            "transliterator_create" | "transliterator_create_from_rules"
-            | "transliterator_create_inverse" | "transliterator_get_error_code"
-            | "transliterator_get_error_message" | "transliterator_list_ids"
+            "transliterator_create"
+            | "transliterator_create_from_rules"
+            | "transliterator_create_inverse"
+            | "transliterator_get_error_code"
+            | "transliterator_get_error_message"
+            | "transliterator_list_ids"
             | "transliterator_transliterate" => Ok(Some(Value::Bool(false))),
 
             // Last remaining: intl + pgsql
@@ -11503,7 +13118,8 @@ fn serializable_to_value(sv: &php_rs_ext_standard::variables::SerializableValue)
 /// Parse INI-format string into a PhpArray
 fn parse_ini_to_array(content: &str, process_sections: bool) -> PhpArray {
     let mut result = PhpArray::new();
-    let mut sections: std::collections::HashMap<String, PhpArray> = std::collections::HashMap::new();
+    let mut sections: std::collections::HashMap<String, PhpArray> =
+        std::collections::HashMap::new();
     let mut current_section = String::new();
     for line in content.lines() {
         let trimmed = line.trim();
@@ -11511,15 +13127,21 @@ fn parse_ini_to_array(content: &str, process_sections: bool) -> PhpArray {
             continue;
         }
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            current_section = trimmed[1..trimmed.len()-1].to_string();
+            current_section = trimmed[1..trimmed.len() - 1].to_string();
             if process_sections {
-                sections.entry(current_section.clone()).or_insert_with(PhpArray::new);
+                sections
+                    .entry(current_section.clone())
+                    .or_insert_with(PhpArray::new);
             }
             continue;
         }
         if let Some(eq_pos) = trimmed.find('=') {
             let key = trimmed[..eq_pos].trim().to_string();
-            let val_str = trimmed[eq_pos+1..].trim().trim_matches('"').trim_matches('\'').to_string();
+            let val_str = trimmed[eq_pos + 1..]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
             let val = match val_str.to_lowercase().as_str() {
                 "true" | "on" | "yes" => Value::String("1".into()),
                 "false" | "off" | "no" | "none" | "" => Value::String(String::new()),
@@ -11527,7 +13149,10 @@ fn parse_ini_to_array(content: &str, process_sections: bool) -> PhpArray {
                 _ => Value::String(val_str),
             };
             if process_sections && !current_section.is_empty() {
-                sections.entry(current_section.clone()).or_insert_with(PhpArray::new).set_string(key, val);
+                sections
+                    .entry(current_section.clone())
+                    .or_insert_with(PhpArray::new)
+                    .set_string(key, val);
             } else {
                 result.set_string(key, val);
             }
@@ -11557,8 +13182,12 @@ fn easter_days_calc(year: i64) -> i64 {
     let m = (a + 11 * h + 22 * l) / 451;
     let n = (h + l - 7 * m + 114) / 31; // month (3=March, 4=April)
     let p = (h + l - 7 * m + 114) % 31 + 1; // day
-    // Days from March 21
-    if n == 3 { p - 21 } else { p + 31 - 21 }
+                                            // Days from March 21
+    if n == 3 {
+        p - 21
+    } else {
+        p + 31 - 21
+    }
 }
 
 /// Simple glob-style pattern matching (for fnmatch)
@@ -11566,15 +13195,21 @@ fn simple_fnmatch(pattern: &str, string: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let s: Vec<char> = string.chars().collect();
     fn matches(p: &[char], s: &[char]) -> bool {
-        if p.is_empty() { return s.is_empty(); }
+        if p.is_empty() {
+            return s.is_empty();
+        }
         if p[0] == '*' {
             // Try matching rest of pattern at each position
             for i in 0..=s.len() {
-                if matches(&p[1..], &s[i..]) { return true; }
+                if matches(&p[1..], &s[i..]) {
+                    return true;
+                }
             }
             return false;
         }
-        if s.is_empty() { return false; }
+        if s.is_empty() {
+            return false;
+        }
         if p[0] == '?' || p[0] == s[0] {
             return matches(&p[1..], &s[1..]);
         }
@@ -11680,22 +13315,6 @@ fn version_cmp(a: &str, b: &str) -> i32 {
         }
     }
     0
-}
-
-/// CRC32 computation
-fn crc32_compute(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFFFFFF;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0xEDB88320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
 }
 
 /// Compute days from epoch (1970-01-01) for a given date
@@ -11828,11 +13447,23 @@ fn php_date_format(format: &str, timestamp: i64) -> String {
             'A' => result.push_str(if hour < 12 { "AM" } else { "PM" }),
             'a' => result.push_str(if hour < 12 { "am" } else { "pm" }),
             'g' => {
-                let h12 = if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour };
+                let h12 = if hour == 0 {
+                    12
+                } else if hour > 12 {
+                    hour - 12
+                } else {
+                    hour
+                };
                 result.push_str(&format!("{}", h12));
             }
             'h' => {
-                let h12 = if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour };
+                let h12 = if hour == 0 {
+                    12
+                } else if hour > 12 {
+                    hour - 12
+                } else {
+                    hour
+                };
                 result.push_str(&format!("{:02}", h12));
             }
             'w' => result.push_str(&format!("{}", wday)),
@@ -11860,13 +13491,23 @@ fn php_date_format(format: &str, timestamp: i64) -> String {
             }
             'c' => {
                 // ISO 8601 date
-                result.push_str(&format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
-                    year, month, day, hour, min, sec));
+                result.push_str(&format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
+                    year, month, day, hour, min, sec
+                ));
             }
             'r' => {
                 // RFC 2822 date
-                result.push_str(&format!("{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
-                    &weekday_name(wday)[..3], day, &month_name(month)[..3], year, hour, min, sec));
+                result.push_str(&format!(
+                    "{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
+                    &weekday_name(wday)[..3],
+                    day,
+                    &month_name(month)[..3],
+                    year,
+                    hour,
+                    min,
+                    sec
+                ));
             }
             _ => result.push(ch),
         }
@@ -11951,10 +13592,18 @@ fn parse_relative_time(s: &str, base: i64) -> Option<i64> {
             let (_, _, _, _, _, _, current_wday, _) = timestamp_to_parts(base);
             let diff = if parts[0] == "next" {
                 let d = tw - current_wday;
-                if d <= 0 { d + 7 } else { d }
+                if d <= 0 {
+                    d + 7
+                } else {
+                    d
+                }
             } else {
                 let d = current_wday - tw;
-                if d <= 0 { -(d + 7) } else { -d }
+                if d <= 0 {
+                    -(d + 7)
+                } else {
+                    -d
+                }
             };
             return Some(base + diff * day_secs);
         }

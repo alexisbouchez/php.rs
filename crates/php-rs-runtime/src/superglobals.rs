@@ -121,10 +121,8 @@ impl Superglobals {
             .insert("CONTENT_LENGTH".to_string(), content_length.to_string());
         self.server
             .insert("GATEWAY_INTERFACE".to_string(), "CGI/1.1".to_string());
-        self.server.insert(
-            "REQUEST_TIME".to_string(),
-            current_timestamp().to_string(),
-        );
+        self.server
+            .insert("REQUEST_TIME".to_string(), current_timestamp().to_string());
         self.server.insert(
             "REQUEST_TIME_FLOAT".to_string(),
             current_timestamp_float().to_string(),
@@ -140,16 +138,14 @@ impl Superglobals {
             let path = &uri[..q];
             self.server
                 .insert("SCRIPT_NAME".to_string(), path.to_string());
-            self.server
-                .insert("PHP_SELF".to_string(), path.to_string());
+            self.server.insert("PHP_SELF".to_string(), path.to_string());
             self.parse_query_string(query);
         } else {
             self.server
                 .insert("QUERY_STRING".to_string(), String::new());
             self.server
                 .insert("SCRIPT_NAME".to_string(), uri.to_string());
-            self.server
-                .insert("PHP_SELF".to_string(), uri.to_string());
+            self.server.insert("PHP_SELF".to_string(), uri.to_string());
         }
     }
 
@@ -204,14 +200,13 @@ impl Superglobals {
             }
 
             // Split headers from body at the double newline
-            let (headers_section, content) =
-                if let Some(pos) = part.find("\r\n\r\n") {
-                    (&part[..pos], &part[pos + 4..])
-                } else if let Some(pos) = part.find("\n\n") {
-                    (&part[..pos], &part[pos + 2..])
-                } else {
-                    continue;
-                };
+            let (headers_section, content) = if let Some(pos) = part.find("\r\n\r\n") {
+                (&part[..pos], &part[pos + 4..])
+            } else if let Some(pos) = part.find("\n\n") {
+                (&part[..pos], &part[pos + 2..])
+            } else {
+                continue;
+            };
 
             // Strip trailing \r\n from content
             let content = content.trim_end_matches("\r\n").trim_end_matches('\n');
@@ -255,18 +250,11 @@ impl Superglobals {
 
                 if max_file_size > 0 && size > max_file_size {
                     // PHP sets error code 1 (UPLOAD_ERR_INI_SIZE)
-                    self.files.insert(
-                        format!("{}[name]", field_name),
-                        fname,
-                    );
-                    self.files.insert(
-                        format!("{}[error]", field_name),
-                        "1".to_string(),
-                    );
-                    self.files.insert(
-                        format!("{}[size]", field_name),
-                        "0".to_string(),
-                    );
+                    self.files.insert(format!("{}[name]", field_name), fname);
+                    self.files
+                        .insert(format!("{}[error]", field_name), "1".to_string());
+                    self.files
+                        .insert(format!("{}[size]", field_name), "0".to_string());
                     continue;
                 }
 
@@ -285,17 +273,13 @@ impl Superglobals {
                         format!("{}[error]", field_name),
                         format!("7"), // UPLOAD_ERR_CANT_WRITE
                     );
-                    self.files.insert(
-                        format!("{}[name]", field_name),
-                        fname,
-                    );
+                    self.files.insert(format!("{}[name]", field_name), fname);
                     let _ = e;
                     continue;
                 }
 
                 // Populate $_FILES entries (PHP's nested array structure flattened)
-                self.files
-                    .insert(format!("{}[name]", field_name), fname);
+                self.files.insert(format!("{}[name]", field_name), fname);
                 self.files
                     .insert(format!("{}[type]", field_name), content_type_val);
                 self.files.insert(
@@ -587,18 +571,12 @@ mod tests {
              ------boundary456--\r\n"
         );
         sg.parse_multipart(body.as_bytes(), boundary, 0, 0).unwrap();
-        assert_eq!(
-            sg.files.get("myfile[name]"),
-            Some(&"test.txt".to_string())
-        );
+        assert_eq!(sg.files.get("myfile[name]"), Some(&"test.txt".to_string()));
         assert_eq!(
             sg.files.get("myfile[type]"),
             Some(&"text/plain".to_string())
         );
-        assert_eq!(
-            sg.files.get("myfile[error]"),
-            Some(&"0".to_string())
-        );
+        assert_eq!(sg.files.get("myfile[error]"), Some(&"0".to_string()));
         assert!(sg.files.get("myfile[tmp_name]").is_some());
         // Clean up temp file
         if let Some(tmp) = sg.files.get("myfile[tmp_name]") {
@@ -619,12 +597,10 @@ mod tests {
              ------boundary789--\r\n"
         );
         // Set max file size to 10 bytes — content is larger
-        sg.parse_multipart(body.as_bytes(), boundary, 10, 0).unwrap();
+        sg.parse_multipart(body.as_bytes(), boundary, 10, 0)
+            .unwrap();
         // Should have error = 1 (UPLOAD_ERR_INI_SIZE)
-        assert_eq!(
-            sg.files.get("bigfile[error]"),
-            Some(&"1".to_string())
-        );
+        assert_eq!(sg.files.get("bigfile[error]"), Some(&"1".to_string()));
     }
 
     #[test]
@@ -647,10 +623,7 @@ mod tests {
             Superglobals::extract_boundary("multipart/form-data; boundary=\"quoted-bound\""),
             Some("quoted-bound".to_string())
         );
-        assert_eq!(
-            Superglobals::extract_boundary("application/json"),
-            None
-        );
+        assert_eq!(Superglobals::extract_boundary("application/json"), None);
     }
 
     #[test]
@@ -666,8 +639,14 @@ mod tests {
         );
         assert_eq!(sg.server.get("REQUEST_METHOD"), Some(&"POST".to_string()));
         assert_eq!(sg.server.get("HTTP_HOST"), Some(&"example.com".to_string()));
-        assert_eq!(sg.server.get("QUERY_STRING"), Some(&"token=abc".to_string()));
-        assert_eq!(sg.server.get("SCRIPT_NAME"), Some(&"/api/upload".to_string()));
+        assert_eq!(
+            sg.server.get("QUERY_STRING"),
+            Some(&"token=abc".to_string())
+        );
+        assert_eq!(
+            sg.server.get("SCRIPT_NAME"),
+            Some(&"/api/upload".to_string())
+        );
         assert_eq!(sg.get.get("token"), Some(&"abc".to_string()));
     }
 }
