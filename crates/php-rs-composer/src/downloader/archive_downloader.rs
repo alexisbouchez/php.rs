@@ -132,6 +132,25 @@ impl ArchiveDownloader {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(url.as_bytes());
-        format!("{:x}", hasher.finalize())
+        let hash = format!("{:x}", hasher.finalize());
+
+        // Extract file extension from URL (strip query params first)
+        let path_part = url.split('?').next().unwrap_or(url);
+        let ext = if path_part.ends_with(".tar.gz") {
+            ".tar.gz"
+        } else if path_part.ends_with(".tgz") {
+            ".tgz"
+        } else if let Some(pos) = path_part.rfind('.') {
+            let candidate = &path_part[pos..];
+            if candidate.len() <= 5 {
+                candidate
+            } else {
+                ".zip"
+            }
+        } else {
+            ".zip"
+        };
+
+        format!("{}{}", hash, ext)
     }
 }
