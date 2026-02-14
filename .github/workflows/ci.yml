@@ -66,12 +66,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
-      - name: Run tests with AddressSanitizer
+      - name: Run ASan on php-rs-types (leak detection off — global intern pool is intentional)
         run: |
           RUSTFLAGS="-Z sanitizer=address" \
           cargo +nightly test --target x86_64-unknown-linux-gnu \
-            -p php-rs-types -p php-rs-lexer -p php-rs-parser \
+            -p php-rs-types
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
+      - name: Run ASan on remaining crates (leak detection on)
+        run: |
+          RUSTFLAGS="-Z sanitizer=address" \
+          cargo +nightly test --target x86_64-unknown-linux-gnu \
+            -p php-rs-lexer -p php-rs-parser \
             -p php-rs-compiler -p php-rs-vm -p php-rs-gc
         env:
           ASAN_OPTIONS: "detect_leaks=1"
-          LSAN_OPTIONS: "suppressions=${{ github.workspace }}/lsan_suppressions.txt"

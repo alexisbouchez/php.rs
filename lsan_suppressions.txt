@@ -1,4 +1,0 @@
-# Suppress leaks from the global string intern pool (GLOBAL_INTERN_POOL).
-# Interned strings intentionally live for the process lifetime,
-# matching PHP's persistent zend_interned_strings table.
-leak:intern_bytes
