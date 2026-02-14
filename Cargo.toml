@@ -93,3 +93,7 @@ repository.workspace = true
 
 [dev-dependencies]
 regex = "1"
+
+[[bin]]
+name = "coverage"
+path = "tools/coverage.rs"
