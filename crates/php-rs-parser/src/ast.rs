@@ -526,6 +526,8 @@ pub struct Parameter {
     pub by_ref: bool,
     pub variadic: bool,
     pub attributes: Vec<Attribute>,
+    /// Visibility modifiers for constructor property promotion (PHP 8.0+).
+    pub modifiers: Vec<Modifier>,
     pub span: Span,
 }
 
@@ -966,6 +968,7 @@ mod tests {
             by_ref: false,
             variadic: false,
             attributes: vec![],
+            modifiers: vec![],
             span,
         };
 
@@ -1114,6 +1117,7 @@ mod tests {
             by_ref: false,
             variadic: false,
             attributes: vec![],
+            modifiers: vec![],
             span,
         };
 

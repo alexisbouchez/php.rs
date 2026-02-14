@@ -6,10 +6,13 @@
 use php_rs_parser::{
     Argument, ArrayElement, BinaryOperator, CastType, ClassMember, ClosureUse, EnumMember,
     Expression, MagicConstantKind, Modifier, Name, Parameter, Program, Statement, UnaryOperator,
+    UseKind,
 };
 
+use std::collections::HashMap;
+
 use crate::op::{Operand, OperandType, ZOp};
-use crate::op_array::{ArgInfo, Literal, ZOpArray};
+use crate::op_array::{ArgInfo, ClassMetadata, ClassPropertyInfo, Literal, ZOpArray};
 use crate::opcode::ZOpcode;
 
 /// Result of compiling an expression — where the value lives.
@@ -64,6 +67,14 @@ pub struct Compiler {
     source_filename: Option<String>,
     /// Current namespace (for prefixing class/function names).
     current_namespace: Option<String>,
+    /// Currently compiling class name (for resolving self::).
+    current_class: Option<String>,
+    /// Parent class of the currently compiling class (for resolving parent::).
+    current_class_parent: Option<String>,
+    /// Use imports: short name → fully qualified name.
+    use_imports: HashMap<String, String>,
+    /// Use function imports: short name → fully qualified function name.
+    use_function_imports: HashMap<String, String>,
 }
 
 impl Default for Compiler {
@@ -79,6 +90,10 @@ impl Compiler {
             loop_stack: Vec::new(),
             source_filename: None,
             current_namespace: None,
+            current_class: None,
+            current_class_parent: None,
+            use_imports: HashMap::new(),
+            use_function_imports: HashMap::new(),
         }
     }
 
@@ -89,6 +104,10 @@ impl Compiler {
             loop_stack: Vec::new(),
             source_filename: Some(filename),
             current_namespace: None,
+            current_class: None,
+            current_class_parent: None,
+            use_imports: HashMap::new(),
+            use_function_imports: HashMap::new(),
         }
     }
 
@@ -100,25 +119,60 @@ impl Compiler {
             loop_stack: Vec::new(),
             source_filename: None,
             current_namespace: None,
+            current_class: None,
+            current_class_parent: None,
+            use_imports: HashMap::new(),
+            use_function_imports: HashMap::new(),
         }
     }
 
-    /// Create a sub-compiler that inherits the source filename and namespace from parent.
+    /// Create a sub-compiler that inherits the source filename, namespace, and class context from parent.
     fn sub_compiler(&self, op_array: ZOpArray) -> Self {
         Self {
             op_array,
             loop_stack: Vec::new(),
             source_filename: self.source_filename.clone(),
             current_namespace: self.current_namespace.clone(),
+            current_class: self.current_class.clone(),
+            current_class_parent: self.current_class_parent.clone(),
+            use_imports: self.use_imports.clone(),
+            use_function_imports: self.use_function_imports.clone(),
         }
     }
 
     /// Qualify a name with the current namespace (if any).
+    /// Checks use imports first, then prepends namespace.
     fn qualify_name(&self, name: &str) -> String {
+        // If the name is already fully qualified (contains backslash), use it as-is
+        if name.contains('\\') {
+            return name.to_string();
+        }
+        // Check use imports
+        if let Some(fq) = self.use_imports.get(name) {
+            return fq.clone();
+        }
+        // Check if the first part of a multi-part name matches a use import
+        // (not applicable here since single-part names only)
         match &self.current_namespace {
             Some(ns) if !ns.is_empty() => format!("{}\\{}", ns, name),
             _ => name.to_string(),
         }
+    }
+
+    /// Qualify a function name with use function imports, then namespace.
+    /// Falls back to unqualified name for built-in functions.
+    fn qualify_function_name(&self, name: &str) -> String {
+        // If the name is already fully qualified (contains backslash), use it as-is
+        if name.contains('\\') {
+            return name.to_string();
+        }
+        // Check use function imports
+        if let Some(fq) = self.use_function_imports.get(name) {
+            return fq.clone();
+        }
+        // For functions, we DON'T namespace-qualify by default because
+        // PHP falls back to global functions. The VM handles this.
+        name.to_string()
     }
 
     /// Compile a complete program to an op array.
@@ -426,9 +480,29 @@ impl Compiler {
                 }
             }
 
+            // Use declarations: register import aliases
+            Statement::Use { uses, kind, .. } => {
+                for u in uses {
+                    let fq = name_parts_to_string(&u.name.parts);
+                    let short = if let Some(ref alias) = u.alias {
+                        alias.clone()
+                    } else {
+                        // Use the last part of the name as the short alias
+                        u.name.parts.last().cloned().unwrap_or(fq.clone())
+                    };
+                    match kind {
+                        UseKind::Function => {
+                            self.use_function_imports.insert(short, fq);
+                        }
+                        _ => {
+                            self.use_imports.insert(short, fq);
+                        }
+                    }
+                }
+            }
+
             // Features not yet needed for VM execution
-            Statement::Use { .. }
-            | Statement::Declare { .. }
+            Statement::Declare { .. }
             | Statement::Goto { .. }
             | Statement::Label { .. }
             | Statement::HaltCompiler { .. }
@@ -441,6 +515,43 @@ impl Compiler {
     // =========================================================================
     // Expression compilation
     // =========================================================================
+
+    /// Compile a class name expression, resolving self/parent/static at compile time.
+    /// Class names are always emitted as string literals (not FetchConstant).
+    fn compile_class_name_expr(&mut self, expr: &Expression) -> ExprResult {
+        if let Expression::ConstantAccess { name, .. } = expr {
+            let resolved = match name.as_str() {
+                "self" | "static" => self.current_class.clone().unwrap_or_else(|| name.clone()),
+                "parent" => self.current_class_parent.clone().unwrap_or_else(|| name.clone()),
+                _ => self.qualify_name(name),
+            };
+            let idx = self.op_array.add_literal(Literal::String(resolved));
+            return ExprResult::constant(idx);
+        }
+        // StringLiteral class names come from `new Foo()` or `new Foo\Bar()` parsing
+        // They need namespace qualification too
+        if let Expression::StringLiteral { value, .. } = expr {
+            let resolved = match value.as_str() {
+                "self" | "static" => self.current_class.clone().unwrap_or_else(|| value.clone()),
+                "parent" => self.current_class_parent.clone().unwrap_or_else(|| value.clone()),
+                _ => self.qualify_name(value),
+            };
+            let idx = self.op_array.add_literal(Literal::String(resolved));
+            return ExprResult::constant(idx);
+        }
+        self.compile_expr(expr)
+    }
+
+    /// Compile a static property name (the `$prop` in `Class::$prop`).
+    /// If the property is a simple Variable, emit its name as a string literal
+    /// rather than fetching the variable's runtime value.
+    fn compile_static_prop_name(&mut self, expr: &Expression) -> ExprResult {
+        if let Expression::Variable { name, .. } = expr {
+            let idx = self.op_array.add_literal(Literal::String(name.clone()));
+            return ExprResult::constant(idx);
+        }
+        self.compile_expr(expr)
+    }
 
     /// Compile an expression, returning where its result lives.
     fn compile_expr(&mut self, expr: &Expression) -> ExprResult {
@@ -770,8 +881,8 @@ impl Compiler {
                 property,
                 span,
             } => {
-                let cls = self.compile_expr(class);
-                let prop = self.compile_expr(property);
+                let cls = self.compile_class_name_expr(class);
+                let prop = self.compile_static_prop_name(property);
                 let tmp = self.op_array.alloc_temp();
                 self.op_array.emit(
                     ZOp::new(ZOpcode::FetchStaticPropR, span.line as u32)
@@ -810,7 +921,34 @@ impl Compiler {
                 constant,
                 span,
             } => {
-                let cls = self.compile_expr(class);
+                // Handle ClassName::class magic constant
+                if constant == "class" {
+                    let class_name = match class.as_ref() {
+                        Expression::ConstantAccess { name, .. } => {
+                            match name.as_str() {
+                                "self" | "static" => self.current_class.clone().unwrap_or_else(|| name.clone()),
+                                "parent" => self.current_class_parent.clone().unwrap_or_else(|| name.clone()),
+                                _ => self.qualify_name(name),
+                            }
+                        }
+                        _ => {
+                            // Dynamic class::class — compile as FetchClassConstant
+                            let cls = self.compile_class_name_expr(class);
+                            let const_lit = self.op_array.add_literal(Literal::String("class".to_string()));
+                            let tmp = self.op_array.alloc_temp();
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::FetchClassConstant, span.line as u32)
+                                    .with_op1(cls.operand, cls.op_type)
+                                    .with_op2(Operand::constant(const_lit), OperandType::Const)
+                                    .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                            );
+                            return ExprResult::tmp(tmp);
+                        }
+                    };
+                    let idx = self.op_array.add_literal(Literal::String(class_name));
+                    return ExprResult::constant(idx);
+                }
+                let cls = self.compile_class_name_expr(class);
                 let const_lit = self.op_array.add_literal(Literal::String(constant.clone()));
                 let tmp = self.op_array.alloc_temp();
                 self.op_array.emit(
@@ -1162,6 +1300,26 @@ impl Compiler {
                 );
                 ExprResult::tmp(tmp)
             }
+            // Static property assignment: Class::$prop = $val
+            Expression::StaticPropertyAccess {
+                class, property, ..
+            } => {
+                let cls = self.compile_class_name_expr(class);
+                let prop = self.compile_static_prop_name(property);
+                let tmp = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::AssignStaticProp, line)
+                        .with_op1(cls.operand, cls.op_type)
+                        .with_op2(prop.operand, prop.op_type)
+                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                );
+                // OP_DATA follows with the value
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::OpData, line)
+                        .with_op1(rhs_result.operand, rhs_result.op_type),
+                );
+                ExprResult::tmp(tmp)
+            }
             // List/array destructuring: list($a, $b) = expr
             Expression::List { elements, .. } => {
                 // rhs_result is the source array. For each element in the list,
@@ -1212,6 +1370,75 @@ impl Compiler {
                                         ),
                                 );
                             }
+                        }
+                    }
+                }
+                rhs_result
+            }
+
+            // Short array destructuring: [$a, $b] = expr
+            Expression::ArrayLiteral { elements, .. } => {
+                // Treat like list() destructuring
+                for (i, elem) in elements.iter().enumerate() {
+                    // Determine the key for this element
+                    let key_expr = if let Some(ref k) = elem.key {
+                        // Keyed destructuring: [$key => $var]
+                        self.compile_expr(k)
+                    } else {
+                        let idx_lit = self.op_array.add_literal(Literal::Long(i as i64));
+                        ExprResult::constant(idx_lit)
+                    };
+                    let fetch_tmp = self.op_array.alloc_temp();
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::FetchDimR, line)
+                            .with_op1(rhs_result.operand, rhs_result.op_type)
+                            .with_op2(key_expr.operand, key_expr.op_type)
+                            .with_result(Operand::tmp_var(fetch_tmp), OperandType::TmpVar),
+                    );
+                    let target = &elem.value;
+                    match target {
+                        Expression::Variable { name, .. } => {
+                            let cv = self.op_array.lookup_cv(name);
+                            let assign_tmp = self.op_array.alloc_temp();
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::Assign, line)
+                                    .with_op1(Operand::cv(cv), OperandType::Cv)
+                                    .with_op2(
+                                        Operand::tmp_var(fetch_tmp),
+                                        OperandType::TmpVar,
+                                    )
+                                    .with_result(
+                                        Operand::tmp_var(assign_tmp),
+                                        OperandType::TmpVar,
+                                    ),
+                            );
+                        }
+                        Expression::ArrayLiteral {
+                            elements: nested, ..
+                        } => {
+                            // Nested array destructuring [$a, [$b, $c]] = expr
+                            let fetch_result = ExprResult::tmp(fetch_tmp);
+                            let nested_elems: Vec<Option<Expression>> = nested
+                                .iter()
+                                .map(|e| Some(e.value.clone()))
+                                .collect();
+                            self.compile_list_destructure(&nested_elems, fetch_result, line);
+                        }
+                        _ => {
+                            let lhs_result = self.compile_expr(target);
+                            let assign_tmp = self.op_array.alloc_temp();
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::Assign, line)
+                                    .with_op1(lhs_result.operand, lhs_result.op_type)
+                                    .with_op2(
+                                        Operand::tmp_var(fetch_tmp),
+                                        OperandType::TmpVar,
+                                    )
+                                    .with_result(
+                                        Operand::tmp_var(assign_tmp),
+                                        OperandType::TmpVar,
+                                    ),
+                            );
                         }
                     }
                 }
@@ -1366,6 +1593,46 @@ impl Compiler {
                 );
                 ExprResult::tmp(tmp)
             }
+            Expression::PropertyAccess {
+                object, property, ..
+            } => {
+                // $obj->prop += $val → read, operate, write back
+                let obj = self.compile_expr(object);
+                let prop = self.compile_expr(property);
+
+                // Read current: FetchObjR(obj, prop) → tmp_old
+                let tmp_old = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::FetchObjR, line)
+                        .with_op1(obj.operand, obj.op_type)
+                        .with_op2(prop.operand, prop.op_type)
+                        .with_result(Operand::tmp_var(tmp_old), OperandType::TmpVar),
+                );
+
+                // Compute: assign_op(tmp_old, rhs) → tmp_new
+                let tmp_new = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(assign_op, line)
+                        .with_op1(Operand::tmp_var(tmp_old), OperandType::TmpVar)
+                        .with_op2(rhs_result.operand, rhs_result.op_type)
+                        .with_result(Operand::tmp_var(tmp_new), OperandType::TmpVar),
+                );
+
+                // Write back: AssignObj(obj, prop) + OpData(tmp_new)
+                let tmp_assign = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::AssignObj, line)
+                        .with_op1(obj.operand, obj.op_type)
+                        .with_op2(prop.operand, prop.op_type)
+                        .with_result(Operand::tmp_var(tmp_assign), OperandType::TmpVar),
+                );
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::OpData, line)
+                        .with_op1(Operand::tmp_var(tmp_new), OperandType::TmpVar),
+                );
+
+                ExprResult::tmp(tmp_new)
+            }
             _ => {
                 // Fallback for complex LHS
                 let lhs_result = self.compile_expr(lhs);
@@ -1509,6 +1776,54 @@ impl Compiler {
     }
 
     fn compile_inc_dec(&mut self, opcode: ZOpcode, var: &Expression, line: u32) -> ExprResult {
+        // Special handling for property access: $obj->prop++ needs read-modify-write
+        if let Expression::PropertyAccess {
+            object, property, ..
+        } = var
+        {
+            let obj = self.compile_expr(object);
+            let prop = self.compile_expr(property);
+
+            // Read current value: FetchObjR(obj, prop) → tmp_old
+            let tmp_old = self.op_array.alloc_temp();
+            self.op_array.emit(
+                ZOp::new(ZOpcode::FetchObjR, line)
+                    .with_op1(obj.operand, obj.op_type)
+                    .with_op2(prop.operand, prop.op_type)
+                    .with_result(Operand::tmp_var(tmp_old), OperandType::TmpVar),
+            );
+
+            // Compute new value
+            let is_inc = matches!(opcode, ZOpcode::PreInc | ZOpcode::PostInc);
+            let one_lit = self.op_array.add_literal(Literal::Long(1));
+            let tmp_new = self.op_array.alloc_temp();
+            self.op_array.emit(
+                ZOp::new(if is_inc { ZOpcode::Add } else { ZOpcode::Sub }, line)
+                    .with_op1(Operand::tmp_var(tmp_old), OperandType::TmpVar)
+                    .with_op2(Operand::constant(one_lit), OperandType::Const)
+                    .with_result(Operand::tmp_var(tmp_new), OperandType::TmpVar),
+            );
+
+            // Write back: AssignObj(obj, prop) + OpData(tmp_new)
+            let tmp_assign = self.op_array.alloc_temp();
+            self.op_array.emit(
+                ZOp::new(ZOpcode::AssignObj, line)
+                    .with_op1(obj.operand, obj.op_type)
+                    .with_op2(prop.operand, prop.op_type)
+                    .with_result(Operand::tmp_var(tmp_assign), OperandType::TmpVar),
+            );
+            self.op_array.emit(
+                ZOp::new(ZOpcode::OpData, line)
+                    .with_op1(Operand::tmp_var(tmp_new), OperandType::TmpVar),
+            );
+
+            // Pre returns new value, Post returns old value
+            return match opcode {
+                ZOpcode::PreInc | ZOpcode::PreDec => ExprResult::tmp(tmp_new),
+                _ => ExprResult::tmp(tmp_old),
+            };
+        }
+
         let var_result = self.compile_expr(var);
 
         match opcode {
@@ -2454,8 +2769,11 @@ impl Compiler {
     ) {
         let line = span.line as u32;
 
+        // Qualify function name with namespace
+        let fq_name = self.qualify_name(name);
+
         // Build the function's op_array
-        let mut func_oa = ZOpArray::for_function(name);
+        let mut func_oa = ZOpArray::for_function(&fq_name);
         func_oa.line_start = line;
         self.setup_params(&mut func_oa, params);
 
@@ -2501,7 +2819,7 @@ impl Compiler {
         self.op_array.dynamic_func_defs.push(sub.op_array);
 
         // Emit DECLARE_FUNCTION in parent
-        let name_lit = self.op_array.add_literal(Literal::String(name.to_string()));
+        let name_lit = self.op_array.add_literal(Literal::String(fq_name));
         self.op_array.emit(
             ZOp::new(ZOpcode::DeclareFunction, line)
                 .with_op1(Operand::constant(func_idx), OperandType::Const)
@@ -2538,7 +2856,8 @@ impl Compiler {
         match name {
             Expression::StringLiteral { value, .. } => {
                 // Named function call: foo()
-                let name_lit = self.op_array.add_literal(Literal::String(value.clone()));
+                let qualified = self.qualify_function_name(value);
+                let name_lit = self.op_array.add_literal(Literal::String(qualified));
                 self.op_array.emit(
                     ZOp::new(ZOpcode::InitFcall, line)
                         .with_op2(Operand::constant(name_lit), OperandType::Const)
@@ -2583,7 +2902,7 @@ impl Compiler {
                 class, property, ..
             } => {
                 // Static method call: Class::method()
-                let cls = self.compile_expr(class);
+                let cls = self.compile_class_name_expr(class);
                 let method = self.compile_expr(property);
                 self.op_array.emit(
                     ZOp::new(ZOpcode::InitStaticMethodCall, line)
@@ -2724,7 +3043,7 @@ impl Compiler {
         args: &[Argument],
         line: u32,
     ) -> ExprResult {
-        let cls = self.compile_expr(class);
+        let cls = self.compile_class_name_expr(class);
         let meth = self.compile_expr(method);
         self.op_array.emit(
             ZOp::new(ZOpcode::InitStaticMethodCall, line)
@@ -2742,7 +3061,7 @@ impl Compiler {
     }
 
     fn compile_new(&mut self, class: &Expression, args: &[Argument], line: u32) -> ExprResult {
-        let cls = self.compile_expr(class);
+        let cls = self.compile_class_name_expr(class);
         let tmp = self.op_array.alloc_temp();
 
         // NEW class -> tmp
@@ -2848,6 +3167,35 @@ impl Compiler {
     // Class compilation (Phase 4.5)
     // =========================================================================
 
+    /// Try to evaluate a compile-time constant expression to a Literal.
+    fn try_expr_to_literal(expr: &Expression) -> Option<Literal> {
+        match expr {
+            Expression::Null { .. } => Some(Literal::Null),
+            Expression::BoolLiteral { value, .. } => Some(Literal::Bool(*value)),
+            Expression::IntLiteral { value, .. } => Some(Literal::Long(*value)),
+            Expression::FloatLiteral { value, .. } => Some(Literal::Double(*value)),
+            Expression::StringLiteral { value, .. } => Some(Literal::String(value.clone())),
+            Expression::ArrayLiteral { elements, .. } if elements.is_empty() => {
+                // Empty array [] — store as special literal
+                Some(Literal::String("__EMPTY_ARRAY__".to_string()))
+            }
+            Expression::ConstantAccess { name, .. } => match name.as_str() {
+                "true" | "TRUE" => Some(Literal::Bool(true)),
+                "false" | "FALSE" => Some(Literal::Bool(false)),
+                "null" | "NULL" => Some(Literal::Null),
+                _ => None,
+            },
+            Expression::UnaryOp { op, operand, .. } if *op == UnaryOperator::Minus => {
+                match Self::try_expr_to_literal(operand) {
+                    Some(Literal::Long(n)) => Some(Literal::Long(-n)),
+                    Some(Literal::Double(f)) => Some(Literal::Double(-f)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn compile_class_decl(
         &mut self,
         name: &str,
@@ -2862,6 +3210,11 @@ impl Compiler {
         // Qualify class name with current namespace
         let fq_name = self.qualify_name(name);
 
+        // Set current class context for self::/parent:: resolution
+        let parent_name = extends.as_ref().map(|p| self.qualify_name(&name_parts_to_string(&p.parts)));
+        self.current_class = Some(fq_name.clone());
+        self.current_class_parent = parent_name.clone();
+
         // Emit DECLARE_CLASS
         let name_lit = self.op_array.add_literal(Literal::String(fq_name.clone()));
         let mut flags: u32 = 0;
@@ -2872,11 +3225,11 @@ impl Compiler {
         // Encode extends/implements info as "parent\0iface1\0iface2" in op2
         let mut class_info = String::new();
         if let Some(parent) = extends {
-            class_info.push_str(&name_parts_to_string(&parent.parts));
+            class_info.push_str(&self.qualify_name(&name_parts_to_string(&parent.parts)));
         }
         for iface in implements {
             class_info.push('\0');
-            class_info.push_str(&name_parts_to_string(&iface.parts));
+            class_info.push_str(&self.qualify_name(&name_parts_to_string(&iface.parts)));
         }
         let info_lit = self.op_array.add_literal(Literal::String(class_info));
 
@@ -2887,39 +3240,210 @@ impl Compiler {
                 .with_extended_value(flags),
         );
 
-        // Compile methods into sub-op_arrays
+        // Collect class metadata (properties and constants)
+        let mut metadata = ClassMetadata::default();
+
+        // Deferred runtime initializations (complex default values)
+        struct DeferredPropInit {
+            name: String,
+            is_static: bool,
+            expr: Expression,
+        }
+        struct DeferredConstInit {
+            name: String,
+            expr: Expression,
+        }
+        let mut deferred_props: Vec<DeferredPropInit> = Vec::new();
+        let mut deferred_consts: Vec<DeferredConstInit> = Vec::new();
+
+        // Compile members
         for member in members {
-            if let ClassMember::Method {
-                name: method_name,
-                params,
-                body: Some(method_body),
-                modifiers: method_mods,
-                ..
-            } = member
-            {
-                let full_name = format!("{}::{}", fq_name, method_name);
-                let mut method_oa = ZOpArray::for_function(&full_name);
-                method_oa.line_start = line;
-                self.setup_params(&mut method_oa, params);
-
-                // Add $this as implicit first CV for non-static methods
-                if !method_mods.contains(&Modifier::Static) {
-                    method_oa.lookup_cv("this");
+            match member {
+                ClassMember::Property {
+                    name: prop_name,
+                    modifiers: prop_mods,
+                    default,
+                    ..
+                } => {
+                    let is_static = prop_mods.contains(&Modifier::Static);
+                    let default_lit = default
+                        .as_ref()
+                        .and_then(|e| Self::try_expr_to_literal(e));
+                    if default_lit.is_some() || default.is_none() {
+                        // Simple literal or no default — use metadata
+                        metadata.properties.push(ClassPropertyInfo {
+                            name: prop_name.clone(),
+                            default: default_lit,
+                            is_static,
+                        });
+                    } else {
+                        // Complex default — register property with None and defer
+                        metadata.properties.push(ClassPropertyInfo {
+                            name: prop_name.clone(),
+                            default: None,
+                            is_static,
+                        });
+                        deferred_props.push(DeferredPropInit {
+                            name: prop_name.clone(),
+                            is_static,
+                            expr: default.as_ref().unwrap().clone(),
+                        });
+                    }
                 }
-
-                let mut sub = self.sub_compiler(method_oa);
-                for s in method_body {
-                    sub.compile_stmt(s);
+                ClassMember::Constant {
+                    name: const_name,
+                    value,
+                    ..
+                } => {
+                    let lit = Self::try_expr_to_literal(value);
+                    if let Some(l) = lit {
+                        metadata.constants.push((const_name.clone(), l));
+                    } else {
+                        // Complex constant value — use Null as placeholder and defer
+                        metadata.constants.push((const_name.clone(), Literal::Null));
+                        deferred_consts.push(DeferredConstInit {
+                            name: const_name.clone(),
+                            expr: value.clone(),
+                        });
+                    }
                 }
-                let null = sub.op_array.add_literal(Literal::Null);
-                sub.op_array.emit(
-                    ZOp::new(ZOpcode::Return, line)
-                        .with_op1(Operand::constant(null), OperandType::Const),
-                );
+                ClassMember::Method {
+                    name: method_name,
+                    params,
+                    body: Some(method_body),
+                    modifiers: method_mods,
+                    ..
+                } => {
+                    let full_name = format!("{}::{}", fq_name, method_name);
+                    let mut method_oa = ZOpArray::for_function(&full_name);
+                    method_oa.line_start = line;
+                    self.setup_params(&mut method_oa, params);
 
-                self.op_array.dynamic_func_defs.push(sub.op_array);
+                    // Add $this as implicit first CV for non-static methods
+                    if !method_mods.contains(&Modifier::Static) {
+                        method_oa.lookup_cv("this");
+                    }
+
+                    let mut sub = self.sub_compiler(method_oa);
+
+                    // Constructor property promotion: for promoted params,
+                    // emit $this->paramName = $paramName at the start
+                    if method_name == "__construct" {
+                        for param in params {
+                            let has_visibility = param.modifiers.iter().any(|m| {
+                                matches!(m, Modifier::Public | Modifier::Protected | Modifier::Private)
+                            });
+                            if has_visibility {
+                                let param_name_stripped = param.name.strip_prefix('$').unwrap_or(&param.name);
+                                // Also register as a class property
+                                metadata.properties.push(ClassPropertyInfo {
+                                    name: param_name_stripped.to_string(),
+                                    default: None,
+                                    is_static: false,
+                                });
+                                // Emit: $this->paramName = $paramName
+                                let this_cv = sub.op_array.lookup_cv("this");
+                                let param_cv = sub.op_array.lookup_cv(param_name_stripped);
+                                let prop_lit = sub.op_array.add_literal(Literal::String(param_name_stripped.to_string()));
+                                let tmp = sub.op_array.alloc_temp();
+                                sub.op_array.emit(
+                                    ZOp::new(ZOpcode::AssignObj, line)
+                                        .with_op1(Operand::cv(this_cv), OperandType::Cv)
+                                        .with_op2(Operand::constant(prop_lit), OperandType::Const)
+                                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                                );
+                                sub.op_array.emit(
+                                    ZOp::new(ZOpcode::OpData, line)
+                                        .with_op1(Operand::cv(param_cv), OperandType::Cv),
+                                );
+                            }
+                        }
+                    }
+
+                    for s in method_body {
+                        sub.compile_stmt(s);
+                    }
+                    let null = sub.op_array.add_literal(Literal::Null);
+                    sub.op_array.emit(
+                        ZOp::new(ZOpcode::Return, line)
+                            .with_op1(Operand::constant(null), OperandType::Const),
+                    );
+
+                    self.op_array.dynamic_func_defs.push(sub.op_array);
+                }
+                ClassMember::TraitUse { traits, .. } => {
+                    for trait_name in traits {
+                        metadata.traits.push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                    }
+                }
+                _ => {} // abstract methods, etc.
             }
         }
+
+        // Store class metadata in op_array
+        self.op_array.class_metadata.insert(fq_name.clone(), metadata);
+
+        // Emit runtime initialization opcodes for complex property defaults
+        for dp in deferred_props {
+            let val_result = self.compile_expr(&dp.expr);
+            let cls_lit = self.op_array.add_literal(Literal::String(fq_name.clone()));
+            let prop_lit = self.op_array.add_literal(Literal::String(dp.name));
+            if dp.is_static {
+                // AssignStaticProp cls prop + OpData value
+                let tmp = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::AssignStaticProp, line)
+                        .with_op1(Operand::constant(cls_lit), OperandType::Const)
+                        .with_op2(Operand::constant(prop_lit), OperandType::Const)
+                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                );
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::OpData, line)
+                        .with_op1(val_result.operand, val_result.op_type),
+                );
+            } else {
+                // For instance properties, use AssignObjProp with class default
+                // Store as a deferred property assignment — we use a special opcode
+                // DeclareClassProperty: op1=class, op2=prop_name, result=value
+                // We'll reuse AssignStaticProp with a flag in extended_value
+                let tmp = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::AssignStaticProp, line)
+                        .with_op1(Operand::constant(cls_lit), OperandType::Const)
+                        .with_op2(Operand::constant(prop_lit), OperandType::Const)
+                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar)
+                        .with_extended_value(1), // flag: instance property default
+                );
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::OpData, line)
+                        .with_op1(val_result.operand, val_result.op_type),
+                );
+            }
+        }
+
+        // Emit runtime initialization for complex class constants
+        for dc in deferred_consts {
+            let val_result = self.compile_expr(&dc.expr);
+            let cls_lit = self.op_array.add_literal(Literal::String(fq_name.clone()));
+            let const_lit = self.op_array.add_literal(Literal::String(dc.name));
+            // Use AssignStaticProp with extended_value=2 to indicate class constant
+            let tmp = self.op_array.alloc_temp();
+            self.op_array.emit(
+                ZOp::new(ZOpcode::AssignStaticProp, line)
+                    .with_op1(Operand::constant(cls_lit), OperandType::Const)
+                    .with_op2(Operand::constant(const_lit), OperandType::Const)
+                    .with_result(Operand::tmp_var(tmp), OperandType::TmpVar)
+                    .with_extended_value(2), // flag: class constant
+            );
+            self.op_array.emit(
+                ZOp::new(ZOpcode::OpData, line)
+                    .with_op1(val_result.operand, val_result.op_type),
+            );
+        }
+
+        // Clear class context
+        self.current_class = None;
+        self.current_class_parent = None;
     }
 
     fn compile_interface_decl(
@@ -2937,7 +3461,7 @@ impl Compiler {
         let mut class_info = String::new();
         for parent in extends {
             class_info.push('\0');
-            class_info.push_str(&name_parts_to_string(&parent.parts));
+            class_info.push_str(&self.qualify_name(&name_parts_to_string(&parent.parts)));
         }
         let info_lit = self.op_array.add_literal(Literal::String(class_info));
 
@@ -2992,36 +3516,68 @@ impl Compiler {
                 .with_extended_value(ZEND_ACC_TRAIT),
         );
 
+        let mut metadata = ClassMetadata::default();
+
         for member in members {
-            if let ClassMember::Method {
-                name: method_name,
-                params,
-                body: Some(method_body),
-                modifiers,
-                ..
-            } = member
-            {
-                let full_name = format!("{}::{}", fq_name, method_name);
-                let mut method_oa = ZOpArray::for_function(&full_name);
-                self.setup_params(&mut method_oa, params);
+            match member {
+                ClassMember::Method {
+                    name: method_name,
+                    params,
+                    body: Some(method_body),
+                    modifiers,
+                    ..
+                } => {
+                    let full_name = format!("{}::{}", fq_name, method_name);
+                    let mut method_oa = ZOpArray::for_function(&full_name);
+                    self.setup_params(&mut method_oa, params);
 
-                if !modifiers.contains(&Modifier::Static) {
-                    method_oa.lookup_cv("this");
+                    if !modifiers.contains(&Modifier::Static) {
+                        method_oa.lookup_cv("this");
+                    }
+
+                    let mut sub = self.sub_compiler(method_oa);
+                    for s in method_body {
+                        sub.compile_stmt(s);
+                    }
+                    let null = sub.op_array.add_literal(Literal::Null);
+                    sub.op_array.emit(
+                        ZOp::new(ZOpcode::Return, line)
+                            .with_op1(Operand::constant(null), OperandType::Const),
+                    );
+
+                    self.op_array.dynamic_func_defs.push(sub.op_array);
                 }
-
-                let mut sub = self.sub_compiler(method_oa);
-                for s in method_body {
-                    sub.compile_stmt(s);
+                ClassMember::Property {
+                    name: prop_name,
+                    modifiers: prop_mods,
+                    default,
+                    ..
+                } => {
+                    let is_static = prop_mods.contains(&Modifier::Static);
+                    let default_lit = default
+                        .as_ref()
+                        .and_then(|e| Self::try_expr_to_literal(e));
+                    metadata.properties.push(ClassPropertyInfo {
+                        name: prop_name.clone(),
+                        default: default_lit,
+                        is_static,
+                    });
                 }
-                let null = sub.op_array.add_literal(Literal::Null);
-                sub.op_array.emit(
-                    ZOp::new(ZOpcode::Return, line)
-                        .with_op1(Operand::constant(null), OperandType::Const),
-                );
-
-                self.op_array.dynamic_func_defs.push(sub.op_array);
+                ClassMember::Constant {
+                    name: const_name,
+                    value,
+                    ..
+                } => {
+                    if let Some(l) = Self::try_expr_to_literal(value) {
+                        metadata.constants.push((const_name.clone(), l));
+                    }
+                }
+                _ => {} // TraitUse in traits, abstract methods, etc.
             }
         }
+
+        // Store trait metadata for property/constant resolution
+        self.op_array.class_metadata.insert(fq_name, metadata);
     }
 
     fn compile_enum_decl(
@@ -3050,33 +3606,61 @@ impl Compiler {
                 .with_extended_value(ZEND_ACC_ENUM),
         );
 
-        // Compile enum methods
+        // Set class context for self:: resolution
+        self.current_class = Some(fq_name.clone());
+
+        // Compile enum members
+        let mut metadata = ClassMetadata::default();
+
         for member in members {
-            if let EnumMember::ClassMember(ClassMember::Method {
-                name: method_name,
-                params,
-                body: Some(method_body),
-                ..
-            }) = member
-            {
-                let full_name = format!("{}::{}", fq_name, method_name);
-                let mut method_oa = ZOpArray::for_function(&full_name);
-                self.setup_params(&mut method_oa, params);
-                method_oa.lookup_cv("this");
-
-                let mut sub = self.sub_compiler(method_oa);
-                for s in method_body {
-                    sub.compile_stmt(s);
+            match member {
+                EnumMember::Case { name: case_name, value, .. } => {
+                    // Store enum case as a class constant
+                    let lit = if let Some(val_expr) = value {
+                        Self::try_expr_to_literal(val_expr).unwrap_or(Literal::String(case_name.clone()))
+                    } else {
+                        // Unit enum case — store name as value
+                        Literal::String(case_name.clone())
+                    };
+                    metadata.constants.push((case_name.clone(), lit));
                 }
-                let null = sub.op_array.add_literal(Literal::Null);
-                sub.op_array.emit(
-                    ZOp::new(ZOpcode::Return, line)
-                        .with_op1(Operand::constant(null), OperandType::Const),
-                );
+                EnumMember::ClassMember(ClassMember::Method {
+                    name: method_name,
+                    params,
+                    body: Some(method_body),
+                    modifiers,
+                    ..
+                }) => {
+                    let full_name = format!("{}::{}", fq_name, method_name);
+                    let mut method_oa = ZOpArray::for_function(&full_name);
+                    self.setup_params(&mut method_oa, params);
+                    if !modifiers.contains(&Modifier::Static) {
+                        method_oa.lookup_cv("this");
+                    }
 
-                self.op_array.dynamic_func_defs.push(sub.op_array);
+                    let mut sub = self.sub_compiler(method_oa);
+                    for s in method_body {
+                        sub.compile_stmt(s);
+                    }
+                    let null = sub.op_array.add_literal(Literal::Null);
+                    sub.op_array.emit(
+                        ZOp::new(ZOpcode::Return, line)
+                            .with_op1(Operand::constant(null), OperandType::Const),
+                    );
+
+                    self.op_array.dynamic_func_defs.push(sub.op_array);
+                }
+                EnumMember::ClassMember(ClassMember::TraitUse { traits, .. }) => {
+                    for trait_name in traits {
+                        metadata.traits.push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                    }
+                }
+                _ => {}
             }
         }
+
+        self.op_array.class_metadata.insert(fq_name.clone(), metadata);
+        self.current_class = None;
     }
 
     // =========================================================================
@@ -4340,7 +4924,7 @@ mod tests {
     fn test_compile_class_constant() {
         let oa = compile_php("<?php echo Foo::BAR;");
         let ops = opcodes(&oa);
-        assert!(ops.contains(&ZOpcode::FetchStaticPropR));
+        assert!(ops.contains(&ZOpcode::FetchClassConstant));
     }
 
     // =========================================================================

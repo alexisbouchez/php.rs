@@ -461,6 +461,11 @@ fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]
         }
     };
 
+    // Debug: print disassembly
+    if std::env::var("PHP_RS_DUMP_OPS").is_ok() {
+        eprintln!("{}", op_array.disassemble());
+    }
+
     // Build superglobals for this request
     let mut sg = Superglobals::new();
     sg.populate_env();
@@ -529,9 +534,11 @@ fn lint_php(source: &str, filename: &str) -> i32 {
 }
 
 /// Read a file to string, handling errors.
+/// Uses lossy UTF-8 conversion to handle PHP files in ISO-8859-1 or other encodings.
 fn read_file(path: &str) -> Result<String, i32> {
-    match std::fs::read_to_string(path) {
-        Ok(contents) => Ok(contents),
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(String::from_utf8(bytes)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())),
         Err(e) => {
             eprintln!("Could not open input file: {}: {}", path, e);
             Err(1)

@@ -3,6 +3,7 @@
 //! Mirrors `struct _zend_op_array` from php-src/Zend/zend_compile.h.
 
 use crate::op::ZOp;
+use std::collections::HashMap;
 use std::fmt;
 
 /// A try/catch/finally element — marks the opcode ranges for exception handling.
@@ -84,6 +85,22 @@ pub struct ArgInfo {
     pub is_variadic: bool,
 }
 
+/// Info about a class property (for compile-time metadata).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassPropertyInfo {
+    pub name: String,
+    pub default: Option<Literal>,
+    pub is_static: bool,
+}
+
+/// Compile-time class metadata (properties, constants, traits).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ClassMetadata {
+    pub properties: Vec<ClassPropertyInfo>,
+    pub constants: Vec<(String, Literal)>,
+    pub traits: Vec<String>,
+}
+
 /// A compiled opcode array — one per function, method, or top-level script.
 ///
 /// Mirrors `struct _zend_op_array` from php-src/Zend/zend_compile.h.
@@ -136,6 +153,10 @@ pub struct ZOpArray {
 
     /// Whether this function contains yield/yield from (is a generator).
     pub is_generator: bool,
+
+    /// Class metadata: properties and constants (keyed by class name).
+    /// Populated during class compilation, consumed by VM during DeclareClass.
+    pub class_metadata: HashMap<String, ClassMetadata>,
 }
 
 /// A literal value in the constant pool.
@@ -207,6 +228,7 @@ impl ZOpArray {
             line_end: 0,
             dynamic_func_defs: Vec::new(),
             is_generator: false,
+            class_metadata: HashMap::new(),
         }
     }
 

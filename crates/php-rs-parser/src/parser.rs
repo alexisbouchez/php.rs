@@ -2173,9 +2173,23 @@ impl<'a> Parser<'a> {
 
         // Parse optional visibility modifier (constructor promotion, PHP 8.0+)
         // and readonly modifier (PHP 8.1+)
+        let mut modifiers = Vec::new();
         loop {
             match self.current_token {
-                Token::Public | Token::Protected | Token::Private | Token::Readonly => {
+                Token::Public => {
+                    modifiers.push(Modifier::Public);
+                    self.advance();
+                }
+                Token::Protected => {
+                    modifiers.push(Modifier::Protected);
+                    self.advance();
+                }
+                Token::Private => {
+                    modifiers.push(Modifier::Private);
+                    self.advance();
+                }
+                Token::Readonly => {
+                    modifiers.push(Modifier::Readonly);
                     self.advance();
                 }
                 _ => break,
@@ -2229,6 +2243,7 @@ impl<'a> Parser<'a> {
             by_ref,
             variadic,
             attributes: Vec::new(), // TODO: Parse attributes
+            modifiers,
             span: start_span,
         })
     }
@@ -4018,13 +4033,10 @@ impl<'a> Parser<'a> {
                             span,
                         })
                     } else {
-                        // Static constant/property: Class::CONST
-                        Ok(Expression::StaticPropertyAccess {
+                        // Class constant: Class::CONST
+                        Ok(Expression::ClassConstant {
                             class: Box::new(left),
-                            property: Box::new(Expression::StringLiteral {
-                                value: member_name,
-                                span: member_span,
-                            }),
+                            constant: member_name,
                             span,
                         })
                     }
@@ -4113,6 +4125,19 @@ impl<'a> Parser<'a> {
             // Function call on expression: $func(), (expr)(), etc.
             Token::LParen => {
                 self.advance();
+
+                // First-class callable syntax: $func(...) — PHP 8.1+
+                if self.current_token == Token::Ellipsis {
+                    self.advance();
+                    self.expect(Token::RParen)?;
+                    // Treat as Closure::fromCallable($func)
+                    return Ok(Expression::FunctionCall {
+                        name: Box::new(left),
+                        args: Vec::new(),
+                        span,
+                    });
+                }
+
                 let mut args = Vec::new();
                 if self.current_token != Token::RParen {
                     loop {

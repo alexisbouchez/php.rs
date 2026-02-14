@@ -61,6 +61,8 @@ struct PendingCall {
     name: String,
     /// Arguments collected so far via SEND_VAL/SEND_VAR.
     args: Vec<Value>,
+    /// Named argument names (parallel to args; empty string = positional).
+    arg_names: Vec<String>,
     /// For method calls: the source location of $this in the caller so we can write
     /// the modified object back after the method returns (PHP objects have reference semantics).
     this_source: Option<(OperandType, u32)>,
@@ -122,6 +124,12 @@ struct ClassDef {
     parent: Option<String>,
     /// Implemented interfaces.
     interfaces: Vec<String>,
+    /// Traits used by this class.
+    traits: Vec<String>,
+    /// Whether this is an abstract class.
+    is_abstract: bool,
+    /// Whether this is an enum.
+    is_enum: bool,
     /// Method table: method_name → op_array index.
     methods: HashMap<String, usize>,
     /// Default property values: prop_name → default value.
@@ -1236,6 +1244,7 @@ impl Vm {
                 frame.call_stack_pending.push(PendingCall {
                     name,
                     args: Vec::new(),
+                    arg_names: Vec::new(),
                     this_source: None,
                 });
                 Ok(DispatchSignal::Next)
@@ -1247,6 +1256,7 @@ impl Vm {
                 frame.call_stack_pending.push(PendingCall {
                     name,
                     args: Vec::new(),
+                    arg_names: Vec::new(),
                     this_source: None,
                 });
                 Ok(DispatchSignal::Next)
@@ -1260,9 +1270,16 @@ impl Vm {
             | ZOpcode::SendVarNoRefEx
             | ZOpcode::SendFuncArg => {
                 let val = self.read_operand(op, 1, oa_idx)?;
+                // Check for named argument: op2_type == Const means there's a name literal
+                let arg_name = if op.op2_type == OperandType::Const {
+                    self.read_operand(op, 2, oa_idx)?.to_php_string()
+                } else {
+                    String::new()
+                };
                 let frame = self.call_stack.last_mut().unwrap();
                 if let Some(pending) = frame.call_stack_pending.last_mut() {
                     pending.args.push(val);
+                    pending.arg_names.push(arg_name);
                 }
                 Ok(DispatchSignal::Next)
             }
@@ -1763,10 +1780,14 @@ impl Vm {
             .map(|s| s.to_string())
             .collect();
 
+        let flags = op.extended_value;
         let mut class_def = ClassDef {
             _name: name.clone(),
             parent,
             interfaces,
+            traits: Vec::new(),
+            is_abstract: flags & 0x20 != 0,
+            is_enum: flags & 0x100 != 0,
             methods: HashMap::new(),
             default_properties: HashMap::new(),
             class_constants: HashMap::new(),
@@ -1827,6 +1848,10 @@ impl Vm {
 
         // Inherit from parent class (methods, constants, properties)
         if let Some(ref parent_name) = class_def.parent.clone() {
+            // Try autoloading the parent if not already loaded
+            if !self.classes.contains_key(parent_name) {
+                self.try_autoload_class(parent_name);
+            }
             if let Some(parent_def) = self.classes.get(parent_name).cloned() {
                 // Copy parent methods that aren't overridden
                 for (method_name, &oa_idx) in &parent_def.methods {
@@ -1853,6 +1878,56 @@ impl Vm {
                 for (prop_name, val) in &parent_def.static_properties {
                     if !class_def.static_properties.contains_key(prop_name) {
                         class_def.static_properties.insert(prop_name.clone(), val.clone());
+                    }
+                }
+            }
+        }
+
+        // Mix in traits
+        if let Some(metadata) = self.op_arrays[oa_idx].class_metadata.get(&name).cloned() {
+            for trait_name in &metadata.traits {
+                class_def.traits.push(trait_name.clone());
+                // Try autoloading the trait if not already loaded
+                if !self.classes.contains_key(trait_name) {
+                    self.try_autoload_class(trait_name);
+                }
+                if let Some(trait_def) = self.classes.get(trait_name).cloned() {
+                    // Copy trait methods that aren't already defined by the class
+                    for (method_name, &trait_oa_idx) in &trait_def.methods {
+                        if !class_def.methods.contains_key(method_name) {
+                            class_def.methods.insert(method_name.clone(), trait_oa_idx);
+                            let full_name = format!("{}::{}", name, method_name);
+                            self.functions.insert(full_name, trait_oa_idx);
+                        }
+                    }
+                    // Copy trait default properties that aren't overridden
+                    for (prop_name, val) in &trait_def.default_properties {
+                        if !class_def.default_properties.contains_key(prop_name) {
+                            class_def.default_properties.insert(prop_name.clone(), val.clone());
+                        }
+                    }
+                    // Copy trait constants that aren't overridden
+                    for (const_name, val) in &trait_def.class_constants {
+                        if const_name != "class" && !class_def.class_constants.contains_key(const_name) {
+                            class_def.class_constants.insert(const_name.clone(), val.clone());
+                        }
+                    }
+                    // Copy trait static properties that aren't overridden
+                    for (prop_name, val) in &trait_def.static_properties {
+                        if !class_def.static_properties.contains_key(prop_name) {
+                            class_def.static_properties.insert(prop_name.clone(), val.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also inherit traits from parent class
+        if let Some(ref parent_name) = class_def.parent.clone() {
+            if let Some(parent_def) = self.classes.get(parent_name).cloned() {
+                for trait_name in &parent_def.traits {
+                    if !class_def.traits.contains(trait_name) {
+                        class_def.traits.push(trait_name.clone());
                     }
                 }
             }
@@ -2010,6 +2085,7 @@ impl Vm {
             frame.call_stack_pending.push(PendingCall {
                 name: "__new_noop__".to_string(),
                 args: Vec::new(),
+                arg_names: Vec::new(),
                 this_source: None,
             });
             return Ok(());
@@ -2018,6 +2094,16 @@ impl Vm {
         // Try autoloading if the class isn't found
         if !self.classes.contains_key(&class_name) {
             self.try_autoload_class(&class_name);
+        }
+
+        // Enforce abstract class restriction
+        if let Some(class_def) = self.classes.get(&class_name) {
+            if class_def.is_abstract {
+                return Err(VmError::FatalError(format!(
+                    "Cannot instantiate abstract class {}",
+                    class_name
+                )));
+            }
         }
 
         let obj = PhpObject::new(class_name.clone());
@@ -2060,6 +2146,7 @@ impl Vm {
             frame.call_stack_pending.push(PendingCall {
                 name: ctor_name,
                 args: ctor_args,
+                arg_names: Vec::new(),
                 this_source: Some((op.result_type, op.result.val)),
             });
         } else {
@@ -2069,6 +2156,7 @@ impl Vm {
             frame.call_stack_pending.push(PendingCall {
                 name: "__new_noop__".to_string(),
                 args: Vec::new(),
+                arg_names: Vec::new(),
                 this_source: None,
             });
         }
@@ -2139,6 +2227,7 @@ impl Vm {
         frame.call_stack_pending.push(PendingCall {
             name: full_name,
             args: vec![obj],
+            arg_names: Vec::new(),
             this_source: Some((op.op1_type, op.op1.val)),
         });
         Ok(())
@@ -2161,6 +2250,7 @@ impl Vm {
         frame.call_stack_pending.push(PendingCall {
             name: full_name,
             args: Vec::new(),
+            arg_names: Vec::new(),
             this_source: None,
         });
         Ok(())
@@ -2465,6 +2555,7 @@ impl Vm {
             .unwrap_or(PendingCall {
                 name: String::new(),
                 args: Vec::new(),
+                arg_names: Vec::new(),
                 this_source: None,
             });
         let func_name = if pending.name.starts_with('\\') && !pending.name.contains("::") {
@@ -2472,8 +2563,57 @@ impl Vm {
         } else {
             pending.name
         };
-        let args = pending.args;
+        let mut args = pending.args;
+        let arg_names = pending.arg_names;
         let this_source = pending.this_source;
+
+        // Reorder named arguments to match parameter positions
+        let has_named_args = arg_names.iter().any(|n| !n.is_empty());
+        if has_named_args {
+            // Look up the function's arg_info to get parameter names
+            let func_oa_idx = self.functions.get(&func_name).copied().or_else(|| {
+                if let Some(sep) = func_name.find("::") {
+                    let class = &func_name[..sep];
+                    let method = &func_name[sep + 2..];
+                    self.resolve_method(class, method)
+                } else {
+                    None
+                }
+            });
+            if let Some(oa_idx) = func_oa_idx {
+                let param_names: Vec<String> = self.op_arrays[oa_idx]
+                    .arg_info
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .collect();
+                if !param_names.is_empty() {
+                    let mut reordered = vec![Value::Null; param_names.len().max(args.len())];
+                    for (i, (arg, name)) in args.iter().zip(arg_names.iter()).enumerate() {
+                        if !name.is_empty() {
+                            // Find the parameter index by name
+                            if let Some(pos) = param_names.iter().position(|p| p == name) {
+                                reordered[pos] = arg.clone();
+                            } else {
+                                // Unknown named arg — put it at its original position
+                                if i < reordered.len() {
+                                    reordered[i] = arg.clone();
+                                } else {
+                                    reordered.push(arg.clone());
+                                }
+                            }
+                        } else {
+                            // Positional arg
+                            if i < reordered.len() {
+                                reordered[i] = arg.clone();
+                            } else {
+                                reordered.push(arg.clone());
+                            }
+                        }
+                    }
+                    args = reordered;
+                }
+            }
+        }
 
         // Handle no-op constructor (NEW without __construct)
         if func_name == "__new_noop__" {
@@ -2517,6 +2657,7 @@ impl Vm {
                 frame.call_stack_pending.push(PendingCall {
                     name: "__ctor_args__".to_string(),
                     args,
+                    arg_names: Vec::new(),
                     this_source: None,
                 });
             }
@@ -2536,6 +2677,7 @@ impl Vm {
                 frame.call_stack_pending.push(PendingCall {
                     name: "__ctor_args__".to_string(),
                     args,
+                    arg_names: Vec::new(),
                     this_source: None,
                 });
             }
@@ -2556,6 +2698,16 @@ impl Vm {
                     self.write_result(op, caller_oa_idx, result)?;
                 }
                 return Ok(DispatchSignal::Next);
+            }
+            // If the function has a namespace prefix, try short name as builtin fallback
+            if func_name.contains('\\') {
+                let short = func_name.rsplit('\\').next().unwrap_or(&func_name);
+                if let Some(result) = self.call_builtin(short, &args)? {
+                    if op.result_type != OperandType::Unused {
+                        self.write_result(op, caller_oa_idx, result)?;
+                    }
+                    return Ok(DispatchSignal::Next);
+                }
             }
         }
 
@@ -2606,6 +2758,10 @@ impl Vm {
                 let class = &func_name[..sep];
                 let method = &func_name[sep + 2..];
                 self.resolve_method(class, method)
+            } else if func_name.contains('\\') {
+                // Namespace fallback: try the short name (after last \)
+                let short = func_name.rsplit('\\').next().unwrap_or(&func_name);
+                self.functions.get(short).copied()
             } else {
                 None
             }
@@ -8557,8 +8713,38 @@ impl Vm {
                 // Stub
                 Ok(Some(Value::Array(PhpArray::new())))
             }
-            "class_implements" => Ok(Some(Value::Array(PhpArray::new()))),
-            "class_uses" => Ok(Some(Value::Array(PhpArray::new()))),
+            "class_implements" => {
+                let class_name = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let class_name = class_name.strip_prefix('\\').unwrap_or(&class_name);
+                let mut arr = PhpArray::new();
+                if let Some(class_def) = self.classes.get(class_name).cloned() {
+                    // Collect interfaces from this class and all parents
+                    let mut current = Some(class_name.to_string());
+                    while let Some(ref cn) = current {
+                        if let Some(def) = self.classes.get(cn.as_str()) {
+                            for iface in &def.interfaces {
+                                arr.set_string(iface.clone(), Value::String(iface.clone()));
+                            }
+                            current = def.parent.clone();
+                        } else {
+                            break;
+                        }
+                    }
+                    let _ = class_def;
+                }
+                Ok(Some(Value::Array(arr)))
+            }
+            "class_uses" => {
+                let class_name = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                let class_name = class_name.strip_prefix('\\').unwrap_or(&class_name);
+                let mut arr = PhpArray::new();
+                if let Some(class_def) = self.classes.get(class_name) {
+                    for trait_name in &class_def.traits {
+                        arr.set_string(trait_name.clone(), Value::String(trait_name.clone()));
+                    }
+                }
+                Ok(Some(Value::Array(arr)))
+            }
 
             // === password extension ===
             "password_hash" => {
@@ -13359,6 +13545,16 @@ impl Vm {
             "pg_socket_poll" => Ok(Some(Value::Long(0))),
             "pg_transaction_status" => Ok(Some(Value::Long(0))),
             "pg_tty" => Ok(Some(Value::String(String::new()))),
+
+            // === APCu stubs (no-op) ===
+            "apcu_fetch" => {
+                // apcu_fetch($key, &$success) — return false, set success to false
+                Ok(Some(Value::Bool(false)))
+            }
+            "apcu_store" | "apcu_add" => Ok(Some(Value::Bool(true))),
+            "apcu_delete" => Ok(Some(Value::Bool(true))),
+            "apcu_exists" => Ok(Some(Value::Bool(false))),
+            "apcu_clear_cache" => Ok(Some(Value::Bool(true))),
 
             _ => Ok(None),
         }
