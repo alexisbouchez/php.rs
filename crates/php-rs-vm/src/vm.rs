@@ -232,6 +232,10 @@ pub struct Vm {
     autoload_callbacks: Vec<(String, Option<Value>)>,
     /// Guard to prevent recursive autoloading of the same class.
     autoloading_classes: HashSet<String>,
+    /// HTTP response headers set by header() calls.
+    response_headers: Vec<String>,
+    /// HTTP response code set by http_response_code().
+    response_code: Option<u16>,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -347,7 +351,24 @@ impl Vm {
             opcode_counter: 0,
             autoload_callbacks: Vec::new(),
             autoloading_classes: HashSet::new(),
+            response_headers: Vec::new(),
+            response_code: None,
         }
+    }
+
+    /// Get HTTP response headers set by header() calls.
+    pub fn response_headers(&self) -> &[String] {
+        &self.response_headers
+    }
+
+    /// Get the HTTP response code set by http_response_code() or header().
+    pub fn response_code(&self) -> Option<u16> {
+        self.response_code
+    }
+
+    /// Get the output buffer contents (useful after Exit errors).
+    pub fn output_so_far(&self) -> String {
+        self.output.clone()
     }
 
     /// Check if a file path is allowed by open_basedir restriction.
@@ -420,6 +441,8 @@ impl Vm {
         self.next_closure_id = 0;
         self.last_return_value = Value::Null;
         self.opcode_counter = 0;
+        self.response_headers.clear();
+        self.response_code = None;
 
         // Start execution timer
         if self.config.max_execution_time > 0 {
@@ -4179,12 +4202,65 @@ impl Vm {
                 let result = self.invoke_user_callback(&func_name, func_args)?;
                 Ok(Some(result))
             }
-            "header" | "header_remove" => Ok(Some(Value::Null)),
+            "header" => {
+                if let Some(header_str) = args.first() {
+                    let h = header_str.to_php_string();
+                    // Check for "replace" parameter (second arg, default true)
+                    let replace = args.get(1).map(|v| v.is_truthy()).unwrap_or(true);
+                    // Check for response code parameter (third arg)
+                    if let Some(code_val) = args.get(2) {
+                        let code = code_val.to_long() as u16;
+                        if code > 0 {
+                            self.response_code = Some(code);
+                        }
+                    }
+                    if let Some(colon_pos) = h.find(':') {
+                        let name = h[..colon_pos].trim().to_lowercase();
+                        if replace {
+                            // Remove existing headers with same name
+                            self.response_headers.retain(|existing| {
+                                if let Some(ecp) = existing.find(':') {
+                                    existing[..ecp].trim().to_lowercase() != name
+                                } else {
+                                    true
+                                }
+                            });
+                        }
+                        self.response_headers.push(h);
+                    } else if h.starts_with("HTTP/") {
+                        // Status line like "HTTP/1.1 404 Not Found"
+                        if let Some(code) = h.split_whitespace().nth(1) {
+                            if let Ok(c) = str::parse::<u16>(code) {
+                                self.response_code = Some(c);
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Value::Null))
+            }
+            "header_remove" => {
+                if let Some(name_val) = args.first() {
+                    let name = name_val.to_php_string().to_lowercase();
+                    self.response_headers.retain(|existing| {
+                        if let Some(cp) = existing.find(':') {
+                            existing[..cp].trim().to_lowercase() != name
+                        } else {
+                            true
+                        }
+                    });
+                } else {
+                    self.response_headers.clear();
+                }
+                Ok(Some(Value::Null))
+            }
             "headers_sent" => Ok(Some(Value::Bool(false))),
             "http_response_code" => {
                 let code = args.first().map(|v| v.to_long() as u16);
                 match code {
-                    Some(c) if c > 0 => Ok(Some(Value::Long(c as i64))),
+                    Some(c) if c > 0 => {
+                        self.response_code = Some(c);
+                        Ok(Some(Value::Long(c as i64)))
+                    }
                     _ => Ok(Some(Value::Long(200))),
                 }
             }

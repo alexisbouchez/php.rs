@@ -8,6 +8,8 @@ use std::io::{BufRead, BufReader, Read as _, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
+use php_rs_vm::{PhpArray, Value};
+
 /// Configuration for the built-in server.
 pub struct ServerConfig {
     /// Listen address (e.g., "localhost:8080").
@@ -166,6 +168,26 @@ fn build_server_vars(req: &HttpRequest, config: &ServerConfig) -> HashMap<String
     server
 }
 
+/// Get the standard status text for an HTTP status code.
+fn status_text(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        304 => "Not Modified",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "OK",
+    }
+}
+
 /// Send an HTTP response.
 fn send_response(
     stream: &mut std::net::TcpStream,
@@ -229,19 +251,19 @@ fn execute_php_request(
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("Failed to read {}: {}", script_path.display(), e))?;
 
-    let op_array = php_rs_compiler::compile(&source).map_err(|e| format!("{}", e))?;
+    let abs_path = script_path
+        .canonicalize()
+        .unwrap_or_else(|_| script_path.to_path_buf());
+    let filename = abs_path.to_string_lossy();
+    let op_array =
+        php_rs_compiler::compile_file(&source, &filename).map_err(|e| format!("{}", e))?;
 
     let mut vm = php_rs_vm::Vm::new();
 
-    // Build $_SERVER, $_GET, $_POST variables and pass to VM
-    let _server_vars = build_server_vars(req, config);
-    // TODO: inject server_vars into VM's superglobals when that integration exists
-
-    // Parse query string for $_GET
-    let _get_vars = parse_query_string(&req.query_string);
-
-    // Parse POST body for $_POST
-    let _post_vars = if req.method == "POST" {
+    // Build $_SERVER, $_GET, $_POST variables
+    let server_vars = build_server_vars(req, config);
+    let get_vars = parse_query_string(&req.query_string);
+    let post_vars = if req.method == "POST" {
         if let Some(ct) = req.headers.get("content-type") {
             if ct.starts_with("application/x-www-form-urlencoded") {
                 let body_str = String::from_utf8_lossy(&req.body);
@@ -256,8 +278,57 @@ fn execute_php_request(
         HashMap::new()
     };
 
-    match vm.execute(&op_array, None) {
-        Ok(output) => Ok((200, "text/html; charset=UTF-8".into(), output.into_bytes())),
+    // Build $_REQUEST (merged GET + POST, POST wins on conflicts — matches PHP behavior)
+    let mut request_vars = get_vars.clone();
+    for (k, v) in &post_vars {
+        request_vars.insert(k.clone(), v.clone());
+    }
+
+    // Make raw body available as HTTP_RAW_POST_DATA in $_SERVER
+    // (php://input is not yet supported, so this is the workaround)
+    let raw_body = String::from_utf8_lossy(&req.body).to_string();
+    let mut server_vars = server_vars;
+    server_vars.insert("HTTP_RAW_POST_DATA".into(), raw_body.clone());
+
+    // Build superglobals map: CV name (without $) → Value::Array
+    let mut superglobals: HashMap<String, Value> = HashMap::new();
+    superglobals.insert("_SERVER".into(), Value::Array(PhpArray::from_string_map(&server_vars)));
+    superglobals.insert("_GET".into(), Value::Array(PhpArray::from_string_map(&get_vars)));
+    superglobals.insert("_POST".into(), Value::Array(PhpArray::from_string_map(&post_vars)));
+    superglobals.insert("_REQUEST".into(), Value::Array(PhpArray::from_string_map(&request_vars)));
+    // Raw POST body for JSON APIs (since php://input isn't available yet)
+    superglobals.insert("_BODY".into(), Value::String(raw_body));
+
+    match vm.execute(&op_array, Some(&superglobals)) {
+        Ok(output) => {
+            // Check for response code set by http_response_code() or header()
+            let status = vm.response_code().unwrap_or(200);
+
+            // Check for Content-Type header set by header()
+            let mut content_type = "text/html; charset=UTF-8".to_string();
+            for h in vm.response_headers() {
+                if let Some(colon) = h.find(':') {
+                    if h[..colon].trim().eq_ignore_ascii_case("content-type") {
+                        content_type = h[colon + 1..].trim().to_string();
+                    }
+                }
+            }
+
+            Ok((status, content_type, output.into_bytes()))
+        }
+        Err(php_rs_vm::VmError::Exit(_)) => {
+            let status = vm.response_code().unwrap_or(200);
+            let output = vm.output_so_far();
+            let mut content_type = "text/html; charset=UTF-8".to_string();
+            for h in vm.response_headers() {
+                if let Some(colon) = h.find(':') {
+                    if h[..colon].trim().eq_ignore_ascii_case("content-type") {
+                        content_type = h[colon + 1..].trim().to_string();
+                    }
+                }
+            }
+            Ok((status, content_type, output.into_bytes()))
+        }
         Err(e) => Err(format!("{:?}", e)),
     }
 }
@@ -332,14 +403,7 @@ fn handle_connection(stream: &mut std::net::TcpStream, config: &ServerConfig) {
         if router.exists() {
             match execute_php_request(router, &req, config) {
                 Ok((status, content_type, body)) => {
-                    let status_text = match status {
-                        200 => "OK",
-                        301 => "Moved Permanently",
-                        302 => "Found",
-                        404 => "Not Found",
-                        _ => "OK",
-                    };
-                    send_response(stream, status, status_text, &content_type, &body);
+                    send_response(stream, status, status_text(status), &content_type, &body);
                 }
                 Err(msg) => send_500(stream, &msg),
             }
@@ -376,8 +440,7 @@ fn handle_connection(stream: &mut std::net::TcpStream, config: &ServerConfig) {
         // Execute PHP
         match execute_php_request(&file_path, &req, config) {
             Ok((status, content_type, body)) => {
-                let status_text = if status == 200 { "OK" } else { "Error" };
-                send_response(stream, status, status_text, &content_type, &body);
+                send_response(stream, status, status_text(status), &content_type, &body);
             }
             Err(msg) => send_500(stream, &msg),
         }
@@ -673,5 +736,87 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         assert!(addr.port() > 0);
         drop(listener);
+    }
+
+    #[test]
+    fn test_superglobals_injected() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("php_rs_superglobal_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let php_file = dir.join("test.php");
+        let mut f = std::fs::File::create(&php_file).unwrap();
+        write!(
+            f,
+            r#"<?php echo $_SERVER['REQUEST_METHOD'] . " " . $_GET['name'] . " " . $_SERVER['QUERY_STRING'];"#
+        )
+        .unwrap();
+        drop(f);
+
+        let req = HttpRequest {
+            method: "GET".into(),
+            uri: "/test.php?name=world".into(),
+            path: "/test.php".into(),
+            query_string: "name=world".into(),
+            headers: {
+                let mut h = HashMap::new();
+                h.insert("host".into(), "localhost:8080".into());
+                h
+            },
+            body: Vec::new(),
+        };
+        let config = ServerConfig {
+            listen: "localhost:8080".into(),
+            docroot: dir.clone(),
+            router: None,
+        };
+        let (status, _, body) = execute_php_request(&php_file, &req, &config).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(String::from_utf8_lossy(&body), "GET world name=world");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_post_superglobals_injected() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join("php_rs_post_superglobal_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let php_file = dir.join("post.php");
+        let mut f = std::fs::File::create(&php_file).unwrap();
+        write!(
+            f,
+            r#"<?php echo $_POST['username'] . ":" . $_POST['password'];"#
+        )
+        .unwrap();
+        drop(f);
+
+        let req = HttpRequest {
+            method: "POST".into(),
+            uri: "/post.php".into(),
+            path: "/post.php".into(),
+            query_string: String::new(),
+            headers: {
+                let mut h = HashMap::new();
+                h.insert(
+                    "content-type".into(),
+                    "application/x-www-form-urlencoded".into(),
+                );
+                h.insert("content-length".into(), "29".into());
+                h
+            },
+            body: b"username=admin&password=s3cr3t".to_vec(),
+        };
+        let config = ServerConfig {
+            listen: "localhost:8080".into(),
+            docroot: dir.clone(),
+            router: None,
+        };
+        let (status, _, body) = execute_php_request(&php_file, &req, &config).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(String::from_utf8_lossy(&body), "admin:s3cr3t");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
