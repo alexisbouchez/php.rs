@@ -49,7 +49,7 @@ fn collect_functions_from_dir(dir: &Path, funcs: &mut BTreeSet<String>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            if path.file_name().map_or(false, |n| n == "tests") {
+            if path.file_name().is_some_and(|n| n == "tests") {
                 continue;
             }
             collect_functions_from_dir(&path, funcs);
@@ -203,7 +203,7 @@ fn is_valid_func_name(name: &str) -> bool {
         && name
             .chars()
             .next()
-            .map_or(false, |c| c.is_alphabetic() || c == '_')
+            .is_some_and(|c| c.is_alphabetic() || c == '_')
 }
 
 /// Parse php-rs vm.rs call_builtin match arms for implemented function names.

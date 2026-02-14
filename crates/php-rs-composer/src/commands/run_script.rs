@@ -21,9 +21,12 @@ pub fn execute(config: &Config, script_name: &str, extra_args: &[String]) -> Res
         .get("scripts")
         .ok_or_else(|| format!("No \"scripts\" section found in composer.json"))?;
 
-    let script_entries = scripts
-        .get(script_name)
-        .ok_or_else(|| format!("Script \"{}\" is not defined in this package's composer.json.", script_name))?;
+    let script_entries = scripts.get(script_name).ok_or_else(|| {
+        format!(
+            "Script \"{}\" is not defined in this package's composer.json.",
+            script_name
+        )
+    })?;
 
     let commands: Vec<String> = match script_entries {
         serde_json::Value::String(s) => vec![s.clone()],
@@ -34,7 +37,7 @@ pub fn execute(config: &Config, script_name: &str, extra_args: &[String]) -> Res
         _ => return Err(format!("Script \"{}\" has an invalid format.", script_name)),
     };
 
-    println!("> {}",  script_name);
+    println!("> {}", script_name);
 
     for cmd in &commands {
         run_single_script(cmd, config, extra_args)?;
@@ -70,8 +73,8 @@ fn run_single_script(script: &str, config: &Config, extra_args: &[String]) -> Re
         println!("  > @php {}", full_cmd);
 
         // Find our own binary to run as php
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("Cannot find php-rs binary: {}", e))?;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("Cannot find php-rs binary: {}", e))?;
 
         let status = std::process::Command::new(&exe)
             .args(full_cmd.split_whitespace())
@@ -98,8 +101,8 @@ fn run_single_script(script: &str, config: &Config, extra_args: &[String]) -> Re
         }
         println!("  > @composer {}", full_cmd);
 
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("Cannot find php-rs binary: {}", e))?;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("Cannot find php-rs binary: {}", e))?;
 
         let status = std::process::Command::new(&exe)
             .arg("composer")

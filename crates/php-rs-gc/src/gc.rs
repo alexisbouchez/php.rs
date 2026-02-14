@@ -446,14 +446,20 @@ impl GcCollector {
     }
 
     /// Phase 3: Collect all white (garbage) nodes.
+    ///
+    /// We gather all garbage nodes first, then free them in a second pass.
+    /// This avoids use-after-free when multiple roots in the buffer point
+    /// into the same cycle (e.g., A ↔ B both in the root buffer — freeing
+    /// B while processing A would make the later access to B invalid).
     fn collect_roots(&mut self) -> usize {
-        let mut freed = 0;
-
-        // Collect white nodes from the root buffer
         let roots: Vec<_> = self.roots.drain(..).collect();
         self.num_roots = 0;
 
-        for entry in roots {
+        // Phase 1: Gather all white (garbage) nodes into a list,
+        // marking them black to prevent revisiting.
+        let mut garbage: Vec<NonNull<GcBox<dyn GcTracer>>> = Vec::new();
+
+        for entry in &roots {
             if let Some(ptr) = entry {
                 // SAFETY: root buffer entries are valid.
                 unsafe {
@@ -461,38 +467,49 @@ impl GcCollector {
                     header.set_root_index(0);
 
                     if header.color() == GcColor::White {
-                        // This is garbage — free it
-                        header.set_color(GcColor::Black);
-                        // Collect children first
-                        Self::collect_white(ptr, &mut freed);
-                        // Free this node
-                        drop(Box::from_raw(ptr.as_ptr()));
-                        freed += 1;
+                        Self::gather_white(*ptr, &mut garbage);
                     } else {
-                        // Not garbage — just clear root info
                         header.set_color(GcColor::Black);
                     }
                 }
             }
         }
 
+        // Phase 2: Free all garbage nodes.
+        let freed = garbage.len();
+        for ptr in garbage {
+            // SAFETY: each pointer appears exactly once (gather_white marks black on visit).
+            unsafe {
+                drop(Box::from_raw(ptr.as_ptr()));
+            }
+        }
+
         freed
     }
 
-    /// Recursively collect white (garbage) children.
+    /// Recursively gather white (garbage) nodes into the collection list.
+    ///
+    /// Marks each visited node black to prevent double-collection.
     ///
     /// # Safety
     /// `ptr` must be valid.
-    unsafe fn collect_white(ptr: NonNull<GcBox<dyn GcTracer>>, freed: &mut usize) {
+    unsafe fn gather_white(
+        ptr: NonNull<GcBox<dyn GcTracer>>,
+        garbage: &mut Vec<NonNull<GcBox<dyn GcTracer>>>,
+    ) {
         let gc_box = ptr.as_ref();
+        let header = &gc_box.header;
+
+        if header.color() != GcColor::White {
+            return;
+        }
+
+        header.set_color(GcColor::Black);
+        header.set_root_index(0);
+        garbage.push(ptr);
+
         gc_box.value.trace(&mut |child| {
-            let child_header = &child.as_ref().header;
-            if child_header.color() == GcColor::White {
-                child_header.set_color(GcColor::Black);
-                Self::collect_white(child, freed);
-                drop(Box::from_raw(child.as_ptr()));
-                *freed += 1;
-            }
+            Self::gather_white(child, garbage);
         });
     }
 

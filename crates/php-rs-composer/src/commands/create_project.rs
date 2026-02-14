@@ -52,14 +52,12 @@ pub fn execute(
     };
 
     let selected = select_best_version(&packages, &constraint, true)?;
-    println!(
-        "  - Installing {} ({})",
-        selected.name, selected.version
-    );
+    println!("  - Installing {} ({})", selected.name, selected.version);
 
     // 3. Download and extract
     let dm = DownloadManager::new(&config.cache_dir);
-    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
     rt.block_on(dm.download(&selected, target))?;
 
     // 4. Run composer install in the new project directory

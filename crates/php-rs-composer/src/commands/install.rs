@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::downloader::DownloadManager;
 use crate::installer::InstallationManager;
 use crate::json::JsonFile;
-use crate::package::{Locker, LockFile, Package, PackageLoader};
+use crate::package::{LockFile, Locker, Package, PackageLoader};
 use crate::repository::{ComposerRepository, RepositorySet};
 use crate::resolver::{DefaultPolicy, Operation, PoolBuilder, Problem, Solver, Transaction};
 
@@ -168,8 +168,8 @@ fn download_packages(
 
     println!("Downloading {} packages...", downloads.len());
 
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("Failed to create runtime: {}", e))?;
+    let rt =
+        tokio::runtime::Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
 
     let total = downloads.len();
     rt.block_on(dm.download_parallel(

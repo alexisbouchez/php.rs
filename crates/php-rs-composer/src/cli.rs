@@ -132,15 +132,18 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                     .position(|a| a == "-d" || a == "--working-dir")
                     .and_then(|i| args.get(i + 1))
                     .map(|d| std::path::PathBuf::from(d));
-                let dir = working_dir
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
+                let dir = working_dir.unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                });
                 let config = Config::new(&dir);
 
                 // Check if this script actually exists in composer.json before trying
                 if script_exists(&config, script_name) {
                     let extra_args: Vec<String> = args[1..]
                         .iter()
-                        .filter(|a| *a != "-d" && *a != "--working-dir" && *a != "-v" && *a != "--verbose")
+                        .filter(|a| {
+                            *a != "-d" && *a != "--working-dir" && *a != "-v" && *a != "--verbose"
+                        })
                         .cloned()
                         .collect();
                     return crate::commands::run_script::execute(&config, script_name, &extra_args);
@@ -158,9 +161,7 @@ fn script_exists(config: &Config, name: &str) -> bool {
     let Ok(root) = json_file.read() else {
         return false;
     };
-    root.get("scripts")
-        .and_then(|s| s.get(name))
-        .is_some()
+    root.get("scripts").and_then(|s| s.get(name)).is_some()
 }
 
 /// Run the Composer CLI from a parsed Cli struct.
