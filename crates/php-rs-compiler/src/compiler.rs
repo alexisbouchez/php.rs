@@ -60,6 +60,10 @@ pub struct Compiler {
     op_array: ZOpArray,
     /// Stack of active loops for break/continue.
     loop_stack: Vec<LoopContext>,
+    /// Source filename (for resolving __FILE__ and __DIR__).
+    source_filename: Option<String>,
+    /// Current namespace (for prefixing class/function names).
+    current_namespace: Option<String>,
 }
 
 impl Default for Compiler {
@@ -73,6 +77,18 @@ impl Compiler {
         Self {
             op_array: ZOpArray::new(),
             loop_stack: Vec::new(),
+            source_filename: None,
+            current_namespace: None,
+        }
+    }
+
+    /// Create a compiler with a source filename for resolving __FILE__ and __DIR__.
+    pub fn with_filename(filename: String) -> Self {
+        Self {
+            op_array: ZOpArray::new(),
+            loop_stack: Vec::new(),
+            source_filename: Some(filename),
+            current_namespace: None,
         }
     }
 
@@ -82,6 +98,26 @@ impl Compiler {
         Self {
             op_array,
             loop_stack: Vec::new(),
+            source_filename: None,
+            current_namespace: None,
+        }
+    }
+
+    /// Create a sub-compiler that inherits the source filename and namespace from parent.
+    fn sub_compiler(&self, op_array: ZOpArray) -> Self {
+        Self {
+            op_array,
+            loop_stack: Vec::new(),
+            source_filename: self.source_filename.clone(),
+            current_namespace: self.current_namespace.clone(),
+        }
+    }
+
+    /// Qualify a name with the current namespace (if any).
+    fn qualify_name(&self, name: &str) -> String {
+        match &self.current_namespace {
+            Some(ns) if !ns.is_empty() => format!("{}\\{}", ns, name),
+            _ => name.to_string(),
         }
     }
 
@@ -375,9 +411,23 @@ impl Compiler {
                 }
             }
 
+            // Namespace declaration: set current namespace for class/function prefixing
+            Statement::Namespace {
+                name, statements, ..
+            } => {
+                self.current_namespace =
+                    name.as_ref().map(|n| name_parts_to_string(&n.parts));
+                for stmt in statements {
+                    self.compile_stmt(stmt);
+                }
+                // Braced namespace: reset namespace after block
+                if !statements.is_empty() {
+                    self.current_namespace = None;
+                }
+            }
+
             // Features not yet needed for VM execution
-            Statement::Namespace { .. }
-            | Statement::Use { .. }
+            Statement::Use { .. }
             | Statement::Declare { .. }
             | Statement::Goto { .. }
             | Statement::Label { .. }
@@ -488,7 +538,15 @@ impl Compiler {
             // --- Instanceof ---
             Expression::Instanceof { expr, class, span } => {
                 let lhs = self.compile_expr(expr);
-                let rhs = self.compile_expr(class);
+                // For instanceof, the class operand is always a class name, not a constant
+                let rhs = match class.as_ref() {
+                    Expression::ConstantAccess { name, .. } => {
+                        let qualified = self.qualify_name(name);
+                        let idx = self.op_array.add_literal(Literal::String(qualified));
+                        ExprResult::constant(idx)
+                    }
+                    _ => self.compile_expr(class),
+                };
                 let tmp = self.op_array.alloc_temp();
                 self.op_array.emit(
                     ZOp::new(ZOpcode::Instanceof, span.line as u32)
@@ -807,8 +865,20 @@ impl Compiler {
             Expression::MagicConstant { kind, .. } => {
                 let lit = match kind {
                     MagicConstantKind::Line => Literal::Long(0), // resolved at runtime
-                    MagicConstantKind::File => Literal::String(String::new()),
-                    MagicConstantKind::Dir => Literal::String(String::new()),
+                    MagicConstantKind::File => Literal::String(
+                        self.source_filename.clone().unwrap_or_default(),
+                    ),
+                    MagicConstantKind::Dir => Literal::String(
+                        self.source_filename
+                            .as_ref()
+                            .map(|f| {
+                                std::path::Path::new(f)
+                                    .parent()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_default()
+                            })
+                            .unwrap_or_default(),
+                    ),
                     MagicConstantKind::Class => Literal::String(String::new()),
                     MagicConstantKind::Trait => Literal::String(String::new()),
                     MagicConstantKind::Method => Literal::String(String::new()),
@@ -818,6 +888,21 @@ impl Compiler {
                 };
                 let idx = self.op_array.add_literal(lit);
                 ExprResult::constant(idx)
+            }
+
+            // --- Constant access ---
+            Expression::ConstantAccess { name, span } => {
+                // Check if this looks like a class name being used where a constant
+                // would normally be. In most contexts, emit FetchConstant. The VM
+                // will return the constant value or null for undefined constants.
+                let lit_idx = self.op_array.add_literal(Literal::String(name.clone()));
+                let tmp = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::FetchConstant, span.line as u32)
+                        .with_op2(Operand::constant(lit_idx), OperandType::Const)
+                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                );
+                ExprResult::tmp(tmp)
             }
 
             // --- List/array destructuring ---
@@ -851,6 +936,20 @@ impl Compiler {
                 let _ = span;
                 self.compile_expr(expr)
             }
+
+            // --- Anonymous class ---
+            Expression::AnonymousClass { span, .. } => {
+                // For now, compile anonymous classes as new stdClass
+                let class_name = "stdClass".to_string();
+                let lit_idx = self.op_array.add_literal(Literal::String(class_name));
+                let tmp = self.op_array.alloc_temp();
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::New, span.line as u32)
+                        .with_op1(Operand::constant(lit_idx), OperandType::Const)
+                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                );
+                ExprResult::tmp(tmp)
+            }
         }
     }
 
@@ -873,32 +972,175 @@ impl Compiler {
                 );
                 ExprResult::tmp(tmp)
             }
-            // Dimension assignment: $a[$k] = $v
+            // Dimension assignment: $a[$k] = $v or $obj->prop[$k] = $v
             Expression::ArrayAccess { array, index, .. } => {
-                let arr = self.compile_expr(array);
-                let tmp = self.op_array.alloc_temp();
-                if let Some(idx_expr) = index {
-                    let idx = self.compile_expr(idx_expr);
-                    self.op_array.emit(
-                        ZOp::new(ZOpcode::AssignDim, line)
-                            .with_op1(arr.operand, arr.op_type)
-                            .with_op2(idx.operand, idx.op_type)
-                            .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
-                    );
-                } else {
-                    // $a[] = $v — append
-                    self.op_array.emit(
-                        ZOp::new(ZOpcode::AssignDim, line)
-                            .with_op1(arr.operand, arr.op_type)
-                            .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
-                    );
+                // Walk the ArrayAccess chain to detect property-dim patterns:
+                // $obj->prop[$k] = $v  or  $obj->prop[$k1][$k2] = $v
+                let mut dim_keys: Vec<&Option<Box<Expression>>> = Vec::new();
+                let mut base = array.as_ref();
+                loop {
+                    match base {
+                        Expression::ArrayAccess {
+                            array: inner,
+                            index: inner_idx,
+                            ..
+                        } => {
+                            dim_keys.push(inner_idx);
+                            base = inner.as_ref();
+                        }
+                        _ => break,
+                    }
                 }
-                // OP_DATA follows with the value
-                self.op_array.emit(
-                    ZOp::new(ZOpcode::OpData, line)
-                        .with_op1(rhs_result.operand, rhs_result.op_type),
-                );
-                ExprResult::tmp(tmp)
+
+                if let Expression::PropertyAccess {
+                    object, property, ..
+                } = base
+                {
+                    // Property-dim assignment with write-back
+                    // dim_keys collected inner-to-outer (reversed), plus current `index`
+                    dim_keys.reverse(); // now inner-to-outer order
+                    dim_keys.push(index); // add the outermost key
+
+                    let obj_r = self.compile_expr(object);
+                    let prop_r = self.compile_expr(property);
+
+                    // FetchObjR to get the base property array
+                    let base_tmp = self.op_array.alloc_temp();
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::FetchObjR, line)
+                            .with_op1(obj_r.operand, obj_r.op_type)
+                            .with_op2(prop_r.operand, prop_r.op_type)
+                            .with_result(Operand::tmp_var(base_tmp), OperandType::TmpVar),
+                    );
+
+                    // For nested dims, fetch intermediate levels
+                    let mut temps = vec![base_tmp];
+                    for key_expr in &dim_keys[..dim_keys.len() - 1] {
+                        let prev_tmp = *temps.last().unwrap();
+                        let next_tmp = self.op_array.alloc_temp();
+                        if let Some(k) = key_expr {
+                            let k_r = self.compile_expr(k);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::FetchDimR, line)
+                                    .with_op1(
+                                        Operand::tmp_var(prev_tmp),
+                                        OperandType::TmpVar,
+                                    )
+                                    .with_op2(k_r.operand, k_r.op_type)
+                                    .with_result(
+                                        Operand::tmp_var(next_tmp),
+                                        OperandType::TmpVar,
+                                    ),
+                            );
+                        }
+                        temps.push(next_tmp);
+                    }
+
+                    // AssignDim on the innermost level
+                    let innermost_tmp = *temps.last().unwrap();
+                    let result_tmp = self.op_array.alloc_temp();
+                    let last_key = dim_keys.last().unwrap();
+                    if let Some(k) = last_key {
+                        let k_r = self.compile_expr(k);
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::AssignDim, line)
+                                .with_op1(
+                                    Operand::tmp_var(innermost_tmp),
+                                    OperandType::TmpVar,
+                                )
+                                .with_op2(k_r.operand, k_r.op_type)
+                                .with_result(
+                                    Operand::tmp_var(result_tmp),
+                                    OperandType::TmpVar,
+                                ),
+                        );
+                    } else {
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::AssignDim, line)
+                                .with_op1(
+                                    Operand::tmp_var(innermost_tmp),
+                                    OperandType::TmpVar,
+                                )
+                                .with_result(
+                                    Operand::tmp_var(result_tmp),
+                                    OperandType::TmpVar,
+                                ),
+                        );
+                    }
+                    // OP_DATA with the assigned value
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(rhs_result.operand, rhs_result.op_type),
+                    );
+
+                    // Write-back chain: propagate modifications back up
+                    // For each intermediate level (reverse order), write inner back to outer
+                    for i in (0..temps.len() - 1).rev() {
+                        let outer_tmp = temps[i];
+                        let inner_tmp = temps[i + 1];
+                        let wb_result = self.op_array.alloc_temp();
+                        if let Some(k) = dim_keys[i] {
+                            let k_r = self.compile_expr(k);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::AssignDim, line)
+                                    .with_op1(
+                                        Operand::tmp_var(outer_tmp),
+                                        OperandType::TmpVar,
+                                    )
+                                    .with_op2(k_r.operand, k_r.op_type)
+                                    .with_result(
+                                        Operand::tmp_var(wb_result),
+                                        OperandType::TmpVar,
+                                    ),
+                            );
+                        }
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::OpData, line)
+                                .with_op1(Operand::tmp_var(inner_tmp), OperandType::TmpVar),
+                        );
+                    }
+
+                    // Final write-back: assign the modified array back to the property
+                    let wb_final = self.op_array.alloc_temp();
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::AssignObj, line)
+                            .with_op1(obj_r.operand, obj_r.op_type)
+                            .with_op2(prop_r.operand, prop_r.op_type)
+                            .with_result(Operand::tmp_var(wb_final), OperandType::TmpVar),
+                    );
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(Operand::tmp_var(base_tmp), OperandType::TmpVar),
+                    );
+
+                    ExprResult::tmp(result_tmp)
+                } else {
+                    // Simple array dim assignment: $arr[$k] = $v
+                    let arr = self.compile_expr(array);
+                    let tmp = self.op_array.alloc_temp();
+                    if let Some(idx_expr) = index {
+                        let idx = self.compile_expr(idx_expr);
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::AssignDim, line)
+                                .with_op1(arr.operand, arr.op_type)
+                                .with_op2(idx.operand, idx.op_type)
+                                .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                        );
+                    } else {
+                        // $a[] = $v — append
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::AssignDim, line)
+                                .with_op1(arr.operand, arr.op_type)
+                                .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                        );
+                    }
+                    // OP_DATA follows with the value
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(rhs_result.operand, rhs_result.op_type),
+                    );
+                    ExprResult::tmp(tmp)
+                }
             }
             // Property assignment: $obj->prop = $val
             Expression::PropertyAccess {
@@ -2218,7 +2460,7 @@ impl Compiler {
         self.setup_params(&mut func_oa, params);
 
         // Compile body in sub-compiler
-        let mut sub = Compiler::with_op_array(func_oa);
+        let mut sub = self.sub_compiler(func_oa);
         for s in body {
             sub.compile_stmt(s);
         }
@@ -2537,7 +2779,7 @@ impl Compiler {
         self.setup_params(&mut closure_oa, params);
 
         // Compile body
-        let mut sub = Compiler::with_op_array(closure_oa);
+        let mut sub = self.sub_compiler(closure_oa);
         for s in body {
             sub.compile_stmt(s);
         }
@@ -2584,7 +2826,7 @@ impl Compiler {
         self.setup_params(&mut closure_oa, params);
 
         // Compile body as a return statement
-        let mut sub = Compiler::with_op_array(closure_oa);
+        let mut sub = self.sub_compiler(closure_oa);
         let result = sub.compile_expr(body);
         sub.op_array
             .emit(ZOp::new(ZOpcode::Return, line).with_op1(result.operand, result.op_type));
@@ -2617,8 +2859,11 @@ impl Compiler {
     ) {
         let line = span.line as u32;
 
+        // Qualify class name with current namespace
+        let fq_name = self.qualify_name(name);
+
         // Emit DECLARE_CLASS
-        let name_lit = self.op_array.add_literal(Literal::String(name.to_string()));
+        let name_lit = self.op_array.add_literal(Literal::String(fq_name.clone()));
         let mut flags: u32 = 0;
         for m in modifiers {
             flags |= modifier_flag(m);
@@ -2652,7 +2897,7 @@ impl Compiler {
                 ..
             } = member
             {
-                let full_name = format!("{}::{}", name, method_name);
+                let full_name = format!("{}::{}", fq_name, method_name);
                 let mut method_oa = ZOpArray::for_function(&full_name);
                 method_oa.line_start = line;
                 self.setup_params(&mut method_oa, params);
@@ -2662,7 +2907,7 @@ impl Compiler {
                     method_oa.lookup_cv("this");
                 }
 
-                let mut sub = Compiler::with_op_array(method_oa);
+                let mut sub = self.sub_compiler(method_oa);
                 for s in method_body {
                     sub.compile_stmt(s);
                 }
@@ -2685,7 +2930,8 @@ impl Compiler {
         span: &php_rs_lexer::Span,
     ) {
         let line = span.line as u32;
-        let name_lit = self.op_array.add_literal(Literal::String(name.to_string()));
+        let fq_name = self.qualify_name(name);
+        let name_lit = self.op_array.add_literal(Literal::String(fq_name.clone()));
 
         // Encode parent interfaces as "\0iface1\0iface2" in op2
         let mut class_info = String::new();
@@ -2711,11 +2957,11 @@ impl Compiler {
                 ..
             } = member
             {
-                let full_name = format!("{}::{}", name, method_name);
+                let full_name = format!("{}::{}", fq_name, method_name);
                 let mut method_oa = ZOpArray::for_function(&full_name);
                 self.setup_params(&mut method_oa, params);
 
-                let mut sub = Compiler::with_op_array(method_oa);
+                let mut sub = self.sub_compiler(method_oa);
                 for s in method_body {
                     sub.compile_stmt(s);
                 }
@@ -2737,7 +2983,8 @@ impl Compiler {
         span: &php_rs_lexer::Span,
     ) {
         let line = span.line as u32;
-        let name_lit = self.op_array.add_literal(Literal::String(name.to_string()));
+        let fq_name = self.qualify_name(name);
+        let name_lit = self.op_array.add_literal(Literal::String(fq_name.clone()));
 
         self.op_array.emit(
             ZOp::new(ZOpcode::DeclareClass, line)
@@ -2754,7 +3001,7 @@ impl Compiler {
                 ..
             } = member
             {
-                let full_name = format!("{}::{}", name, method_name);
+                let full_name = format!("{}::{}", fq_name, method_name);
                 let mut method_oa = ZOpArray::for_function(&full_name);
                 self.setup_params(&mut method_oa, params);
 
@@ -2762,7 +3009,7 @@ impl Compiler {
                     method_oa.lookup_cv("this");
                 }
 
-                let mut sub = Compiler::with_op_array(method_oa);
+                let mut sub = self.sub_compiler(method_oa);
                 for s in method_body {
                     sub.compile_stmt(s);
                 }
@@ -2785,7 +3032,8 @@ impl Compiler {
         span: &php_rs_lexer::Span,
     ) {
         let line = span.line as u32;
-        let name_lit = self.op_array.add_literal(Literal::String(name.to_string()));
+        let fq_name = self.qualify_name(name);
+        let name_lit = self.op_array.add_literal(Literal::String(fq_name.clone()));
 
         // Encode implements info as "\0iface1\0iface2" in op2
         let mut class_info = String::new();
@@ -2811,12 +3059,12 @@ impl Compiler {
                 ..
             }) = member
             {
-                let full_name = format!("{}::{}", name, method_name);
+                let full_name = format!("{}::{}", fq_name, method_name);
                 let mut method_oa = ZOpArray::for_function(&full_name);
                 self.setup_params(&mut method_oa, params);
                 method_oa.lookup_cv("this");
 
-                let mut sub = Compiler::with_op_array(method_oa);
+                let mut sub = self.sub_compiler(method_oa);
                 for s in method_body {
                     sub.compile_stmt(s);
                 }
@@ -3072,6 +3320,16 @@ pub fn compile(source: &str) -> Result<ZOpArray, php_rs_parser::ParseError> {
     let program = parser.parse()?;
     let compiler = Compiler::new();
     Ok(compiler.compile_program(&program))
+}
+
+/// Compile a PHP source string with a known filename (for __FILE__ and __DIR__).
+pub fn compile_file(source: &str, filename: &str) -> Result<ZOpArray, php_rs_parser::ParseError> {
+    let mut parser = php_rs_parser::Parser::new(source);
+    let program = parser.parse()?;
+    let compiler = Compiler::with_filename(filename.to_string());
+    let mut oa = compiler.compile_program(&program);
+    oa.filename = Some(filename.to_string());
+    Ok(oa)
 }
 
 /// Compile a PHP source string to an optimized op array.

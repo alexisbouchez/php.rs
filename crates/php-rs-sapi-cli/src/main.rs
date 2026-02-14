@@ -439,8 +439,21 @@ fn vm_config_from_ini(ini: &IniSystem) -> php_rs_vm::VmConfig {
 /// `script_path` is the script name (e.g. "test.php" or "-" for stdin/-r).
 /// `argv` is the full argument list for this run (script path + script args), used for $_SERVER['argv'] and argc.
 fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]) -> i32 {
-    // Compile
-    let op_array = match php_rs_compiler::compile(source) {
+    // Compile (use compile_file for file execution to resolve __DIR__/__FILE__)
+    let op_array = if script_path == "-" {
+        // -r mode or stdin — no filename context
+        match php_rs_compiler::compile(source) {
+            ok @ Ok(_) => ok,
+            err @ Err(_) => err,
+        }
+    } else {
+        let abs_path = std::path::Path::new(script_path)
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from(script_path));
+        let abs_str = abs_path.to_string_lossy().to_string();
+        php_rs_compiler::compile_file(source, &abs_str)
+    };
+    let op_array = match op_array {
         Ok(oa) => oa,
         Err(e) => {
             eprintln!("{}", e);

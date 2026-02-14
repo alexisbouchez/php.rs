@@ -302,6 +302,14 @@ pub enum Expression {
         args: Vec<Argument>,
         span: Span,
     },
+    /// Anonymous class: `new class(args) [extends Base] [implements Iface, ...] { members }`
+    AnonymousClass {
+        args: Vec<Argument>,
+        extends: Option<Box<Expression>>,
+        implements: Vec<Name>,
+        members: Vec<ClassMember>,
+        span: Span,
+    },
     /// Clone: `clone expr`
     Clone { object: Box<Expression>, span: Span },
     /// Instanceof: `expr instanceof Class`
@@ -400,6 +408,8 @@ pub enum Expression {
         expr: Option<Box<Expression>>,
         span: Span,
     },
+    /// Constant access: `CONST_NAME` or `Namespace\CONST_NAME`
+    ConstantAccess { name: String, span: Span },
 }
 
 /// Binary operators

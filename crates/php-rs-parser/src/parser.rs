@@ -1423,63 +1423,72 @@ impl<'a> Parser<'a> {
                 Vec::new()
             };
 
-            // Parse modifiers (public, private, protected, static, readonly, final, abstract)
-            let mut modifiers = Vec::new();
-            loop {
-                match self.current_token {
-                    Token::Public | Token::Var => {
-                        modifiers.push(Modifier::Public);
-                        self.advance();
-                    }
-                    Token::Protected => {
-                        modifiers.push(Modifier::Protected);
-                        self.advance();
-                    }
-                    Token::Private => {
-                        modifiers.push(Modifier::Private);
-                        self.advance();
-                    }
-                    Token::Static => {
-                        modifiers.push(Modifier::Static);
-                        self.advance();
-                    }
-                    Token::Readonly => {
-                        modifiers.push(Modifier::Readonly);
-                        self.advance();
-                    }
-                    Token::Final => {
-                        modifiers.push(Modifier::Final);
-                        self.advance();
-                    }
-                    Token::Abstract => {
-                        modifiers.push(Modifier::Abstract);
-                        self.advance();
-                    }
-                    _ => break,
-                }
-            }
-
-            // Determine what kind of member this is
-            match self.current_token {
-                Token::Function => {
-                    members.push(self.parse_class_method(modifiers, attributes)?);
-                }
-                Token::Const => {
-                    members.push(self.parse_class_constant(modifiers, attributes)?);
-                }
-                Token::Use => {
-                    members.push(self.parse_trait_use()?);
-                }
-                _ => {
-                    // Must be a property (with optional type hint)
-                    // Could have multiple comma-separated properties
-                    let mut props = self.parse_class_properties(modifiers, attributes)?;
-                    members.append(&mut props);
-                }
-            }
+            let mut new_members = self.parse_class_member_with_attributes(attributes)?;
+            members.append(&mut new_members);
         }
 
         Ok(members)
+    }
+
+    /// Parse a single class member (method, constant, property, or trait use) with pre-parsed attributes.
+    /// Returns a Vec because properties can be comma-separated.
+    fn parse_class_member_with_attributes(
+        &mut self,
+        attributes: Vec<Attribute>,
+    ) -> Result<Vec<ClassMember>, ParseError> {
+        // Parse modifiers (public, private, protected, static, readonly, final, abstract)
+        let mut modifiers = Vec::new();
+        loop {
+            match self.current_token {
+                Token::Public | Token::Var => {
+                    modifiers.push(Modifier::Public);
+                    self.advance();
+                }
+                Token::Protected => {
+                    modifiers.push(Modifier::Protected);
+                    self.advance();
+                }
+                Token::Private => {
+                    modifiers.push(Modifier::Private);
+                    self.advance();
+                }
+                Token::Static => {
+                    modifiers.push(Modifier::Static);
+                    self.advance();
+                }
+                Token::Readonly => {
+                    modifiers.push(Modifier::Readonly);
+                    self.advance();
+                }
+                Token::Final => {
+                    modifiers.push(Modifier::Final);
+                    self.advance();
+                }
+                Token::Abstract => {
+                    modifiers.push(Modifier::Abstract);
+                    self.advance();
+                }
+                _ => break,
+            }
+        }
+
+        // Determine what kind of member this is
+        match self.current_token {
+            Token::Function => {
+                Ok(vec![self.parse_class_method(modifiers, attributes)?])
+            }
+            Token::Const => {
+                Ok(vec![self.parse_class_constant(modifiers, attributes)?])
+            }
+            Token::Use => {
+                Ok(vec![self.parse_trait_use()?])
+            }
+            _ => {
+                // Must be a property (with optional type hint)
+                // Could have multiple comma-separated properties
+                self.parse_class_properties(modifiers, attributes)
+            }
+        }
     }
 
     /// Parse one or more class properties (comma-separated) with optional hooks
@@ -1854,9 +1863,7 @@ impl<'a> Parser<'a> {
 
         // Parse interface body
         self.expect(Token::LBrace)?;
-        let members = Vec::new();
-        // For now, skip interface members parsing - we'll implement that later
-        // Just verify we have a closing brace
+        let members = self.parse_class_members()?;
         self.expect(Token::RBrace)?;
 
         Ok(Statement::Interface {
@@ -1890,9 +1897,7 @@ impl<'a> Parser<'a> {
 
         // Parse trait body
         self.expect(Token::LBrace)?;
-        let members = Vec::new();
-        // For now, skip trait members parsing - we'll implement that later
-        // Just verify we have a closing brace
+        let members = self.parse_class_members()?;
         self.expect(Token::RBrace)?;
 
         Ok(Statement::Trait {
@@ -1950,9 +1955,47 @@ impl<'a> Parser<'a> {
 
         // Parse enum body
         self.expect(Token::LBrace)?;
-        let members = Vec::new();
-        // For now, skip enum members parsing - we'll implement that later
-        // Just verify we have a closing brace
+        let mut members = Vec::new();
+        while self.current_token != Token::RBrace && self.current_token != Token::End {
+            // Parse attributes
+            let attributes = if self.current_token == Token::Attribute {
+                self.parse_attributes()?
+            } else {
+                Vec::new()
+            };
+
+            if self.current_token == Token::Case {
+                // Enum case: case Name [= value];
+                let case_span = self.current_span;
+                self.advance(); // consume 'case'
+                let case_name = if let Token::String = self.current_token {
+                    let n = self.lexer.source_text(&self.current_span).to_string();
+                    self.advance();
+                    n
+                } else {
+                    return Err(self.error("case name"));
+                };
+                let value = if self.current_token == Token::Equals {
+                    self.advance();
+                    Some(self.parse_expression(0)?)
+                } else {
+                    None
+                };
+                self.expect(Token::Semicolon)?;
+                members.push(EnumMember::Case {
+                    name: case_name,
+                    value,
+                    attributes,
+                    span: case_span,
+                });
+            } else {
+                // Methods, constants, trait uses — reuse class member parsing
+                let class_members = self.parse_class_member_with_attributes(attributes)?;
+                for m in class_members {
+                    members.push(EnumMember::ClassMember(m));
+                }
+            }
+        }
         self.expect(Token::RBrace)?;
 
         Ok(Statement::Enum {
@@ -2188,6 +2231,97 @@ impl<'a> Parser<'a> {
             attributes: Vec::new(), // TODO: Parse attributes
             span: start_span,
         })
+    }
+
+    /// Parse a class name for `new` expressions.
+    /// Handles: `ClassName`, `\Fully\Qualified\Name`, `$var`, `static`, `self`, `parent`
+    /// Does NOT consume trailing `(args)` — those are parsed by the `new` handler.
+    fn parse_new_class_name(&mut self) -> Result<Expression, ParseError> {
+        let span = self.current_span;
+
+        match self.current_token {
+            // Fully-qualified name: \Foo\Bar (if lexer produces combined token)
+            Token::NameFullyQualified => {
+                let text = self.lexer.source_text(&span).to_string();
+                self.advance();
+                Ok(Expression::StringLiteral { value: text, span })
+            }
+            // Qualified name: Foo\Bar (if lexer produces combined token)
+            Token::NameQualified => {
+                let text = self.lexer.source_text(&span).to_string();
+                self.advance();
+                Ok(Expression::StringLiteral { value: text, span })
+            }
+            // Leading backslash: \ClassName or \Foo\Bar\Baz (fully-qualified)
+            Token::Backslash | Token::NsSeparator => {
+                self.advance(); // consume the leading backslash
+                let mut parts = Vec::new();
+                if let Token::String = self.current_token {
+                    parts.push(self.lexer.source_text(&self.current_span).to_string());
+                    self.advance();
+                    while self.current_token == Token::NsSeparator
+                        || self.current_token == Token::Backslash
+                    {
+                        self.advance();
+                        if let Token::String = self.current_token {
+                            parts.push(
+                                self.lexer.source_text(&self.current_span).to_string(),
+                            );
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                Ok(Expression::StringLiteral {
+                    value: format!("\\{}", parts.join("\\")),
+                    span,
+                })
+            }
+            // Simple identifier: ClassName
+            Token::String => {
+                let text = self.lexer.source_text(&span).to_string();
+                self.advance();
+
+                // Handle qualified names: Foo\Bar\Baz
+                if self.current_token == Token::NsSeparator
+                    || self.current_token == Token::Backslash
+                {
+                    let mut parts = vec![text];
+                    while self.current_token == Token::NsSeparator
+                        || self.current_token == Token::Backslash
+                    {
+                        self.advance();
+                        if let Token::String = self.current_token {
+                            parts.push(
+                                self.lexer.source_text(&self.current_span).to_string(),
+                            );
+                            self.advance();
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(Expression::StringLiteral {
+                        value: parts.join("\\"),
+                        span,
+                    })
+                } else {
+                    Ok(Expression::StringLiteral { value: text, span })
+                }
+            }
+            // Dynamic class: new $var()
+            Token::Variable => self.parse_prefix(),
+            // static keyword
+            Token::Static => {
+                self.advance();
+                Ok(Expression::StringLiteral {
+                    value: "static".to_string(),
+                    span,
+                })
+            }
+            // Fallback for other cases (anonymous classes etc.)
+            _ => self.parse_prefix(),
+        }
     }
 
     /// Parse a function/method argument
@@ -2889,6 +3023,9 @@ impl<'a> Parser<'a> {
                                 args.push(self.parse_argument()?);
                                 if self.current_token == Token::Comma {
                                     self.advance();
+                                    if self.current_token == Token::RParen {
+                                        break; // trailing comma
+                                    }
                                     continue;
                                 }
                                 break;
@@ -2902,10 +3039,55 @@ impl<'a> Parser<'a> {
                             args,
                             span,
                         })
-                    } else {
-                        // It's a constant reference - represent as StringLiteral for now
-                        // In the future, might need a dedicated Constant expression type
+                    } else if self.current_token == Token::PaamayimNekudotayim {
+                        // Class::method() or Class::CONST — keep as StringLiteral (class name)
                         Ok(Expression::StringLiteral { value: name, span })
+                    } else if self.current_token == Token::NsSeparator
+                        || self.current_token == Token::Backslash
+                    {
+                        // Qualified name: Foo\Bar\Baz (could be constant or class)
+                        let mut parts = vec![name];
+                        while self.current_token == Token::NsSeparator
+                            || self.current_token == Token::Backslash
+                        {
+                            self.advance(); // consume '\'
+                            let part = self.lexer.source_text(&self.current_span).to_string();
+                            self.advance();
+                            parts.push(part);
+                        }
+                        let full_name = parts.join("\\");
+                        if self.current_token == Token::LParen {
+                            // Qualified function call
+                            self.advance();
+                            let mut args = Vec::new();
+                            if self.current_token != Token::RParen {
+                                loop {
+                                    args.push(self.parse_argument()?);
+                                    if self.current_token == Token::Comma {
+                                        self.advance();
+                                        if self.current_token == Token::RParen {
+                                            break; // trailing comma
+                                        }
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                            self.expect(Token::RParen)?;
+                            Ok(Expression::FunctionCall {
+                                name: Box::new(Expression::StringLiteral { value: full_name, span }),
+                                args,
+                                span,
+                            })
+                        } else if self.current_token == Token::PaamayimNekudotayim {
+                            // Qualified class name before :: — keep as StringLiteral
+                            Ok(Expression::StringLiteral { value: full_name, span })
+                        } else {
+                            Ok(Expression::ConstantAccess { name: full_name, span })
+                        }
+                    } else {
+                        // It's a constant reference
+                        Ok(Expression::ConstantAccess { name, span })
                     }
                 }
             }
@@ -3131,29 +3313,100 @@ impl<'a> Parser<'a> {
                 Ok(Expression::Clone { object, span })
             }
 
-            // New expression: `new Class(args)`
+            // New expression: `new Class(args)` or `new class { ... }` (anonymous)
             Token::New => {
                 self.advance();
-                let class = Box::new(self.parse_prefix()?);
-                let args = if self.current_token == Token::LParen {
+
+                // Check for anonymous class: `new class [(args)] [extends ...] [implements ...] { ... }`
+                if self.current_token == Token::Class {
                     self.advance();
-                    let mut args = Vec::new();
-                    if self.current_token != Token::RParen {
+
+                    // Parse optional constructor args
+                    let args = if self.current_token == Token::LParen {
+                        self.advance();
+                        let mut args = Vec::new();
+                        if self.current_token != Token::RParen {
+                            loop {
+                                args.push(self.parse_argument()?);
+                                if self.current_token == Token::Comma {
+                                    self.advance();
+                                    if self.current_token == Token::RParen {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                        args
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Parse optional extends
+                    let extends = if self.current_token == Token::Extends {
+                        self.advance();
+                        Some(Box::new(self.parse_new_class_name()?))
+                    } else {
+                        None
+                    };
+
+                    // Parse optional implements
+                    let implements = if self.current_token == Token::Implements {
+                        self.advance();
+                        let mut interfaces = Vec::new();
                         loop {
-                            args.push(self.parse_argument()?);
+                            interfaces.push(self.parse_qualified_name()?);
                             if self.current_token == Token::Comma {
                                 self.advance();
                                 continue;
                             }
                             break;
                         }
-                    }
-                    self.expect(Token::RParen)?;
-                    args
+                        interfaces
+                    } else {
+                        Vec::new()
+                    };
+
+                    // Parse body
+                    self.expect(Token::LBrace)?;
+                    let members = self.parse_class_members()?;
+                    self.expect(Token::RBrace)?;
+
+                    Ok(Expression::AnonymousClass {
+                        args,
+                        extends,
+                        implements,
+                        members,
+                        span,
+                    })
                 } else {
-                    Vec::new()
-                };
-                Ok(Expression::New { class, args, span })
+                    // Regular new: parse class name
+                    let class = Box::new(self.parse_new_class_name()?);
+                    let args = if self.current_token == Token::LParen {
+                        self.advance();
+                        let mut args = Vec::new();
+                        if self.current_token != Token::RParen {
+                            loop {
+                                args.push(self.parse_argument()?);
+                                if self.current_token == Token::Comma {
+                                    self.advance();
+                                    if self.current_token == Token::RParen {
+                                        break; // trailing comma
+                                    }
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                        args
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Expression::New { class, args, span })
+                }
             }
 
             // Throw expression (PHP 8.0+): can appear in expressions
@@ -3176,6 +3429,9 @@ impl<'a> Parser<'a> {
                             args.push(self.parse_argument()?);
                             if self.current_token == Token::Comma {
                                 self.advance();
+                                if self.current_token == Token::RParen {
+                                    break; // trailing comma
+                                }
                                 continue;
                             }
                             break;
@@ -3740,6 +3996,9 @@ impl<'a> Parser<'a> {
                                 args.push(self.parse_argument()?);
                                 if self.current_token == Token::Comma {
                                     self.advance();
+                                    if self.current_token == Token::RParen {
+                                        break; // trailing comma
+                                    }
                                     continue;
                                 }
                                 break;
@@ -3777,6 +4036,48 @@ impl<'a> Parser<'a> {
                         property: prop,
                         span,
                     })
+                } else if self.current_token == Token::LBrace {
+                    // Dynamic static member: Class::{$expr}()
+                    self.advance();
+                    let expr = self.parse_expression(0)?;
+                    self.expect(Token::RBrace)?;
+                    let member = Box::new(expr);
+
+                    if self.current_token == Token::LParen {
+                        // Dynamic static method call: Class::{$expr}(args)
+                        self.advance();
+                        let mut args = Vec::new();
+                        if self.current_token != Token::RParen {
+                            loop {
+                                args.push(self.parse_argument()?);
+                                if self.current_token == Token::Comma {
+                                    self.advance();
+                                    if self.current_token == Token::RParen {
+                                        break; // trailing comma
+                                    }
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        self.expect(Token::RParen)?;
+                        Ok(Expression::FunctionCall {
+                            name: Box::new(Expression::StaticPropertyAccess {
+                                class: Box::new(left),
+                                property: member,
+                                span,
+                            }),
+                            args,
+                            span,
+                        })
+                    } else {
+                        // Dynamic static property: Class::{$expr}
+                        Ok(Expression::StaticPropertyAccess {
+                            class: Box::new(left),
+                            property: member,
+                            span,
+                        })
+                    }
                 } else {
                     Err(self.error("static member name"))
                 }
@@ -3818,6 +4119,9 @@ impl<'a> Parser<'a> {
                         args.push(self.parse_argument()?);
                         if self.current_token == Token::Comma {
                             self.advance();
+                            if self.current_token == Token::RParen {
+                                break; // trailing comma
+                            }
                             continue;
                         }
                         break;

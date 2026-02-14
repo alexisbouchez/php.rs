@@ -228,6 +228,10 @@ pub struct Vm {
     execution_start: Option<Instant>,
     /// Opcode counter for periodic limit checks (avoids checking clock on every op).
     opcode_counter: u64,
+    /// Registered SPL autoload callbacks (function name, optional $this object).
+    autoload_callbacks: Vec<(String, Option<Value>)>,
+    /// Guard to prevent recursive autoloading of the same class.
+    autoloading_classes: HashSet<String>,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -257,7 +261,73 @@ impl Vm {
             functions: HashMap::new(),
             op_arrays: Vec::new(),
             call_stack: Vec::new(),
-            constants: HashMap::new(),
+            constants: {
+                let mut c = HashMap::new();
+                c.insert("DIRECTORY_SEPARATOR".to_string(), Value::String("/".to_string()));
+                c.insert("PATH_SEPARATOR".to_string(), Value::String(":".to_string()));
+                c.insert("PHP_EOL".to_string(), Value::String("\n".to_string()));
+                c.insert("PHP_INT_MAX".to_string(), Value::Long(i64::MAX));
+                c.insert("PHP_INT_MIN".to_string(), Value::Long(i64::MIN));
+                c.insert("PHP_INT_SIZE".to_string(), Value::Long(8));
+                c.insert("PHP_FLOAT_MAX".to_string(), Value::Double(f64::MAX));
+                c.insert("PHP_FLOAT_MIN".to_string(), Value::Double(f64::MIN_POSITIVE));
+                c.insert("PHP_FLOAT_EPSILON".to_string(), Value::Double(f64::EPSILON));
+                c.insert("PHP_MAJOR_VERSION".to_string(), Value::Long(8));
+                c.insert("PHP_MINOR_VERSION".to_string(), Value::Long(6));
+                c.insert("PHP_RELEASE_VERSION".to_string(), Value::Long(0));
+                c.insert("PHP_VERSION".to_string(), Value::String("8.6.0".to_string()));
+                c.insert("PHP_VERSION_ID".to_string(), Value::Long(80600));
+                c.insert("PHP_MAXPATHLEN".to_string(), Value::Long(1024));
+                c.insert("PHP_OS".to_string(), Value::String(if cfg!(target_os = "macos") { "Darwin" } else if cfg!(target_os = "windows") { "WINNT" } else { "Linux" }.to_string()));
+                c.insert("PHP_OS_FAMILY".to_string(), Value::String(if cfg!(target_os = "windows") { "Windows" } else { "Unix" }.to_string()));
+                c.insert("PHP_SAPI".to_string(), Value::String("cli".to_string()));
+                c.insert("PHP_PREFIX".to_string(), Value::String("/usr".to_string()));
+                c.insert("PHP_BINDIR".to_string(), Value::String("/usr/bin".to_string()));
+                c.insert("TRUE".to_string(), Value::Bool(true));
+                c.insert("FALSE".to_string(), Value::Bool(false));
+                c.insert("NULL".to_string(), Value::Null);
+                c.insert("STDIN".to_string(), Value::Long(0));
+                c.insert("STDOUT".to_string(), Value::Long(1));
+                c.insert("STDERR".to_string(), Value::Long(2));
+                c.insert("E_ERROR".to_string(), Value::Long(1));
+                c.insert("E_WARNING".to_string(), Value::Long(2));
+                c.insert("E_PARSE".to_string(), Value::Long(4));
+                c.insert("E_NOTICE".to_string(), Value::Long(8));
+                c.insert("E_ALL".to_string(), Value::Long(32767));
+                c.insert("E_STRICT".to_string(), Value::Long(2048));
+                c.insert("E_DEPRECATED".to_string(), Value::Long(8192));
+                c.insert("STR_PAD_RIGHT".to_string(), Value::Long(1));
+                c.insert("STR_PAD_LEFT".to_string(), Value::Long(0));
+                c.insert("STR_PAD_BOTH".to_string(), Value::Long(2));
+                c.insert("SORT_REGULAR".to_string(), Value::Long(0));
+                c.insert("SORT_NUMERIC".to_string(), Value::Long(1));
+                c.insert("SORT_STRING".to_string(), Value::Long(2));
+                c.insert("SORT_ASC".to_string(), Value::Long(4));
+                c.insert("SORT_DESC".to_string(), Value::Long(3));
+                c.insert("SORT_NATURAL".to_string(), Value::Long(6));
+                c.insert("SORT_FLAG_CASE".to_string(), Value::Long(8));
+                c.insert("ARRAY_FILTER_USE_BOTH".to_string(), Value::Long(1));
+                c.insert("ARRAY_FILTER_USE_KEY".to_string(), Value::Long(2));
+                c.insert("ARRAY_FILTER_USE_VALUE".to_string(), Value::Long(0));
+                c.insert("PREG_SPLIT_NO_EMPTY".to_string(), Value::Long(1));
+                c.insert("PREG_SPLIT_DELIM_CAPTURE".to_string(), Value::Long(2));
+                c.insert("JSON_PRETTY_PRINT".to_string(), Value::Long(128));
+                c.insert("JSON_UNESCAPED_SLASHES".to_string(), Value::Long(64));
+                c.insert("JSON_UNESCAPED_UNICODE".to_string(), Value::Long(256));
+                c.insert("JSON_THROW_ON_ERROR".to_string(), Value::Long(4194304));
+                c.insert("JSON_FORCE_OBJECT".to_string(), Value::Long(16));
+                c.insert("JSON_HEX_TAG".to_string(), Value::Long(1));
+                c.insert("JSON_HEX_AMP".to_string(), Value::Long(2));
+                c.insert("JSON_HEX_APOS".to_string(), Value::Long(4));
+                c.insert("JSON_HEX_QUOT".to_string(), Value::Long(8));
+                c.insert("JSON_NUMERIC_CHECK".to_string(), Value::Long(32));
+                c.insert("FILTER_VALIDATE_INT".to_string(), Value::Long(257));
+                c.insert("FILTER_VALIDATE_EMAIL".to_string(), Value::Long(274));
+                c.insert("FILTER_VALIDATE_URL".to_string(), Value::Long(273));
+                c.insert("FILTER_SANITIZE_STRING".to_string(), Value::Long(513));
+                c.insert("FILTER_DEFAULT".to_string(), Value::Long(516));
+                c
+            },
             classes: HashMap::new(),
             next_object_id: 1,
             current_exception: None,
@@ -275,6 +345,8 @@ impl Vm {
             config,
             execution_start: None,
             opcode_counter: 0,
+            autoload_callbacks: Vec::new(),
+            autoloading_classes: HashSet::new(),
         }
     }
 
@@ -658,8 +730,9 @@ impl Vm {
             }
             ZOpcode::AssignDim => {
                 // $arr[$key] = $val
-                // op1 = array CV, op2 = key (or Unused for append), next op is OP_DATA with value
-                let arr_cv = op.op1.val as usize;
+                // op1 = array (CV or TmpVar/Var), op2 = key (or Unused for append), next op is OP_DATA with value
+                let arr_idx = op.op1.val as usize;
+                let arr_op1_type = op.op1_type;
                 let key = if op.op2_type != OperandType::Unused {
                     Some(self.read_operand(op, 2, oa_idx)?)
                 } else {
@@ -681,7 +754,20 @@ impl Vm {
                 };
 
                 let frame = self.call_stack.last_mut().unwrap();
-                let arr_val = &mut frame.cvs[arr_cv];
+                let arr_val = match arr_op1_type {
+                    OperandType::Cv => &mut frame.cvs[arr_idx],
+                    OperandType::TmpVar | OperandType::Var => {
+                        if arr_idx >= frame.temps.len() {
+                            frame.temps.resize(arr_idx + 1, Value::Null);
+                        }
+                        &mut frame.temps[arr_idx]
+                    }
+                    _ => {
+                        // Skip OP_DATA
+                        self.call_stack.last_mut().unwrap().ip += 1;
+                        return Ok(DispatchSignal::Next);
+                    }
+                };
                 // Ensure it's an array
                 if matches!(arr_val, Value::Null) {
                     *arr_val = Value::Array(PhpArray::new());
@@ -1595,9 +1681,100 @@ impl Vm {
         Ok(())
     }
 
+    /// Try to autoload a class by calling registered spl_autoload callbacks.
+    /// Returns true if the class was successfully loaded.
+    fn try_autoload_class(&mut self, class_name: &str) -> bool {
+        // Normalize: strip leading backslash
+        let class_name = class_name.strip_prefix('\\').unwrap_or(class_name);
+
+        // Already loaded?
+        if self.classes.contains_key(class_name) {
+            return true;
+        }
+
+        // Prevent recursive autoloading of the same class
+        if self.autoloading_classes.contains(class_name) {
+            return false;
+        }
+
+        let callbacks = self.autoload_callbacks.clone();
+        if callbacks.is_empty() {
+            return false;
+        }
+
+        self.autoloading_classes.insert(class_name.to_string());
+
+        for (callback_name, this_obj) in &callbacks {
+            let oa_idx_opt = if callback_name.contains("::") {
+                // Handle static/instance method calls like "ClassName::methodName"
+                let parts: Vec<&str> = callback_name.splitn(2, "::").collect();
+                let method_class = parts[0];
+                let method_name = parts[1];
+                self.classes
+                    .get(method_class)
+                    .and_then(|c| c.methods.get(method_name).copied())
+            } else {
+                // Regular function call
+                self.functions.get(callback_name).copied()
+            };
+
+            if let Some(oa_idx) = oa_idx_opt {
+                let oa = self.op_arrays[oa_idx].clone();
+                let mut frame = Frame::new(&oa);
+                frame.op_array_idx = oa_idx;
+
+                if callback_name.contains("::") {
+                    // Method call: first arg is $this, second is class name
+                    let this_val = this_obj.clone().unwrap_or(Value::Null);
+                    frame.args = vec![this_val.clone(), Value::String(class_name.to_string())];
+                    // Set $this CV
+                    let this_cv_idx = oa.vars.iter().position(|v| v == "this").unwrap_or(0);
+                    if this_cv_idx < frame.cvs.len() {
+                        frame.cvs[this_cv_idx] = this_val;
+                    }
+                    // Set the class name parameter (typically CV after $this)
+                    let param_names: Vec<&str> = oa.vars.iter().map(|s| s.as_str()).collect();
+                    if let Some(class_param_idx) = param_names.iter().position(|&v| v == "class") {
+                        if class_param_idx < frame.cvs.len() {
+                            frame.cvs[class_param_idx] =
+                                Value::String(class_name.to_string());
+                        }
+                    } else {
+                        // Fallback: put class name in first non-$this CV
+                        for i in 0..frame.cvs.len() {
+                            if i != this_cv_idx {
+                                frame.cvs[i] = Value::String(class_name.to_string());
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    frame.args = vec![Value::String(class_name.to_string())];
+                    // Set first CV to the class name (the $class parameter)
+                    if !frame.cvs.is_empty() {
+                        frame.cvs[0] = Value::String(class_name.to_string());
+                    }
+                }
+
+                let depth = self.call_stack.len();
+                self.call_stack.push(frame);
+                let _ = self.dispatch_loop_until(depth);
+                if self.classes.contains_key(class_name) {
+                    self.autoloading_classes.remove(class_name);
+                    return true;
+                }
+            }
+        }
+
+        self.autoloading_classes.remove(class_name);
+        false
+    }
+
     /// Handle NEW — create a new object instance.
     fn handle_new(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
-        let class_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
+        let raw_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
+        // Strip leading backslash from fully-qualified class names
+        let class_name = raw_name.strip_prefix('\\').unwrap_or(&raw_name).to_string();
 
         // Special handling for Fiber
         if class_name == "Fiber" {
@@ -1650,6 +1827,11 @@ impl Vm {
                 this_source: None,
             });
             return Ok(());
+        }
+
+        // Try autoloading if the class isn't found
+        if !self.classes.contains_key(&class_name) {
+            self.try_autoload_class(&class_name);
         }
 
         let mut obj = PhpObject::new(class_name.clone());
@@ -1778,8 +1960,15 @@ impl Vm {
 
     /// Handle INIT_STATIC_METHOD_CALL — prepare to call Class::method().
     fn handle_init_static_method_call(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
-        let class_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
+        let raw = self.read_operand(op, 1, oa_idx)?.to_php_string();
+        let class_name = raw.strip_prefix('\\').unwrap_or(&raw).to_string();
         let method_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
+
+        // Try autoloading if the class isn't found
+        if !self.classes.contains_key(&class_name) {
+            self.try_autoload_class(&class_name);
+        }
+
         let full_name = format!("{}::{}", class_name, method_name);
         let frame = self.call_stack.last_mut().unwrap();
         frame.call_stack_pending.push(PendingCall {
@@ -1792,8 +1981,14 @@ impl Vm {
 
     /// Handle FETCH_CLASS_CONSTANT — read Class::CONST.
     fn handle_fetch_class_constant(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
-        let class_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
+        let raw = self.read_operand(op, 1, oa_idx)?.to_php_string();
+        let class_name = raw.strip_prefix('\\').unwrap_or(&raw).to_string();
         let const_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
+
+        // Try autoloading if the class isn't found
+        if !self.classes.contains_key(&class_name) {
+            self.try_autoload_class(&class_name);
+        }
 
         let val = self
             .classes
@@ -1973,15 +2168,16 @@ impl Vm {
         let mode = op.extended_value;
         // mode: 0=eval, 1=include, 2=include_once, 3=require, 4=require_once
 
-        let source = match mode {
+        let (source, file_path) = match mode {
             0 => {
                 // eval(): operand is the code string
                 let code = operand.to_php_string();
-                if code.starts_with("<?php") || code.starts_with("<?") {
+                let code = if code.starts_with("<?php") || code.starts_with("<?") {
                     code
                 } else {
                     format!("<?php {}", code)
-                }
+                };
+                (code, None)
             }
             1 | 2 | 3 | 4 => {
                 let path = operand.to_php_string();
@@ -1997,8 +2193,8 @@ impl Vm {
 
                 match std::fs::read_to_string(&path) {
                     Ok(contents) => {
-                        self.included_files.insert(path);
-                        contents
+                        self.included_files.insert(path.clone());
+                        (contents, Some(path))
                     }
                     Err(_) => {
                         if mode == 3 || mode == 4 {
@@ -2021,7 +2217,12 @@ impl Vm {
         };
 
         // Compile and execute the source
-        match php_rs_compiler::compile(&source) {
+        let compile_result = if let Some(ref fp) = file_path {
+            php_rs_compiler::compile_file(&source, fp)
+        } else {
+            php_rs_compiler::compile(&source)
+        };
+        match compile_result {
             Ok(included_oa) => {
                 let base_idx = self.op_arrays.len();
                 self.op_arrays.push(included_oa.clone());
@@ -2060,12 +2261,42 @@ impl Vm {
                 args: Vec::new(),
                 this_source: None,
             });
-        let func_name = pending.name;
+        let func_name = if pending.name.starts_with('\\') && !pending.name.contains("::") {
+            pending.name[1..].to_string()
+        } else {
+            pending.name
+        };
         let args = pending.args;
         let this_source = pending.this_source;
 
         // Handle no-op constructor (NEW without __construct)
         if func_name == "__new_noop__" {
+            // For Fiber objects, save the constructor args (callback name)
+            if !args.is_empty() {
+                // Check if the result of the preceding NEW is a Fiber
+                if let Some(obj_val) = {
+                    let frame = self.call_stack.last().unwrap();
+                    if op.result_type != OperandType::Unused {
+                        let slot = op.result.val as usize;
+                        match op.result_type {
+                            OperandType::TmpVar | OperandType::Var => frame.temps.get(slot).cloned(),
+                            OperandType::Cv => frame.cvs.get(slot).cloned(),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                } {
+                    if let Value::Object(ref o) = obj_val {
+                        if o.internal == crate::value::InternalState::Fiber {
+                            let callback_name = args[0].to_php_string();
+                            if let Some(fiber_state) = self.fibers.get_mut(&o.object_id) {
+                                fiber_state.callback_name = callback_name;
+                            }
+                        }
+                    }
+                }
+            }
             return Ok(DispatchSignal::Next);
         }
 
@@ -3273,7 +3504,16 @@ impl Vm {
             }
             "class_exists" => {
                 let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(self.classes.contains_key(&name))))
+                let autoload = args.get(1).map(|v| v.to_bool()).unwrap_or(true);
+                let exists = if self.classes.contains_key(&name) {
+                    true
+                } else if autoload {
+                    self.try_autoload_class(&name);
+                    self.classes.contains_key(&name)
+                } else {
+                    false
+                };
+                Ok(Some(Value::Bool(exists)))
             }
             "method_exists" => {
                 let obj_or_class = args.first().cloned().unwrap_or(Value::Null);
@@ -7949,11 +8189,50 @@ impl Vm {
 
             // === spl extension ===
             "spl_autoload_register" => {
-                // Stub: ignore
+                // Register an autoloader callback
+                let callback = args.first().cloned().unwrap_or(Value::Null);
+                let _throw = args.get(1).map(|v| v.to_bool()).unwrap_or(true);
+                let prepend = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
+
+                let (func_name, this_obj) = match &callback {
+                    Value::String(s) => (s.clone(), None),
+                    Value::Array(arr) => {
+                        // [$object, 'method'] or ['ClassName', 'method'] style
+                        let class_part = arr.get_int(0).unwrap_or(&Value::Null).clone();
+                        let method_part = arr.get_int(1).unwrap_or(&Value::Null).to_php_string();
+                        let (class_name, this_val) = match &class_part {
+                            Value::Object(o) => (o.class_name.clone(), Some(class_part.clone())),
+                            Value::String(s) => (s.clone(), None),
+                            _ => ("unknown".to_string(), None),
+                        };
+                        (format!("{}::{}", class_name, method_part), this_val)
+                    }
+                    Value::Null => ("spl_autoload".to_string(), None),
+                    _ => (callback.to_php_string(), None),
+                };
+
+                if !self.autoload_callbacks.iter().any(|(n, _)| n == &func_name) {
+                    let entry = (func_name, this_obj);
+                    if prepend {
+                        self.autoload_callbacks.insert(0, entry);
+                    } else {
+                        self.autoload_callbacks.push(entry);
+                    }
+                }
                 Ok(Some(Value::Bool(true)))
             }
-            "spl_autoload_unregister" => Ok(Some(Value::Bool(true))),
-            "spl_autoload_functions" => Ok(Some(Value::Array(PhpArray::new()))),
+            "spl_autoload_unregister" => {
+                let callback = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                self.autoload_callbacks.retain(|(n, _)| n != &callback);
+                Ok(Some(Value::Bool(true)))
+            }
+            "spl_autoload_functions" => {
+                let mut arr = PhpArray::new();
+                for (name, _) in &self.autoload_callbacks {
+                    arr.push(Value::String(name.clone()));
+                }
+                Ok(Some(Value::Array(arr)))
+            }
             "spl_object_id" => {
                 // Return a unique identifier
                 Ok(Some(Value::Long(0)))
