@@ -73,4 +73,5 @@ jobs:
             -p php-rs-types -p php-rs-lexer -p php-rs-parser \
             -p php-rs-compiler -p php-rs-vm -p php-rs-gc
         env:
-          ASAN_OPTIONS: "detect_leaks=0"
+          ASAN_OPTIONS: "detect_leaks=1"
+          LSAN_OPTIONS: "suppressions=${{ github.workspace }}/lsan_suppressions.txt"
