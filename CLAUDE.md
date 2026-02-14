@@ -167,19 +167,6 @@ When implementing a feature, find relevant `.phpt` files in `php-src/tests/` and
 - Use `#[inline]` on opcode handlers and type-check fast paths
 - Benchmark against PHP-src regularly: `echo` loops, array operations, function call overhead, object creation
 
-## Ralph Loop (Autonomous Mode)
-
-This project uses an autonomous loop (`ralph.sh`) that invokes Claude Code headless (`-p`) to work through `TODO.txt` one item at a time. When running inside Ralph:
-
-- You receive instructions from `.claude/ralph-prompt.md` — follow them exactly.
-- Your **last line of output** MUST be a status code: `RALPH_OK`, `RALPH_FAIL`, `RALPH_BLOCKED`, or `RALPH_DONE`.
-- Work on exactly ONE `[ ]` item per invocation. Do not batch.
-- Always run `cargo test`, `cargo fmt --all`, `cargo clippy --all-targets` before finishing.
-- Commit completed work: `git add -A && git commit -m "[Phase.Item] description"`.
-- Logs are saved to `.ralph-logs/`. If you see previous iteration failures there, learn from them.
-
-Run Ralph: `./ralph.sh` (or `./ralph.sh --max 10 --model opus --budget 8`)
-
 ## What NOT To Do
 
 - Do not implement deprecated PHP features (e.g., `mysql_*` functions, `each()`, short open tags logic unless `short_open_tag=On`)

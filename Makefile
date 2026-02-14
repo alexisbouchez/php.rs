@@ -2,7 +2,7 @@
 # Convenience targets for build, test, lint, and PHPT runs.
 # See CLAUDE.md for full project and cargo command reference.
 
-.PHONY: all build release install uninstall check test test-verbose test-phpt fmt lint clippy bench clean ralph help
+.PHONY: all build release install uninstall check test test-verbose test-phpt fmt lint clippy bench clean help
 
 # Default: build everything
 all: build
@@ -16,10 +16,12 @@ release:
 	cargo build -p php-rs-sapi-cli --release
 
 # Install to /usr/local/bin (or PREFIX=/custom/path)
+# Use: sudo make install  (if installing to /usr/local)
 PREFIX ?= /usr/local
 install: release
-	install -d $(PREFIX)/bin
-	install -m 755 target/release/php-rs $(PREFIX)/bin/php-rs
+	mkdir -p $(PREFIX)/bin
+	cp target/release/php-rs $(PREFIX)/bin/php-rs
+	chmod 755 $(PREFIX)/bin/php-rs
 
 # Uninstall
 uninstall:
@@ -59,10 +61,6 @@ bench:
 clean:
 	cargo clean
 
-# Run Ralph autonomous loop (see .claude/ralph-prompt.md)
-ralph:
-	./ralph.sh
-
 # Build a specific crate: make build-pkg PACKAGE=php-rs-vm
 build-pkg:
 	@if [ -z "$(PACKAGE)" ]; then echo "Usage: make build-pkg PACKAGE=crate-name"; exit 1; fi
@@ -88,7 +86,6 @@ help:
 	@echo "  lint, clippy   Run Clippy"
 	@echo "  bench          Benchmarks (optional: BENCH_PKG=php-rs-vm)"
 	@echo "  clean          Remove build artifacts"
-	@echo "  ralph          Run Ralph autonomous loop"
 	@echo "  build-pkg      Build one crate: make build-pkg PACKAGE=php-rs-vm"
 	@echo "  test-pkg       Test one crate: make test-pkg PACKAGE=php-rs-types [TEST=name]"
 	@echo "  help           Show this help"
