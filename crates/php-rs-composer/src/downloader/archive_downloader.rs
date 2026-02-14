@@ -28,17 +28,29 @@ impl ArchiveDownloader {
             std::fs::create_dir_all(cache_path.parent().unwrap())
                 .map_err(|e| format!("Failed to create cache dir: {}", e))?;
 
-            let response = reqwest::get(url)
+            let client = reqwest::Client::new();
+            let response = client
+                .get(url)
+                .header("User-Agent", "php-rs-composer/0.1.0")
+                .send()
                 .await
                 .map_err(|e| format!("Failed to download {}: {}", url, e))?;
+
+            if !response.status().is_success() {
+                return Err(format!(
+                    "HTTP {} when downloading {}",
+                    response.status(),
+                    url
+                ));
+            }
 
             let bytes = response
                 .bytes()
                 .await
                 .map_err(|e| format!("Failed to read response: {}", e))?;
 
-            // Verify checksum if provided
-            if let Some(expected) = expected_shasum {
+            // Verify checksum if provided (skip empty checksums)
+            if let Some(expected) = expected_shasum.filter(|s| !s.is_empty()) {
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(&bytes);

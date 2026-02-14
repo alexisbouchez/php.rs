@@ -818,14 +818,13 @@ fn main() {
             Ok(source) => execute_php(&source, &ini, "-", &["-".to_string()]),
             Err(code) => code,
         },
-        CliMode::Composer(args) => {
-            let result = php_rs_composer::cli::run(args);
-            if result.is_ok() {
-                0
-            } else {
+        CliMode::Composer(args) => match php_rs_composer::cli::run(args) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("{}", e);
                 1
             }
-        }
+        },
     };
 
     process::exit(exit_code);

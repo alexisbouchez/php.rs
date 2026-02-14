@@ -2,7 +2,7 @@
 # Convenience targets for build, test, lint, and PHPT runs.
 # See CLAUDE.md for full project and cargo command reference.
 
-.PHONY: all build check test test-verbose test-phpt fmt lint clippy bench clean ralph help
+.PHONY: all build release install uninstall check test test-verbose test-phpt fmt lint clippy bench clean ralph help
 
 # Default: build everything
 all: build
@@ -10,6 +10,20 @@ all: build
 # Build all crates
 build:
 	cargo build
+
+# Build optimized release binary
+release:
+	cargo build -p php-rs-sapi-cli --release
+
+# Install to /usr/local/bin (or PREFIX=/custom/path)
+PREFIX ?= /usr/local
+install: release
+	install -d $(PREFIX)/bin
+	install -m 755 target/release/php-rs $(PREFIX)/bin/php-rs
+
+# Uninstall
+uninstall:
+	rm -f $(PREFIX)/bin/php-rs
 
 # Check without building artifacts
 check:
@@ -62,7 +76,10 @@ test-pkg:
 # Show this help
 help:
 	@echo "php.rs Makefile targets:"
-	@echo "  all, build     Build all crates"
+	@echo "  all, build     Build all crates (debug)"
+	@echo "  release        Build optimized release binary"
+	@echo "  install        Install to /usr/local/bin (PREFIX=/custom/path)"
+	@echo "  uninstall      Remove installed binary"
 	@echo "  check          Check without building"
 	@echo "  test           Run all unit tests"
 	@echo "  test-verbose   Run tests with --nocapture"
