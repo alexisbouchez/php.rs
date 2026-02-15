@@ -21,6 +21,13 @@ pub enum Value {
     Array(PhpArray),
     Object(PhpObject),
 
+    /// A PHP resource (resource_id, resource_type).
+    Resource(i64, String),
+
+    /// A PHP reference — shared mutable cell (used for &$param and $a = &$b).
+    /// Multiple variables may hold clones of the same Rc, sharing one underlying Value.
+    Reference(Rc<RefCell<Value>>),
+
     /// Internal: foreach iterator state (not a PHP type).
     _Iterator {
         array: PhpArray,
@@ -33,6 +40,14 @@ pub enum Value {
         /// Whether the generator needs to be advanced before reading.
         /// False on the first fetch (already positioned at first yield from FE_RESET).
         needs_advance: bool,
+    },
+
+    /// Internal: object iterator state for foreach over Iterator/IteratorAggregate objects.
+    _ObjectIterator {
+        /// The iterator object (implements Iterator interface).
+        iterator: PhpObject,
+        /// Whether this is the first fetch (rewind already called, don't advance).
+        first: bool,
     },
 }
 
@@ -47,9 +62,28 @@ impl Value {
     // Type coercion (PHP semantics)
     // =========================================================================
 
+    /// Dereference: if this is a Reference, return a clone of the inner value.
+    /// Otherwise, return a clone of self.
+    pub fn deref_value(&self) -> Value {
+        match self {
+            Value::Reference(rc) => {
+                let inner = rc.borrow();
+                // Recursive deref in case of nested references
+                inner.deref_value()
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Check if this value is a Reference.
+    pub fn is_reference(&self) -> bool {
+        matches!(self, Value::Reference(_))
+    }
+
     /// Convert to PHP integer (matching PHP's type juggling).
     pub fn to_long(&self) -> i64 {
         match self {
+            Value::Reference(rc) => rc.borrow().to_long(),
             Value::Null => 0,
             Value::Bool(false) => 0,
             Value::Bool(true) => 1,
@@ -74,13 +108,15 @@ impl Value {
                 }
             }
             Value::Object(_) => 1,
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => 0,
+            Value::Resource(id, _) => *id,
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => 0,
         }
     }
 
     /// Convert to PHP float.
     pub fn to_double(&self) -> f64 {
         match self {
+            Value::Reference(rc) => rc.borrow().to_double(),
             Value::Null => 0.0,
             Value::Bool(false) => 0.0,
             Value::Bool(true) => 1.0,
@@ -95,13 +131,15 @@ impl Value {
                 }
             }
             Value::Object(_) => 1.0,
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => 0.0,
+            Value::Resource(id, _) => *id as f64,
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => 0.0,
         }
     }
 
     /// Convert to PHP boolean.
     pub fn to_bool(&self) -> bool {
         match self {
+            Value::Reference(rc) => rc.borrow().to_bool(),
             Value::Null => false,
             Value::Bool(b) => *b,
             Value::Long(n) => *n != 0,
@@ -109,13 +147,15 @@ impl Value {
             Value::String(s) => !s.is_empty() && s != "0",
             Value::Array(a) => !a.is_empty(),
             Value::Object(_) => true,
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => true,
+            Value::Resource(_, _) => true,
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => true,
         }
     }
 
     /// Convert to PHP string.
     pub fn to_php_string(&self) -> String {
         match self {
+            Value::Reference(rc) => rc.borrow().to_php_string(),
             Value::Null => String::new(),
             Value::Bool(true) => "1".to_string(),
             Value::Bool(false) => String::new(),
@@ -148,13 +188,28 @@ impl Value {
                 // For now, return class name as placeholder
                 format!("{} Object", o.class_name())
             }
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => String::new(),
+            Value::Resource(id, _) => format!("Resource id #{}", id),
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => String::new(),
+        }
+    }
+
+    /// Extract resource ID: returns the ID for Resource values,
+    /// falls back to to_long() for Long (backward compat).
+    pub fn resource_id(&self) -> i64 {
+        match self {
+            Value::Reference(rc) => rc.borrow().resource_id(),
+            Value::Resource(id, _) => *id,
+            _ => self.to_long(),
         }
     }
 
     /// Check if the value is null.
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        match self {
+            Value::Reference(rc) => rc.borrow().is_null(),
+            Value::Null => true,
+            _ => false,
+        }
     }
 
     /// Check if the value is "truthy" in PHP.
@@ -168,6 +223,13 @@ impl Value {
 
     /// Loose equality (==) using PHP type juggling rules.
     pub fn loose_eq(&self, other: &Value) -> bool {
+        // Auto-deref references
+        if let Value::Reference(rc) = self {
+            return rc.borrow().loose_eq(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.loose_eq(&rc.borrow());
+        }
         match (self, other) {
             // Same types
             (Value::Null, Value::Null) => true,
@@ -218,18 +280,34 @@ impl Value {
 
     /// Strict equality (===).
     pub fn strict_eq(&self, other: &Value) -> bool {
+        // Auto-deref references
+        if let Value::Reference(rc) = self {
+            return rc.borrow().strict_eq(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.strict_eq(&rc.borrow());
+        }
         match (self, other) {
             (Value::Null, Value::Null) => true,
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Long(a), Value::Long(b)) => a == b,
             (Value::Double(a), Value::Double(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
+            (Value::Resource(a, _), Value::Resource(b, _)) => a == b,
+            (Value::Object(a), Value::Object(b)) => a.is_same_instance(b),
+            (Value::Array(_), Value::Array(_)) => {
+                // PHP strict equality for arrays: same keys, same values (===), same order
+                // For now, compare by converting to string (basic implementation)
+                false
+            }
             _ => false,
         }
     }
 
     /// PHP spaceship operator (<=>).
     pub fn spaceship(&self, other: &Value) -> i64 {
+        if let Value::Reference(rc) = self { return rc.borrow().spaceship(other); }
+        if let Value::Reference(rc) = other { return self.spaceship(&rc.borrow()); }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => {
                 if a < b {
@@ -256,6 +334,8 @@ impl Value {
 
     /// PHP less-than comparison.
     pub fn is_smaller(&self, other: &Value) -> bool {
+        if let Value::Reference(rc) = self { return rc.borrow().is_smaller(other); }
+        if let Value::Reference(rc) = other { return self.is_smaller(&rc.borrow()); }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => a < b,
             (Value::Double(a), Value::Double(b)) => a < b,
@@ -270,6 +350,8 @@ impl Value {
     // =========================================================================
 
     pub fn add(&self, other: &Value) -> Value {
+        if let Value::Reference(rc) = self { return rc.borrow().add(other); }
+        if let Value::Reference(rc) = other { return self.add(&rc.borrow()); }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => match a.checked_add(*b) {
                 Some(r) => Value::Long(r),
@@ -288,6 +370,8 @@ impl Value {
     }
 
     pub fn sub(&self, other: &Value) -> Value {
+        if let Value::Reference(rc) = self { return rc.borrow().sub(other); }
+        if let Value::Reference(rc) = other { return self.sub(&rc.borrow()); }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => match a.checked_sub(*b) {
                 Some(r) => Value::Long(r),
@@ -305,6 +389,8 @@ impl Value {
     }
 
     pub fn mul(&self, other: &Value) -> Value {
+        if let Value::Reference(rc) = self { return rc.borrow().mul(other); }
+        if let Value::Reference(rc) = other { return self.mul(&rc.borrow()); }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => match a.checked_mul(*b) {
                 Some(r) => Value::Long(r),
@@ -322,6 +408,8 @@ impl Value {
     }
 
     pub fn div(&self, other: &Value) -> Value {
+        if let Value::Reference(rc) = self { return rc.borrow().div(other); }
+        if let Value::Reference(rc) = other { return self.div(&rc.borrow()); }
         let b_val = match other {
             Value::Long(0) => return Value::Bool(false), // Division by zero
             Value::Double(f) if *f == 0.0 => return Value::Bool(false),
@@ -361,6 +449,8 @@ impl Value {
     }
 
     pub fn pow(&self, other: &Value) -> Value {
+        if let Value::Reference(rc) = self { return rc.borrow().pow(other); }
+        if let Value::Reference(rc) = other { return self.pow(&rc.borrow()); }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) if *b >= 0 => match a.checked_pow(*b as u32) {
                 Some(r) => Value::Long(r),
@@ -414,6 +504,7 @@ impl Value {
 
     /// Increment (++$a).
     pub fn increment(&self) -> Value {
+        if let Value::Reference(rc) = self { return rc.borrow().increment(); }
         match self {
             Value::Long(n) => match n.checked_add(1) {
                 Some(r) => Value::Long(r),
@@ -442,6 +533,7 @@ impl Value {
 
     /// Decrement (--$a).
     pub fn decrement(&self) -> Value {
+        if let Value::Reference(rc) = self { return rc.borrow().decrement(); }
         match self {
             Value::Long(n) => match n.checked_sub(1) {
                 Some(r) => Value::Long(r),
@@ -466,6 +558,7 @@ impl Value {
 
     /// Cast to a specific PHP type.
     pub fn cast(&self, type_code: u32) -> Value {
+        if let Value::Reference(rc) = self { return rc.borrow().cast(type_code); }
         match type_code {
             4 => Value::Long(self.to_long()),         // IS_LONG
             5 => Value::Double(self.to_double()),     // IS_DOUBLE
@@ -521,6 +614,9 @@ impl Value {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Value::Reference(rc) = self {
+            return write!(f, "{}", rc.borrow().to_php_string());
+        }
         write!(f, "{}", self.to_php_string())
     }
 }
@@ -679,6 +775,11 @@ impl PhpObject {
         }
     }
 
+    /// Check if two PhpObjects are the same instance (same Rc pointer).
+    pub fn is_same_instance(&self, other: &PhpObject) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn class_name(&self) -> String {
         self.inner.borrow().class_name.clone()
     }
@@ -747,6 +848,22 @@ impl PhpArray {
         Self {
             entries: Vec::new(),
             next_int_key: 0,
+        }
+    }
+
+    /// Build a PhpArray from pre-built entries (preserves keys and order).
+    pub fn from_entries(entries: Vec<(ArrayKey, Value)>) -> Self {
+        let mut next_int_key = 0i64;
+        for (k, _) in &entries {
+            if let ArrayKey::Int(i) = k {
+                if *i >= next_int_key {
+                    next_int_key = *i + 1;
+                }
+            }
+        }
+        Self {
+            entries,
+            next_int_key,
         }
     }
 

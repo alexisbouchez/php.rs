@@ -41,6 +41,13 @@ pub struct Lexer<'src> {
     /// True when entering DoubleQuotes state and the string starts with $var;
     /// used to emit an empty EncapsedAndWhitespace prefix token exactly once.
     dq_needs_prefix: bool,
+    /// State stack for nested interpolation (e.g. `"hello{$name}"` pushes DoubleQuotes
+    /// when entering InScripting for the interpolation expression).
+    state_stack: Vec<State>,
+    /// Brace depth tracking for curly-brace interpolation inside strings.
+    /// When > 0, we're inside a `{$...}` expression and the matching `}` should
+    /// pop the state back to the enclosing string state.
+    curly_brace_depth: usize,
 }
 
 impl<'src> Lexer<'src> {
@@ -56,6 +63,8 @@ impl<'src> Lexer<'src> {
             heredoc_label: None,
             halt_compiler_state: 0,
             dq_needs_prefix: false,
+            state_stack: Vec::new(),
+            curly_brace_depth: 0,
         }
     }
 
@@ -71,6 +80,8 @@ impl<'src> Lexer<'src> {
             heredoc_label: None,
             halt_compiler_state: 0,
             dq_needs_prefix: false,
+            state_stack: Vec::new(),
+            curly_brace_depth: 0,
         }
     }
 
@@ -820,16 +831,29 @@ impl<'src> Lexer<'src> {
         // the start of an interpolated string.
         if self.dq_needs_prefix {
             self.dq_needs_prefix = false;
-            if self.peek() == Some('$') {
+            let needs_prefix = if self.peek() == Some('$') {
+                // String starts with $var
                 if self.pos + 1 < self.source.len() {
                     let next_ch = self.source.as_bytes()[self.pos + 1];
-                    if next_ch.is_ascii_alphabetic() || next_ch == b'_' {
-                        return Some((
-                            Token::EncapsedAndWhitespace,
-                            Span::new(start_pos, self.pos, start_line, start_column),
-                        ));
-                    }
+                    next_ch.is_ascii_alphabetic() || next_ch == b'_'
+                } else {
+                    false
                 }
+            } else if self.peek() == Some('{') {
+                // String starts with {$...} complex interpolation
+                if self.pos + 1 < self.source.len() {
+                    self.source.as_bytes()[self.pos + 1] == b'$'
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if needs_prefix {
+                return Some((
+                    Token::EncapsedAndWhitespace,
+                    Span::new(start_pos, self.pos, start_line, start_column),
+                ));
             }
         }
 
@@ -887,6 +911,36 @@ impl<'src> Lexer<'src> {
                         }
                     }
                     // Not a variable, just a regular $ character
+                    self.consume();
+                }
+                Some('{') => {
+                    // Check for {$ — complex variable interpolation
+                    if self.pos + 1 < self.source.len() {
+                        let next_ch = self.source.as_bytes()[self.pos + 1];
+                        if next_ch == b'$' {
+                            // Emit any text before the `{` as EncapsedAndWhitespace
+                            if self.pos > start_pos {
+                                return Some((
+                                    Token::EncapsedAndWhitespace,
+                                    Span::new(start_pos, self.pos, start_line, start_column),
+                                ));
+                            }
+                            // Emit CurlyOpen token (just the `{`)
+                            let brace_pos = self.pos;
+                            let brace_line = self.line;
+                            let brace_column = self.column;
+                            self.consume(); // consume `{`
+                            // Push current state and switch to InScripting
+                            self.state_stack.push(State::DoubleQuotes);
+                            self.curly_brace_depth = 1;
+                            self.state = State::InScripting;
+                            return Some((
+                                Token::CurlyOpen,
+                                Span::new(brace_pos, self.pos, brace_line, brace_column),
+                            ));
+                        }
+                    }
+                    // Regular `{` character
                     self.consume();
                 }
                 Some('\\') => {
@@ -1849,6 +1903,10 @@ impl<'src> Lexer<'src> {
             }
             '{' => {
                 self.consume();
+                // Track nested braces inside curly-brace interpolation
+                if self.curly_brace_depth > 0 {
+                    self.curly_brace_depth += 1;
+                }
                 Some((
                     Token::LBrace,
                     Span::new(start_pos, self.pos, start_line, start_column),
@@ -1856,6 +1914,15 @@ impl<'src> Lexer<'src> {
             }
             '}' => {
                 self.consume();
+                // If we're inside a curly-brace interpolation ({$...}), pop state
+                if self.curly_brace_depth > 0 {
+                    self.curly_brace_depth -= 1;
+                    if self.curly_brace_depth == 0 {
+                        if let Some(prev_state) = self.state_stack.pop() {
+                            self.state = prev_state;
+                        }
+                    }
+                }
                 Some((
                     Token::RBrace,
                     Span::new(start_pos, self.pos, start_line, start_column),

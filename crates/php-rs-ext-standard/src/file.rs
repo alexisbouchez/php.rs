@@ -231,9 +231,17 @@ pub struct PathInfo {
 
 // ── File handle operations ───────────────────────────────────────────────────
 
-/// A PHP file handle wrapping std::fs::File.
+/// Inner stream type for a PHP file handle.
+enum StreamInner {
+    File(std::fs::File),
+    Stdin,
+    Stdout,
+    Stderr,
+}
+
+/// A PHP file handle wrapping a file or stdio stream.
 pub struct FileHandle {
-    file: std::fs::File,
+    inner: StreamInner,
     eof: bool,
 }
 
@@ -264,13 +272,49 @@ impl FileHandle {
                 ))
             }
         };
-        Ok(Self { file, eof: false })
+        Ok(Self {
+            inner: StreamInner::File(file),
+            eof: false,
+        })
+    }
+
+    /// Create a handle for STDIN.
+    pub fn stdin() -> Self {
+        Self {
+            inner: StreamInner::Stdin,
+            eof: false,
+        }
+    }
+
+    /// Create a handle for STDOUT.
+    pub fn stdout() -> Self {
+        Self {
+            inner: StreamInner::Stdout,
+            eof: false,
+        }
+    }
+
+    /// Create a handle for STDERR.
+    pub fn stderr() -> Self {
+        Self {
+            inner: StreamInner::Stderr,
+            eof: false,
+        }
     }
 
     /// fread() — Binary-safe file read.
     pub fn read(&mut self, length: usize) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; length];
-        let n = self.file.read(&mut buf)?;
+        let n = match &mut self.inner {
+            StreamInner::File(f) => f.read(&mut buf)?,
+            StreamInner::Stdin => io::stdin().read(&mut buf)?,
+            StreamInner::Stdout | StreamInner::Stderr => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Cannot read from output stream",
+                ))
+            }
+        };
         buf.truncate(n);
         if n == 0 {
             self.eof = true;
@@ -280,19 +324,44 @@ impl FileHandle {
 
     /// fwrite() — Binary-safe file write.
     pub fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.file.write(data)
+        match &mut self.inner {
+            StreamInner::File(f) => f.write(data),
+            StreamInner::Stdout => io::stdout().write(data),
+            StreamInner::Stderr => io::stderr().write(data),
+            StreamInner::Stdin => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cannot write to input stream",
+            )),
+        }
     }
 
     /// fgets() — Gets line from file pointer.
     pub fn gets(&mut self) -> io::Result<Option<String>> {
-        let mut reader = io::BufReader::new(&self.file);
-        let mut line = String::new();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            self.eof = true;
-            return Ok(None);
+        match &mut self.inner {
+            StreamInner::File(f) => {
+                let mut reader = io::BufReader::new(f);
+                let mut line = String::new();
+                let n = reader.read_line(&mut line)?;
+                if n == 0 {
+                    self.eof = true;
+                    return Ok(None);
+                }
+                Ok(Some(line))
+            }
+            StreamInner::Stdin => {
+                let mut line = String::new();
+                let n = io::stdin().read_line(&mut line)?;
+                if n == 0 {
+                    self.eof = true;
+                    return Ok(None);
+                }
+                Ok(Some(line))
+            }
+            StreamInner::Stdout | StreamInner::Stderr => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cannot read from output stream",
+            )),
         }
-        Ok(Some(line))
     }
 
     /// feof() — Tests for end-of-file.
@@ -307,31 +376,66 @@ impl FileHandle {
             SeekWhence::Cur => io::SeekFrom::Current(offset),
             SeekWhence::End => io::SeekFrom::End(offset),
         };
-        self.file.seek(pos)?;
+        match &mut self.inner {
+            StreamInner::File(f) => {
+                f.seek(pos)?;
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Cannot seek on this stream",
+                ))
+            }
+        }
         self.eof = false;
         Ok(())
     }
 
     /// ftell() — Returns the current position of the file read/write pointer.
     pub fn tell(&mut self) -> io::Result<u64> {
-        self.file.stream_position()
+        match &mut self.inner {
+            StreamInner::File(f) => f.stream_position(),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cannot tell on this stream",
+            )),
+        }
     }
 
     /// rewind() — Rewinds the position of a file pointer.
     pub fn rewind(&mut self) -> io::Result<()> {
-        self.file.seek(io::SeekFrom::Start(0))?;
-        self.eof = false;
-        Ok(())
+        match &mut self.inner {
+            StreamInner::File(f) => {
+                f.seek(io::SeekFrom::Start(0))?;
+                self.eof = false;
+                Ok(())
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cannot rewind this stream",
+            )),
+        }
     }
 
     /// fflush() — Flushes the output to a file.
     pub fn flush(&mut self) -> io::Result<()> {
-        self.file.flush()
+        match &mut self.inner {
+            StreamInner::File(f) => f.flush(),
+            StreamInner::Stdout => io::stdout().flush(),
+            StreamInner::Stderr => io::stderr().flush(),
+            StreamInner::Stdin => Ok(()),
+        }
     }
 
     /// ftruncate() — Truncates a file to a given length.
     pub fn truncate(&mut self, size: u64) -> io::Result<()> {
-        self.file.set_len(size)
+        match &mut self.inner {
+            StreamInner::File(f) => f.set_len(size),
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Cannot truncate this stream",
+            )),
+        }
     }
 }
 

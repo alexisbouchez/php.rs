@@ -2,7 +2,9 @@
 //!
 //! Equivalent to php-src/Zend/zend_execute.c and zend_vm_def.h.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -74,6 +76,9 @@ struct PendingCall {
     /// By-reference argument sources: (arg_index, operand_type, operand_val)
     /// Used by builtins like preg_match to write back to the caller's variable.
     ref_args: Vec<(usize, OperandType, u32)>,
+    /// Property-level ref args: (arg_index, object_value, property_name)
+    /// For `foo($obj->prop)` with &$param — write back to object property on return.
+    ref_prop_args: Vec<(usize, Value, String)>,
 }
 
 /// An execution frame — one per function call / script execution.
@@ -113,6 +118,21 @@ struct Frame {
     /// When AssignDim modifies a temp that was fetched in W mode from a static property,
     /// the modified value must be written back to the class's static property storage.
     static_prop_write_back: Vec<(usize, String, String)>,
+    /// Pass-by-reference write-back: (callee_param_cv_idx, caller_operand_type, caller_slot)
+    /// On return, callee's CV[callee_param_cv_idx] is written back to the caller's slot.
+    ref_write_back: Vec<(usize, OperandType, u32)>,
+    /// Property-level ref write-back: (callee_param_cv_idx, object, property_name)
+    /// On return, callee's CV[callee_param_cv_idx] is written back to the object property.
+    ref_prop_write_back: Vec<(usize, PhpObject, String)>,
+    /// Tracks temp slots that came from FetchObjR: temp_idx → (object, property_name).
+    /// Used to set up ref_prop_write_back when a temp from a property fetch is passed by ref.
+    temp_prop_source: HashMap<usize, (Value, String)>,
+    /// Tracks temp slots that came from FetchDimR on a Reference:
+    /// temp_idx → (reference_rc, key). Used by AssignRef to create shared sub-references.
+    temp_dim_ref_source: HashMap<usize, (Rc<RefCell<Value>>, Value)>,
+    /// The name under which this function was invoked (e.g., "Carbon\\Carbon::__construct").
+    /// Used by trait methods to determine the using class for parent:: resolution.
+    called_as: Option<String>,
 }
 
 impl Frame {
@@ -133,6 +153,11 @@ impl Frame {
             is_constructor: false,
             static_class: None,
             static_prop_write_back: Vec::new(),
+            ref_write_back: Vec::new(),
+            ref_prop_write_back: Vec::new(),
+            temp_prop_source: HashMap::new(),
+            temp_dim_ref_source: HashMap::new(),
+            called_as: None,
         }
     }
 }
@@ -162,6 +187,8 @@ struct ClassDef {
     class_constants: HashMap<String, Value>,
     /// Static properties: prop_name → value.
     static_properties: HashMap<String, Value>,
+    /// Class attributes: Vec<(attr_name, Vec<(param_name, param_value)>)>.
+    attributes: Vec<(String, Vec<(Option<String>, String)>)>,
 }
 
 /// Configuration for VM execution limits, parsed from INI settings.
@@ -361,9 +388,18 @@ impl Vm {
                 c.insert("TRUE".to_string(), Value::Bool(true));
                 c.insert("FALSE".to_string(), Value::Bool(false));
                 c.insert("NULL".to_string(), Value::Null);
-                c.insert("STDIN".to_string(), Value::Long(0));
-                c.insert("STDOUT".to_string(), Value::Long(1));
-                c.insert("STDERR".to_string(), Value::Long(2));
+                c.insert(
+                    "STDIN".to_string(),
+                    Value::Resource(0, "stream".to_string()),
+                );
+                c.insert(
+                    "STDOUT".to_string(),
+                    Value::Resource(1, "stream".to_string()),
+                );
+                c.insert(
+                    "STDERR".to_string(),
+                    Value::Resource(2, "stream".to_string()),
+                );
                 c.insert("E_ERROR".to_string(), Value::Long(1));
                 c.insert("E_WARNING".to_string(), Value::Long(2));
                 c.insert("E_PARSE".to_string(), Value::Long(4));
@@ -414,7 +450,129 @@ impl Vm {
                 c.insert("FILTER_DEFAULT".to_string(), Value::Long(516));
                 c
             },
-            classes: HashMap::new(),
+            classes: {
+                let mut cls = HashMap::new();
+                // Register built-in SPL classes with their constants
+                let make_class = |name: &str,
+                                  parent: Option<&str>,
+                                  constants: Vec<(&str, i64)>|
+                 -> ClassDef {
+                    let mut cc = HashMap::new();
+                    for (k, v) in constants {
+                        cc.insert(k.to_string(), Value::Long(v));
+                    }
+                    ClassDef {
+                        _name: name.to_string(),
+                        parent: parent.map(|s| s.to_string()),
+                        interfaces: Vec::new(),
+                        traits: Vec::new(),
+                        is_abstract: false,
+                        is_interface: false,
+                        is_enum: false,
+                        methods: HashMap::new(),
+                        default_properties: HashMap::new(),
+                        class_constants: cc,
+                        static_properties: HashMap::new(),
+                        attributes: Vec::new(),
+                    }
+                };
+                cls.insert(
+                    "SplFileInfo".to_string(),
+                    make_class("SplFileInfo", None, vec![]),
+                );
+                cls.insert(
+                    "DirectoryIterator".to_string(),
+                    make_class(
+                        "DirectoryIterator",
+                        Some("SplFileInfo"),
+                        vec![],
+                    ),
+                );
+                cls.insert(
+                    "FilesystemIterator".to_string(),
+                    make_class(
+                        "FilesystemIterator",
+                        Some("DirectoryIterator"),
+                        vec![
+                            ("CURRENT_AS_PATHNAME", 32),
+                            ("CURRENT_AS_FILEINFO", 0),
+                            ("CURRENT_AS_SELF", 16),
+                            ("KEY_AS_PATHNAME", 0),
+                            ("KEY_AS_FILENAME", 256),
+                            ("FOLLOW_SYMLINKS", 512),
+                            ("NEW_CURRENT_AND_KEY", 256),
+                            ("SKIP_DOTS", 4096),
+                            ("UNIX_PATHS", 8192),
+                            ("OTHER_MODE_MASK", 0xF000),
+                        ],
+                    ),
+                );
+                cls.insert(
+                    "RecursiveDirectoryIterator".to_string(),
+                    make_class(
+                        "RecursiveDirectoryIterator",
+                        Some("FilesystemIterator"),
+                        vec![],
+                    ),
+                );
+                cls.insert(
+                    "RecursiveIteratorIterator".to_string(),
+                    make_class(
+                        "RecursiveIteratorIterator",
+                        None,
+                        vec![
+                            ("LEAVES_ONLY", 0),
+                            ("SELF_FIRST", 1),
+                            ("CHILD_FIRST", 2),
+                            ("CATCH_GET_CHILD", 16),
+                        ],
+                    ),
+                );
+                cls.insert(
+                    "FilterIterator".to_string(),
+                    make_class("FilterIterator", None, vec![]),
+                );
+                cls.insert(
+                    "RecursiveFilterIterator".to_string(),
+                    make_class(
+                        "RecursiveFilterIterator",
+                        Some("FilterIterator"),
+                        vec![],
+                    ),
+                );
+                cls.insert(
+                    "IteratorIterator".to_string(),
+                    make_class("IteratorIterator", None, vec![]),
+                );
+                cls.insert(
+                    "AppendIterator".to_string(),
+                    make_class("AppendIterator", None, vec![]),
+                );
+                cls.insert(
+                    "RegexIterator".to_string(),
+                    make_class(
+                        "RegexIterator",
+                        Some("FilterIterator"),
+                        vec![
+                            ("MATCH", 0),
+                            ("GET_MATCH", 1),
+                            ("ALL_MATCHES", 2),
+                            ("SPLIT", 3),
+                            ("REPLACE", 4),
+                            ("USE_KEY", 1),
+                        ],
+                    ),
+                );
+                cls.insert(
+                    "RecursiveRegexIterator".to_string(),
+                    make_class(
+                        "RecursiveRegexIterator",
+                        Some("RegexIterator"),
+                        vec![],
+                    ),
+                );
+                cls
+            },
             next_object_id: 1,
             current_exception: None,
             included_files: HashSet::new(),
@@ -427,9 +585,15 @@ impl Vm {
             next_closure_id: 0,
             closure_bindings: HashMap::new(),
             closure_scopes: HashMap::new(),
-            file_handles: HashMap::new(),
+            file_handles: {
+                let mut fh = HashMap::new();
+                fh.insert(0, php_rs_ext_standard::file::FileHandle::stdin());
+                fh.insert(1, php_rs_ext_standard::file::FileHandle::stdout());
+                fh.insert(2, php_rs_ext_standard::file::FileHandle::stderr());
+                fh
+            },
             curl_handles: HashMap::new(),
-            next_resource_id: 1,
+            next_resource_id: 3,
             config,
             execution_start: None,
             opcode_counter: 0,
@@ -579,7 +743,7 @@ impl Vm {
         let funcs: Vec<String> = self.shutdown_functions.drain(..).collect();
         for func_name in funcs {
             // Try built-in first
-            if let Ok(Some(_)) = self.call_builtin(&func_name, &[], &[]) {
+            if let Ok(Some(_)) = self.call_builtin(&func_name, &[], &[], &[]) {
                 continue;
             }
             // Try user-defined function
@@ -754,12 +918,35 @@ impl Vm {
                 }
                 DispatchSignal::Return => {
                     let frame = self.call_stack.pop().unwrap();
-                    let ret_val = frame.return_value;
+                    let ret_val = frame.return_value.clone();
                     self.last_return_value = ret_val.clone();
 
-                    // Note: this_write_back is no longer needed because PhpObject
-                    // uses Rc<RefCell<>> — mutations through $this are automatically
-                    // visible to all references.
+                    // Write back pass-by-reference parameters to caller's CVs
+                    if !frame.ref_write_back.is_empty() {
+                        if let Some(caller) = self.call_stack.last_mut() {
+                            for &(callee_cv_idx, caller_op_type, caller_slot) in
+                                &frame.ref_write_back
+                            {
+                                if callee_cv_idx < frame.cvs.len() {
+                                    let val = frame.cvs[callee_cv_idx].clone();
+                                    Self::write_to_slot(
+                                        caller,
+                                        caller_op_type,
+                                        caller_slot,
+                                        val,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Write back pass-by-reference parameters to object properties
+                    for (callee_cv_idx, obj, prop_name) in &frame.ref_prop_write_back {
+                        if *callee_cv_idx < frame.cvs.len() {
+                            let val = frame.cvs[*callee_cv_idx].clone();
+                            obj.set_property(prop_name.clone(), val);
+                        }
+                    }
 
                     // Store return value in caller's result slot if specified
                     if let Some((ret_type, ret_slot)) = frame.return_dest {
@@ -797,7 +984,13 @@ impl Vm {
             ZOpcode::Sl => self.op_binary(op, oa_idx, |a, b| a.shl(&b)),
             ZOpcode::Sr => self.op_binary(op, oa_idx, |a, b| a.shr(&b)),
             ZOpcode::Concat | ZOpcode::FastConcat => {
-                self.op_binary(op, oa_idx, |a, b| a.concat(&b))
+                let a = self.read_operand(op, 1, oa_idx)?;
+                let b = self.read_operand(op, 2, oa_idx)?;
+                let sa = self.value_to_string(&a)?;
+                let sb = self.value_to_string(&b)?;
+                let result = Value::String(format!("{}{}", sa, sb));
+                self.write_result(op, oa_idx, result)?;
+                Ok(DispatchSignal::Next)
             }
 
             // Bitwise
@@ -849,11 +1042,71 @@ impl Vm {
             }
             ZOpcode::AssignRef => {
                 // Reference assignment: $a = &$b
-                // For now, just copy the value (true reference semantics need Rc<RefCell>)
-                let val = self.read_operand(op, 2, oa_idx)?;
-                self.write_cv(op, oa_idx, val.clone())?;
+                // Creates a shared Reference so both variables point to the same storage.
+                let rhs_val = self.read_operand(op, 2, oa_idx)?;
+
+                // Check if the RHS temp came from indexing into a Reference
+                // (e.g., $array = &$array[$key] where $array is a Reference)
+                let dim_ref_info = if matches!(op.op2_type, OperandType::TmpVar | OperandType::Var) {
+                    let frame = self.call_stack.last().unwrap();
+                    frame.temp_dim_ref_source.get(&(op.op2.val as usize)).cloned()
+                } else {
+                    None
+                };
+
+                let ref_val = if let Some((parent_rc, dim_key)) = dim_ref_info {
+                    // RHS came from $ref[$key] — create or share a sub-reference
+                    // Check if the element in the parent array is already a Reference
+                    let parent_inner = parent_rc.borrow();
+                    let existing_ref = if let Value::Array(ref arr) = *parent_inner {
+                        arr.get(&dim_key).and_then(|v| {
+                            if let Value::Reference(rc) = v {
+                                Some(Value::Reference(rc.clone()))
+                            } else {
+                                None
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    drop(parent_inner);
+
+                    if let Some(existing) = existing_ref {
+                        // Element is already a Reference — share it
+                        existing
+                    } else {
+                        // Create a new sub-reference
+                        let element_val = rhs_val.deref_value();
+                        let sub_rc = Rc::new(RefCell::new(element_val));
+                        let sub_ref = Value::Reference(sub_rc);
+                        // Store the sub-reference back into the parent array
+                        let mut parent_inner = parent_rc.borrow_mut();
+                        if let Value::Array(ref mut arr) = *parent_inner {
+                            arr.set(&dim_key, sub_ref.clone());
+                        }
+                        sub_ref
+                    }
+                } else if let Value::Reference(_) = &rhs_val {
+                    // RHS is already a Reference, share the same Rc
+                    rhs_val.clone()
+                } else {
+                    // Create a new Reference wrapping the value
+                    let rc = Rc::new(RefCell::new(rhs_val));
+                    let ref_val = Value::Reference(rc);
+                    // Also store back in rhs source to make it a Reference
+                    if op.op2_type == OperandType::Cv {
+                        let frame = self.call_stack.last_mut().unwrap();
+                        let cv_idx = op.op2.val as usize;
+                        if cv_idx < frame.cvs.len() {
+                            frame.cvs[cv_idx] = ref_val.clone();
+                        }
+                    }
+                    ref_val
+                };
+
+                self.write_cv(op, oa_idx, ref_val.clone())?;
                 if op.result_type != OperandType::Unused {
-                    self.write_result(op, oa_idx, val)?;
+                    self.write_result(op, oa_idx, ref_val)?;
                 }
                 Ok(DispatchSignal::Next)
             }
@@ -897,6 +1150,41 @@ impl Vm {
                         return Ok(DispatchSignal::Next);
                     }
                 };
+                // Handle References: modify the inner value
+                if let Value::Reference(rc) = arr_val {
+                    let mut inner = rc.borrow_mut();
+                    // Handle ArrayAccess on referenced objects
+                    if let Value::Object(ref obj) = *inner {
+                        let class_name = obj.class_name();
+                        let k = key.clone().unwrap_or(Value::Null);
+                        let obj_clone = obj.clone();
+                        drop(inner);
+                        self.call_stack.last_mut().unwrap().ip += 1;
+                        let method_name = format!("{}::offsetSet", class_name);
+                        self.invoke_user_callback(
+                            &method_name,
+                            vec![Value::Object(obj_clone), k, val],
+                        )?;
+                        return Ok(DispatchSignal::Next);
+                    }
+                    if matches!(*inner, Value::Null) {
+                        *inner = Value::Array(PhpArray::new());
+                    }
+                    let assigned_val = val.clone();
+                    if let Value::Array(ref mut arr) = *inner {
+                        match key {
+                            Some(k) => arr.set(&k, val),
+                            None => arr.push(val),
+                        }
+                    }
+                    drop(inner);
+                    if op.result_type != OperandType::Unused {
+                        self.write_result(op, oa_idx, assigned_val)?;
+                    }
+                    // Skip OP_DATA
+                    self.call_stack.last_mut().unwrap().ip += 1;
+                    return Ok(DispatchSignal::Next);
+                }
                 // Handle objects implementing ArrayAccess
                 if let Value::Object(ref obj) = arr_val {
                     let class_name = obj.class_name();
@@ -979,6 +1267,11 @@ impl Vm {
                     } else {
                         lhs
                     }
+                } else if op.extended_value == 8 {
+                    // CONCAT — use value_to_string for __toString support
+                    let sa = self.value_to_string(&lhs)?;
+                    let sb = self.value_to_string(&rhs)?;
+                    Value::String(format!("{}{}", sa, sb))
                 } else {
                     apply_assign_op(op.extended_value, &lhs, &rhs)
                 };
@@ -1066,15 +1359,39 @@ impl Vm {
             }
             ZOpcode::FetchDimR | ZOpcode::FetchDimIs => {
                 // Array read: op1[$op2] → result
-                let arr = self.read_operand(op, 1, oa_idx)?;
+                let arr_raw = self.read_operand(op, 1, oa_idx)?;
                 let key = self.read_operand(op, 2, oa_idx)?;
+
+                // If arr is a Reference, track it for potential AssignRef use
+                if let Value::Reference(ref rc) = arr_raw {
+                    if matches!(op.result_type, OperandType::TmpVar | OperandType::Var) {
+                        let frame = self.call_stack.last_mut().unwrap();
+                        frame.temp_dim_ref_source.insert(
+                            op.result.val as usize,
+                            (rc.clone(), key.clone()),
+                        );
+                    }
+                }
+
+                // Auto-deref Reference for array access
+                let arr = arr_raw.deref_value();
                 let val = if let Value::Array(ref a) = arr {
                     a.get(&key).cloned().unwrap_or(Value::Null)
                 } else if let Value::String(ref s) = arr {
-                    // String character access
+                    // String character access (supports negative indices)
                     let idx = key.to_long();
-                    if idx >= 0 && (idx as usize) < s.len() {
-                        Value::String(s.chars().nth(idx as usize).unwrap().to_string())
+                    let actual_idx = if idx < 0 {
+                        (s.len() as i64 + idx) as usize
+                    } else {
+                        idx as usize
+                    };
+                    if actual_idx < s.len() {
+                        Value::String(
+                            s.as_bytes()
+                                .get(actual_idx)
+                                .map(|&b| (b as char).to_string())
+                                .unwrap_or_default(),
+                        )
                     } else {
                         Value::String(String::new())
                     }
@@ -1140,7 +1457,7 @@ impl Vm {
             }
             ZOpcode::IssetIsemptyDimObj => {
                 // isset($arr[$key]) / empty($arr[$key]) / isset($obj->prop) / isset($str[$idx])
-                let arr = self.read_operand(op, 1, oa_idx)?;
+                let arr = self.read_operand(op, 1, oa_idx)?.deref_value();
                 let key = self.read_operand(op, 2, oa_idx)?;
                 let val = match &arr {
                     Value::Array(ref a) => a.get(&key).cloned().unwrap_or(Value::Null),
@@ -1150,10 +1467,15 @@ impl Vm {
                         obj.get_property(&prop_name).unwrap_or(Value::Null)
                     }
                     Value::String(ref s) => {
-                        // isset($str[$idx]) — check if index is within bounds
-                        let idx = key.to_long() as usize;
-                        if idx < s.len() {
-                            Value::String(s[idx..idx + 1].to_string())
+                        // isset($str[$idx]) — check if index is within bounds (negative OK)
+                        let raw_idx = key.to_long();
+                        let actual_idx = if raw_idx < 0 {
+                            (s.len() as i64 + raw_idx) as usize
+                        } else {
+                            raw_idx as usize
+                        };
+                        if actual_idx < s.len() {
+                            Value::String(s[actual_idx..actual_idx + 1].to_string())
                         } else {
                             Value::Null
                         }
@@ -1295,6 +1617,67 @@ impl Vm {
                         self.write_result(op, oa_idx, iter)?;
                         Ok(DispatchSignal::Next)
                     }
+                    Value::Object(o) => {
+                        // Object implementing Iterator or IteratorAggregate
+                        let class_name = o.class_name().to_string();
+                        // Check if this is a builtin iterator (has __dir_entries or __inner_iterator)
+                        let is_builtin_iterator = o.get_property("__dir_entries").is_some()
+                            || o.get_property("__inner_iterator").is_some()
+                            || o.get_property("__array_data").is_some();
+                        // Check for getIterator (IteratorAggregate)
+                        let iter_obj =
+                            if self.resolve_method(&class_name, "getIterator").is_some() {
+                                match self.call_method_sync(&arr, "getIterator") {
+                                    Ok(Value::Object(it)) => it,
+                                    Ok(_) => {
+                                        return Ok(DispatchSignal::Jump(op.op2.val as usize));
+                                    }
+                                    Err(_) => {
+                                        return Ok(DispatchSignal::Jump(op.op2.val as usize));
+                                    }
+                                }
+                            } else if is_builtin_iterator
+                                || self.resolve_method(&class_name, "current").is_some()
+                            {
+                                // Direct Iterator (user-defined or builtin)
+                                o.clone()
+                            } else {
+                                // Not iterable — iterate over public properties as an array
+                                let mut arr_val = PhpArray::new();
+                                for (k, v) in o.properties() {
+                                    arr_val.set_string(k, v);
+                                }
+                                let iter = Value::_Iterator {
+                                    array: arr_val,
+                                    index: 0,
+                                };
+                                self.write_result(op, oa_idx, iter)?;
+                                return Ok(DispatchSignal::Next);
+                            };
+                        // Call rewind() on the iterator
+                        let iter_val = Value::Object(iter_obj.clone());
+                        let _ = self.call_method_sync(&iter_val, "rewind");
+                        let iter = Value::_ObjectIterator {
+                            iterator: iter_obj,
+                            first: true,
+                        };
+                        self.write_result(op, oa_idx, iter)?;
+                        Ok(DispatchSignal::Next)
+                    }
+                    Value::Reference(rc) => {
+                        // Dereference and handle
+                        let inner = rc.borrow().deref_value();
+                        if let Value::Array(a) = inner {
+                            let iter = Value::_Iterator {
+                                array: a,
+                                index: 0,
+                            };
+                            self.write_result(op, oa_idx, iter)?;
+                            Ok(DispatchSignal::Next)
+                        } else {
+                            Ok(DispatchSignal::Jump(op.op2.val as usize))
+                        }
+                    }
                     _ => {
                         // Jump to end if not iterable
                         Ok(DispatchSignal::Jump(op.op2.val as usize))
@@ -1411,6 +1794,44 @@ impl Vm {
 
                         Ok(DispatchSignal::Next)
                     }
+                } else if let Value::_ObjectIterator { ref iterator, first } = iter {
+                    let iter_val = Value::Object(iterator.clone());
+                    // Advance on subsequent fetches (not the first)
+                    if !first {
+                        let _ = self.call_method_sync(&iter_val, "next");
+                    }
+                    // Check valid()
+                    let valid = match self.call_method_sync(&iter_val, "valid") {
+                        Ok(v) => v.to_bool(),
+                        Err(_) => false,
+                    };
+                    if !valid {
+                        if key_dest.is_some() {
+                            self.call_stack.last_mut().unwrap().ip += 1;
+                        }
+                        return Ok(DispatchSignal::Jump(op.op2.val as usize));
+                    }
+                    // Get current value and key
+                    let current = self
+                        .call_method_sync(&iter_val, "current")
+                        .unwrap_or(Value::Null);
+                    let key_val = self
+                        .call_method_sync(&iter_val, "key")
+                        .unwrap_or(Value::Null);
+
+                    self.write_result(op, oa_idx, current)?;
+                    if let Some((key_type, key_slot)) = key_dest {
+                        let frame = self.call_stack.last_mut().unwrap();
+                        Self::write_to_slot(frame, key_type, key_slot, key_val);
+                        frame.ip += 1;
+                    }
+                    // Update iterator state: no longer first
+                    let frame = self.call_stack.last_mut().unwrap();
+                    frame.temps[iter_slot] = Value::_ObjectIterator {
+                        iterator: iterator.clone(),
+                        first: false,
+                    };
+                    Ok(DispatchSignal::Next)
                 } else {
                     if key_dest.is_some() {
                         self.call_stack.last_mut().unwrap().ip += 1;
@@ -1477,6 +1898,7 @@ impl Vm {
                     static_class: None,
                     forwarded_this: None,
                     ref_args: Vec::new(),
+                    ref_prop_args: Vec::new(),
                 });
                 Ok(DispatchSignal::Next)
             }
@@ -1500,6 +1922,7 @@ impl Vm {
                                     static_class: Some(class_name),
                                     forwarded_this: None,
                                     ref_args: Vec::new(),
+                                    ref_prop_args: Vec::new(),
                                 });
                                 return Ok(DispatchSignal::Next);
                             }
@@ -1514,6 +1937,7 @@ impl Vm {
                                     static_class: Some(class_name.clone()),
                                     forwarded_this: None,
                                     ref_args: Vec::new(),
+                                    ref_prop_args: Vec::new(),
                                 });
                                 return Ok(DispatchSignal::Next);
                             }
@@ -1531,6 +1955,7 @@ impl Vm {
                     static_class: None,
                     forwarded_this: None,
                     ref_args: Vec::new(),
+                    ref_prop_args: Vec::new(),
                 });
                 Ok(DispatchSignal::Next)
             }
@@ -1557,6 +1982,18 @@ impl Vm {
                         pending
                             .ref_args
                             .push((pending.args.len(), op.op1_type, op.op1.val));
+                    }
+                    // For Tmp/Var operands, check if this came from a property fetch
+                    // (needed for implicit pass-by-ref where compiler emits SendVar, not SendRef)
+                    if matches!(op.op1_type, OperandType::TmpVar | OperandType::Var) {
+                        let temp_idx = op.op1.val as usize;
+                        if let Some((obj_val, prop_name)) =
+                            frame.temp_prop_source.get(&temp_idx).cloned()
+                        {
+                            pending
+                                .ref_prop_args
+                                .push((pending.args.len(), obj_val, prop_name));
+                        }
                     }
                     pending.args.push(val);
                     pending.arg_names.push(arg_name);
@@ -1642,7 +2079,8 @@ impl Vm {
             // =====================================================================
             ZOpcode::Echo => {
                 let val = self.read_operand(op, 1, oa_idx)?;
-                self.output.push_str(&val.to_php_string());
+                let s = self.value_to_string(&val)?;
+                self.output.push_str(&s);
                 Ok(DispatchSignal::Next)
             }
 
@@ -1651,7 +2089,12 @@ impl Vm {
             // =====================================================================
             ZOpcode::Cast => {
                 let val = self.read_operand(op, 1, oa_idx)?;
-                let result = val.cast(op.extended_value);
+                let result = if op.extended_value == 6 {
+                    // IS_STRING — use value_to_string for __toString support
+                    Value::String(self.value_to_string(&val)?)
+                } else {
+                    val.cast(op.extended_value)
+                };
                 self.write_result(op, oa_idx, result)?;
                 Ok(DispatchSignal::Next)
             }
@@ -2167,20 +2610,11 @@ impl Vm {
                 name.to_string()
             }
             "self" => {
-                // self:: resolves to the class where the method is defined
-                // Walk up the call stack to find class context (skip closures)
+                // self:: resolves to the class where the method is lexically defined
+                // (compile-time binding). Use the op_array's function_name which contains
+                // the defining class. Do NOT use static_class or $this (those give runtime class).
                 for frame in self.call_stack.iter().rev() {
-                    if let Some(ref sc) = frame.static_class {
-                        return sc.clone();
-                    }
                     let oa = &self.op_arrays[frame.op_array_idx];
-                    if let Some(this_idx) = oa.vars.iter().position(|v| v == "this") {
-                        if this_idx < frame.cvs.len() {
-                            if let Value::Object(ref obj) = frame.cvs[this_idx] {
-                                return obj.class_name().to_string();
-                            }
-                        }
-                    }
                     if let Some(ref func_name) = oa.function_name {
                         if func_name.contains("::") && !func_name.contains("{closure}") {
                             if let Some(class) = func_name.split("::").next() {
@@ -2192,26 +2626,62 @@ impl Vm {
                 name.to_string()
             }
             "parent" => {
-                // Find the parent of the currently executing class
+                // Find the parent of the class where the code is lexically defined.
+                // Priority:
+                // 1. Use op_array's function_name to get the defining class
+                // 2. If defining class has no parent (e.g. it's a trait), use called_as
+                //    (the actual class::method name used to invoke the function)
+                // 3. Fall back to static_class or $this
                 if let Some(frame) = self.call_stack.last() {
-                    // Determine the current class: check static_class, then $this, then func_name
-                    let current_class = frame.static_class.clone().or_else(|| {
-                        let oa = &self.op_arrays[frame.op_array_idx];
-                        if let Some(this_idx) = oa.vars.iter().position(|v| v == "this") {
-                            if this_idx < frame.cvs.len() {
-                                if let Value::Object(ref obj) = frame.cvs[this_idx] {
-                                    return Some(obj.class_name().to_string());
+                    let oa = &self.op_arrays[frame.op_array_idx];
+                    let defining_class = oa
+                        .function_name
+                        .as_ref()
+                        .and_then(|f| {
+                            if f.contains("::") && !f.contains("{closure}") {
+                                f.split("::").next().map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        });
+
+                    // First try the defining class (works for normal methods)
+                    if let Some(ref dc) = defining_class {
+                        if let Some(class_def) = self.classes.get(dc) {
+                            if let Some(ref parent) = class_def.parent {
+                                return parent.clone();
+                            }
+                        }
+                    }
+
+                    // Defining class has no parent (trait or interface).
+                    // Use called_as to find the actual class using this method.
+                    if let Some(ref called) = frame.called_as {
+                        if let Some(sep) = called.find("::") {
+                            let called_class = &called[..sep];
+                            if let Some(class_def) = self.classes.get(called_class) {
+                                if let Some(ref parent) = class_def.parent {
+                                    return parent.clone();
                                 }
                             }
                         }
-                        oa.function_name
-                            .as_ref()
-                            .and_then(|f| f.split("::").next().map(|s| s.to_string()))
-                    });
-                    if let Some(class) = current_class {
-                        if let Some(class_def) = self.classes.get(&class) {
+                    }
+
+                    // Final fallback: try static_class, then $this
+                    if let Some(ref sc) = frame.static_class {
+                        if let Some(class_def) = self.classes.get(sc) {
                             if let Some(ref parent) = class_def.parent {
                                 return parent.clone();
+                            }
+                        }
+                    }
+                    if let Some(this_idx) = oa.vars.iter().position(|v| v == "this") {
+                        if let Some(Value::Object(ref obj)) = frame.cvs.get(this_idx) {
+                            let cls = obj.class_name();
+                            if let Some(class_def) = self.classes.get(&cls) {
+                                if let Some(ref parent) = class_def.parent {
+                                    return parent.clone();
+                                }
                             }
                         }
                     }
@@ -2273,13 +2743,34 @@ impl Vm {
     fn handle_declare_class(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let name = self.read_operand(op, 1, oa_idx)?.to_php_string();
 
-        // Parse parent/interfaces from op2: "parent\0iface1\0iface2"
+        // Parse parent/interfaces from op2: "parent\0iface1\0iface2\x01attr..."
         let class_info = if op.op2_type != OperandType::Unused {
             self.read_operand(op, 2, oa_idx)?.to_php_string()
         } else {
             String::new()
         };
-        let mut parts: Vec<&str> = class_info.split('\0').collect();
+        // Split off attributes (separated by \x01)
+        let mut attr_sections: Vec<&str> = class_info.split('\x01').collect();
+        let base_info = attr_sections.remove(0); // parent\0iface1\0iface2
+
+        // Parse class attributes
+        let mut class_attributes = Vec::new();
+        for attr_section in &attr_sections {
+            if attr_section.is_empty() { continue; }
+            let mut attr_parts: Vec<&str> = attr_section.split('\x02').collect();
+            let attr_name = attr_parts.remove(0).to_string();
+            let mut args = Vec::new();
+            for arg_str in attr_parts {
+                if let Some((k, v)) = arg_str.split_once('=') {
+                    args.push((Some(k.to_string()), v.to_string()));
+                } else {
+                    args.push((None, arg_str.to_string()));
+                }
+            }
+            class_attributes.push((attr_name, args));
+        }
+
+        let mut parts: Vec<&str> = base_info.split('\0').collect();
         let parent = if !parts.is_empty() && !parts[0].is_empty() {
             Some(parts.remove(0).to_string())
         } else {
@@ -2307,6 +2798,7 @@ impl Vm {
             default_properties: HashMap::new(),
             class_constants: HashMap::new(),
             static_properties: HashMap::new(),
+            attributes: class_attributes,
         };
 
         // Methods are stored in dynamic_func_defs with names like "ClassName::method_name"
@@ -2637,6 +3129,7 @@ impl Vm {
                 static_class: None,
                 forwarded_this: None,
                 ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
             });
             return Ok(());
         }
@@ -2658,12 +3151,13 @@ impl Vm {
                 static_class: None,
                 forwarded_this: None,
                 ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
             });
             return Ok(());
         }
 
-        // Special handling for ReflectionClass
-        if class_name == "ReflectionClass" {
+        // Special handling for ReflectionClass / ReflectionObject
+        if class_name == "ReflectionClass" || class_name == "ReflectionObject" {
             let obj = PhpObject::new("ReflectionClass".to_string());
             obj.set_object_id(self.next_object_id);
             self.next_object_id += 1;
@@ -2681,6 +3175,29 @@ impl Vm {
                 static_class: None,
                 forwarded_this: None,
                 ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
+            });
+            return Ok(());
+        }
+
+        // Special handling for ReflectionMethod
+        if class_name == "ReflectionMethod" {
+            let obj = PhpObject::new("ReflectionMethod".to_string());
+            obj.set_object_id(self.next_object_id);
+            self.next_object_id += 1;
+            let obj_val = Value::Object(obj);
+            self.write_result(op, oa_idx, obj_val.clone())?;
+
+            let frame = self.call_stack.last_mut().unwrap();
+            frame.call_stack_pending.push(PendingCall {
+                name: "ReflectionMethod::__construct".to_string(),
+                args: vec![obj_val],
+                arg_names: Vec::new(),
+                this_source: Some((op.result_type, op.result.val)),
+                static_class: None,
+                forwarded_this: None,
+                ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
             });
             return Ok(());
         }
@@ -2726,14 +3243,28 @@ impl Vm {
             Vec::new()
         };
 
-        // Set up constructor call if one exists
-        let has_constructor = self
-            .classes
-            .get(&class_name)
-            .is_some_and(|c| c.methods.contains_key("__construct"));
-        if has_constructor {
+        // Set up constructor call if one exists (walk parent chain for inherited constructors)
+        let ctor_class = {
+            let mut current = class_name.clone();
+            let mut found = None;
+            loop {
+                if let Some(class_def) = self.classes.get(&current) {
+                    if class_def.methods.contains_key("__construct") {
+                        found = Some(current);
+                        break;
+                    }
+                    if let Some(ref parent) = class_def.parent {
+                        current = parent.clone();
+                        continue;
+                    }
+                }
+                break;
+            }
+            found
+        };
+        if let Some(ctor_owner) = ctor_class {
             let frame = self.call_stack.last_mut().unwrap();
-            let ctor_name = format!("{}::__construct", class_name);
+            let ctor_name = format!("{}::__construct", ctor_owner);
             let mut ctor_args = vec![obj_val];
             ctor_args.extend(saved_args);
             // The constructor writes $this back to the NEW result slot
@@ -2742,22 +3273,25 @@ impl Vm {
                 args: ctor_args,
                 arg_names: Vec::new(),
                 this_source: Some((op.result_type, op.result.val)),
-                static_class: None,
+                static_class: Some(class_name.clone()),
                 forwarded_this: None,
                 ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
             });
         } else {
             // Push a dummy pending call that DO_FCALL will consume (for the constructor call
-            // that always follows NEW in compiled output)
+            // that always follows NEW in compiled output).
+            // Pass saved_args so __new_noop__ can initialize builtin classes (ArrayIterator, etc.)
             let frame = self.call_stack.last_mut().unwrap();
             frame.call_stack_pending.push(PendingCall {
                 name: "__new_noop__".to_string(),
-                args: Vec::new(),
+                args: saved_args,
                 arg_names: Vec::new(),
                 this_source: None,
                 static_class: None,
                 forwarded_this: None,
                 ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
             });
         }
 
@@ -2773,6 +3307,13 @@ impl Vm {
             Value::Object(ref o) => o.get_property(&prop_name).unwrap_or(Value::Null),
             _ => Value::Null,
         };
+        // Track the source object+property for this temp slot (for pass-by-reference write-back)
+        if matches!(op.result_type, OperandType::TmpVar | OperandType::Var) {
+            let frame = self.call_stack.last_mut().unwrap();
+            frame
+                .temp_prop_source
+                .insert(op.result.val as usize, (obj.clone(), prop_name.clone()));
+        }
         self.write_result(op, oa_idx, val)?;
         Ok(())
     }
@@ -2867,6 +3408,7 @@ impl Vm {
             static_class: Some(class_name),
             forwarded_this: None,
             ref_args: Vec::new(),
+            ref_prop_args: Vec::new(),
         });
         Ok(())
     }
@@ -2880,6 +3422,8 @@ impl Vm {
             _ => raw_val.to_php_string(),
         };
         let raw = raw.strip_prefix('\\').unwrap_or(&raw).to_string();
+        let is_parent_call = raw == "parent";
+        let is_static_call = raw == "static";
         let class_name = self.resolve_class_name(&raw);
         let method_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
 
@@ -2893,6 +3437,28 @@ impl Vm {
         // For parent::/self::/static:: calls in a non-static context,
         // forward the current $this so the called method has the correct context.
         let frame = self.call_stack.last_mut().unwrap();
+
+        // For parent:: and self:: calls, preserve the caller's static_class (late static binding).
+        // For static:: calls, it's already resolved via resolve_class_name.
+        // For explicit Class:: calls, use the resolved class name.
+        let effective_static_class = if is_parent_call {
+            // parent:: calls preserve late static binding from the current context
+            frame.static_class.clone().or_else(|| {
+                // Fall back to $this's class if no explicit static_class
+                let oa = &self.op_arrays[frame.op_array_idx];
+                if let Some(this_idx) = oa.vars.iter().position(|v| v == "this") {
+                    if let Some(Value::Object(ref obj)) = frame.cvs.get(this_idx) {
+                        return Some(obj.class_name().to_string());
+                    }
+                }
+                Some(class_name.clone())
+            })
+        } else if is_static_call {
+            Some(class_name.clone())
+        } else {
+            Some(class_name.clone())
+        };
+
         let this_val = {
             let this_cv_idx = self.op_arrays[frame.op_array_idx]
                 .vars
@@ -2914,9 +3480,10 @@ impl Vm {
             args: Vec::new(),
             arg_names: Vec::new(),
             this_source: None,
-            static_class: Some(class_name),
+            static_class: effective_static_class,
             forwarded_this: this_val,
             ref_args: Vec::new(),
+            ref_prop_args: Vec::new(),
         });
         Ok(())
     }
@@ -2937,12 +3504,13 @@ impl Vm {
             self.try_autoload_class(&class_name);
         }
 
-        let val = self
-            .classes
-            .get(&class_name)
-            .and_then(|c| c.class_constants.get(&const_name))
-            .cloned()
-            .unwrap_or(Value::Null);
+        // The magic "class" constant returns the class name itself
+        let val = if const_name == "class" {
+            Value::String(class_name)
+        } else {
+            self.resolve_class_constant(&class_name, &const_name)
+                .unwrap_or(Value::Null)
+        };
 
         self.write_result(op, oa_idx, val)?;
         Ok(())
@@ -3041,35 +3609,68 @@ impl Vm {
             _ => return Err(VmError::TypeError("Not an object".to_string())),
         };
         let method_key = format!("{}::{}", class_name, method_name);
-        let oa_idx = self
+        // Try user-defined method first (PHP-level overrides take priority)
+        let oa_idx_opt = self
             .functions
             .get(&method_key)
             .copied()
-            .ok_or_else(|| VmError::UndefinedFunction(method_key.clone()))?;
-
-        let saved_depth = self.call_stack.len();
-
-        let func_oa = &self.op_arrays[oa_idx];
-        let mut frame = Frame::new(func_oa);
-        frame.op_array_idx = oa_idx;
-
-        // Bind $this
-        let this_cv = func_oa.vars.iter().position(|v| v == "this").unwrap_or(0);
-        if this_cv < frame.cvs.len() {
-            frame.cvs[this_cv] = obj.clone();
+            .or_else(|| self.resolve_method(&class_name, method_name));
+        if let Some(oa_idx_val) = oa_idx_opt {
+            let saved_depth = self.call_stack.len();
+            let func_oa = &self.op_arrays[oa_idx_val];
+            let mut frame = Frame::new(func_oa);
+            frame.op_array_idx = oa_idx_val;
+            let this_cv = func_oa.vars.iter().position(|v| v == "this").unwrap_or(0);
+            if this_cv < frame.cvs.len() {
+                frame.cvs[this_cv] = obj.clone();
+            }
+            self.call_stack.push(frame);
+            self.dispatch_loop_until(saved_depth)?;
+            return Ok(self.last_return_value.clone());
         }
+        // Fall back to builtin method
+        if let Some(result) = self.call_builtin_method(&method_key, &[obj.clone()])? {
+            return Ok(result);
+        }
+        Err(VmError::UndefinedFunction(method_key))
+    }
 
-        self.call_stack.push(frame);
-        self.dispatch_loop_until(saved_depth)?;
-
-        Ok(self.last_return_value.clone())
+    /// Convert a Value to a PHP string, calling __toString() for objects.
+    fn value_to_string(&mut self, val: &Value) -> VmResult<String> {
+        match val {
+            Value::Object(obj) => {
+                let class_name = obj.class_name().to_string();
+                // Walk the class hierarchy looking for __toString()
+                let mut search_class = class_name.clone();
+                loop {
+                    let method_name = format!("{}::__toString", search_class);
+                    if self.functions.contains_key(&method_name) {
+                        let result = self.invoke_user_callback(&method_name, vec![val.clone()])?;
+                        return Ok(result.to_php_string());
+                    }
+                    // Try parent class
+                    if let Some(parent) = self.classes.get(&search_class).and_then(|c| c.parent.clone()) {
+                        search_class = parent;
+                    } else {
+                        break;
+                    }
+                }
+                // No __toString found — fallback
+                Ok(val.to_php_string())
+            }
+            Value::Reference(rc) => {
+                let inner = rc.borrow().clone();
+                self.value_to_string(&inner)
+            }
+            _ => Ok(val.to_php_string()),
+        }
     }
 
     /// Invoke a user-defined callback (function or closure) synchronously.
     /// Returns the callback's return value. Used by call_user_func, array_map, etc.
     fn invoke_user_callback(&mut self, func_name: &str, args: Vec<Value>) -> VmResult<Value> {
         // Try builtin first
-        if let Some(result) = self.call_builtin(func_name, &args, &[])? {
+        if let Some(result) = self.call_builtin(func_name, &args, &[], &[])? {
             return Ok(result);
         }
         // Look up user-defined function (or closure like {closure}#N)
@@ -3210,6 +3811,46 @@ impl Vm {
     }
 
     /// Handle INCLUDE_OR_EVAL — include/require/eval.
+    /// Check if a class is an exception class (extends Exception, Error, or Throwable)
+    fn is_exception_class(&self, class_name: &str) -> bool {
+        let short = class_name.rsplit('\\').next().unwrap_or(class_name);
+        // Known built-in exception/error base classes
+        if matches!(short,
+            "Exception" | "Error" | "Throwable"
+            | "RuntimeException" | "LogicException" | "InvalidArgumentException"
+            | "BadMethodCallException" | "BadFunctionCallException"
+            | "OutOfRangeException" | "OverflowException" | "UnderflowException"
+            | "LengthException" | "DomainException" | "RangeException"
+            | "UnexpectedValueException" | "TypeError" | "ValueError"
+            | "ArithmeticError" | "DivisionByZeroError" | "ParseError"
+        ) {
+            return true;
+        }
+        // Walk parent chain to check if it extends Exception or Error
+        let mut current = class_name.to_string();
+        for _ in 0..20 {
+            if let Some(class_def) = self.classes.get(&current) {
+                if let Some(ref parent) = class_def.parent {
+                    let parent_short = parent.rsplit('\\').next().unwrap_or(parent);
+                    if matches!(parent_short, "Exception" | "Error" | "Throwable"
+                        | "RuntimeException" | "LogicException" | "InvalidArgumentException"
+                        | "BadMethodCallException" | "BadFunctionCallException"
+                        | "OutOfRangeException" | "OverflowException" | "UnderflowException"
+                        | "LengthException" | "DomainException" | "RangeException"
+                        | "UnexpectedValueException" | "TypeError" | "ValueError"
+                        | "ArithmeticError" | "DivisionByZeroError" | "ParseError"
+                    ) {
+                        return true;
+                    }
+                    current = parent.clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        false
+    }
+
     fn handle_include_or_eval(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<DispatchSignal> {
         let operand = self.read_operand(op, 1, oa_idx)?;
         let mode = op.extended_value;
@@ -3315,6 +3956,7 @@ impl Vm {
                 static_class: None,
                 forwarded_this: None,
                 ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
             });
         let func_name = if pending.name.starts_with('\\') && !pending.name.contains("::") {
             pending.name[1..].to_string()
@@ -3327,6 +3969,7 @@ impl Vm {
         let pending_static_class = pending.static_class;
         let pending_forwarded_this = pending.forwarded_this;
         let ref_args = pending.ref_args;
+        let ref_prop_args = pending.ref_prop_args;
 
         // For method calls via InitMethodCall, extract $this (first arg) before named arg reordering
         // so it doesn't participate in the parameter position shuffling.
@@ -3435,9 +4078,65 @@ impl Vm {
                     }
                 }
 
-                // For Exception/Error classes, set message/code/previous from constructor args
+                // For SplFileInfo/directory iterator classes, store the filename path
                 let class = o.class_name();
-                let base = class.rsplit('\\').next().unwrap_or(&class);
+                let base_class = class.rsplit('\\').next().unwrap_or(&class);
+                if base_class == "SplFileInfo" {
+                    let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                    o.set_property("__spl_path".to_string(), Value::String(path));
+                }
+                if matches!(
+                    base_class,
+                    "RecursiveDirectoryIterator"
+                        | "FilesystemIterator"
+                        | "DirectoryIterator"
+                ) {
+                    let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+                    // Read directory entries
+                    let mut entries = PhpArray::new();
+                    if let Ok(read_dir) = std::fs::read_dir(&path) {
+                        for entry in read_dir.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let full = entry.path().to_string_lossy().to_string();
+                            let mut info = PhpArray::new();
+                            info.set_string("name".to_string(), Value::String(name));
+                            info.set_string("path".to_string(), Value::String(full));
+                            entries.push(Value::Array(info));
+                        }
+                    }
+                    o.set_property("__dir_path".to_string(), Value::String(path));
+                    o.set_property("__dir_entries".to_string(), Value::Array(entries));
+                    o.set_property("__dir_index".to_string(), Value::Long(0));
+                    o.set_property("__dir_sub_path".to_string(), Value::String(String::new()));
+                }
+
+                // For RecursiveIteratorIterator / IteratorIterator / FilterIterator
+                if matches!(
+                    base_class,
+                    "RecursiveIteratorIterator"
+                        | "IteratorIterator"
+                        | "FilterIterator"
+                        | "RecursiveFilterIterator"
+                ) {
+                    if let Some(inner) = args.first() {
+                        o.set_property("__inner_iterator".to_string(), inner.clone());
+                        // No pre-flattening — delegate to inner iterator at runtime
+                    }
+                }
+
+                // For ArrayIterator / ArrayObject
+                if matches!(base_class, "ArrayIterator" | "ArrayObject") {
+                    let data = args.first().cloned().unwrap_or(Value::Array(PhpArray::new()));
+                    if let Value::Array(a) = data {
+                        o.set_property("__array_data".to_string(), Value::Array(a));
+                    } else {
+                        o.set_property("__array_data".to_string(), Value::Array(PhpArray::new()));
+                    }
+                    o.set_property("__array_index".to_string(), Value::Long(0));
+                }
+
+                // For Exception/Error classes, set message/code/previous from constructor args
+                let base = base_class;
                 if base.contains("Exception") || base.contains("Error") || base == "Throwable" {
                     let msg = args
                         .first()
@@ -3453,13 +4152,18 @@ impl Vm {
             return Ok(DispatchSignal::Next);
         }
 
-        // Handle ReflectionClass constructor
-        if func_name == "ReflectionClass::__construct" {
-            // args[0] is $this (the ReflectionClass object), args[1] is the class name
+        // Handle ReflectionClass/ReflectionObject constructor
+        if func_name == "ReflectionClass::__construct" || func_name == "ReflectionObject::__construct" {
+            // args[0] is $this (the ReflectionClass/Object), args[1] is the class name or object
             if let Some(Value::Object(ref obj)) = args.first() {
                 if obj.internal() == crate::value::InternalState::ReflectionClass {
                     let obj_id = obj.object_id();
-                    let reflected_name = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                    // ReflectionObject takes an object, ReflectionClass takes a string
+                    let reflected_name = match args.get(1) {
+                        Some(Value::Object(ref o)) => o.class_name().to_string(),
+                        Some(v) => v.to_php_string(),
+                        None => String::new(),
+                    };
 
                     // Try autoloading the reflected class
                     if !self.classes.contains_key(&reflected_name) {
@@ -3480,6 +4184,47 @@ impl Vm {
                 }
             }
             // Don't write result — constructor doesn't return a value
+            return Ok(DispatchSignal::Next);
+        }
+
+        // Handle ReflectionMethod constructor
+        if func_name == "ReflectionMethod::__construct" {
+            // args[0] is $this (ReflectionMethod obj), args[1] is class/object, args[2] is method name
+            if let Some(Value::Object(ref obj)) = args.first() {
+                let class_name = match args.get(1) {
+                    Some(Value::Object(ref o)) => o.class_name().to_string(),
+                    Some(Value::String(s)) => s.clone(),
+                    Some(v) => v.to_php_string(),
+                    None => String::new(),
+                };
+                let method_name = match args.get(2) {
+                    Some(v) => v.to_php_string(),
+                    None => String::new(),
+                };
+
+                // Find the declaring class by looking up the op_array's function_name.
+                // When methods are inherited, the op_array still has the original class prefix.
+                let declaring_class = {
+                    let full_method = format!("{}::{}", class_name, method_name);
+                    if let Some(&oa_idx) = self.functions.get(&full_method) {
+                        if let Some(ref fname) = self.op_arrays.get(oa_idx).and_then(|oa| oa.function_name.as_ref()) {
+                            // function_name is like "OriginalClass::method"
+                            if let Some(class_part) = fname.rsplit_once("::").map(|(c, _)| c) {
+                                class_part.to_string()
+                            } else {
+                                class_name.clone()
+                            }
+                        } else {
+                            class_name.clone()
+                        }
+                    } else {
+                        class_name.clone()
+                    }
+                };
+
+                obj.set_property("class".to_string(), Value::String(declaring_class));
+                obj.set_property("name".to_string(), Value::String(method_name));
+            }
             return Ok(DispatchSignal::Next);
         }
 
@@ -3525,10 +4270,8 @@ impl Vm {
             }
 
             // Exception/Error constructors: set message, code, previous properties
-            if base_class.contains("Exception")
-                || base_class.contains("Error")
-                || base_class == "Throwable"
-            {
+            // Only match if the class actually extends Exception/Error (check parent chain)
+            if self.is_exception_class(class_part) {
                 if let Some(Value::Object(ref obj)) = args.first() {
                     let msg = args.get(1).cloned().unwrap_or(Value::String(String::new()));
                     let code = args.get(2).cloned().unwrap_or(Value::Long(0));
@@ -3557,6 +4300,7 @@ impl Vm {
                     static_class: None,
                     forwarded_this: None,
                     ref_args: Vec::new(),
+                    ref_prop_args: Vec::new(),
                 });
             }
             return Ok(DispatchSignal::Next);
@@ -3580,6 +4324,7 @@ impl Vm {
                     static_class: None,
                     forwarded_this: None,
                     ref_args: Vec::new(),
+                    ref_prop_args: Vec::new(),
                 });
             }
             return Ok(DispatchSignal::Next);
@@ -3594,7 +4339,7 @@ impl Vm {
 
         // For non-method calls, check builtins
         if !func_name.contains("::") {
-            if let Some(result) = self.call_builtin(simple_name, &args, &ref_args)? {
+            if let Some(result) = self.call_builtin(simple_name, &args, &ref_args, &ref_prop_args)? {
                 if op.result_type != OperandType::Unused {
                     self.write_result(op, caller_oa_idx, result)?;
                 }
@@ -3603,7 +4348,7 @@ impl Vm {
             // If the function has a namespace prefix, try short name as builtin fallback
             if func_name.contains('\\') {
                 let short = func_name.rsplit('\\').next().unwrap_or(&func_name);
-                if let Some(result) = self.call_builtin(short, &args, &ref_args)? {
+                if let Some(result) = self.call_builtin(short, &args, &ref_args, &ref_prop_args)? {
                     if op.result_type != OperandType::Unused {
                         self.write_result(op, caller_oa_idx, result)?;
                     }
@@ -3665,6 +4410,49 @@ impl Vm {
             }
             return Ok(DispatchSignal::Next);
         }
+        // Handle ReflectionAttribute::* calls
+        if let Some(method) = func_name.strip_prefix("ReflectionAttribute::") {
+            if let Some(Value::Object(ref attr_obj)) = args.first() {
+                if attr_obj.class_name() == "ReflectionAttribute" {
+                    let result = match method {
+                        "getName" => {
+                            attr_obj.get_property("name").unwrap_or(Value::String(String::new()))
+                        }
+                        "getArguments" => {
+                            attr_obj.get_property("arguments").unwrap_or(Value::Array(PhpArray::new()))
+                        }
+                        "newInstance" => {
+                            // Create an instance of the attribute class
+                            let attr_name = attr_obj.get_property("name")
+                                .map(|v| v.to_php_string()).unwrap_or_default();
+                            let attr_args = attr_obj.get_property("arguments");
+                            let instance = PhpObject::new(attr_name.clone());
+                            instance.set_object_id(self.next_object_id);
+                            self.next_object_id += 1;
+                            // Set properties from arguments
+                            if let Some(Value::Array(ref args_arr)) = attr_args {
+                                for (key, val) in args_arr.entries() {
+                                    match &key {
+                                        crate::value::ArrayKey::String(k) => {
+                                            instance.set_property(k.clone(), val.clone());
+                                        }
+                                        crate::value::ArrayKey::Int(i) => {
+                                            instance.set_property(i.to_string(), val.clone());
+                                        }
+                                    }
+                                }
+                            }
+                            Value::Object(instance)
+                        }
+                        _ => Value::Null,
+                    };
+                    if op.result_type != OperandType::Unused {
+                        self.write_result(op, caller_oa_idx, result)?;
+                    }
+                    return Ok(DispatchSignal::Next);
+                }
+            }
+        }
         if let Some(refl_result) = self.try_reflection_parameter_call(&func_name, &args)? {
             if op.result_type != OperandType::Unused {
                 self.write_result(op, caller_oa_idx, refl_result)?;
@@ -3700,12 +4488,24 @@ impl Vm {
             }
 
             // Advance caller's IP past DO_FCALL BEFORE pushing new frame
+            if self.call_stack.len() > 200 {
+                let stack: Vec<String> = self.call_stack.iter().rev().take(20)
+                    .map(|f| self.op_arrays.get(f.op_array_idx)
+                        .and_then(|oa| oa.function_name.as_deref())
+                        .unwrap_or("<main>").to_string())
+                    .collect();
+                return Err(VmError::FatalError(format!(
+                    "Maximum function nesting level of 200 reached, aborting! Stack (top 20): {}",
+                    stack.join(" -> ")
+                )));
+            }
             self.call_stack.last_mut().unwrap().ip += 1;
 
             let func_oa = &self.op_arrays[oa_idx];
             let mut new_frame = Frame::new(func_oa);
             new_frame.op_array_idx = oa_idx;
             new_frame.static_class = pending_static_class;
+            new_frame.called_as = Some(func_name.clone());
 
             // Bind $this if we have one (extracted from args[0] or forwarded_this earlier)
             if let Some(ref this_val) = this_arg {
@@ -3799,6 +4599,67 @@ impl Vm {
                 }
             }
 
+            // Set up pass-by-reference write-back
+            // Set up true reference semantics for pass-by-reference params.
+            // Create shared Value::Reference wrappers between caller and callee.
+            for &(arg_idx, caller_op_type, caller_slot) in &ref_args {
+                let effective_idx = if has_this_in_args && arg_idx > 0 {
+                    arg_idx - 1
+                } else {
+                    arg_idx
+                };
+                if effective_idx < func_oa.arg_info.len()
+                    && func_oa.arg_info[effective_idx].pass_by_reference
+                {
+                    let param_name = &func_oa.arg_info[effective_idx].name;
+                    if let Some(cv_idx) = func_oa.vars.iter().position(|v| v == param_name) {
+                        let current_val = new_frame.cvs[cv_idx].clone();
+                        // If already a Reference, share the same Rc (don't re-wrap)
+                        let ref_val = if let Value::Reference(_) = &current_val {
+                            current_val
+                        } else {
+                            // Create a new shared reference cell
+                            Value::Reference(Rc::new(RefCell::new(current_val)))
+                        };
+                        // Store in callee's CV
+                        new_frame.cvs[cv_idx] = ref_val.clone();
+                        // Store back in caller's slot
+                        if let Some(caller) = self.call_stack.last_mut() {
+                            Self::write_to_slot(caller, caller_op_type, caller_slot, ref_val);
+                        }
+                    }
+                }
+            }
+
+            // Set up true reference semantics for property-level pass-by-reference params.
+            for (arg_idx, obj_val, prop_name) in &ref_prop_args {
+                let effective_idx = if has_this_in_args && *arg_idx > 0 {
+                    arg_idx - 1
+                } else {
+                    *arg_idx
+                };
+                if effective_idx < func_oa.arg_info.len()
+                    && func_oa.arg_info[effective_idx].pass_by_reference
+                {
+                    let param_name = &func_oa.arg_info[effective_idx].name;
+                    if let Some(cv_idx) = func_oa.vars.iter().position(|v| v == param_name) {
+                        let current_val = new_frame.cvs[cv_idx].clone();
+                        // If already a Reference, share the same Rc (don't re-wrap)
+                        let ref_val = if let Value::Reference(_) = &current_val {
+                            current_val
+                        } else {
+                            Value::Reference(Rc::new(RefCell::new(current_val)))
+                        };
+                        // Store in callee's CV
+                        new_frame.cvs[cv_idx] = ref_val.clone();
+                        // Store back in caller's object property
+                        if let Value::Object(ref obj) = obj_val {
+                            obj.set_property(prop_name.clone(), ref_val);
+                        }
+                    }
+                }
+            }
+
             // Apply closure bindings (captured `use` variables)
             if let Some(bindings) = self.closure_bindings.get(&func_name) {
                 for (var_name, val) in bindings {
@@ -3821,16 +4682,10 @@ impl Vm {
             return Ok(DispatchSignal::CallPushed);
         }
 
-        // For method calls, try falling back to non-prefixed function
+        // For method calls, try class-specific method handlers first, then fall back
         if func_name.contains("::") {
-            if let Some(result) = self.call_builtin(simple_name, &args, &ref_args)? {
-                if op.result_type != OperandType::Unused {
-                    self.write_result(op, caller_oa_idx, result)?;
-                }
-                return Ok(DispatchSignal::Next);
-            }
-
-            // Handle built-in class methods (DateTime, DateTimeZone, etc.)
+            // Handle built-in class methods (SPL, DateTime, etc.) — must come before
+            // call_builtin(simple_name) to avoid e.g. current() matching the array function
             if let Some(result) = self.call_builtin_method(&func_name, &args)? {
                 if op.result_type != OperandType::Unused {
                     self.write_result(op, caller_oa_idx, result)?;
@@ -3840,6 +4695,14 @@ impl Vm {
 
             // Handle Exception/Error base methods (getMessage, getCode, etc.)
             if let Some(result) = Self::try_exception_method(&func_name, &args) {
+                if op.result_type != OperandType::Unused {
+                    self.write_result(op, caller_oa_idx, result)?;
+                }
+                return Ok(DispatchSignal::Next);
+            }
+
+            // Fall back to non-prefixed builtin function (e.g. namespace-qualified calls)
+            if let Some(result) = self.call_builtin(simple_name, &args, &ref_args, &ref_prop_args)? {
                 if op.result_type != OperandType::Unused {
                     self.write_result(op, caller_oa_idx, result)?;
                 }
@@ -5004,8 +5867,10 @@ impl Vm {
         if func_name.starts_with("ReflectionFunction::") {
             return self.try_reflection_function_method(func_name, args);
         }
-        // Match ReflectionClass::method
+        // Match ReflectionClass/ReflectionObject::method
         let method_name = if let Some(m) = func_name.strip_prefix("ReflectionClass::") {
+            m
+        } else if let Some(m) = func_name.strip_prefix("ReflectionObject::") {
             m
         } else {
             return Ok(None);
@@ -5085,8 +5950,34 @@ impl Vm {
             }
 
             "getAttributes" => {
-                // Return empty array — we don't support attributes yet
-                Ok(Some(Value::Array(PhpArray::new())))
+                // Return ReflectionAttribute objects for class attributes
+                let filter_name = args.get(1).map(|v| v.to_php_string());
+                let mut result = PhpArray::new();
+                if let Some(class_def) = self.classes.get(&reflected_name) {
+                    for (attr_name, attr_args) in &class_def.attributes {
+                        // Apply filter if specified
+                        if let Some(ref filter) = filter_name {
+                            if attr_name != filter {
+                                continue;
+                            }
+                        }
+                        let attr_obj = PhpObject::new("ReflectionAttribute".to_string());
+                        attr_obj.set_property("name".to_string(), Value::String(attr_name.clone()));
+                        // Store args as properties for newInstance()
+                        let mut args_arr = PhpArray::new();
+                        for (arg_name, arg_value) in attr_args {
+                            if let Some(name) = arg_name {
+                                let key = Value::String(name.clone());
+                                args_arr.set(&key, Value::String(arg_value.clone()));
+                            } else {
+                                args_arr.push(Value::String(arg_value.clone()));
+                            }
+                        }
+                        attr_obj.set_property("arguments".to_string(), Value::Array(args_arr));
+                        result.push(Value::Object(attr_obj));
+                    }
+                }
+                Ok(Some(Value::Array(result)))
             }
 
             "getParentClass" => {
@@ -5215,6 +6106,61 @@ impl Vm {
             }
 
             "getAttributes" => Ok(Some(Value::Array(PhpArray::new()))),
+
+            "getDeclaringClass" => {
+                let rc_obj = PhpObject::new("ReflectionClass".to_string());
+                rc_obj.set_property("name".to_string(), Value::String(class_name.clone()));
+                rc_obj.set_object_id(self.next_object_id);
+                self.next_object_id += 1;
+                rc_obj.set_internal(crate::value::InternalState::ReflectionClass);
+                let obj_id = rc_obj.object_id();
+                self.reflection_classes.insert(obj_id, class_name.clone());
+                Ok(Some(Value::Object(rc_obj)))
+            }
+
+            "isPublic" => {
+                // For now assume all methods are public
+                Ok(Some(Value::Bool(true)))
+            }
+
+            "isStatic" => {
+                Ok(Some(Value::Bool(false)))
+            }
+
+            "getNumberOfParameters" | "getNumberOfRequiredParameters" => {
+                let full_name = format!("{}::{}", class_name, method_n);
+                let oa_idx = self.functions.get(&full_name).copied()
+                    .or_else(|| self.resolve_method(&class_name, &method_n));
+                let count = if let Some(idx) = oa_idx {
+                    let info = &self.op_arrays[idx].arg_info;
+                    if method_name == "getNumberOfRequiredParameters" {
+                        info.iter().filter(|a| a.default.is_none() && !a.is_variadic).count()
+                    } else {
+                        info.len()
+                    }
+                } else { 0 };
+                Ok(Some(Value::Long(count as i64)))
+            }
+
+            "invoke" | "invokeArgs" => {
+                // invoke($object, ...$args) or invokeArgs($object, $args)
+                let full_name = format!("{}::{}", class_name, method_n);
+                let target_obj = args.get(1).cloned().unwrap_or(Value::Null);
+                let call_args = if method_name == "invokeArgs" {
+                    match args.get(2) {
+                        Some(Value::Array(a)) => {
+                            a.entries().iter().map(|(_, v)| v.clone()).collect()
+                        }
+                        _ => Vec::new(),
+                    }
+                } else {
+                    args.get(2..).map(|s| s.to_vec()).unwrap_or_default()
+                };
+                let mut full_args = vec![target_obj];
+                full_args.extend(call_args);
+                let result = self.invoke_user_callback(&full_name, full_args)?;
+                Ok(Some(result))
+            }
 
             _ => Ok(None),
         }
@@ -5474,11 +6420,789 @@ impl Vm {
         }
     }
 
+    /// Check if a class inherits from an SPL class (returns the SPL ancestor name if found).
+    fn find_spl_ancestor(&self, class_name: &str) -> Option<String> {
+        let spl_classes = [
+            "SplFileInfo",
+            "DirectoryIterator",
+            "FilesystemIterator",
+            "RecursiveDirectoryIterator",
+            "FilterIterator",
+            "RecursiveFilterIterator",
+            "RecursiveIteratorIterator",
+            "IteratorIterator",
+            "AppendIterator",
+            "SplFileObject",
+        ];
+        let base = class_name.rsplit('\\').next().unwrap_or(class_name);
+        if spl_classes.contains(&base) {
+            return Some(base.to_string());
+        }
+        let mut current = class_name.to_string();
+        for _ in 0..20 {
+            // depth limit
+            if let Some(class_def) = self.classes.get(&current) {
+                if let Some(ref parent) = class_def.parent {
+                    let parent_base = parent.rsplit('\\').next().unwrap_or(parent);
+                    if spl_classes.contains(&parent_base) {
+                        return Some(parent_base.to_string());
+                    }
+                    current = parent.clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        None
+    }
+
+    /// Check if a class is a directory iterator (DirectoryIterator, FilesystemIterator, or
+    /// RecursiveDirectoryIterator) — as opposed to plain SplFileInfo.
+    fn is_directory_iterator_class(&self, class_name: &str) -> bool {
+        let dir_classes = [
+            "DirectoryIterator",
+            "FilesystemIterator",
+            "RecursiveDirectoryIterator",
+        ];
+        let base = class_name.rsplit('\\').next().unwrap_or(class_name);
+        if dir_classes.contains(&base) {
+            return true;
+        }
+        // Walk the class hierarchy
+        let mut current = class_name.to_string();
+        for _ in 0..20 {
+            if let Some(class_def) = self.classes.get(&current) {
+                if let Some(ref parent) = class_def.parent {
+                    let parent_base = parent.rsplit('\\').next().unwrap_or(parent);
+                    if dir_classes.contains(&parent_base) {
+                        return true;
+                    }
+                    current = parent.clone();
+                    continue;
+                }
+            }
+            break;
+        }
+        false
+    }
+
+    /// Handle ArrayIterator / ArrayObject method calls.
+    fn call_array_iterator_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(ref o)) => o,
+            _ => return Ok(None),
+        };
+
+        match method {
+            "__construct" => {
+                let data = args.get(1).cloned().unwrap_or(Value::Array(PhpArray::new()));
+                if let Value::Array(a) = data {
+                    obj.set_property("__array_data".to_string(), Value::Array(a));
+                } else {
+                    obj.set_property("__array_data".to_string(), Value::Array(PhpArray::new()));
+                }
+                obj.set_property("__array_index".to_string(), Value::Long(0));
+                Ok(Some(Value::Null))
+            }
+            "rewind" => {
+                obj.set_property("__array_index".to_string(), Value::Long(0));
+                Ok(Some(Value::Null))
+            }
+            "valid" => {
+                let index = obj.get_property("__array_index").map(|v| v.to_long()).unwrap_or(0) as usize;
+                let len = match obj.get_property("__array_data") {
+                    Some(Value::Array(ref a)) => a.len(),
+                    _ => 0,
+                };
+                Ok(Some(Value::Bool(index < len)))
+            }
+            "current" => {
+                let index = obj.get_property("__array_index").map(|v| v.to_long()).unwrap_or(0) as usize;
+                if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
+                    if let Some((_, val)) = a.entry_at(index) {
+                        return Ok(Some(val.clone()));
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "key" => {
+                let index = obj.get_property("__array_index").map(|v| v.to_long()).unwrap_or(0) as usize;
+                if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
+                    if let Some((key, _)) = a.entry_at(index) {
+                        let key_val = match key {
+                            crate::value::ArrayKey::Int(i) => Value::Long(*i),
+                            crate::value::ArrayKey::String(s) => Value::String(s.clone()),
+                        };
+                        return Ok(Some(key_val));
+                    }
+                }
+                Ok(Some(Value::Null))
+            }
+            "next" => {
+                let index = obj.get_property("__array_index").map(|v| v.to_long()).unwrap_or(0);
+                obj.set_property("__array_index".to_string(), Value::Long(index + 1));
+                Ok(Some(Value::Null))
+            }
+            "count" => {
+                let len = match obj.get_property("__array_data") {
+                    Some(Value::Array(ref a)) => a.len(),
+                    _ => 0,
+                };
+                Ok(Some(Value::Long(len as i64)))
+            }
+            "offsetExists" => {
+                let key = args.get(1).cloned().unwrap_or(Value::Null);
+                if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
+                    Ok(Some(Value::Bool(a.get(&key).is_some())))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "offsetGet" => {
+                let key = args.get(1).cloned().unwrap_or(Value::Null);
+                if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
+                    Ok(Some(a.get(&key).cloned().unwrap_or(Value::Null)))
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "offsetSet" => {
+                let key = args.get(1).cloned().unwrap_or(Value::Null);
+                let value = args.get(2).cloned().unwrap_or(Value::Null);
+                if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
+                    let mut a = a.clone();
+                    if key == Value::Null {
+                        a.push(value);
+                    } else {
+                        a.set(&key, value);
+                    }
+                    obj.set_property("__array_data".to_string(), Value::Array(a));
+                }
+                Ok(Some(Value::Null))
+            }
+            "offsetUnset" => {
+                let key = args.get(1).cloned().unwrap_or(Value::Null);
+                if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
+                    let mut a = a.clone();
+                    a.unset(&key);
+                    obj.set_property("__array_data".to_string(), Value::Array(a));
+                }
+                Ok(Some(Value::Null))
+            }
+            "append" => {
+                let value = args.get(1).cloned().unwrap_or(Value::Null);
+                if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
+                    let mut a = a.clone();
+                    a.push(value);
+                    obj.set_property("__array_data".to_string(), Value::Array(a));
+                }
+                Ok(Some(Value::Null))
+            }
+            "getArrayCopy" => {
+                let data = obj.get_property("__array_data").unwrap_or(Value::Array(PhpArray::new()));
+                Ok(Some(data))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Handle FilterIterator / IteratorIterator / RecursiveIteratorIterator method calls.
+    /// These wrap an inner iterator and delegate to it.
+    fn call_wrapper_iterator_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(ref o)) => o,
+            _ => return Ok(None),
+        };
+
+        match method {
+            "__construct" => {
+                // Store inner iterator — delegate all iteration to it
+                if let Some(inner) = args.get(1) {
+                    obj.set_property("__inner_iterator".to_string(), inner.clone());
+                }
+                let _mode = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+                Ok(Some(Value::Null))
+            }
+            "getInnerIterator" => {
+                let inner = obj
+                    .get_property("__inner_iterator")
+                    .unwrap_or(Value::Null);
+                Ok(Some(inner))
+            }
+            "rewind" => {
+                let inner = obj
+                    .get_property("__inner_iterator")
+                    .unwrap_or(Value::Null);
+                if let Value::Object(_) = &inner {
+                    let _ = self.call_method_sync(&inner, "rewind");
+                }
+                // FilterIterator: skip to first accepted element
+                let this_val = Value::Object(obj.clone());
+                let has_accept = self
+                    .resolve_method(&obj.class_name(), "accept")
+                    .is_some();
+                if has_accept {
+                    for _ in 0..10000 {
+                        let inner = obj
+                            .get_property("__inner_iterator")
+                            .unwrap_or(Value::Null);
+                        let valid = if let Value::Object(_) = &inner {
+                            self.call_method_sync(&inner, "valid")
+                                .unwrap_or(Value::Bool(false))
+                                .to_bool()
+                        } else {
+                            false
+                        };
+                        if !valid {
+                            break;
+                        }
+                        let accepted = self
+                            .call_method_sync(&this_val, "accept")
+                            .unwrap_or(Value::Bool(false))
+                            .to_bool();
+                        if accepted {
+                            break;
+                        }
+                        if let Value::Object(_) = &inner {
+                            let _ = self.call_method_sync(&inner, "next");
+                        }
+                    }
+                }
+                Ok(Some(Value::Null))
+            }
+            "valid" => {
+                let inner = obj
+                    .get_property("__inner_iterator")
+                    .unwrap_or(Value::Null);
+                if let Value::Object(_) = &inner {
+                    match self.call_method_sync(&inner, "valid") {
+                        Ok(v) => Ok(Some(v)),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "next" => {
+                let inner = obj
+                    .get_property("__inner_iterator")
+                    .unwrap_or(Value::Null);
+                if let Value::Object(_) = &inner {
+                    let _ = self.call_method_sync(&inner, "next");
+                }
+                // FilterIterator: skip non-accepted elements
+                let this_val = Value::Object(obj.clone());
+                let has_accept = self
+                    .resolve_method(&obj.class_name(), "accept")
+                    .is_some();
+                if has_accept {
+                    for _ in 0..10000 {
+                        let inner = obj
+                            .get_property("__inner_iterator")
+                            .unwrap_or(Value::Null);
+                        let valid = if let Value::Object(_) = &inner {
+                            self.call_method_sync(&inner, "valid")
+                                .unwrap_or(Value::Bool(false))
+                                .to_bool()
+                        } else {
+                            false
+                        };
+                        if !valid {
+                            break;
+                        }
+                        let accepted = self
+                            .call_method_sync(&this_val, "accept")
+                            .unwrap_or(Value::Bool(false))
+                            .to_bool();
+                        if accepted {
+                            break;
+                        }
+                        if let Value::Object(_) = &inner {
+                            let _ = self.call_method_sync(&inner, "next");
+                        }
+                    }
+                }
+                Ok(Some(Value::Null))
+            }
+            "current" => {
+                let inner = obj
+                    .get_property("__inner_iterator")
+                    .unwrap_or(Value::Null);
+                if let Value::Object(_) = &inner {
+                    match self.call_method_sync(&inner, "current") {
+                        Ok(v) => Ok(Some(v)),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "key" => {
+                let inner = obj
+                    .get_property("__inner_iterator")
+                    .unwrap_or(Value::Null);
+                if let Value::Object(_) = &inner {
+                    match self.call_method_sync(&inner, "key") {
+                        Ok(v) => Ok(Some(v)),
+                        Err(_) => Ok(Some(Value::Null)),
+                    }
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "setMaxDepth" => {
+                let depth = args.get(1).map(|v| v.to_long()).unwrap_or(-1);
+                obj.set_property("__max_depth".to_string(), Value::Long(depth));
+                Ok(Some(Value::Null))
+            }
+            "getMaxDepth" => {
+                let depth = obj
+                    .get_property("__max_depth")
+                    .map(|v| v.to_long())
+                    .unwrap_or(-1);
+                Ok(Some(Value::Long(depth)))
+            }
+            "getDepth" => {
+                // For now, return 0 (single-level iteration)
+                // TODO: Track actual recursion depth when implementing true recursive traversal
+                Ok(Some(Value::Long(0)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Handle RecursiveDirectoryIterator / DirectoryIterator method calls.
+    fn call_dir_iterator_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(ref o)) => o,
+            _ => return Ok(None),
+        };
+
+        match method {
+            "__construct" => {
+                // Initialize SplFileInfo or directory iterator state
+                let path = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+
+                // Check if this is a directory iterator subclass or just SplFileInfo
+                let class_name = obj.class_name();
+                let is_dir_iterator = self.is_directory_iterator_class(&class_name);
+
+                if is_dir_iterator {
+                    // Directory iterator: read directory entries
+                    let mut entries = PhpArray::new();
+                    if let Ok(read_dir) = std::fs::read_dir(&path) {
+                        for entry in read_dir.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let full = entry.path().to_string_lossy().to_string();
+                            let mut info = PhpArray::new();
+                            info.set_string("name".to_string(), Value::String(name));
+                            info.set_string("path".to_string(), Value::String(full));
+                            entries.push(Value::Array(info));
+                        }
+                    }
+                    obj.set_property("__dir_path".to_string(), Value::String(path));
+                    obj.set_property("__dir_entries".to_string(), Value::Array(entries));
+                    obj.set_property("__dir_index".to_string(), Value::Long(0));
+                    obj.set_property("__dir_sub_path".to_string(), Value::String(String::new()));
+                } else {
+                    // Plain SplFileInfo: just store the path
+                    obj.set_property("__spl_path".to_string(), Value::String(path));
+                }
+                Ok(Some(Value::Null))
+            }
+            "rewind" => {
+                obj.set_property("__dir_index".to_string(), Value::Long(0));
+                Ok(Some(Value::Null))
+            }
+            "valid" => {
+                let index = obj
+                    .get_property("__dir_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
+                let entries = obj.get_property("__dir_entries").unwrap_or(Value::Null);
+                let len = if let Value::Array(ref a) = entries {
+                    a.len()
+                } else {
+                    0
+                };
+                Ok(Some(Value::Bool(index < len)))
+            }
+            "next" => {
+                let index = obj
+                    .get_property("__dir_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0);
+                obj.set_property("__dir_index".to_string(), Value::Long(index + 1));
+                Ok(Some(Value::Null))
+            }
+            "key" => {
+                let index = obj
+                    .get_property("__dir_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0);
+                Ok(Some(Value::Long(index)))
+            }
+            "current" => {
+                let index = obj
+                    .get_property("__dir_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
+                let entries = obj.get_property("__dir_entries").unwrap_or(Value::Null);
+                if let Value::Array(ref a) = entries {
+                    if let Some((_, entry)) = a.entry_at(index) {
+                        if let Value::Array(ref info) = entry {
+                            let full_path = info
+                                .get_string("path")
+                                .map(|v| v.to_php_string())
+                                .unwrap_or_default();
+                            // Return an SplFileInfo-like object
+                            let fi = PhpObject::new("SplFileInfo".to_string());
+                            fi.set_object_id(self.next_object_id);
+                            self.next_object_id += 1;
+                            fi.set_property(
+                                "__spl_path".to_string(),
+                                Value::String(full_path),
+                            );
+                            return Ok(Some(Value::Object(fi)));
+                        }
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "hasChildren" => {
+                let index = obj
+                    .get_property("__dir_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
+                let entries = obj.get_property("__dir_entries").unwrap_or(Value::Null);
+                if let Value::Array(ref a) = entries {
+                    if let Some((_, entry)) = a.entry_at(index) {
+                        if let Value::Array(ref info) = entry {
+                            let full_path = info
+                                .get_string("path")
+                                .map(|v| v.to_php_string())
+                                .unwrap_or_default();
+                            return Ok(Some(Value::Bool(
+                                std::path::Path::new(&full_path).is_dir(),
+                            )));
+                        }
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "getChildren" => {
+                let index = obj
+                    .get_property("__dir_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
+                let entries = obj.get_property("__dir_entries").unwrap_or(Value::Null);
+                if let Value::Array(ref a) = entries {
+                    if let Some((_, entry)) = a.entry_at(index) {
+                        if let Value::Array(ref info) = entry {
+                            let full_path = info
+                                .get_string("path")
+                                .map(|v| v.to_php_string())
+                                .unwrap_or_default();
+                            // Create a new RecursiveDirectoryIterator for the subdirectory
+                            let child_obj =
+                                PhpObject::new(obj.class_name().to_string());
+                            child_obj.set_object_id(self.next_object_id);
+                            self.next_object_id += 1;
+                            // Initialize child's entries
+                            let mut child_entries = PhpArray::new();
+                            if let Ok(read_dir) = std::fs::read_dir(&full_path) {
+                                for entry in read_dir.flatten() {
+                                    let name =
+                                        entry.file_name().to_string_lossy().to_string();
+                                    let full =
+                                        entry.path().to_string_lossy().to_string();
+                                    let mut ei = PhpArray::new();
+                                    ei.set_string(
+                                        "name".to_string(),
+                                        Value::String(name),
+                                    );
+                                    ei.set_string(
+                                        "path".to_string(),
+                                        Value::String(full),
+                                    );
+                                    child_entries.push(Value::Array(ei));
+                                }
+                            }
+                            child_obj.set_property(
+                                "__dir_path".to_string(),
+                                Value::String(full_path),
+                            );
+                            child_obj.set_property(
+                                "__dir_entries".to_string(),
+                                Value::Array(child_entries),
+                            );
+                            child_obj.set_property(
+                                "__dir_index".to_string(),
+                                Value::Long(0),
+                            );
+                            child_obj.set_property(
+                                "__dir_sub_path".to_string(),
+                                Value::String(String::new()),
+                            );
+                            return Ok(Some(Value::Object(child_obj)));
+                        }
+                    }
+                }
+                Ok(Some(Value::Bool(false)))
+            }
+            "getSubPath" => {
+                let sub = obj
+                    .get_property("__dir_sub_path")
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
+                Ok(Some(Value::String(sub)))
+            }
+            "getSubPathname" => {
+                let index = obj
+                    .get_property("__dir_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
+                let entries = obj.get_property("__dir_entries").unwrap_or(Value::Null);
+                let sub = obj
+                    .get_property("__dir_sub_path")
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
+                if let Value::Array(ref a) = entries {
+                    if let Some((_, entry)) = a.entry_at(index) {
+                        if let Value::Array(ref info) = entry {
+                            let name = info
+                                .get_string("name")
+                                .map(|v| v.to_php_string())
+                                .unwrap_or_default();
+                            if sub.is_empty() {
+                                return Ok(Some(Value::String(name)));
+                            } else {
+                                return Ok(Some(Value::String(format!("{}/{}", sub, name))));
+                            }
+                        }
+                    }
+                }
+                Ok(Some(Value::String(String::new())))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Handle SplFileInfo method calls.
+    fn call_spl_file_info_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let path = if let Some(Value::Object(ref obj)) = args.first() {
+            // First try __spl_path (set directly on SplFileInfo objects)
+            if let Some(p) = obj.get_property("__spl_path") {
+                p.to_php_string()
+            } else if let Some(entries) = obj.get_property("__dir_entries") {
+                // For iterator objects, use the current entry's path
+                let index = obj
+                    .get_property("__dir_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
+                if let Value::Array(ref a) = entries {
+                    if let Some((_, entry)) = a.entry_at(index) {
+                        if let Value::Array(ref info) = entry {
+                            info.get_string("path")
+                                .map(|v| v.to_php_string())
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            }
+        } else {
+            return Ok(None);
+        };
+        let p = std::path::Path::new(&path);
+        match method {
+            "isFile" => Ok(Some(Value::Bool(p.is_file()))),
+            "isDir" => Ok(Some(Value::Bool(p.is_dir()))),
+            "isLink" => Ok(Some(Value::Bool(p.is_symlink()))),
+            "isReadable" | "isWritable" => Ok(Some(Value::Bool(p.exists()))),
+            "getRealPath" => {
+                match std::fs::canonicalize(p) {
+                    Ok(real) => Ok(Some(Value::String(real.to_string_lossy().to_string()))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "getPathname" => Ok(Some(Value::String(path.clone()))),
+            "getFilename" => {
+                let fname = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                Ok(Some(Value::String(fname)))
+            }
+            "getBasename" => {
+                let fname = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let suffix = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                if !suffix.is_empty() && fname.ends_with(&suffix) {
+                    Ok(Some(Value::String(
+                        fname[..fname.len() - suffix.len()].to_string(),
+                    )))
+                } else {
+                    Ok(Some(Value::String(fname)))
+                }
+            }
+            "getPath" => {
+                let dir = p
+                    .parent()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                Ok(Some(Value::String(dir)))
+            }
+            "getExtension" => {
+                let ext = p
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                Ok(Some(Value::String(ext)))
+            }
+            "getSize" => match std::fs::metadata(p) {
+                Ok(m) => Ok(Some(Value::Long(m.len() as i64))),
+                Err(_) => Ok(Some(Value::Bool(false))),
+            },
+            "getMTime" | "getCTime" | "getATime" => match std::fs::metadata(p) {
+                Ok(m) => {
+                    let time = match method {
+                        "getMTime" => m.modified(),
+                        "getCTime" | "getATime" => m.modified(), // fallback to mtime
+                        _ => m.modified(),
+                    };
+                    match time {
+                        Ok(t) => {
+                            let secs = t
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64;
+                            Ok(Some(Value::Long(secs)))
+                        }
+                        Err(_) => Ok(Some(Value::Long(0))),
+                    }
+                }
+                Err(_) => Ok(Some(Value::Bool(false))),
+            },
+            "getType" => {
+                if p.is_file() {
+                    Ok(Some(Value::String("file".to_string())))
+                } else if p.is_dir() {
+                    Ok(Some(Value::String("dir".to_string())))
+                } else if p.is_symlink() {
+                    Ok(Some(Value::String("link".to_string())))
+                } else {
+                    Ok(Some(Value::String("unknown".to_string())))
+                }
+            }
+            "getContents" => match std::fs::read_to_string(p) {
+                Ok(s) => Ok(Some(Value::String(s))),
+                Err(e) => Err(VmError::FatalError(format!(
+                    "SplFileInfo::getContents(): Unable to read file: {}",
+                    e
+                ))),
+            },
+            "__toString" | "toString" => Ok(Some(Value::String(path.clone()))),
+            _ => Ok(None),
+        }
+    }
+
     fn call_builtin_method(&mut self, full_name: &str, args: &[Value]) -> VmResult<Option<Value>> {
         let sep = full_name.find("::").unwrap_or(0);
         let class_part = &full_name[..sep];
         let method = &full_name[sep + 2..];
         let base_class = class_part.rsplit('\\').next().unwrap_or(class_part);
+
+        // Check if this is a SplFileInfo family method
+        let is_spl_file_info = matches!(
+            base_class,
+            "SplFileInfo" | "DirectoryIterator" | "FilesystemIterator" | "RecursiveDirectoryIterator" | "SplFileObject"
+        );
+
+        if is_spl_file_info {
+            // Check for iterator methods first
+            if let Some(result) = self.call_dir_iterator_method(method, args)? {
+                return Ok(Some(result));
+            }
+            return self.call_spl_file_info_method(method, args);
+        }
+
+        // Check if this class inherits from an SPL iterator/file class
+        if !is_spl_file_info {
+            let spl_ancestor = self.find_spl_ancestor(class_part);
+            if let Some(ref ancestor) = spl_ancestor {
+                let ancestor_base = ancestor.rsplit('\\').next().unwrap_or(ancestor);
+                // For directory iterators, try dir methods first, then SplFileInfo
+                if matches!(
+                    ancestor_base,
+                    "SplFileInfo"
+                        | "DirectoryIterator"
+                        | "FilesystemIterator"
+                        | "RecursiveDirectoryIterator"
+                ) {
+                    if let Some(result) = self.call_dir_iterator_method(method, args)? {
+                        return Ok(Some(result));
+                    }
+                    return self.call_spl_file_info_method(method, args);
+                }
+                // For filter/wrapper iterators, delegate to inner iterator
+                if matches!(
+                    ancestor_base,
+                    "FilterIterator"
+                        | "RecursiveFilterIterator"
+                        | "IteratorIterator"
+                        | "RecursiveIteratorIterator"
+                ) {
+                    if let Some(result) =
+                        self.call_wrapper_iterator_method(method, args)?
+                    {
+                        return Ok(Some(result));
+                    }
+                }
+            }
+        }
+
+        // Check if this is an ArrayIterator / ArrayObject
+        if matches!(base_class, "ArrayIterator" | "ArrayObject") {
+            if let Some(result) = self.call_array_iterator_method(method, args)? {
+                return Ok(Some(result));
+            }
+        }
+
+        // EmptyIterator — always empty
+        if base_class == "EmptyIterator" {
+            return match method {
+                "rewind" | "next" | "__construct" => Ok(Some(Value::Null)),
+                "valid" => Ok(Some(Value::Bool(false))),
+                "current" | "key" => Ok(Some(Value::Null)),
+                _ => Ok(None),
+            };
+        }
 
         // Check if this is a DateTime/DateTimeZone family method
         let is_datetime = matches!(
@@ -5591,12 +7315,44 @@ impl Vm {
         result
     }
 
+    /// Write back a modified array value to the original variable (CV or object property).
+    /// Used by array_shift, array_pop, sort, etc. that take arrays by reference.
+    fn write_back_arg(
+        &mut self,
+        arg_idx: usize,
+        new_val: Value,
+        ref_args: &[(usize, OperandType, u32)],
+        ref_prop_args: &[(usize, Value, String)],
+    ) {
+        // Try CV write-back first
+        if let Some((_, op_type, op_val)) = ref_args.iter().find(|(idx, _, _)| *idx == arg_idx) {
+            if *op_type == OperandType::Cv {
+                if let Some(frame) = self.call_stack.last_mut() {
+                    let cv_idx = *op_val as usize;
+                    if cv_idx < frame.cvs.len() {
+                        frame.cvs[cv_idx] = new_val;
+                        return;
+                    }
+                }
+            }
+        }
+        // Fall back to property write-back
+        if let Some((_, obj_val, prop_name)) =
+            ref_prop_args.iter().find(|(idx, _, _)| *idx == arg_idx)
+        {
+            if let Value::Object(ref obj) = obj_val {
+                obj.set_property(prop_name.clone(), new_val);
+            }
+        }
+    }
+
     /// Call a built-in function. Returns Some(Value) if handled, None if not a built-in.
     fn call_builtin(
         &mut self,
         name: &str,
         args: &[Value],
         ref_args: &[(usize, OperandType, u32)],
+        ref_prop_args: &[(usize, Value, String)],
     ) -> VmResult<Option<Value>> {
         // Check disable_functions
         if self
@@ -5616,9 +7372,9 @@ impl Vm {
                 Ok(Some(Value::Long(s.to_php_string().len() as i64)))
             }
             "count" | "sizeof" => {
-                let v = args.first().cloned().unwrap_or(Value::Null);
-                let n = match v {
-                    Value::Array(ref a) => a.len() as i64,
+                let v = args.first().map(|v| v.deref_value()).unwrap_or(Value::Null);
+                let n = match &v {
+                    Value::Array(a) => a.len() as i64,
                     _ => 1,
                 };
                 Ok(Some(Value::Long(n)))
@@ -5641,19 +7397,19 @@ impl Vm {
                 }
             }
             "is_int" | "is_integer" | "is_long" => {
-                let v = args.first().cloned().unwrap_or(Value::Null);
+                let v = args.first().cloned().unwrap_or(Value::Null).deref_value();
                 Ok(Some(Value::Bool(matches!(v, Value::Long(_)))))
             }
             "is_float" | "is_double" => {
-                let v = args.first().cloned().unwrap_or(Value::Null);
+                let v = args.first().cloned().unwrap_or(Value::Null).deref_value();
                 Ok(Some(Value::Bool(matches!(v, Value::Double(_)))))
             }
             "is_string" => {
-                let v = args.first().cloned().unwrap_or(Value::Null);
+                let v = args.first().cloned().unwrap_or(Value::Null).deref_value();
                 Ok(Some(Value::Bool(matches!(v, Value::String(_)))))
             }
             "is_bool" => {
-                let v = args.first().cloned().unwrap_or(Value::Null);
+                let v = args.first().cloned().unwrap_or(Value::Null).deref_value();
                 Ok(Some(Value::Bool(matches!(v, Value::Bool(_)))))
             }
             "is_null" => {
@@ -5661,7 +7417,7 @@ impl Vm {
                 Ok(Some(Value::Bool(v.is_null())))
             }
             "is_array" => {
-                let v = args.first().cloned().unwrap_or(Value::Null);
+                let v = args.first().cloned().unwrap_or(Value::Null).deref_value();
                 Ok(Some(Value::Bool(matches!(v, Value::Array(_)))))
             }
             "is_numeric" => {
@@ -5691,6 +7447,7 @@ impl Vm {
             }
             "gettype" => {
                 let v = args.first().cloned().unwrap_or(Value::Null);
+                let v = v.deref_value();
                 let t = match v {
                     Value::Null => "NULL",
                     Value::Bool(_) => "boolean",
@@ -5699,7 +7456,9 @@ impl Vm {
                     Value::String(_) => "string",
                     Value::Array(_) => "array",
                     Value::Object(_) => "object",
-                    Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => "unknown type",
+                    Value::Resource(_, _) => "resource",
+                    Value::Reference(_) => unreachable!(),
+                    Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => "unknown type",
                 };
                 Ok(Some(Value::String(t.to_string())))
             }
@@ -5720,12 +7479,13 @@ impl Vm {
                     Value::String(_) => "string".to_string(),
                     Value::Array(_) => "array".to_string(),
                     Value::Object(ref o) => o.class_name(),
+                    Value::Resource(_, _) => "resource".to_string(),
                     _ => "unknown".to_string(),
                 };
                 Ok(Some(Value::String(t)))
             }
             "is_object" => {
-                let v = args.first().cloned().unwrap_or(Value::Null);
+                let v = args.first().cloned().unwrap_or(Value::Null).deref_value();
                 Ok(Some(Value::Bool(matches!(v, Value::Object(_)))))
             }
             "property_exists" => {
@@ -5828,8 +7588,8 @@ impl Vm {
                 Ok(Some(Value::Long(count as i64)))
             }
             "array_key_exists" => {
-                let key = args.first().cloned().unwrap_or(Value::Null);
-                let arr = args.get(1).cloned().unwrap_or(Value::Null);
+                let key = args.first().map(|v| v.deref_value()).unwrap_or(Value::Null);
+                let arr = args.get(1).map(|v| v.deref_value()).unwrap_or(Value::Null);
                 let exists = if let Value::Array(ref a) = arr {
                     a.get(&key).is_some()
                 } else {
@@ -5966,46 +7726,197 @@ impl Vm {
                 Ok(Some(Value::String(subject.replace(&search, &replace))))
             }
             "sprintf" => {
-                // Basic sprintf: handle %s, %d, %f
                 let fmt = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let mut result = String::new();
-                let mut arg_idx = 1;
-                let mut chars = fmt.chars().peekable();
-                while let Some(ch) = chars.next() {
-                    if ch == '%' {
-                        if let Some(&next) = chars.peek() {
-                            match next {
-                                '%' => {
-                                    chars.next();
-                                    result.push('%');
+                let mut auto_arg_idx = 1usize; // auto-incremented for non-positional args
+                let bytes = fmt.as_bytes();
+                let mut i = 0;
+                while i < bytes.len() {
+                    if bytes[i] == b'%' {
+                        i += 1;
+                        if i >= bytes.len() {
+                            result.push('%');
+                            break;
+                        }
+                        if bytes[i] == b'%' {
+                            result.push('%');
+                            i += 1;
+                            continue;
+                        }
+
+                        // Parse: [argnum$] [flags] [width] [.precision] type
+                        let mut arg_num: Option<usize> = None;
+                        let mut pad_char = ' ';
+                        let mut left_align = false;
+                        let mut width: Option<usize> = None;
+                        let mut precision: Option<usize> = None;
+                        let mut sign_plus = false;
+
+                        // Check for argnum$ (digits followed by $)
+                        let save = i;
+                        let mut num = 0usize;
+                        let mut has_digits = false;
+                        while i < bytes.len() && bytes[i].is_ascii_digit() {
+                            num = num * 10 + (bytes[i] - b'0') as usize;
+                            has_digits = true;
+                            i += 1;
+                        }
+                        if has_digits && i < bytes.len() && bytes[i] == b'$' {
+                            arg_num = Some(num);
+                            i += 1;
+                        } else {
+                            // Not a positional arg — rewind
+                            i = save;
+                        }
+
+                        // Parse flags
+                        loop {
+                            if i >= bytes.len() {
+                                break;
+                            }
+                            match bytes[i] {
+                                b'-' => {
+                                    left_align = true;
+                                    i += 1;
                                 }
-                                's' => {
-                                    chars.next();
-                                    let v = args.get(arg_idx).cloned().unwrap_or(Value::Null);
-                                    result.push_str(&v.to_php_string());
-                                    arg_idx += 1;
+                                b'+' => {
+                                    sign_plus = true;
+                                    i += 1;
                                 }
-                                'd' => {
-                                    chars.next();
-                                    let v = args.get(arg_idx).cloned().unwrap_or(Value::Null);
-                                    result.push_str(&v.to_long().to_string());
-                                    arg_idx += 1;
+                                b'0' => {
+                                    pad_char = '0';
+                                    i += 1;
                                 }
-                                'f' => {
-                                    chars.next();
-                                    let v = args.get(arg_idx).cloned().unwrap_or(Value::Null);
-                                    result.push_str(&format!("{:.6}", v.to_double()));
-                                    arg_idx += 1;
+                                b'\'' => {
+                                    i += 1;
+                                    if i < bytes.len() {
+                                        pad_char = bytes[i] as char;
+                                        i += 1;
+                                    }
                                 }
-                                _ => {
-                                    result.push(ch);
+                                b' ' => {
+                                    i += 1;
+                                }
+                                _ => break,
+                            }
+                        }
+
+                        // Parse width (could be * for variable width)
+                        if i < bytes.len() && bytes[i] == b'*' {
+                            let w_idx = arg_num.unwrap_or(auto_arg_idx);
+                            width = Some(
+                                args.get(w_idx)
+                                    .map(|v| v.to_long().unsigned_abs() as usize)
+                                    .unwrap_or(0),
+                            );
+                            if arg_num.is_none() {
+                                auto_arg_idx += 1;
+                            }
+                            arg_num = None; // width consumed the argnum
+                            i += 1;
+                        } else {
+                            let mut w = 0usize;
+                            let mut has_w = false;
+                            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                                w = w * 10 + (bytes[i] - b'0') as usize;
+                                has_w = true;
+                                i += 1;
+                            }
+                            if has_w {
+                                width = Some(w);
+                            }
+                        }
+
+                        // Parse precision
+                        if i < bytes.len() && bytes[i] == b'.' {
+                            i += 1;
+                            let mut p = 0usize;
+                            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                                p = p * 10 + (bytes[i] - b'0') as usize;
+                                i += 1;
+                            }
+                            precision = Some(p);
+                        }
+
+                        // Parse type
+                        if i >= bytes.len() {
+                            break;
+                        }
+                        let type_char = bytes[i] as char;
+                        i += 1;
+
+                        let idx = arg_num.unwrap_or_else(|| {
+                            let cur = auto_arg_idx;
+                            auto_arg_idx += 1;
+                            cur
+                        });
+                        let val = args.get(idx).cloned().unwrap_or(Value::Null);
+
+                        let formatted = match type_char {
+                            's' => {
+                                let s = val.to_php_string();
+                                match precision {
+                                    Some(p) if p < s.len() => s[..p].to_string(),
+                                    _ => s,
                                 }
                             }
+                            'd' => {
+                                let n = val.to_long();
+                                if sign_plus && n >= 0 {
+                                    format!("+{}", n)
+                                } else {
+                                    n.to_string()
+                                }
+                            }
+                            'f' | 'F' => {
+                                let p = precision.unwrap_or(6);
+                                format!("{:.prec$}", val.to_double(), prec = p)
+                            }
+                            'x' => format!("{:x}", val.to_long()),
+                            'X' => format!("{:X}", val.to_long()),
+                            'o' => format!("{:o}", val.to_long()),
+                            'b' => format!("{:b}", val.to_long()),
+                            'c' => {
+                                let n = val.to_long();
+                                String::from(char::from_u32(n as u32).unwrap_or('\0'))
+                            }
+                            'e' | 'E' => {
+                                let d = val.to_double();
+                                let p = precision.unwrap_or(6);
+                                if type_char == 'E' {
+                                    format!("{:.prec$E}", d, prec = p)
+                                } else {
+                                    format!("{:.prec$e}", d, prec = p)
+                                }
+                            }
+                            'u' => format!("{}", val.to_long() as u64),
+                            _ => format!("%{}", type_char),
+                        };
+
+                        // Apply width and alignment
+                        if let Some(w) = width {
+                            if formatted.len() < w {
+                                let padding = w - formatted.len();
+                                if left_align {
+                                    result.push_str(&formatted);
+                                    for _ in 0..padding {
+                                        result.push(' ');
+                                    }
+                                } else {
+                                    for _ in 0..padding {
+                                        result.push(pad_char);
+                                    }
+                                    result.push_str(&formatted);
+                                }
+                            } else {
+                                result.push_str(&formatted);
+                            }
                         } else {
-                            result.push(ch);
+                            result.push_str(&formatted);
                         }
                     } else {
-                        result.push(ch);
+                        result.push(bytes[i] as char);
+                        i += 1;
                     }
                 }
                 Ok(Some(Value::String(result)))
@@ -6205,7 +8116,82 @@ impl Vm {
                 }
             }
             "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" => {
-                // Sorting functions modify in-place; we can't do that, return true
+                let arr_val = args.first().cloned().unwrap_or(Value::Null);
+                let cmp_ord = |r: i64| -> std::cmp::Ordering {
+                    if r < 0 { std::cmp::Ordering::Less }
+                    else if r > 0 { std::cmp::Ordering::Greater }
+                    else { std::cmp::Ordering::Equal }
+                };
+                let sort_fn = |a: &mut PhpArray, cmp_ord: &dyn Fn(i64) -> std::cmp::Ordering| {
+                    let mut entries = a.entries().to_vec();
+                    match name {
+                        "sort" => {
+                            entries.sort_by(|(_, a), (_, b)| cmp_ord(a.spaceship(b)));
+                            let sorted: Vec<(crate::value::ArrayKey, Value)> = entries
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, (_, v))| (crate::value::ArrayKey::Int(i as i64), v))
+                                .collect();
+                            *a = PhpArray::from_entries(sorted);
+                        }
+                        "rsort" => {
+                            entries.sort_by(|(_, a), (_, b)| cmp_ord(b.spaceship(a)));
+                            let sorted: Vec<(crate::value::ArrayKey, Value)> = entries
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, (_, v))| (crate::value::ArrayKey::Int(i as i64), v))
+                                .collect();
+                            *a = PhpArray::from_entries(sorted);
+                        }
+                        "asort" => {
+                            entries.sort_by(|(_, a), (_, b)| cmp_ord(a.spaceship(b)));
+                            *a = PhpArray::from_entries(entries);
+                        }
+                        "arsort" => {
+                            entries.sort_by(|(_, a), (_, b)| cmp_ord(b.spaceship(a)));
+                            *a = PhpArray::from_entries(entries);
+                        }
+                        "ksort" => {
+                            entries.sort_by(|(ka, _), (kb, _)| {
+                                let a = match ka {
+                                    crate::value::ArrayKey::Int(i) => Value::Long(*i),
+                                    crate::value::ArrayKey::String(s) => Value::String(s.clone()),
+                                };
+                                let b = match kb {
+                                    crate::value::ArrayKey::Int(i) => Value::Long(*i),
+                                    crate::value::ArrayKey::String(s) => Value::String(s.clone()),
+                                };
+                                cmp_ord(a.spaceship(&b))
+                            });
+                            *a = PhpArray::from_entries(entries);
+                        }
+                        "krsort" => {
+                            entries.sort_by(|(ka, _), (kb, _)| {
+                                let a = match ka {
+                                    crate::value::ArrayKey::Int(i) => Value::Long(*i),
+                                    crate::value::ArrayKey::String(s) => Value::String(s.clone()),
+                                };
+                                let b = match kb {
+                                    crate::value::ArrayKey::Int(i) => Value::Long(*i),
+                                    crate::value::ArrayKey::String(s) => Value::String(s.clone()),
+                                };
+                                cmp_ord(b.spaceship(&a))
+                            });
+                            *a = PhpArray::from_entries(entries);
+                        }
+                        _ => {}
+                    }
+                };
+                if let Value::Reference(rc) = &arr_val {
+                    let mut inner = rc.borrow_mut();
+                    if let Value::Array(ref mut a) = *inner {
+                        sort_fn(a, &cmp_ord);
+                    }
+                } else if let Value::Array(ref a) = arr_val {
+                    let mut arr_clone = a.clone();
+                    sort_fn(&mut arr_clone, &cmp_ord);
+                    self.write_back_arg(0, Value::Array(arr_clone), ref_args, ref_prop_args);
+                }
                 Ok(Some(Value::Bool(true)))
             }
             "array_count_values" => {
@@ -6542,19 +8528,7 @@ impl Vm {
                                     }
                                     // Write $matches back via ref_args (arg index 2)
                                     if args.len() > 2 {
-                                        if let Some((_arg_idx, op_type, op_val)) =
-                                            ref_args.iter().find(|(idx, _, _)| *idx == 2)
-                                        {
-                                            if *op_type == OperandType::Cv {
-                                                if let Some(frame) = self.call_stack.last_mut() {
-                                                    let cv_idx = *op_val as usize;
-                                                    if cv_idx < frame.cvs.len() {
-                                                        frame.cvs[cv_idx] =
-                                                            Value::Array(matches_arr);
-                                                    }
-                                                }
-                                            }
-                                        }
+                                        self.write_back_arg(2, Value::Array(matches_arr), ref_args, ref_prop_args);
                                     }
                                     true
                                 } else {
@@ -6578,21 +8552,7 @@ impl Vm {
                                                 }
                                             }
                                             if args.len() > 2 {
-                                                if let Some((_arg_idx, op_type, op_val)) =
-                                                    ref_args.iter().find(|(idx, _, _)| *idx == 2)
-                                                {
-                                                    if *op_type == OperandType::Cv {
-                                                        if let Some(frame) =
-                                                            self.call_stack.last_mut()
-                                                        {
-                                                            let cv_idx = *op_val as usize;
-                                                            if cv_idx < frame.cvs.len() {
-                                                                frame.cvs[cv_idx] =
-                                                                    Value::Array(matches_arr);
-                                                            }
-                                                        }
-                                                    }
-                                                }
+                                                self.write_back_arg(2, Value::Array(matches_arr), ref_args, ref_prop_args);
                                             }
                                             true
                                         } else {
@@ -6611,22 +8571,72 @@ impl Vm {
             "preg_match_all" => {
                 let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let subj = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let preg_flags = args.get(3).map(|v| v.to_long()).unwrap_or(0);
+                let offset_capture = preg_flags & 256 != 0; // PREG_OFFSET_CAPTURE
+
                 match parse_php_regex(&pat) {
                     Some((re, flags)) => {
                         let pattern = apply_regex_flags(&re, &flags);
-                        match regex::Regex::new(&pattern) {
-                            Ok(r) => Ok(Some(Value::Long(r.find_iter(&subj).count() as i64))),
-                            Err(_) => {
-                                // Fallback to fancy_regex for lookahead/lookbehind
-                                match fancy_regex::Regex::new(&pattern) {
-                                    Ok(r) => {
-                                        let count = r.find_iter(&subj).count();
-                                        Ok(Some(Value::Long(count as i64)))
+
+                        // Helper: collect all captures from a match into group-indexed arrays.
+                        // We use fancy_regex which handles both normal and lookahead patterns.
+                        let fr = match fancy_regex::Regex::new(&pattern) {
+                            Ok(r) => r,
+                            Err(_) => return Ok(Some(Value::Bool(false))),
+                        };
+
+                        let num_groups = fr.captures_len();
+                        // Build per-group arrays (PHP default: PREG_PATTERN_ORDER)
+                        let mut group_arrays: Vec<PhpArray> =
+                            (0..num_groups).map(|_| PhpArray::new()).collect();
+                        let mut match_count: i64 = 0;
+
+                        for cap_result in fr.captures_iter(&subj) {
+                            match cap_result {
+                                Ok(caps) => {
+                                    match_count += 1;
+                                    for g in 0..num_groups {
+                                        if let Some(m) = caps.get(g) {
+                                            let val = if offset_capture {
+                                                let mut pair = PhpArray::new();
+                                                pair.push(Value::String(m.as_str().to_string()));
+                                                pair.push(Value::Long(m.start() as i64));
+                                                Value::Array(pair)
+                                            } else {
+                                                Value::String(m.as_str().to_string())
+                                            };
+                                            group_arrays[g].push(val);
+                                        } else {
+                                            let val = if offset_capture {
+                                                let mut pair = PhpArray::new();
+                                                pair.push(Value::String(String::new()));
+                                                pair.push(Value::Long(-1));
+                                                Value::Array(pair)
+                                            } else {
+                                                Value::String(String::new())
+                                            };
+                                            group_arrays[g].push(val);
+                                        }
                                     }
-                                    Err(_) => Ok(Some(Value::Bool(false))),
                                 }
+                                Err(_) => break,
                             }
                         }
+
+                        // Write $matches back (arg index 2)
+                        if args.len() > 2 {
+                            let mut matches_arr = PhpArray::new();
+                            for ga in group_arrays {
+                                matches_arr.push(Value::Array(ga));
+                            }
+                            self.write_back_arg(
+                                2,
+                                Value::Array(matches_arr),
+                                ref_args,
+                                ref_prop_args,
+                            );
+                        }
+                        Ok(Some(Value::Long(match_count)))
                     }
                     None => Ok(Some(Value::Bool(false))),
                 }
@@ -6654,11 +8664,22 @@ impl Vm {
             "preg_split" => {
                 let pat = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let subj = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let limit = args.get(2).map(|v| v.to_long()).unwrap_or(-1);
+                let flags = args.get(3).map(|v| v.to_long()).unwrap_or(0);
+                let no_empty = flags & 1 != 0; // PREG_SPLIT_NO_EMPTY = 1
                 match parse_php_regex(&pat) {
-                    Some((re, flags)) => match regex::Regex::new(&apply_regex_flags(&re, &flags)) {
+                    Some((re, re_flags)) => match regex::Regex::new(&apply_regex_flags(&re, &re_flags)) {
                         Ok(r) => {
                             let mut arr = PhpArray::new();
-                            for part in r.split(&subj) {
+                            let parts: Vec<&str> = if limit > 0 {
+                                r.splitn(&subj, limit as usize).collect()
+                            } else {
+                                r.split(&subj).collect()
+                            };
+                            for part in parts {
+                                if no_empty && part.is_empty() {
+                                    continue;
+                                }
                                 arr.push(Value::String(part.to_string()));
                             }
                             Ok(Some(Value::Array(arr)))
@@ -7019,12 +9040,17 @@ impl Vm {
             }
             "basename" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(
-                    std::path::Path::new(&p)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default(),
-                )))
+                let suffix = args.get(1).map(|v| v.to_php_string());
+                let mut name = std::path::Path::new(&p)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if let Some(ref sfx) = suffix {
+                    if name.ends_with(sfx.as_str()) && name.len() > sfx.len() {
+                        name.truncate(name.len() - sfx.len());
+                    }
+                }
+                Ok(Some(Value::String(name)))
             }
             "realpath" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -7446,7 +9472,7 @@ impl Vm {
             "printf" => {
                 // printf = echo sprintf(...)
                 let fmt_args: Vec<Value> = args.to_vec();
-                let result = self.call_builtin("sprintf", &fmt_args, &[])?;
+                let result = self.call_builtin("sprintf", &fmt_args, &[], &[])?;
                 if let Some(Value::String(s)) = result {
                     let len = s.len();
                     self.output.push_str(&s);
@@ -7914,27 +9940,49 @@ impl Vm {
                 Ok(Some(Value::Bool(false)))
             }
             "array_shift" => {
-                // We can't mutate the original, but we return the first value
-                let arr = args.first().cloned().unwrap_or(Value::Null);
-                if let Value::Array(ref a) = arr {
-                    if let Some((_, v)) = a.entries().first() {
-                        Ok(Some(v.clone()))
+                let arr_val = args.first().cloned().unwrap_or(Value::Null);
+                // If the argument is a Reference, modify in-place
+                if let Value::Reference(rc) = &arr_val {
+                    let mut inner = rc.borrow_mut();
+                    if let Value::Array(ref mut a) = *inner {
+                        let shifted = a.shift();
+                        Ok(Some(shifted))
                     } else {
                         Ok(Some(Value::Null))
                     }
+                } else if let Value::Array(ref a) = arr_val {
+                    let mut arr_clone = a.clone();
+                    let shifted = arr_clone.shift();
+                    self.write_back_arg(0, Value::Array(arr_clone), ref_args, ref_prop_args);
+                    Ok(Some(shifted))
                 } else {
                     Ok(Some(Value::Null))
                 }
             }
             "array_unshift" => {
-                // Can't mutate; return new count
-                let arr = args.first().cloned().unwrap_or(Value::Null);
-                let count = if let Value::Array(ref a) = arr {
-                    a.len() + args.len() - 1
+                let arr_val = args.first().cloned().unwrap_or(Value::Null);
+                let values_to_add: Vec<Value> = args.iter().skip(1).cloned().collect();
+                if let Value::Reference(rc) = &arr_val {
+                    let mut inner = rc.borrow_mut();
+                    if let Value::Array(ref mut a) = *inner {
+                        for v in values_to_add.into_iter().rev() {
+                            a.unshift(v);
+                        }
+                        Ok(Some(Value::Long(a.len() as i64)))
+                    } else {
+                        Ok(Some(Value::Long(0)))
+                    }
+                } else if let Value::Array(ref a) = arr_val {
+                    let mut arr_clone = a.clone();
+                    for v in values_to_add.into_iter().rev() {
+                        arr_clone.unshift(v);
+                    }
+                    let count = arr_clone.len() as i64;
+                    self.write_back_arg(0, Value::Array(arr_clone), ref_args, ref_prop_args);
+                    Ok(Some(Value::Long(count)))
                 } else {
-                    0
-                };
-                Ok(Some(Value::Long(count as i64)))
+                    Ok(Some(Value::Long(0)))
+                }
             }
             "array_splice" => {
                 // Return the extracted portion
@@ -8776,13 +10824,20 @@ impl Vm {
                 )))
             }
             "array_pop" => {
-                // Can't mutate the original, return last element
-                let arr = args.first().cloned().unwrap_or(Value::Null);
-                if let Value::Array(ref a) = arr {
-                    match a.entries().last() {
-                        Some((_, v)) => Ok(Some(v.clone())),
-                        None => Ok(Some(Value::Null)),
+                let arr_val = args.first().cloned().unwrap_or(Value::Null);
+                if let Value::Reference(rc) = &arr_val {
+                    let mut inner = rc.borrow_mut();
+                    if let Value::Array(ref mut a) = *inner {
+                        let popped = a.pop();
+                        Ok(Some(popped))
+                    } else {
+                        Ok(Some(Value::Null))
                     }
+                } else if let Value::Array(ref a) = arr_val {
+                    let mut arr_clone = a.clone();
+                    let popped = arr_clone.pop();
+                    self.write_back_arg(0, Value::Array(arr_clone), ref_args, ref_prop_args);
+                    Ok(Some(popped))
                 } else {
                     Ok(Some(Value::Null))
                 }
@@ -9466,8 +11521,8 @@ impl Vm {
                 Ok(Some(Value::Bool(matches!(val, Value::Array(_)))))
             }
             "is_resource" => {
-                // We don't have resources yet
-                Ok(Some(Value::Bool(false)))
+                let val = args.first().cloned().unwrap_or(Value::Null).deref_value();
+                Ok(Some(Value::Bool(matches!(val, Value::Resource(_, _)))))
             }
 
             // === More array functions ===
@@ -10116,6 +12171,12 @@ impl Vm {
                 Ok(Some(Value::String(s.to_uppercase())))
             }
             "mb_detect_encoding" => Ok(Some(Value::String("UTF-8".into()))),
+            // intl extension stubs
+            "normalizer_is_normalized" => Ok(Some(Value::Bool(true))),
+            "normalizer_normalize" => {
+                let s = args.first().cloned().unwrap_or(Value::Null);
+                Ok(Some(Value::String(s.to_php_string())))
+            }
             "mb_internal_encoding" => {
                 if args.is_empty() {
                     Ok(Some(Value::String("UTF-8".into())))
@@ -10640,8 +12701,44 @@ impl Vm {
             "spl_object_hash" => Ok(Some(Value::String("0000000000000000".into()))),
             "iterator_to_array" => {
                 let val = args.first().cloned().unwrap_or(Value::Null);
+                let preserve_keys = args.get(1).map(|v| v.to_bool()).unwrap_or(true);
                 if let Value::Array(a) = val {
                     Ok(Some(Value::Array(a)))
+                } else if let Value::Object(_) = val {
+                    // Check for IteratorAggregate — call getIterator() first
+                    let iter_val = if let Value::Object(ref o) = val {
+                        let class_name = o.class_name();
+                        if self.resolve_method(&class_name, "getIterator").is_some() {
+                            match self.call_method_sync(&val, "getIterator") {
+                                Ok(v @ Value::Object(_)) => v,
+                                _ => val.clone(),
+                            }
+                        } else {
+                            val.clone()
+                        }
+                    } else {
+                        val.clone()
+                    };
+                    let mut result = PhpArray::new();
+                    self.call_method_sync(&iter_val, "rewind")?;
+                    for _ in 0..100000 {
+                        let valid = self.call_method_sync(&iter_val, "valid")?;
+                        if !valid.to_bool() {
+                            break;
+                        }
+                        let current = self.call_method_sync(&iter_val, "current")?;
+                        if preserve_keys {
+                            let key = self.call_method_sync(&iter_val, "key")?;
+                            match key {
+                                Value::Long(_) | Value::String(_) => result.set(&key, current),
+                                _ => result.push(current),
+                            }
+                        } else {
+                            result.push(current);
+                        }
+                        self.call_method_sync(&iter_val, "next")?;
+                    }
+                    Ok(Some(Value::Array(result)))
                 } else {
                     Ok(Some(Value::Array(PhpArray::new())))
                 }
@@ -10650,6 +12747,32 @@ impl Vm {
                 let val = args.first().cloned().unwrap_or(Value::Null);
                 if let Value::Array(ref a) = val {
                     Ok(Some(Value::Long(a.len() as i64)))
+                } else if let Value::Object(_) = val {
+                    // Handle IteratorAggregate
+                    let iter_val = if let Value::Object(ref o) = val {
+                        let class_name = o.class_name();
+                        if self.resolve_method(&class_name, "getIterator").is_some() {
+                            match self.call_method_sync(&val, "getIterator") {
+                                Ok(v @ Value::Object(_)) => v,
+                                _ => val.clone(),
+                            }
+                        } else {
+                            val.clone()
+                        }
+                    } else {
+                        val.clone()
+                    };
+                    let mut count = 0i64;
+                    self.call_method_sync(&iter_val, "rewind")?;
+                    for _ in 0..100000 {
+                        let valid = self.call_method_sync(&iter_val, "valid")?;
+                        if !valid.to_bool() {
+                            break;
+                        }
+                        count += 1;
+                        self.call_method_sync(&iter_val, "next")?;
+                    }
+                    Ok(Some(Value::Long(count)))
                 } else {
                     Ok(Some(Value::Long(0)))
                 }
@@ -10758,14 +12881,24 @@ impl Vm {
                     .get(1)
                     .map(|v| v.to_php_string())
                     .unwrap_or_else(|| "r".into());
-                match php_rs_ext_standard::file::FileHandle::open(&filename, &mode) {
-                    Ok(handle) => {
-                        let id = self.next_resource_id;
-                        self.next_resource_id += 1;
-                        self.file_handles.insert(id, handle);
-                        Ok(Some(Value::Long(id)))
+                // Handle php:// stream wrappers for stdio
+                match filename.as_str() {
+                    "php://stdin" => Ok(Some(Value::Resource(0, "stream".to_string()))),
+                    "php://stdout" | "php://output" => {
+                        Ok(Some(Value::Resource(1, "stream".to_string())))
                     }
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                    "php://stderr" => Ok(Some(Value::Resource(2, "stream".to_string()))),
+                    _ => {
+                        match php_rs_ext_standard::file::FileHandle::open(&filename, &mode) {
+                            Ok(handle) => {
+                                let id = self.next_resource_id;
+                                self.next_resource_id += 1;
+                                self.file_handles.insert(id, handle);
+                                Ok(Some(Value::Resource(id, "stream".to_string())))
+                            }
+                            Err(_) => Ok(Some(Value::Bool(false))),
+                        }
+                    }
                 }
             }
             "fclose" => {
@@ -11004,7 +13137,7 @@ impl Vm {
                             let id = self.next_resource_id;
                             self.next_resource_id += 1;
                             self.file_handles.insert(id, handle);
-                            Ok(Some(Value::Long(id)))
+                            Ok(Some(Value::Resource(id, "stream".to_string())))
                         }
                         Err(_) => Ok(Some(Value::Bool(false))),
                     },
@@ -11167,7 +13300,7 @@ impl Vm {
                             .insert(format!("__dir_entries_{}", id), Value::String(data));
                         self.constants
                             .insert(format!("__dir_pos_{}", id), Value::Long(0));
-                        Ok(Some(Value::Long(id)))
+                        Ok(Some(Value::Resource(id, "stream".to_string())))
                     }
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
@@ -11383,7 +13516,7 @@ impl Vm {
                     match handle.gets() {
                         Ok(Some(line)) => {
                             let scan_args = vec![Value::String(line), Value::String(format)];
-                            self.call_builtin("sscanf", &scan_args, &[])
+                            self.call_builtin("sscanf", &scan_args, &[], &[])
                         }
                         _ => Ok(Some(Value::Bool(false))),
                     }
@@ -12076,11 +14209,17 @@ impl Vm {
                 }
             }
             "get_resource_id" => {
-                // Resources are represented as longs in our implementation
-                let val = args.first().cloned().unwrap_or(Value::Null);
-                Ok(Some(Value::Long(val.to_long())))
+                let val = args.first().unwrap_or(&Value::Null);
+                Ok(Some(Value::Long(val.resource_id())))
             }
-            "get_resource_type" => Ok(Some(Value::String("Unknown".to_string()))),
+            "get_resource_type" => {
+                let val = args.first().unwrap_or(&Value::Null);
+                let rtype = match val {
+                    Value::Resource(_, ref t) => t.clone(),
+                    _ => "Unknown".to_string(),
+                };
+                Ok(Some(Value::String(rtype)))
+            }
             "get_resources" => Ok(Some(Value::Array(PhpArray::new()))),
             "zend_thread_id" => Ok(Some(Value::Long(1))),
             "clone" => {
@@ -14377,7 +16516,7 @@ impl Vm {
                 let id = self.next_resource_id;
                 self.next_resource_id += 1;
                 self.curl_handles.insert(id, handle);
-                Ok(Some(Value::Long(id)))
+                Ok(Some(Value::Resource(id, "curl".to_string())))
             }
             "curl_close" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
@@ -14388,13 +16527,13 @@ impl Vm {
                 Ok(Some(Value::Null))
             }
             "curl_copy_handle" => {
-                let id = args.first().map(|v| v.to_long()).unwrap_or(0);
+                let id = args.first().map(|v| v.resource_id()).unwrap_or(0);
                 if let Some(handle) = self.curl_handles.get(&id) {
                     let cloned = handle.clone();
                     let new_id = self.next_resource_id;
                     self.next_resource_id += 1;
                     self.curl_handles.insert(new_id, cloned);
-                    Ok(Some(Value::Long(new_id)))
+                    Ok(Some(Value::Resource(new_id, "curl".to_string())))
                 } else {
                     Ok(Some(Value::Bool(false)))
                 }
@@ -15326,9 +17465,47 @@ impl Vm {
             | "datefmt_set_lenient"
             | "datefmt_set_pattern"
             | "datefmt_set_timezone" => Ok(Some(Value::Bool(false))),
-            "grapheme_extract" | "grapheme_stripos" | "grapheme_stristr" | "grapheme_strlen"
-            | "grapheme_strpos" | "grapheme_strripos" | "grapheme_strrpos" | "grapheme_strstr"
-            | "grapheme_substr" | "grapheme_str_split" => Ok(Some(Value::Bool(false))),
+            "grapheme_strlen" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                // For ASCII/BMP text, grapheme count ≈ char count
+                Ok(Some(Value::Long(s.chars().count() as i64)))
+            }
+            "grapheme_substr" => {
+                let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let start = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                let length = args.get(2).map(|v| Some(v.to_long()));
+                let chars: Vec<char> = s.chars().collect();
+                let len = chars.len() as i64;
+                let start_idx = if start < 0 {
+                    (len + start).max(0) as usize
+                } else {
+                    start as usize
+                };
+                if start_idx >= chars.len() {
+                    return Ok(Some(Value::String(String::new())));
+                }
+                let end_idx = match length {
+                    Some(Some(l)) if l < 0 => (len + l).max(start_idx as i64) as usize,
+                    Some(Some(l)) => (start_idx + l as usize).min(chars.len()),
+                    _ => chars.len(),
+                };
+                let result: String = chars[start_idx..end_idx].iter().collect();
+                Ok(Some(Value::String(result)))
+            }
+            "grapheme_strpos" => {
+                let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+                let needle = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let offset = args.get(2).map(|v| v.to_long() as usize).unwrap_or(0);
+                if let Some(byte_pos) = haystack[offset..].find(&needle) {
+                    let char_pos = haystack[..offset + byte_pos].chars().count();
+                    Ok(Some(Value::Long(char_pos as i64)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "grapheme_extract" | "grapheme_stripos" | "grapheme_stristr"
+            | "grapheme_strripos" | "grapheme_strrpos" | "grapheme_strstr"
+            | "grapheme_str_split" => Ok(Some(Value::Bool(false))),
             "idn_to_ascii" | "idn_to_utf8" => {
                 let domain = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(domain)))
@@ -15508,6 +17685,7 @@ impl Vm {
 
     /// Convert a VM Value to a JsonValue for encoding.
     fn value_to_json(val: &Value) -> JsonValue {
+        if let Value::Reference(rc) = val { return Self::value_to_json(&rc.borrow()); }
         match val {
             Value::Null => JsonValue::Null,
             Value::Bool(b) => JsonValue::Bool(*b),
@@ -15554,7 +17732,9 @@ impl Vm {
                 entries.sort_by(|a, b| a.0.cmp(&b.0));
                 JsonValue::Object(entries)
             }
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => JsonValue::Null,
+            Value::Resource(_, _) => JsonValue::Null,
+            Value::Reference(_) => unreachable!("Reference handled above"),
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => JsonValue::Null,
         }
     }
 
@@ -15598,6 +17778,7 @@ impl Vm {
     // =========================================================================
 
     fn var_dump(&mut self, val: &Value, depth: usize) {
+        if let Value::Reference(rc) = val { let inner = rc.borrow().clone(); return self.var_dump(&inner, depth); }
         let indent = "  ".repeat(depth);
         match val {
             Value::Null => {
@@ -15649,13 +17830,19 @@ impl Vm {
                 }
                 self.output.push_str(&format!("{}}}\n", indent));
             }
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => {
+            Value::Resource(id, _) => {
+                self.output
+                    .push_str(&format!("{}resource({}) of type (stream)\n", indent, id));
+            }
+            Value::Reference(_) => unreachable!("Reference handled above"),
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => {
                 self.output.push_str(&format!("{}NULL\n", indent));
             }
         }
     }
 
     fn print_r_string(&self, val: &Value, depth: usize) -> String {
+        if let Value::Reference(rc) = val { return self.print_r_string(&rc.borrow(), depth); }
         let indent = "    ".repeat(depth);
         match val {
             Value::Null => String::new(),
@@ -15691,11 +17878,14 @@ impl Vm {
                 s.push_str(&format!("{})\n", indent));
                 s
             }
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => String::new(),
+            Value::Resource(id, _) => format!("Resource id #{}", id),
+            Value::Reference(_) => unreachable!("Reference handled above"),
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => String::new(),
         }
     }
 
     fn var_export_string(&self, val: &Value) -> String {
+        if let Value::Reference(rc) = val { return self.var_export_string(&rc.borrow()); }
         match val {
             Value::Null => "NULL".to_string(),
             Value::Bool(true) => "true".to_string(),
@@ -15722,7 +17912,9 @@ impl Vm {
             Value::Object(o) => {
                 format!("(object) array(/* {} properties */)", o.properties_count())
             }
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => "NULL".to_string(),
+            Value::Resource(_, _) => "NULL".to_string(),
+            Value::Reference(_) => unreachable!("Reference handled above"),
+            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => "NULL".to_string(),
         }
     }
 
@@ -15977,6 +18169,7 @@ fn apply_regex_flags(pattern: &str, flags: &str) -> String {
 /// Convert a VM Value to a SerializableValue for PHP serialize().
 fn value_to_serializable(val: &Value) -> php_rs_ext_standard::variables::SerializableValue {
     use php_rs_ext_standard::variables::SerializableValue as SV;
+    if let Value::Reference(rc) = val { return value_to_serializable(&rc.borrow()); }
     match val {
         Value::Null => SV::Null,
         Value::Bool(b) => SV::Bool(*b),
@@ -15998,7 +18191,9 @@ fn value_to_serializable(val: &Value) -> php_rs_ext_standard::variables::Seriali
             SV::Array(entries)
         }
         Value::Object(_) => SV::Null, // Simplified: objects serialize as null for now
-        Value::_Iterator { .. } | Value::_GeneratorIterator { .. } => SV::Null,
+        Value::Resource(id, _) => SV::Int(*id),
+        Value::Reference(_) => unreachable!("Reference handled above"),
+        Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => SV::Null,
     }
 }
 

@@ -4,9 +4,9 @@
 //! Mirrors php-src/Zend/zend_compile.c.
 
 use php_rs_parser::{
-    Argument, ArrayElement, BinaryOperator, CastType, ClassMember, ClosureUse, EnumMember,
-    Expression, MagicConstantKind, Modifier, Name, Parameter, Program, Statement, UnaryOperator,
-    UseKind,
+    Argument, ArrayElement, Attribute, BinaryOperator, CastType, ClassMember, ClosureUse,
+    EnumMember, Expression, MagicConstantKind, Modifier, Name, Parameter, Program, Statement,
+    UnaryOperator, UseKind,
 };
 
 use std::collections::HashMap;
@@ -137,6 +137,17 @@ impl Compiler {
             current_class_parent: self.current_class_parent.clone(),
             use_imports: self.use_imports.clone(),
             use_function_imports: self.use_function_imports.clone(),
+        }
+    }
+
+    /// Qualify a parsed Name (e.g. from extends/implements/use trait clause).
+    /// Respects the fully_qualified flag so `\Foo` resolves globally, not under current namespace.
+    fn qualify_parsed_name(&self, name: &Name) -> String {
+        let name_str = name_parts_to_string(&name.parts);
+        if name.fully_qualified {
+            self.qualify_name(&format!("\\{}", name_str))
+        } else {
+            self.qualify_name(&name_str)
         }
     }
 
@@ -408,9 +419,10 @@ impl Compiler {
                 implements,
                 modifiers,
                 span,
+                attributes,
                 ..
             } => {
-                self.compile_class_decl(name, modifiers, extends, implements, members, span);
+                self.compile_class_decl(name, modifiers, extends, implements, members, attributes, span);
             }
 
             // --- Interface declaration ---
@@ -515,12 +527,20 @@ impl Compiler {
                 }
             }
 
+            // Match as statement: compile for side effects, discard result
+            Statement::Match {
+                condition,
+                arms,
+                span,
+            } => {
+                self.compile_match_expr(condition, arms, span.line as u32);
+            }
+
             // Features not yet needed for VM execution
             Statement::Declare { .. }
             | Statement::Goto { .. }
             | Statement::Label { .. }
-            | Statement::HaltCompiler { .. }
-            | Statement::Match { .. } => {
+            | Statement::HaltCompiler { .. } => {
                 self.op_array.emit(ZOp::nop());
             }
         }
@@ -536,12 +556,11 @@ impl Compiler {
         if let Expression::ConstantAccess { name, .. } = expr {
             let resolved = match name.as_str() {
                 "self" => self.current_class.clone().unwrap_or_else(|| name.clone()),
-                // "static" must NOT be resolved at compile time — it uses late static binding
+                // "static" and "parent" must NOT be resolved at compile time:
+                // - "static" uses late static binding
+                // - "parent" must preserve LSB context (static::class) from caller
                 "static" => "static".to_string(),
-                "parent" => self
-                    .current_class_parent
-                    .clone()
-                    .unwrap_or_else(|| "parent".to_string()),
+                "parent" => "parent".to_string(),
                 _ => self.qualify_name(name),
             };
             let idx = self.op_array.add_literal(Literal::String(resolved));
@@ -553,10 +572,7 @@ impl Compiler {
             let resolved = match value.as_str() {
                 "self" => self.current_class.clone().unwrap_or_else(|| value.clone()),
                 "static" => "static".to_string(),
-                "parent" => self
-                    .current_class_parent
-                    .clone()
-                    .unwrap_or_else(|| "parent".to_string()),
+                "parent" => "parent".to_string(),
                 _ => self.qualify_name(value),
             };
             let idx = self.op_array.add_literal(Literal::String(resolved));
@@ -949,7 +965,30 @@ impl Compiler {
                     let class_name = match class.as_ref() {
                         Expression::ConstantAccess { name, .. }
                         | Expression::StringLiteral { value: name, .. } => match name.as_str() {
-                            "self" | "static" => {
+                            "static" => {
+                                // static::class must be resolved at runtime (late static binding)
+                                let lit = self
+                                    .op_array
+                                    .add_literal(Literal::String("static".to_string()));
+                                let const_lit = self
+                                    .op_array
+                                    .add_literal(Literal::String("class".to_string()));
+                                let tmp = self.op_array.alloc_temp();
+                                self.op_array.emit(
+                                    ZOp::new(ZOpcode::FetchClassConstant, span.line as u32)
+                                        .with_op1(Operand::constant(lit), OperandType::Const)
+                                        .with_op2(
+                                            Operand::constant(const_lit),
+                                            OperandType::Const,
+                                        )
+                                        .with_result(
+                                            Operand::tmp_var(tmp),
+                                            OperandType::TmpVar,
+                                        ),
+                                );
+                                return ExprResult::tmp(tmp);
+                            }
+                            "self" => {
                                 self.current_class.clone().unwrap_or_else(|| name.clone())
                             }
                             "parent" => self
@@ -1352,8 +1391,138 @@ impl Compiler {
                     );
 
                     ExprResult::tmp(result_tmp)
+                } else if let Expression::Variable { name, .. } = base {
+                    // Variable-dim assignment with possible nesting:
+                    // $a[$k] = $v  or  $a[$k1][$k2] = $v  or  $a[$k1][] = $v
+                    dim_keys.reverse();
+                    dim_keys.push(index);
+
+                    let cv = self.op_array.lookup_cv(name);
+
+                    if dim_keys.len() == 1 {
+                        // Simple case: $a[$k] = $v  or  $a[] = $v
+                        let tmp = self.op_array.alloc_temp();
+                        if let Some(idx_expr) = dim_keys[0] {
+                            let idx = self.compile_expr(idx_expr);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::AssignDim, line)
+                                    .with_op1(Operand::cv(cv), OperandType::Cv)
+                                    .with_op2(idx.operand, idx.op_type)
+                                    .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                            );
+                        } else {
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::AssignDim, line)
+                                    .with_op1(Operand::cv(cv), OperandType::Cv)
+                                    .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                            );
+                        }
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::OpData, line)
+                                .with_op1(rhs_result.operand, rhs_result.op_type),
+                        );
+                        ExprResult::tmp(tmp)
+                    } else {
+                        // Nested case: $a[$k1][$k2] = $v — need FetchDimR + AssignDim + write-back
+                        // Read base var into temp
+                        let base_tmp = self.op_array.alloc_temp();
+                        if let Some(k) = dim_keys[0] {
+                            let k_r = self.compile_expr(k);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::FetchDimR, line)
+                                    .with_op1(Operand::cv(cv), OperandType::Cv)
+                                    .with_op2(k_r.operand, k_r.op_type)
+                                    .with_result(Operand::tmp_var(base_tmp), OperandType::TmpVar),
+                            );
+                        }
+
+                        let mut temps = vec![base_tmp];
+                        // Fetch intermediate levels
+                        for key_expr in &dim_keys[1..dim_keys.len() - 1] {
+                            let prev_tmp = *temps.last().unwrap();
+                            let next_tmp = self.op_array.alloc_temp();
+                            if let Some(k) = key_expr {
+                                let k_r = self.compile_expr(k);
+                                self.op_array.emit(
+                                    ZOp::new(ZOpcode::FetchDimR, line)
+                                        .with_op1(Operand::tmp_var(prev_tmp), OperandType::TmpVar)
+                                        .with_op2(k_r.operand, k_r.op_type)
+                                        .with_result(Operand::tmp_var(next_tmp), OperandType::TmpVar),
+                                );
+                            }
+                            temps.push(next_tmp);
+                        }
+
+                        // AssignDim on the innermost level
+                        let innermost_tmp = *temps.last().unwrap();
+                        let result_tmp = self.op_array.alloc_temp();
+                        let last_key = dim_keys.last().unwrap();
+                        if let Some(k) = last_key {
+                            let k_r = self.compile_expr(k);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::AssignDim, line)
+                                    .with_op1(Operand::tmp_var(innermost_tmp), OperandType::TmpVar)
+                                    .with_op2(k_r.operand, k_r.op_type)
+                                    .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                            );
+                        } else {
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::AssignDim, line)
+                                    .with_op1(Operand::tmp_var(innermost_tmp), OperandType::TmpVar)
+                                    .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                            );
+                        }
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::OpData, line)
+                                .with_op1(rhs_result.operand, rhs_result.op_type),
+                        );
+
+                        // Write-back chain for nested dims (inner to outer)
+                        for i in (0..temps.len() - 1).rev() {
+                            let outer_tmp = temps[i];
+                            let inner_tmp = temps[i + 1];
+                            let wb_result = self.op_array.alloc_temp();
+                            if let Some(k) = dim_keys[i + 1] {
+                                let k_r = self.compile_expr(k);
+                                self.op_array.emit(
+                                    ZOp::new(ZOpcode::AssignDim, line)
+                                        .with_op1(Operand::tmp_var(outer_tmp), OperandType::TmpVar)
+                                        .with_op2(k_r.operand, k_r.op_type)
+                                        .with_result(Operand::tmp_var(wb_result), OperandType::TmpVar),
+                                );
+                            }
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::OpData, line)
+                                    .with_op1(Operand::tmp_var(inner_tmp), OperandType::TmpVar),
+                            );
+                        }
+
+                        // Final write-back: assign modified array back to CV
+                        let wb_final = self.op_array.alloc_temp();
+                        if let Some(k) = dim_keys[0] {
+                            let k_r = self.compile_expr(k);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::AssignDim, line)
+                                    .with_op1(Operand::cv(cv), OperandType::Cv)
+                                    .with_op2(k_r.operand, k_r.op_type)
+                                    .with_result(Operand::tmp_var(wb_final), OperandType::TmpVar),
+                            );
+                        } else {
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::AssignDim, line)
+                                    .with_op1(Operand::cv(cv), OperandType::Cv)
+                                    .with_result(Operand::tmp_var(wb_final), OperandType::TmpVar),
+                            );
+                        }
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::OpData, line)
+                                .with_op1(Operand::tmp_var(base_tmp), OperandType::TmpVar),
+                        );
+
+                        ExprResult::tmp(result_tmp)
+                    }
                 } else {
-                    // Simple array dim assignment: $arr[$k] = $v
+                    // Fallback: compile array expression and do simple dim assignment
                     let arr = self.compile_expr(array);
                     let tmp = self.op_array.alloc_temp();
                     if let Some(idx_expr) = index {
@@ -1365,14 +1534,12 @@ impl Compiler {
                                 .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
                         );
                     } else {
-                        // $a[] = $v — append
                         self.op_array.emit(
                             ZOp::new(ZOpcode::AssignDim, line)
                                 .with_op1(arr.operand, arr.op_type)
                                 .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
                         );
                     }
-                    // OP_DATA follows with the value
                     self.op_array.emit(
                         ZOp::new(ZOpcode::OpData, line)
                             .with_op1(rhs_result.operand, rhs_result.op_type),
@@ -1682,7 +1849,7 @@ impl Compiler {
             Expression::PropertyAccess {
                 object, property, ..
             } => {
-                // $obj->prop += $val → read, operate, write back
+                // $obj->prop op= $val → read, operate, write back
                 let obj = self.compile_expr(object);
                 let prop = self.compile_expr(property);
 
@@ -1695,29 +1862,151 @@ impl Compiler {
                         .with_result(Operand::tmp_var(tmp_old), OperandType::TmpVar),
                 );
 
-                // Compute: assign_op(tmp_old, rhs) → tmp_new
-                let tmp_new = self.op_array.alloc_temp();
+                let result_tmp = self.op_array.alloc_temp();
+
+                // Save operands before they're consumed
+                let obj_operand = obj.operand;
+                let obj_op_type = obj.op_type;
+                let prop_operand = prop.operand;
+                let prop_op_type = prop.op_type;
+
+                if assign_op == ZOpcode::Coalesce {
+                    // Special handling for ??=: Coalesce jump
+                    let coalesce_idx = self.op_array.emit(
+                        ZOp::new(ZOpcode::Coalesce, line)
+                            .with_op1(Operand::tmp_var(tmp_old), OperandType::TmpVar)
+                            .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+
+                    // RHS (only evaluated if null)
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::QmAssign, line)
+                            .with_op1(rhs_result.operand, rhs_result.op_type)
+                            .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+
+                    // Write back: AssignObj(obj, prop) + OpData(result_tmp)
+                    let assign_tmp = self.op_array.alloc_temp();
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::AssignObj, line)
+                            .with_op1(obj_operand, obj_op_type)
+                            .with_op2(prop_operand, prop_op_type)
+                            .with_result(Operand::tmp_var(assign_tmp), OperandType::TmpVar),
+                    );
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+
+                    // Patch Coalesce jump target to skip the assignment
+                    let end_target = self.op_array.next_opline();
+                    self.op_array.opcodes[coalesce_idx as usize].op2 =
+                        Operand::jmp_target(end_target);
+                } else {
+                    // Regular compound assign (+= -= etc.)
+                    self.op_array.emit(
+                        ZOp::new(assign_op, line)
+                            .with_op1(Operand::tmp_var(tmp_old), OperandType::TmpVar)
+                            .with_op2(rhs_result.operand, rhs_result.op_type)
+                            .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+
+                    // Write back: AssignObj(obj, prop) + OpData(result_tmp)
+                    let assign_tmp = self.op_array.alloc_temp();
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::AssignObj, line)
+                            .with_op1(obj_operand, obj_op_type)
+                            .with_op2(prop_operand, prop_op_type)
+                            .with_result(Operand::tmp_var(assign_tmp), OperandType::TmpVar),
+                    );
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+                }
+
+                ExprResult::tmp(result_tmp)
+            }
+            Expression::StaticPropertyAccess {
+                class, property, ..
+            } => {
+                // Static prop compound assign: self::$prop op= $val
+                let cls = self.compile_class_name_expr(class);
+                let prop = self.compile_static_prop_name(property);
+
+                // Read current static property
+                let tmp_old = self.op_array.alloc_temp();
                 self.op_array.emit(
-                    ZOp::new(assign_op, line)
-                        .with_op1(Operand::tmp_var(tmp_old), OperandType::TmpVar)
-                        .with_op2(rhs_result.operand, rhs_result.op_type)
-                        .with_result(Operand::tmp_var(tmp_new), OperandType::TmpVar),
+                    ZOp::new(ZOpcode::FetchStaticPropR, line)
+                        .with_op1(prop.operand, prop.op_type)
+                        .with_op2(cls.operand, cls.op_type)
+                        .with_result(Operand::tmp_var(tmp_old), OperandType::TmpVar),
                 );
 
-                // Write back: AssignObj(obj, prop) + OpData(tmp_new)
-                let tmp_assign = self.op_array.alloc_temp();
-                self.op_array.emit(
-                    ZOp::new(ZOpcode::AssignObj, line)
-                        .with_op1(obj.operand, obj.op_type)
-                        .with_op2(prop.operand, prop.op_type)
-                        .with_result(Operand::tmp_var(tmp_assign), OperandType::TmpVar),
-                );
-                self.op_array.emit(
-                    ZOp::new(ZOpcode::OpData, line)
-                        .with_op1(Operand::tmp_var(tmp_new), OperandType::TmpVar),
-                );
+                let result_tmp = self.op_array.alloc_temp();
 
-                ExprResult::tmp(tmp_new)
+                if assign_op == ZOpcode::Coalesce {
+                    // Special handling for ??=: use Coalesce jump
+                    // If not null, jump past the assignment
+                    let coalesce_idx = self.op_array.emit(
+                        ZOp::new(ZOpcode::Coalesce, line)
+                            .with_op1(Operand::tmp_var(tmp_old), OperandType::TmpVar)
+                            .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+
+                    // RHS value (only evaluated if null)
+                    let rhs_val = rhs_result;
+
+                    // Assign RHS to result
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::QmAssign, line)
+                            .with_op1(rhs_val.operand, rhs_val.op_type)
+                            .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+
+                    // Write back to static property
+                    let cls2 = self.compile_class_name_expr(class);
+                    let prop2 = self.compile_static_prop_name(property);
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::AssignStaticProp, line)
+                            .with_op1(cls2.operand, cls2.op_type)
+                            .with_op2(prop2.operand, prop2.op_type)
+                            .with_extended_value(0),
+                    );
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+
+                    // Patch Coalesce jump target to skip the assignment
+                    let end_target = self.op_array.next_opline();
+                    self.op_array.opcodes[coalesce_idx as usize].op2 =
+                        Operand::jmp_target(end_target);
+                } else {
+                    // Regular compound assign (+= -= etc.)
+                    self.op_array.emit(
+                        ZOp::new(assign_op, line)
+                            .with_op1(Operand::tmp_var(tmp_old), OperandType::TmpVar)
+                            .with_op2(rhs_result.operand, rhs_result.op_type)
+                            .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+
+                    // Write back to static property
+                    let cls2 = self.compile_class_name_expr(class);
+                    let prop2 = self.compile_static_prop_name(property);
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::AssignStaticProp, line)
+                            .with_op1(cls2.operand, cls2.op_type)
+                            .with_op2(prop2.operand, prop2.op_type)
+                            .with_extended_value(0),
+                    );
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+                    );
+                }
+
+                ExprResult::tmp(result_tmp)
             }
             _ => {
                 // Fallback for complex LHS
@@ -3054,6 +3343,9 @@ impl Compiler {
         args: &[Argument],
         line: u32,
     ) -> ExprResult {
+        // Track nullsafe JmpNull index for patching after DoFcall
+        let mut nullsafe_jmp: Option<(u32, u32)> = None; // (jmp_null_idx, result_tmp)
+
         // Determine call type from the name expression
         match name {
             Expression::StringLiteral { value, .. } => {
@@ -3084,11 +3376,11 @@ impl Compiler {
             } => {
                 // Nullsafe method call: $obj?->method()
                 let obj = self.compile_expr(object);
-                let tmp = self.op_array.alloc_temp();
+                let result_tmp = self.op_array.alloc_temp();
                 let jmp_null_idx = self.op_array.emit(
                     ZOp::new(ZOpcode::JmpNull, line)
                         .with_op1(obj.operand, obj.op_type)
-                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                        .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
                 );
                 let method = self.compile_expr(property);
                 self.op_array.emit(
@@ -3097,8 +3389,7 @@ impl Compiler {
                         .with_op2(method.operand, method.op_type)
                         .with_extended_value(args.len() as u32),
                 );
-                // Patch jmp_null to skip past the full call (patched after DO_FCALL below)
-                let _ = (jmp_null_idx, tmp); // handled after args + DO_FCALL
+                nullsafe_jmp = Some((jmp_null_idx, result_tmp));
             }
             Expression::StaticPropertyAccess {
                 class, property, ..
@@ -3127,14 +3418,24 @@ impl Compiler {
         // Send arguments
         self.compile_send_args(args, line);
 
-        // Do the call
-        let tmp = self.op_array.alloc_temp();
-        self.op_array.emit(
-            ZOp::new(ZOpcode::DoFcall, line)
-                .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
-        );
-
-        ExprResult::tmp(tmp)
+        // Do the call — for nullsafe, reuse the JmpNull result temp
+        if let Some((jmp_null_idx, result_tmp)) = nullsafe_jmp {
+            self.op_array.emit(
+                ZOp::new(ZOpcode::DoFcall, line)
+                    .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+            );
+            // Patch JmpNull to jump past DoFcall
+            let target = self.op_array.next_opline();
+            self.op_array.opcodes[jmp_null_idx as usize].op2 = Operand::jmp_target(target);
+            ExprResult::tmp(result_tmp)
+        } else {
+            let tmp = self.op_array.alloc_temp();
+            self.op_array.emit(
+                ZOp::new(ZOpcode::DoFcall, line)
+                    .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+            );
+            ExprResult::tmp(tmp)
+        }
     }
 
     fn compile_send_args(&mut self, args: &[Argument], line: u32) {
@@ -3460,6 +3761,7 @@ impl Compiler {
         extends: &Option<Name>,
         implements: &[Name],
         members: &[ClassMember],
+        attributes: &[Attribute],
         span: &php_rs_lexer::Span,
     ) {
         let line = span.line as u32;
@@ -3468,9 +3770,7 @@ impl Compiler {
         let fq_name = self.qualify_name(name);
 
         // Set current class context for self::/parent:: resolution
-        let parent_name = extends
-            .as_ref()
-            .map(|p| self.qualify_name(&name_parts_to_string(&p.parts)));
+        let parent_name = extends.as_ref().map(|p| self.qualify_parsed_name(p));
         self.current_class = Some(fq_name.clone());
         self.current_class_parent = parent_name.clone();
 
@@ -3482,13 +3782,57 @@ impl Compiler {
         }
 
         // Encode extends/implements info as "parent\0iface1\0iface2" in op2
+        // Attributes appended after \x01 separator: \x01AttrName\x02name=val\x03name=val\x01...
         let mut class_info = String::new();
         if let Some(parent) = extends {
-            class_info.push_str(&self.qualify_name(&name_parts_to_string(&parent.parts)));
+            class_info.push_str(&self.qualify_parsed_name(parent));
         }
         for iface in implements {
             class_info.push('\0');
-            class_info.push_str(&self.qualify_name(&name_parts_to_string(&iface.parts)));
+            class_info.push_str(&self.qualify_parsed_name(iface));
+        }
+        // Encode attributes
+        for attr in attributes {
+            class_info.push('\x01');
+            let attr_name = attr.name.parts.join("\\");
+            class_info.push_str(&self.qualify_name(&attr_name));
+            for arg in &attr.args {
+                class_info.push('\x02');
+                if let Some(ref name) = arg.name {
+                    class_info.push_str(name);
+                    class_info.push('=');
+                }
+                // Serialize argument value as string
+                match &arg.value {
+                    Expression::StringLiteral { value, .. } => class_info.push_str(value),
+                    Expression::IntLiteral { value, .. } => {
+                        class_info.push_str(&value.to_string());
+                    }
+                    Expression::FloatLiteral { value, .. } => {
+                        class_info.push_str(&value.to_string());
+                    }
+                    Expression::ConstantAccess { name, .. } => {
+                        class_info.push_str(name);
+                    }
+                    Expression::ArrayLiteral { elements, .. } => {
+                        class_info.push_str("[");
+                        for (i, el) in elements.iter().enumerate() {
+                            if i > 0 { class_info.push_str(","); }
+                            if let Some(ref key) = el.key {
+                                if let Expression::StringLiteral { value, .. } = key {
+                                    class_info.push_str(value);
+                                    class_info.push_str(":");
+                                }
+                            }
+                            if let Expression::StringLiteral { value, .. } = &el.value {
+                                class_info.push_str(value);
+                            }
+                        }
+                        class_info.push_str("]");
+                    }
+                    _ => class_info.push_str("?"),
+                }
+            }
         }
         let info_lit = self.op_array.add_literal(Literal::String(class_info));
 
@@ -3638,7 +3982,7 @@ impl Compiler {
                     for trait_name in traits {
                         metadata
                             .traits
-                            .push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                            .push(self.qualify_parsed_name(trait_name));
                     }
                 }
                 _ => {} // abstract methods, etc.
@@ -3727,7 +4071,7 @@ impl Compiler {
         let mut class_info = String::new();
         for parent in extends {
             class_info.push('\0');
-            class_info.push_str(&self.qualify_name(&name_parts_to_string(&parent.parts)));
+            class_info.push_str(&self.qualify_parsed_name(parent));
         }
         let info_lit = self.op_array.add_literal(Literal::String(class_info));
 
@@ -3840,7 +4184,7 @@ impl Compiler {
                     for trait_name in traits {
                         metadata
                             .traits
-                            .push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                            .push(self.qualify_parsed_name(trait_name));
                     }
                 }
                 _ => {} // abstract methods, etc.
@@ -3930,7 +4274,7 @@ impl Compiler {
                     for trait_name in traits {
                         metadata
                             .traits
-                            .push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                            .push(self.qualify_parsed_name(trait_name));
                     }
                 }
                 _ => {}

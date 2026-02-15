@@ -1228,21 +1228,17 @@ impl<'a> Parser<'a> {
                 self.advance(); // consume (
                 let mut arguments = Vec::new();
 
-                // Parse comma-separated argument list
+                // Parse comma-separated argument list (supports named arguments)
                 if self.current_token != Token::RParen {
                     loop {
-                        // For now, parse each argument as a simple expression
-                        // In the future, we'll support named arguments, unpacking, etc.
-                        let value = self.parse_expression(0)?;
-                        arguments.push(Argument {
-                            name: None,
-                            value,
-                            unpack: false,
-                            by_ref: false,
-                        });
+                        let arg = self.parse_argument()?;
+                        arguments.push(arg);
 
                         if self.current_token == Token::Comma {
                             self.advance();
+                            if self.current_token == Token::RParen {
+                                break; // trailing comma
+                            }
                             continue;
                         }
                         break;
@@ -2217,6 +2213,19 @@ impl<'a> Parser<'a> {
     fn parse_parameter(&mut self) -> Result<Parameter, ParseError> {
         let start_span = self.current_span;
 
+        // Skip PHP 8.0+ attributes on parameters: #[SensitiveParameter], #[Attr(...)], etc.
+        while self.current_token == Token::Attribute {
+            self.advance(); // skip #[
+            let mut depth = 1;
+            while depth > 0 && self.current_token != Token::End {
+                match self.current_token {
+                    Token::LBracket => { depth += 1; self.advance(); }
+                    Token::RBracket => { depth -= 1; self.advance(); }
+                    _ => { self.advance(); }
+                }
+            }
+        }
+
         // Parse optional visibility modifier (constructor promotion, PHP 8.0+)
         // and readonly modifier (PHP 8.1+)
         let mut modifiers = Vec::new();
@@ -2392,8 +2401,9 @@ impl<'a> Parser<'a> {
         };
 
         // Check for named argument (name: value)
-        // We need to peek ahead to see if there's a colon after an identifier
-        let name = if let Token::String = self.current_token {
+        // We need to peek ahead to see if there's a colon after an identifier.
+        // PHP 8.0+ allows reserved keywords as named argument names (e.g. default:, match:, class:)
+        let name = if self.is_named_arg_label() {
             let potential_name = self.lexer.source_text(&self.current_span).to_string();
             let next = self.peek();
             if *next == Token::Colon {
@@ -2417,6 +2427,28 @@ impl<'a> Parser<'a> {
             unpack,
             by_ref: false, // by_ref is determined at runtime in PHP
         })
+    }
+
+    /// Check if the current token can be a named argument label.
+    /// PHP 8.0+ allows reserved keywords as named argument names.
+    fn is_named_arg_label(&self) -> bool {
+        matches!(
+            self.current_token,
+            Token::String      // regular identifiers (includes true, false, null)
+            | Token::Default   // default:
+            | Token::Match     // match:
+            | Token::Class     // class:
+            | Token::Array     // array:
+            | Token::List      // list:
+            | Token::Fn        // fn:
+            | Token::Static    // static:
+            | Token::Abstract  // abstract:
+            | Token::Final     // final:
+            | Token::Private   // private:
+            | Token::Protected // protected:
+            | Token::Public    // public:
+            | Token::Readonly  // readonly:
+        )
     }
 
     /// Parse array elements for array() or [] syntax
@@ -3622,9 +3654,125 @@ impl<'a> Parser<'a> {
             }
 
             // Encapsed string (double-quoted with interpolation)
+            // Heredoc/Nowdoc: <<<LABEL ... LABEL; or <<<'LABEL' ... LABEL;
+            Token::StartHeredoc => {
+                let heredoc_text = self.lexer.source_text(&self.current_span).to_string();
+                let is_nowdoc = heredoc_text.contains("'");
+                self.advance(); // consume StartHeredoc
+
+                let mut parts: Vec<Expression> = Vec::new();
+                loop {
+                    match &self.current_token {
+                        Token::EndHeredoc => {
+                            self.advance();
+                            break;
+                        }
+                        Token::EncapsedAndWhitespace => {
+                            let text = self.lexer.source_text(&self.current_span).to_string();
+                            if !text.is_empty() {
+                                let value = if is_nowdoc {
+                                    text // Nowdoc: no escape processing
+                                } else {
+                                    unescape_double_quoted(&text) // Heredoc: process escapes
+                                };
+                                parts.push(Expression::StringLiteral {
+                                    value,
+                                    span: self.current_span.clone(),
+                                });
+                            }
+                            self.advance();
+                        }
+                        Token::Variable => {
+                            let text = self.lexer.source_text(&self.current_span);
+                            let name = text.strip_prefix('$').unwrap_or(text).to_string();
+                            let var_span = self.current_span.clone();
+                            self.advance();
+                            let mut expr = Expression::Variable {
+                                name,
+                                span: var_span.clone(),
+                            };
+                            // Check for ->prop or [index] after variable
+                            if self.current_token == Token::ObjectOperator {
+                                self.advance();
+                                if let Token::String = self.current_token {
+                                    let prop = self.lexer.source_text(&self.current_span).to_string();
+                                    let prop_span = self.current_span.clone();
+                                    self.advance();
+                                    expr = Expression::PropertyAccess {
+                                        object: Box::new(expr),
+                                        property: Box::new(Expression::StringLiteral {
+                                            value: prop,
+                                            span: prop_span.clone(),
+                                        }),
+                                        span: prop_span,
+                                    };
+                                }
+                            } else if self.current_token == Token::LBracket {
+                                self.advance();
+                                let index = self.parse_expression(0)?;
+                                if self.current_token == Token::RBracket {
+                                    self.advance();
+                                }
+                                expr = Expression::ArrayAccess {
+                                    array: Box::new(expr),
+                                    index: Some(Box::new(index)),
+                                    span: var_span,
+                                };
+                            }
+                            parts.push(expr);
+                        }
+                        Token::DollarOpenCurlyBraces => {
+                            self.advance();
+                            if let Token::String = self.current_token {
+                                let name = self.lexer.source_text(&self.current_span).to_string();
+                                let var_span = self.current_span.clone();
+                                self.advance();
+                                parts.push(Expression::Variable {
+                                    name,
+                                    span: var_span,
+                                });
+                            }
+                            if self.current_token == Token::RBrace {
+                                self.advance();
+                            }
+                        }
+                        Token::CurlyOpen => {
+                            self.advance();
+                            let expr = self.parse_expression(0)?;
+                            parts.push(expr);
+                            if self.current_token == Token::RBrace {
+                                self.advance();
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                // Build concat tree
+                if parts.is_empty() {
+                    Ok(Expression::StringLiteral {
+                        value: String::new(),
+                        span,
+                    })
+                } else {
+                    let mut result = parts.remove(0);
+                    for part in parts {
+                        let s = span.clone();
+                        result = Expression::BinaryOp {
+                            lhs: Box::new(result),
+                            op: BinaryOperator::Concat,
+                            rhs: Box::new(part),
+                            span: s,
+                        };
+                    }
+                    Ok(result)
+                }
+            }
+
             // The lexer emits EncapsedAndWhitespace and Variable tokens for
             // interpolated strings. Build a concat expression tree.
-            Token::EncapsedAndWhitespace => {
+            // CurlyOpen and DollarOpenCurlyBraces can also start an encapsed string
+            // (e.g. "{$var}..." or "${var}...")
+            Token::EncapsedAndWhitespace | Token::CurlyOpen | Token::DollarOpenCurlyBraces => {
                 let mut parts: Vec<Expression> = Vec::new();
                 loop {
                     match &self.current_token {
@@ -4008,12 +4156,23 @@ impl<'a> Parser<'a> {
             // Assignment (right-associative)
             Token::Equals => {
                 self.advance();
-                let right = self.parse_expression(precedence)?;
-                Ok(Expression::Assign {
-                    lhs: Box::new(left),
-                    rhs: Box::new(right),
-                    span,
-                })
+                // Check for reference assignment: $a = &$b
+                if self.current_token == Token::Ampersand {
+                    self.advance();
+                    let right = self.parse_expression(precedence)?;
+                    Ok(Expression::AssignRef {
+                        lhs: Box::new(left),
+                        rhs: Box::new(right),
+                        span,
+                    })
+                } else {
+                    let right = self.parse_expression(precedence)?;
+                    Ok(Expression::Assign {
+                        lhs: Box::new(left),
+                        rhs: Box::new(right),
+                        span,
+                    })
+                }
             }
 
             // Compound assignment operators (right-associative)
@@ -4309,7 +4468,24 @@ impl<'a> Parser<'a> {
                 if self.current_token == Token::Ellipsis && *self.peek() == Token::RParen {
                     self.advance();
                     self.expect(Token::RParen)?;
-                    // Emit Closure::fromCallable($func)
+                    // For $obj->method(...), convert to Closure::fromCallable([$obj, 'method'])
+                    let callable = match left {
+                        Expression::PropertyAccess { object, property, .. } => {
+                            // Extract method name from property expression
+                            let method_name = match *property {
+                                Expression::StringLiteral { value, .. } => value,
+                                _ => "unknown".to_string(),
+                            };
+                            Expression::ArrayLiteral {
+                                elements: vec![
+                                    ArrayElement { key: None, value: *object, unpack: false, by_ref: false },
+                                    ArrayElement { key: None, value: Expression::StringLiteral { value: method_name, span }, unpack: false, by_ref: false },
+                                ],
+                                span,
+                            }
+                        }
+                        other => other,
+                    };
                     return Ok(Expression::FunctionCall {
                         name: Box::new(Expression::StringLiteral {
                             value: "Closure::fromCallable".to_string(),
@@ -4317,7 +4493,7 @@ impl<'a> Parser<'a> {
                         }),
                         args: vec![Argument {
                             name: None,
-                            value: left,
+                            value: callable,
                             unpack: false,
                             by_ref: false,
                         }],

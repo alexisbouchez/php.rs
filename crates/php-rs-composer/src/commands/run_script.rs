@@ -1,6 +1,37 @@
 use crate::config::Config;
 use crate::json::JsonFile;
 
+use std::sync::OnceLock;
+
+/// Returns a PATH string with a temporary directory prepended that contains a `php` symlink
+/// pointing to the current php-rs binary, so that shell commands like `php artisan serve`
+/// use php-rs instead of the system PHP.
+fn prepare_php_path_env() -> Result<String, String> {
+    static BIN_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+    let bin_dir = BIN_DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join("php-rs-bin");
+        let _ = std::fs::create_dir_all(&dir);
+        let link_path = dir.join("php");
+        // Remove stale symlink if it exists
+        let _ = std::fs::remove_file(&link_path);
+        if let Ok(exe) = std::env::current_exe() {
+            #[cfg(unix)]
+            {
+                let _ = std::os::unix::fs::symlink(&exe, &link_path);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::os::windows::fs::symlink_file(&exe, &link_path);
+            }
+        }
+        dir
+    });
+
+    let system_path = std::env::var("PATH").unwrap_or_default();
+    Ok(format!("{}:{}", bin_dir.display(), system_path))
+}
+
 /// Execute a named script from composer.json "scripts" section.
 ///
 /// Supports:
@@ -141,10 +172,15 @@ fn run_single_script(script: &str, config: &Config, extra_args: &[String]) -> Re
     }
     println!("  > {}", full_cmd);
 
+    // Ensure `php` in shell commands resolves to php-rs by prepending a directory
+    // containing a `php` symlink to PATH.
+    let path_env = prepare_php_path_env()?;
+
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg(&full_cmd)
         .current_dir(&config.working_dir)
+        .env("PATH", &path_env)
         .status()
         .map_err(|e| format!("Failed to run script '{}': {}", full_cmd, e))?;
 
