@@ -535,12 +535,13 @@ impl PartialEq for Value {
 // Generator & Fiber state types
 // =============================================================================
 
-/// Internal state marker for objects that are generators or fibers.
+/// Internal state marker for objects that are generators, fibers, or reflection objects.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InternalState {
     None,
     Generator,
     Fiber,
+    ReflectionClass,
 }
 
 /// Status of a generator.

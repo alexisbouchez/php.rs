@@ -14,6 +14,7 @@ php-rs-ext-standard = { path = "../php-rs-ext-standard" }
 php-rs-ext-zlib = { path = "../php-rs-ext-zlib" }
 php-rs-ext-curl = { path = "../php-rs-ext-curl" }
 regex = "1"
+fancy-regex = "0.14"
 
 [dev-dependencies]
 criterion = "0.5"

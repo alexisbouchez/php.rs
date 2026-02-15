@@ -143,16 +143,31 @@ impl Compiler {
     /// Qualify a name with the current namespace (if any).
     /// Checks use imports first, then prepends namespace.
     fn qualify_name(&self, name: &str) -> String {
-        // If the name is already fully qualified (contains backslash), use it as-is
-        if name.contains('\\') {
-            return name.to_string();
+        // Fully qualified name: starts with backslash (e.g. \Foo\Bar -> Foo\Bar)
+        if name.starts_with('\\') {
+            return name[1..].to_string();
         }
-        // Check use imports
+        // Check use imports for single-part names
         if let Some(fq) = self.use_imports.get(name) {
             return fq.clone();
         }
-        // Check if the first part of a multi-part name matches a use import
-        // (not applicable here since single-part names only)
+        // Multi-part relative name (e.g. Configuration\ApplicationBuilder):
+        // check if the first segment matches a use import
+        if let Some(sep) = name.find('\\') {
+            let first = &name[..sep];
+            let rest = &name[sep + 1..];
+            if let Some(fq_prefix) = self.use_imports.get(first) {
+                return format!("{}\\{}", fq_prefix, rest);
+            }
+            // No use import match — prepend current namespace
+            if let Some(ref ns) = self.current_namespace {
+                if !ns.is_empty() {
+                    return format!("{}\\{}", ns, name);
+                }
+            }
+            return name.to_string();
+        }
+        // Single-part unqualified name — prepend current namespace
         match &self.current_namespace {
             Some(ns) if !ns.is_empty() => format!("{}\\{}", ns, name),
             _ => name.to_string(),
@@ -162,9 +177,9 @@ impl Compiler {
     /// Qualify a function name with use function imports, then namespace.
     /// Falls back to unqualified name for built-in functions.
     fn qualify_function_name(&self, name: &str) -> String {
-        // If the name is already fully qualified (contains backslash), use it as-is
-        if name.contains('\\') {
-            return name.to_string();
+        // Fully qualified: starts with backslash
+        if name.starts_with('\\') {
+            return name[1..].to_string();
         }
         // Check use function imports
         if let Some(fq) = self.use_function_imports.get(name) {
@@ -521,8 +536,10 @@ impl Compiler {
     fn compile_class_name_expr(&mut self, expr: &Expression) -> ExprResult {
         if let Expression::ConstantAccess { name, .. } = expr {
             let resolved = match name.as_str() {
-                "self" | "static" => self.current_class.clone().unwrap_or_else(|| name.clone()),
-                "parent" => self.current_class_parent.clone().unwrap_or_else(|| name.clone()),
+                "self" => self.current_class.clone().unwrap_or_else(|| name.clone()),
+                // "static" must NOT be resolved at compile time — it uses late static binding
+                "static" => "static".to_string(),
+                "parent" => self.current_class_parent.clone().unwrap_or_else(|| "parent".to_string()),
                 _ => self.qualify_name(name),
             };
             let idx = self.op_array.add_literal(Literal::String(resolved));
@@ -532,8 +549,9 @@ impl Compiler {
         // They need namespace qualification too
         if let Expression::StringLiteral { value, .. } = expr {
             let resolved = match value.as_str() {
-                "self" | "static" => self.current_class.clone().unwrap_or_else(|| value.clone()),
-                "parent" => self.current_class_parent.clone().unwrap_or_else(|| value.clone()),
+                "self" => self.current_class.clone().unwrap_or_else(|| value.clone()),
+                "static" => "static".to_string(),
+                "parent" => self.current_class_parent.clone().unwrap_or_else(|| "parent".to_string()),
                 _ => self.qualify_name(value),
             };
             let idx = self.op_array.add_literal(Literal::String(resolved));
@@ -924,7 +942,7 @@ impl Compiler {
                 // Handle ClassName::class magic constant
                 if constant == "class" {
                     let class_name = match class.as_ref() {
-                        Expression::ConstantAccess { name, .. } => {
+                        Expression::ConstantAccess { name, .. } | Expression::StringLiteral { value: name, .. } => {
                             match name.as_str() {
                                 "self" | "static" => self.current_class.clone().unwrap_or_else(|| name.clone()),
                                 "parent" => self.current_class_parent.clone().unwrap_or_else(|| name.clone()),
@@ -1245,6 +1263,125 @@ impl Compiler {
                             .with_op1(obj_r.operand, obj_r.op_type)
                             .with_op2(prop_r.operand, prop_r.op_type)
                             .with_result(Operand::tmp_var(wb_final), OperandType::TmpVar),
+                    );
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(Operand::tmp_var(base_tmp), OperandType::TmpVar),
+                    );
+
+                    ExprResult::tmp(result_tmp)
+                } else if let Expression::StaticPropertyAccess {
+                    class, property, ..
+                } = base
+                {
+                    // Static-property-dim assignment with write-back:
+                    // static::$arr[$k] = $v  or  self::$arr[$k1][$k2] = $v
+                    dim_keys.reverse();
+                    dim_keys.push(index);
+
+                    let cls = self.compile_class_name_expr(class);
+                    let prop = self.compile_static_prop_name(property);
+
+                    // FetchStaticPropW to get the current array value
+                    let base_tmp = self.op_array.alloc_temp();
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::FetchStaticPropW, line)
+                            .with_op1(prop.operand, prop.op_type)
+                            .with_op2(cls.operand, cls.op_type)
+                            .with_result(Operand::tmp_var(base_tmp), OperandType::TmpVar),
+                    );
+
+                    // For nested dims, fetch intermediate levels
+                    let mut temps = vec![base_tmp];
+                    for key_expr in &dim_keys[..dim_keys.len() - 1] {
+                        let prev_tmp = *temps.last().unwrap();
+                        let next_tmp = self.op_array.alloc_temp();
+                        if let Some(k) = key_expr {
+                            let k_r = self.compile_expr(k);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::FetchDimR, line)
+                                    .with_op1(
+                                        Operand::tmp_var(prev_tmp),
+                                        OperandType::TmpVar,
+                                    )
+                                    .with_op2(k_r.operand, k_r.op_type)
+                                    .with_result(
+                                        Operand::tmp_var(next_tmp),
+                                        OperandType::TmpVar,
+                                    ),
+                            );
+                        }
+                        temps.push(next_tmp);
+                    }
+
+                    // AssignDim on the innermost level
+                    let innermost_tmp = *temps.last().unwrap();
+                    let result_tmp = self.op_array.alloc_temp();
+                    let last_key = dim_keys.last().unwrap();
+                    if let Some(k) = last_key {
+                        let k_r = self.compile_expr(k);
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::AssignDim, line)
+                                .with_op1(
+                                    Operand::tmp_var(innermost_tmp),
+                                    OperandType::TmpVar,
+                                )
+                                .with_op2(k_r.operand, k_r.op_type)
+                                .with_result(
+                                    Operand::tmp_var(result_tmp),
+                                    OperandType::TmpVar,
+                                ),
+                        );
+                    } else {
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::AssignDim, line)
+                                .with_op1(
+                                    Operand::tmp_var(innermost_tmp),
+                                    OperandType::TmpVar,
+                                )
+                                .with_result(
+                                    Operand::tmp_var(result_tmp),
+                                    OperandType::TmpVar,
+                                ),
+                        );
+                    }
+                    // OP_DATA with the assigned value
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::OpData, line)
+                            .with_op1(rhs_result.operand, rhs_result.op_type),
+                    );
+
+                    // Write-back chain for nested dims
+                    for i in (0..temps.len() - 1).rev() {
+                        let outer_tmp = temps[i];
+                        let inner_tmp = temps[i + 1];
+                        let wb_result = self.op_array.alloc_temp();
+                        if let Some(k) = dim_keys[i] {
+                            let k_r = self.compile_expr(k);
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::AssignDim, line)
+                                    .with_op1(
+                                        Operand::tmp_var(outer_tmp),
+                                        OperandType::TmpVar,
+                                    )
+                                    .with_op2(k_r.operand, k_r.op_type)
+                                    .with_result(
+                                        Operand::tmp_var(wb_result),
+                                        OperandType::TmpVar,
+                                    ),
+                            );
+                        }
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::OpData, line)
+                                .with_op1(Operand::tmp_var(inner_tmp), OperandType::TmpVar),
+                        );
+                    }
+
+                    // Final write-back: assign the modified array back to the static property
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::AssignStaticProp, line)
+                            .with_op1(cls.operand, cls.op_type)
+                            .with_op2(prop.operand, prop.op_type),
                     );
                     self.op_array.emit(
                         ZOp::new(ZOpcode::OpData, line)
@@ -2699,9 +2836,22 @@ impl Compiler {
 
         let catch_start = self.op_array.next_opline();
 
-        // Compile catch blocks
+        // Compile catch blocks, recording each catch's opline and types
+        use crate::op_array::TryCatchElement;
         let mut catch_jmp_patches = Vec::new();
+        let mut catch_info: Vec<(u32, Vec<String>)> = Vec::new(); // (catch_opline, class_names)
         for catch in catches {
+            let this_catch_op = self.op_array.next_opline();
+
+            // Collect exception class names for this catch clause
+            let mut class_names = Vec::new();
+            for type_name in &catch.types {
+                let joined = type_name.parts.join("\\");
+                let name_str = self.qualify_name(&joined);
+                class_names.push(name_str);
+            }
+            catch_info.push((this_catch_op, class_names));
+
             // CATCH opcode
             if let Some(ref var_name) = catch.var {
                 let cv = self.op_array.lookup_cv(var_name);
@@ -2746,14 +2896,27 @@ impl Compiler {
             };
         }
 
-        // Record try/catch element
-        use crate::op_array::TryCatchElement;
-        self.op_array.try_catch_array.push(TryCatchElement {
-            try_op: try_start,
-            catch_op: if !catches.is_empty() { catch_start } else { 0 },
-            finally_op: if finally.is_some() { finally_start } else { 0 },
-            finally_end: after_try,
-        });
+        // Record one TryCatchElement per catch clause for type-checked dispatch
+        for (catch_op, class_names) in catch_info {
+            self.op_array.try_catch_array.push(TryCatchElement {
+                try_op: try_start,
+                catch_op,
+                finally_op: if finally.is_some() { finally_start } else { 0 },
+                finally_end: after_try,
+                catch_classes: class_names,
+            });
+        }
+
+        // If no catch clauses but there's a finally, still record the try/finally
+        if catches.is_empty() {
+            self.op_array.try_catch_array.push(TryCatchElement {
+                try_op: try_start,
+                catch_op: 0,
+                finally_op: if finally.is_some() { finally_start } else { 0 },
+                finally_end: after_try,
+                catch_classes: Vec::new(),
+            });
+        }
     }
 
     // =========================================================================
@@ -2827,6 +2990,74 @@ impl Compiler {
         );
     }
 
+    /// Extract the primary type name from a Type annotation.
+    fn extract_type_name(t: &php_rs_parser::Type) -> Option<String> {
+        match t {
+            php_rs_parser::Type::Named { name, .. } => {
+                let full = name.parts.join("\\");
+                if name.fully_qualified {
+                    Some(full.strip_prefix('\\').unwrap_or(&full).to_string())
+                } else {
+                    Some(full)
+                }
+            }
+            php_rs_parser::Type::Nullable { inner, .. } => Self::extract_type_name(inner),
+            php_rs_parser::Type::Union { types, .. } => {
+                types.first().and_then(|t| Self::extract_type_name(t))
+            }
+            _ => None,
+        }
+    }
+
+    /// Try to evaluate a constant expression to a Literal (for parameter defaults).
+    fn expr_to_literal(expr: &Expression) -> Option<Literal> {
+        match expr {
+            Expression::IntLiteral { value, .. } => Some(Literal::Long(*value)),
+            Expression::FloatLiteral { value, .. } => Some(Literal::Double(*value)),
+            Expression::StringLiteral { value, .. } => Some(Literal::String(value.clone())),
+            Expression::BoolLiteral { value, .. } => Some(Literal::Bool(*value)),
+            Expression::Null { .. } => Some(Literal::Null),
+            Expression::ConstantAccess { name, .. } => {
+                let lower = name.to_lowercase();
+                match lower.as_str() {
+                    "null" => Some(Literal::Null),
+                    "true" => Some(Literal::Bool(true)),
+                    "false" => Some(Literal::Bool(false)),
+                    _ => None, // Non-trivial constant — can't evaluate at compile time
+                }
+            }
+            Expression::ArrayLiteral { elements, .. } if elements.is_empty() => {
+                // Empty array [] — store as special literal
+                Some(Literal::String("__EMPTY_ARRAY__".to_string()))
+            }
+            Expression::UnaryOp { op, operand, .. } => {
+                // Handle negative numbers: -1, -3.14
+                if *op == php_rs_parser::UnaryOperator::Minus {
+                    match Self::expr_to_literal(operand) {
+                        Some(Literal::Long(n)) => Some(Literal::Long(-n)),
+                        Some(Literal::Double(f)) => Some(Literal::Double(-f)),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            Expression::ClassConstant {
+                class, constant, ..
+            } => {
+                // Extract class name for runtime resolution
+                let class_name = match class.as_ref() {
+                    Expression::ConstantAccess { name, .. } => name.clone(),
+                    Expression::StringLiteral { value, .. } => value.clone(),
+                    Expression::Variable { name, .. } => name.clone(),
+                    _ => return None,
+                };
+                Some(Literal::ClassConst(class_name, constant.clone()))
+            }
+            _ => None, // Complex expression — not a simple literal
+        }
+    }
+
     /// Set up parameter CVs and arg_info for a function/method op_array.
     fn setup_params(&self, func_oa: &mut ZOpArray, params: &[Parameter]) {
         let mut required = 0u32;
@@ -2834,10 +3065,26 @@ impl Compiler {
             // Strip leading $ from parameter name to match variable reference CVs
             let cv_name = param.name.strip_prefix('$').unwrap_or(&param.name);
             func_oa.lookup_cv(cv_name);
+            let default_lit = param.default.as_ref().and_then(|expr| Self::expr_to_literal(expr));
+            // Extract type hint name if available
+            let type_name = param.param_type.as_ref().and_then(|t| Self::extract_type_name(t));
+            // Qualify the type name with the current namespace
+            let type_name = type_name.map(|t| {
+                match t.as_str() {
+                    // Built-in types: don't qualify
+                    "int" | "float" | "string" | "bool" | "array" | "callable" |
+                    "iterable" | "object" | "mixed" | "void" | "never" | "null" |
+                    "false" | "true" | "self" | "static" | "parent" => t,
+                    // Class types: qualify with namespace
+                    _ => self.qualify_name(&t),
+                }
+            });
             func_oa.arg_info.push(ArgInfo {
                 name: cv_name.to_string(),
                 pass_by_reference: param.by_ref,
                 is_variadic: param.variadic,
+                default: default_lit,
+                type_name,
             });
             if param.default.is_none() && !param.variadic {
                 required += 1;
@@ -3130,6 +3377,21 @@ impl Compiler {
             );
         }
 
+        // Implicit $this binding for non-static closures in method context
+        if !_is_static && self.current_class.is_some() {
+            // Check if the closure body references $this
+            let closure_oa = self.op_array.dynamic_func_defs.last().unwrap();
+            if closure_oa.vars.iter().any(|v| v == "this") {
+                let this_cv = self.op_array.lookup_cv("this");
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::BindLexical, line)
+                        .with_op1(Operand::tmp_var(tmp), OperandType::TmpVar)
+                        .with_op2(Operand::cv(this_cv), OperandType::Cv)
+                        .with_extended_value(0), // by value
+                );
+            }
+        }
+
         ExprResult::tmp(tmp)
     }
 
@@ -3159,6 +3421,46 @@ impl Compiler {
                 .with_op1(Operand::constant(func_idx), OperandType::Const)
                 .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
         );
+
+        // Arrow functions auto-capture all referenced variables from parent scope
+        let closure_oa = &self.op_array.dynamic_func_defs[func_idx as usize];
+        let captured_vars: Vec<String> = closure_oa
+            .vars
+            .iter()
+            .filter(|v| {
+                // Skip parameters (they're local to the arrow function)
+                !closure_oa.arg_info.iter().any(|a| &a.name == *v)
+            })
+            .filter(|v| {
+                // Only bind variables that exist in the parent scope
+                self.op_array.vars.contains(v)
+            })
+            .cloned()
+            .collect();
+
+        for var_name in &captured_vars {
+            let parent_cv = self.op_array.lookup_cv(var_name);
+            self.op_array.emit(
+                ZOp::new(ZOpcode::BindLexical, line)
+                    .with_op1(Operand::tmp_var(tmp), OperandType::TmpVar)
+                    .with_op2(Operand::cv(parent_cv), OperandType::Cv)
+                    .with_extended_value(0),
+            );
+        }
+
+        // Implicit $this binding for arrow functions in method context
+        if self.current_class.is_some() && !captured_vars.contains(&"this".to_string()) {
+            let closure_oa = &self.op_array.dynamic_func_defs[func_idx as usize];
+            if closure_oa.vars.iter().any(|v| v == "this") {
+                let this_cv = self.op_array.lookup_cv("this");
+                self.op_array.emit(
+                    ZOp::new(ZOpcode::BindLexical, line)
+                        .with_op1(Operand::tmp_var(tmp), OperandType::TmpVar)
+                        .with_op2(Operand::cv(this_cv), OperandType::Cv)
+                        .with_extended_value(0),
+                );
+            }
+        }
 
         ExprResult::tmp(tmp)
     }
@@ -3572,7 +3874,12 @@ impl Compiler {
                         metadata.constants.push((const_name.clone(), l));
                     }
                 }
-                _ => {} // TraitUse in traits, abstract methods, etc.
+                ClassMember::TraitUse { traits, .. } => {
+                    for trait_name in traits {
+                        metadata.traits.push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                    }
+                }
+                _ => {} // abstract methods, etc.
             }
         }
 

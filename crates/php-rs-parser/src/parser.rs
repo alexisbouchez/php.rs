@@ -183,6 +183,15 @@ impl<'a> Parser<'a> {
         loop {
             let precedence = self.infix_precedence(&self.current_token);
             if precedence == 0 || precedence < min_precedence {
+                // PHP special rule: assignment operators always bind when the LHS is
+                // an assignable expression (variable, array access, property access, etc.).
+                // This makes `$a && $b = $c` parse as `$a && ($b = $c)` even though
+                // `=` has lower precedence than `&&`. In PHP's grammar, `variable = expr`
+                // is a production of `expr`, so it's valid as the RHS of any binary op.
+                if Self::is_assignment_token(&self.current_token) && Self::is_assignable(&left) {
+                    left = self.parse_infix(left, precedence)?;
+                    continue;
+                }
                 break;
             }
 
@@ -190,6 +199,39 @@ impl<'a> Parser<'a> {
         }
 
         Ok(left)
+    }
+
+    /// Check if a token is an assignment operator
+    fn is_assignment_token(token: &Token) -> bool {
+        matches!(
+            token,
+            Token::Equals
+                | Token::PlusEqual
+                | Token::MinusEqual
+                | Token::MulEqual
+                | Token::DivEqual
+                | Token::ModEqual
+                | Token::PowEqual
+                | Token::ConcatEqual
+                | Token::AndEqual
+                | Token::OrEqual
+                | Token::XorEqual
+                | Token::SlEqual
+                | Token::SrEqual
+                | Token::CoalesceEqual
+        )
+    }
+
+    /// Check if an expression is assignable (can be the LHS of an assignment)
+    fn is_assignable(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::Variable { .. }
+                | Expression::ArrayAccess { .. }
+                | Expression::PropertyAccess { .. }
+                | Expression::StaticPropertyAccess { .. }
+                | Expression::NullsafePropertyAccess { .. }
+        )
     }
 
     /// Parse a statement
@@ -1622,6 +1664,9 @@ impl<'a> Parser<'a> {
             let mut params = Vec::new();
             if self.current_token != Token::RParen {
                 loop {
+                    if self.current_token == Token::RParen {
+                        break;
+                    }
                     params.push(self.parse_parameter()?);
                     if self.current_token == Token::Comma {
                         self.advance();
@@ -1678,8 +1723,10 @@ impl<'a> Parser<'a> {
             false
         };
 
-        // Parse method name
-        let name = if let Token::String = self.current_token {
+        // Parse method name (PHP allows semi-reserved keywords as method names)
+        let name = if self.current_token == Token::String
+            || self.is_semi_reserved_keyword()
+        {
             let n = self.lexer.source_text(&self.current_span).to_string();
             self.advance();
             n
@@ -1692,6 +1739,9 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         if self.current_token != Token::RParen {
             loop {
+                if self.current_token == Token::RParen {
+                    break;
+                }
                 params.push(self.parse_parameter()?);
                 if self.current_token == Token::Comma {
                     self.advance();
@@ -2154,6 +2204,10 @@ impl<'a> Parser<'a> {
         }
 
         loop {
+            // Trailing comma support: if we see ) after a comma, stop
+            if self.current_token == Token::RParen {
+                break;
+            }
             params.push(self.parse_parameter()?);
 
             if self.current_token == Token::Comma {
@@ -2527,12 +2581,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Check if current token is an identifier or a keyword that can be used as a name
-    fn is_identifier_or_keyword(&self) -> bool {
+    /// Check if current token is a semi-reserved keyword that can be used as a method/property name
+    fn is_semi_reserved_keyword(&self) -> bool {
         matches!(
             self.current_token,
-            Token::String
-                | Token::Array
+            Token::Array
                 | Token::Callable
                 | Token::Static
                 | Token::Class
@@ -2540,7 +2593,62 @@ impl<'a> Parser<'a> {
                 | Token::Match
                 | Token::Readonly
                 | Token::Enum
+                | Token::Empty
+                | Token::Isset
+                | Token::Unset
+                | Token::List
+                | Token::Switch
+                | Token::Case
+                | Token::Default
+                | Token::For
+                | Token::Foreach
+                | Token::While
+                | Token::Do
+                | Token::If
+                | Token::Else
+                | Token::Elseif
+                | Token::New
+                | Token::Clone
+                | Token::Throw
+                | Token::Try
+                | Token::Catch
+                | Token::Finally
+                | Token::Return
+                | Token::Yield
+                | Token::Print
+                | Token::Echo
+                | Token::Include
+                | Token::IncludeOnce
+                | Token::Require
+                | Token::RequireOnce
+                | Token::Extends
+                | Token::Implements
+                | Token::Var
+                | Token::Exit
+                | Token::Interface
+                | Token::Trait
+                | Token::Abstract
+                | Token::Final
+                | Token::Global
+                | Token::Goto
+                | Token::Instanceof
+                | Token::Insteadof
+                | Token::As
+                | Token::Break
+                | Token::Continue
+                | Token::Use
+                | Token::Namespace
+                | Token::Function
+                | Token::Const
+                | Token::LogicalAnd
+                | Token::LogicalOr
+                | Token::LogicalXor
         )
+    }
+
+    /// Check if current token is an identifier or a keyword that can be used as a name
+    fn is_identifier_or_keyword(&self) -> bool {
+        self.current_token == Token::String || self.is_semi_reserved_keyword()
     }
 
     /// Check if current token can start a type annotation
@@ -2813,7 +2921,7 @@ impl<'a> Parser<'a> {
             }
             Token::Exclamation => {
                 self.advance();
-                let operand = self.parse_expression(Self::PREFIX_PRECEDENCE)?;
+                let operand = self.parse_expression(Self::NOT_PRECEDENCE)?;
                 Ok(Expression::UnaryOp {
                     op: UnaryOperator::Not,
                     operand: Box::new(operand),
@@ -3030,6 +3138,24 @@ impl<'a> Parser<'a> {
                     // Check if it's a function call (followed by '(')
                     if self.current_token == Token::LParen {
                         self.advance(); // consume '('
+
+                        // First-class callable syntax: func(...)
+                        if self.current_token == Token::Ellipsis && *self.peek() == Token::RParen {
+                            self.advance(); // consume '...'
+                            self.advance(); // consume ')'
+                            // Emit Closure::fromCallable('func')
+                            return Ok(Expression::FunctionCall {
+                                name: Box::new(Expression::StringLiteral { value: "Closure::fromCallable".to_string(), span }),
+                                args: vec![Argument {
+                                    name: None,
+                                    value: Expression::StringLiteral { value: name, span },
+                                    unpack: false,
+                                    by_ref: false,
+                                }],
+                                span,
+                            });
+                        }
+
                         let mut args = Vec::new();
 
                         // Parse arguments
@@ -3433,8 +3559,9 @@ impl<'a> Parser<'a> {
 
             // Backslash for fully-qualified names: \ClassName or \func()
             Token::Backslash => {
-                // Fully-qualified name
-                let name = self.parse_qualified_name_as_expression()?;
+                // Fully-qualified name (e.g., \DIRECTORY_SEPARATOR, \strlen(), \Foo\Bar)
+                let qname = self.parse_qualified_name()?;
+                let name_str = format!("\\{}", qname.parts.join("\\"));
                 // Check if it's a function call
                 if self.current_token == Token::LParen {
                     self.advance();
@@ -3453,13 +3580,18 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(Token::RParen)?;
+                    let name_expr = Expression::StringLiteral { value: name_str, span };
                     Ok(Expression::FunctionCall {
-                        name: Box::new(name),
+                        name: Box::new(name_expr),
                         args,
                         span,
                     })
+                } else if self.current_token == Token::PaamayimNekudotayim {
+                    // Class reference: \Foo\Bar::method()
+                    Ok(Expression::StringLiteral { value: name_str, span })
                 } else {
-                    Ok(name)
+                    // Constant access: \DIRECTORY_SEPARATOR, \PHP_EOL, etc.
+                    Ok(Expression::ConstantAccess { name: name_str, span })
                 }
             }
 
@@ -3978,14 +4110,10 @@ impl<'a> Parser<'a> {
                 self.advance();
                 if self.current_token == Token::Class {
                     // ::class magic constant
-                    let prop_span = self.current_span;
                     self.advance();
-                    Ok(Expression::StaticPropertyAccess {
+                    Ok(Expression::ClassConstant {
                         class: Box::new(left),
-                        property: Box::new(Expression::StringLiteral {
-                            value: "class".to_string(),
-                            span: prop_span,
-                        }),
+                        constant: "class".to_string(),
                         span,
                     })
                 } else if self.current_token == Token::Variable {
@@ -3996,7 +4124,7 @@ impl<'a> Parser<'a> {
                         property: prop,
                         span,
                     })
-                } else if let Token::String = self.current_token {
+                } else if self.current_token == Token::String || self.is_semi_reserved_keyword() {
                     // Static method/constant: Class::method() or Class::CONST
                     let member_name = self.lexer.source_text(&self.current_span).to_string();
                     let member_span = self.current_span;
@@ -4005,6 +4133,31 @@ impl<'a> Parser<'a> {
                     if self.current_token == Token::LParen {
                         // Static method call: Class::method(args)
                         self.advance();
+
+                        // First-class callable syntax: Class::method(...)
+                        if self.current_token == Token::Ellipsis && *self.peek() == Token::RParen {
+                            self.advance(); // consume '...'
+                            self.advance(); // consume ')'
+                            // Emit Closure::fromCallable([Class, 'method'])
+                            let callable = Expression::ArrayLiteral {
+                                elements: vec![
+                                    ArrayElement { key: None, value: left, unpack: false, by_ref: false },
+                                    ArrayElement { key: None, value: Expression::StringLiteral { value: member_name, span: member_span }, unpack: false, by_ref: false },
+                                ],
+                                span,
+                            };
+                            return Ok(Expression::FunctionCall {
+                                name: Box::new(Expression::StringLiteral { value: "Closure::fromCallable".to_string(), span }),
+                                args: vec![Argument {
+                                    name: None,
+                                    value: callable,
+                                    unpack: false,
+                                    by_ref: false,
+                                }],
+                                span,
+                            });
+                        }
+
                         let mut args = Vec::new();
                         if self.current_token != Token::RParen {
                             loop {
@@ -4127,13 +4280,19 @@ impl<'a> Parser<'a> {
                 self.advance();
 
                 // First-class callable syntax: $func(...) — PHP 8.1+
-                if self.current_token == Token::Ellipsis {
+                // Only if `...` is followed by `)`, otherwise it's a spread argument like $fn(...$args)
+                if self.current_token == Token::Ellipsis && *self.peek() == Token::RParen {
                     self.advance();
                     self.expect(Token::RParen)?;
-                    // Treat as Closure::fromCallable($func)
+                    // Emit Closure::fromCallable($func)
                     return Ok(Expression::FunctionCall {
-                        name: Box::new(left),
-                        args: Vec::new(),
+                        name: Box::new(Expression::StringLiteral { value: "Closure::fromCallable".to_string(), span }),
+                        args: vec![Argument {
+                            name: None,
+                            value: left,
+                            unpack: false,
+                            by_ref: false,
+                        }],
                         span,
                     });
                 }
@@ -4211,21 +4370,24 @@ impl<'a> Parser<'a> {
             Token::Star => 17,                   // *
             Token::Slash => 17,                  // /
             Token::Percent => 17,                // %
-            Token::Pow => 19,                    // ** (right-associative, higher precedence)
-            Token::Inc => 20,                    // ++ (postfix)
-            Token::Dec => 20,                    // -- (postfix)
-            Token::Instanceof => 14,             // instanceof
-            Token::ObjectOperator => 21,         // -> (object property access)
-            Token::NullsafeObjectOperator => 21, // ?-> (nullsafe property access)
-            Token::PaamayimNekudotayim => 21,    // :: (static access)
-            Token::LBracket => 21,               // [ ] (array access)
-            Token::LParen => 21,                 // ( ) (function call)
+            Token::Instanceof => 19,             // instanceof (above ! but below other prefix)
+            Token::Pow => 21,                    // ** (right-associative, higher precedence)
+            Token::Inc => 22,                    // ++ (postfix)
+            Token::Dec => 22,                    // -- (postfix)
+            Token::ObjectOperator => 23,         // -> (object property access)
+            Token::NullsafeObjectOperator => 23, // ?-> (nullsafe property access)
+            Token::PaamayimNekudotayim => 23,    // :: (static access)
+            Token::LBracket => 23,               // [ ] (array access)
+            Token::LParen => 23,                 // ( ) (function call)
             _ => 0,                              // Not an infix operator
         }
     }
 
-    /// Precedence for prefix operators (unary, cast, etc.)
-    const PREFIX_PRECEDENCE: u8 = 18;
+    /// Precedence for most prefix operators (unary ~, ++, --, casts, @, +, -)
+    const PREFIX_PRECEDENCE: u8 = 20;
+    /// Precedence for logical NOT (!) — lower than instanceof but higher than * / %
+    /// PHP precedence: ++ -- ~ (type) @ > instanceof > ! > * / %
+    const NOT_PRECEDENCE: u8 = 18;
 
     /// Convert token to binary operator
     fn token_to_binary_op(token: &Token) -> Option<BinaryOperator> {

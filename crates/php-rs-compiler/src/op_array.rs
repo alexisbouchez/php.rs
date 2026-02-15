@@ -19,6 +19,8 @@ pub struct TryCatchElement {
     pub finally_op: u32,
     /// Opline index where the finally block ends (0 if no finally).
     pub finally_end: u32,
+    /// Exception class names matched by this catch block (empty = catch all).
+    pub catch_classes: Vec<String>,
 }
 
 /// Indicates the kind of value that lives in a live range.
@@ -75,7 +77,7 @@ impl LiveRange {
 /// Argument info for a function parameter.
 ///
 /// Corresponds to `zend_arg_info` in php-src.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArgInfo {
     /// Parameter name.
     pub name: String,
@@ -83,6 +85,10 @@ pub struct ArgInfo {
     pub pass_by_reference: bool,
     /// Whether the parameter is variadic (...$args).
     pub is_variadic: bool,
+    /// Default value (if any). Only simple compile-time constants are stored here.
+    pub default: Option<Literal>,
+    /// Type hint name (if any), e.g. "Application", "string", "int".
+    pub type_name: Option<String>,
 }
 
 /// Info about a class property (for compile-time metadata).
@@ -170,6 +176,8 @@ pub enum Literal {
     Long(i64),
     Double(f64),
     String(String),
+    /// Class constant reference: (class_name, const_name) — resolved at runtime
+    ClassConst(String, String),
 }
 
 impl Literal {
@@ -200,6 +208,7 @@ impl Literal {
                 }
             }
             Literal::String(s) => format!("\"{}\"", s),
+            Literal::ClassConst(class, name) => format!("{}::{}", class, name),
         }
     }
 }
@@ -606,11 +615,15 @@ mod tests {
             name: "a".to_string(),
             pass_by_reference: false,
             is_variadic: false,
+            default: None,
+            type_name: None,
         });
         op_array.arg_info.push(ArgInfo {
             name: "b".to_string(),
             pass_by_reference: false,
             is_variadic: false,
+            default: None,
+            type_name: None,
         });
         op_array.required_num_args = 2;
 

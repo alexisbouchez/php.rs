@@ -482,7 +482,23 @@ fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]
             0
         }
         Err(e) => {
-            eprintln!("Fatal error: {:?}", e);
+            // Print any partial output accumulated before the error
+            let partial = vm.get_output();
+            if !partial.is_empty() {
+                print!("{}", partial);
+            }
+            match &e {
+                php_rs_vm::VmError::Thrown(val) => {
+                    if let php_rs_vm::Value::Object(obj) = val {
+                        let class = obj.class_name();
+                        let msg = obj.get_property("message").map(|v| v.to_php_string()).unwrap_or_default();
+                        eprintln!("Fatal error: Uncaught {}: {} in unknown:0", class, msg);
+                    } else {
+                        eprintln!("Fatal error: {:?}", e);
+                    }
+                }
+                _ => eprintln!("Fatal error: {:?}", e),
+            }
             255
         }
     }
