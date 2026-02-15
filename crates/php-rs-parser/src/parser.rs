@@ -1516,15 +1516,9 @@ impl<'a> Parser<'a> {
 
         // Determine what kind of member this is
         match self.current_token {
-            Token::Function => {
-                Ok(vec![self.parse_class_method(modifiers, attributes)?])
-            }
-            Token::Const => {
-                Ok(vec![self.parse_class_constant(modifiers, attributes)?])
-            }
-            Token::Use => {
-                Ok(vec![self.parse_trait_use()?])
-            }
+            Token::Function => Ok(vec![self.parse_class_method(modifiers, attributes)?]),
+            Token::Const => Ok(vec![self.parse_class_constant(modifiers, attributes)?]),
+            Token::Use => Ok(vec![self.parse_trait_use()?]),
             _ => {
                 // Must be a property (with optional type hint)
                 // Could have multiple comma-separated properties
@@ -1724,9 +1718,7 @@ impl<'a> Parser<'a> {
         };
 
         // Parse method name (PHP allows semi-reserved keywords as method names)
-        let name = if self.current_token == Token::String
-            || self.is_semi_reserved_keyword()
-        {
+        let name = if self.current_token == Token::String || self.is_semi_reserved_keyword() {
             let n = self.lexer.source_text(&self.current_span).to_string();
             self.advance();
             n
@@ -2333,9 +2325,7 @@ impl<'a> Parser<'a> {
                     {
                         self.advance();
                         if let Token::String = self.current_token {
-                            parts.push(
-                                self.lexer.source_text(&self.current_span).to_string(),
-                            );
+                            parts.push(self.lexer.source_text(&self.current_span).to_string());
                             self.advance();
                         } else {
                             break;
@@ -2362,9 +2352,7 @@ impl<'a> Parser<'a> {
                     {
                         self.advance();
                         if let Token::String = self.current_token {
-                            parts.push(
-                                self.lexer.source_text(&self.current_span).to_string(),
-                            );
+                            parts.push(self.lexer.source_text(&self.current_span).to_string());
                             self.advance();
                         } else {
                             break;
@@ -3143,9 +3131,12 @@ impl<'a> Parser<'a> {
                         if self.current_token == Token::Ellipsis && *self.peek() == Token::RParen {
                             self.advance(); // consume '...'
                             self.advance(); // consume ')'
-                            // Emit Closure::fromCallable('func')
+                                            // Emit Closure::fromCallable('func')
                             return Ok(Expression::FunctionCall {
-                                name: Box::new(Expression::StringLiteral { value: "Closure::fromCallable".to_string(), span }),
+                                name: Box::new(Expression::StringLiteral {
+                                    value: "Closure::fromCallable".to_string(),
+                                    span,
+                                }),
                                 args: vec![Argument {
                                     name: None,
                                     value: Expression::StringLiteral { value: name, span },
@@ -3216,15 +3207,24 @@ impl<'a> Parser<'a> {
                             }
                             self.expect(Token::RParen)?;
                             Ok(Expression::FunctionCall {
-                                name: Box::new(Expression::StringLiteral { value: full_name, span }),
+                                name: Box::new(Expression::StringLiteral {
+                                    value: full_name,
+                                    span,
+                                }),
                                 args,
                                 span,
                             })
                         } else if self.current_token == Token::PaamayimNekudotayim {
                             // Qualified class name before :: — keep as StringLiteral
-                            Ok(Expression::StringLiteral { value: full_name, span })
+                            Ok(Expression::StringLiteral {
+                                value: full_name,
+                                span,
+                            })
                         } else {
-                            Ok(Expression::ConstantAccess { name: full_name, span })
+                            Ok(Expression::ConstantAccess {
+                                name: full_name,
+                                span,
+                            })
                         }
                     } else {
                         // It's a constant reference
@@ -3580,7 +3580,10 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.expect(Token::RParen)?;
-                    let name_expr = Expression::StringLiteral { value: name_str, span };
+                    let name_expr = Expression::StringLiteral {
+                        value: name_str,
+                        span,
+                    };
                     Ok(Expression::FunctionCall {
                         name: Box::new(name_expr),
                         args,
@@ -3588,10 +3591,16 @@ impl<'a> Parser<'a> {
                     })
                 } else if self.current_token == Token::PaamayimNekudotayim {
                     // Class reference: \Foo\Bar::method()
-                    Ok(Expression::StringLiteral { value: name_str, span })
+                    Ok(Expression::StringLiteral {
+                        value: name_str,
+                        span,
+                    })
                 } else {
                     // Constant access: \DIRECTORY_SEPARATOR, \PHP_EOL, etc.
-                    Ok(Expression::ConstantAccess { name: name_str, span })
+                    Ok(Expression::ConstantAccess {
+                        name: name_str,
+                        span,
+                    })
                 }
             }
 
@@ -4138,16 +4147,32 @@ impl<'a> Parser<'a> {
                         if self.current_token == Token::Ellipsis && *self.peek() == Token::RParen {
                             self.advance(); // consume '...'
                             self.advance(); // consume ')'
-                            // Emit Closure::fromCallable([Class, 'method'])
+                                            // Emit Closure::fromCallable([Class, 'method'])
                             let callable = Expression::ArrayLiteral {
                                 elements: vec![
-                                    ArrayElement { key: None, value: left, unpack: false, by_ref: false },
-                                    ArrayElement { key: None, value: Expression::StringLiteral { value: member_name, span: member_span }, unpack: false, by_ref: false },
+                                    ArrayElement {
+                                        key: None,
+                                        value: left,
+                                        unpack: false,
+                                        by_ref: false,
+                                    },
+                                    ArrayElement {
+                                        key: None,
+                                        value: Expression::StringLiteral {
+                                            value: member_name,
+                                            span: member_span,
+                                        },
+                                        unpack: false,
+                                        by_ref: false,
+                                    },
                                 ],
                                 span,
                             };
                             return Ok(Expression::FunctionCall {
-                                name: Box::new(Expression::StringLiteral { value: "Closure::fromCallable".to_string(), span }),
+                                name: Box::new(Expression::StringLiteral {
+                                    value: "Closure::fromCallable".to_string(),
+                                    span,
+                                }),
                                 args: vec![Argument {
                                     name: None,
                                     value: callable,
@@ -4286,7 +4311,10 @@ impl<'a> Parser<'a> {
                     self.expect(Token::RParen)?;
                     // Emit Closure::fromCallable($func)
                     return Ok(Expression::FunctionCall {
-                        name: Box::new(Expression::StringLiteral { value: "Closure::fromCallable".to_string(), span }),
+                        name: Box::new(Expression::StringLiteral {
+                            value: "Closure::fromCallable".to_string(),
+                            span,
+                        }),
                         args: vec![Argument {
                             name: None,
                             value: left,

@@ -513,6 +513,7 @@ mod tests {
             catch_op: 5,
             finally_op: 10,
             finally_end: 15,
+            catch_classes: vec![],
         };
         assert_eq!(elem.try_op, 0);
         assert_eq!(elem.catch_op, 5);

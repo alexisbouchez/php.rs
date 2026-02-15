@@ -491,7 +491,10 @@ fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]
                 php_rs_vm::VmError::Thrown(val) => {
                     if let php_rs_vm::Value::Object(obj) = val {
                         let class = obj.class_name();
-                        let msg = obj.get_property("message").map(|v| v.to_php_string()).unwrap_or_default();
+                        let msg = obj
+                            .get_property("message")
+                            .map(|v| v.to_php_string())
+                            .unwrap_or_default();
                         eprintln!("Fatal error: Uncaught {}: {} in unknown:0", class, msg);
                     } else {
                         eprintln!("Fatal error: {:?}", e);

@@ -1,0 +1,1 @@
+<?php echo "Required file loaded!\n";

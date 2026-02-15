@@ -484,8 +484,7 @@ impl Compiler {
             Statement::Namespace {
                 name, statements, ..
             } => {
-                self.current_namespace =
-                    name.as_ref().map(|n| name_parts_to_string(&n.parts));
+                self.current_namespace = name.as_ref().map(|n| name_parts_to_string(&n.parts));
                 for stmt in statements {
                     self.compile_stmt(stmt);
                 }
@@ -539,7 +538,10 @@ impl Compiler {
                 "self" => self.current_class.clone().unwrap_or_else(|| name.clone()),
                 // "static" must NOT be resolved at compile time — it uses late static binding
                 "static" => "static".to_string(),
-                "parent" => self.current_class_parent.clone().unwrap_or_else(|| "parent".to_string()),
+                "parent" => self
+                    .current_class_parent
+                    .clone()
+                    .unwrap_or_else(|| "parent".to_string()),
                 _ => self.qualify_name(name),
             };
             let idx = self.op_array.add_literal(Literal::String(resolved));
@@ -551,7 +553,10 @@ impl Compiler {
             let resolved = match value.as_str() {
                 "self" => self.current_class.clone().unwrap_or_else(|| value.clone()),
                 "static" => "static".to_string(),
-                "parent" => self.current_class_parent.clone().unwrap_or_else(|| "parent".to_string()),
+                "parent" => self
+                    .current_class_parent
+                    .clone()
+                    .unwrap_or_else(|| "parent".to_string()),
                 _ => self.qualify_name(value),
             };
             let idx = self.op_array.add_literal(Literal::String(resolved));
@@ -942,17 +947,23 @@ impl Compiler {
                 // Handle ClassName::class magic constant
                 if constant == "class" {
                     let class_name = match class.as_ref() {
-                        Expression::ConstantAccess { name, .. } | Expression::StringLiteral { value: name, .. } => {
-                            match name.as_str() {
-                                "self" | "static" => self.current_class.clone().unwrap_or_else(|| name.clone()),
-                                "parent" => self.current_class_parent.clone().unwrap_or_else(|| name.clone()),
-                                _ => self.qualify_name(name),
+                        Expression::ConstantAccess { name, .. }
+                        | Expression::StringLiteral { value: name, .. } => match name.as_str() {
+                            "self" | "static" => {
+                                self.current_class.clone().unwrap_or_else(|| name.clone())
                             }
-                        }
+                            "parent" => self
+                                .current_class_parent
+                                .clone()
+                                .unwrap_or_else(|| name.clone()),
+                            _ => self.qualify_name(name),
+                        },
                         _ => {
                             // Dynamic class::class — compile as FetchClassConstant
                             let cls = self.compile_class_name_expr(class);
-                            let const_lit = self.op_array.add_literal(Literal::String("class".to_string()));
+                            let const_lit = self
+                                .op_array
+                                .add_literal(Literal::String("class".to_string()));
                             let tmp = self.op_array.alloc_temp();
                             self.op_array.emit(
                                 ZOp::new(ZOpcode::FetchClassConstant, span.line as u32)
@@ -1021,9 +1032,9 @@ impl Compiler {
             Expression::MagicConstant { kind, .. } => {
                 let lit = match kind {
                     MagicConstantKind::Line => Literal::Long(0), // resolved at runtime
-                    MagicConstantKind::File => Literal::String(
-                        self.source_filename.clone().unwrap_or_default(),
-                    ),
+                    MagicConstantKind::File => {
+                        Literal::String(self.source_filename.clone().unwrap_or_default())
+                    }
                     MagicConstantKind::Dir => Literal::String(
                         self.source_filename
                             .as_ref()
@@ -1178,15 +1189,9 @@ impl Compiler {
                             let k_r = self.compile_expr(k);
                             self.op_array.emit(
                                 ZOp::new(ZOpcode::FetchDimR, line)
-                                    .with_op1(
-                                        Operand::tmp_var(prev_tmp),
-                                        OperandType::TmpVar,
-                                    )
+                                    .with_op1(Operand::tmp_var(prev_tmp), OperandType::TmpVar)
                                     .with_op2(k_r.operand, k_r.op_type)
-                                    .with_result(
-                                        Operand::tmp_var(next_tmp),
-                                        OperandType::TmpVar,
-                                    ),
+                                    .with_result(Operand::tmp_var(next_tmp), OperandType::TmpVar),
                             );
                         }
                         temps.push(next_tmp);
@@ -1200,27 +1205,15 @@ impl Compiler {
                         let k_r = self.compile_expr(k);
                         self.op_array.emit(
                             ZOp::new(ZOpcode::AssignDim, line)
-                                .with_op1(
-                                    Operand::tmp_var(innermost_tmp),
-                                    OperandType::TmpVar,
-                                )
+                                .with_op1(Operand::tmp_var(innermost_tmp), OperandType::TmpVar)
                                 .with_op2(k_r.operand, k_r.op_type)
-                                .with_result(
-                                    Operand::tmp_var(result_tmp),
-                                    OperandType::TmpVar,
-                                ),
+                                .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
                         );
                     } else {
                         self.op_array.emit(
                             ZOp::new(ZOpcode::AssignDim, line)
-                                .with_op1(
-                                    Operand::tmp_var(innermost_tmp),
-                                    OperandType::TmpVar,
-                                )
-                                .with_result(
-                                    Operand::tmp_var(result_tmp),
-                                    OperandType::TmpVar,
-                                ),
+                                .with_op1(Operand::tmp_var(innermost_tmp), OperandType::TmpVar)
+                                .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
                         );
                     }
                     // OP_DATA with the assigned value
@@ -1239,15 +1232,9 @@ impl Compiler {
                             let k_r = self.compile_expr(k);
                             self.op_array.emit(
                                 ZOp::new(ZOpcode::AssignDim, line)
-                                    .with_op1(
-                                        Operand::tmp_var(outer_tmp),
-                                        OperandType::TmpVar,
-                                    )
+                                    .with_op1(Operand::tmp_var(outer_tmp), OperandType::TmpVar)
                                     .with_op2(k_r.operand, k_r.op_type)
-                                    .with_result(
-                                        Operand::tmp_var(wb_result),
-                                        OperandType::TmpVar,
-                                    ),
+                                    .with_result(Operand::tmp_var(wb_result), OperandType::TmpVar),
                             );
                         }
                         self.op_array.emit(
@@ -1300,15 +1287,9 @@ impl Compiler {
                             let k_r = self.compile_expr(k);
                             self.op_array.emit(
                                 ZOp::new(ZOpcode::FetchDimR, line)
-                                    .with_op1(
-                                        Operand::tmp_var(prev_tmp),
-                                        OperandType::TmpVar,
-                                    )
+                                    .with_op1(Operand::tmp_var(prev_tmp), OperandType::TmpVar)
                                     .with_op2(k_r.operand, k_r.op_type)
-                                    .with_result(
-                                        Operand::tmp_var(next_tmp),
-                                        OperandType::TmpVar,
-                                    ),
+                                    .with_result(Operand::tmp_var(next_tmp), OperandType::TmpVar),
                             );
                         }
                         temps.push(next_tmp);
@@ -1322,27 +1303,15 @@ impl Compiler {
                         let k_r = self.compile_expr(k);
                         self.op_array.emit(
                             ZOp::new(ZOpcode::AssignDim, line)
-                                .with_op1(
-                                    Operand::tmp_var(innermost_tmp),
-                                    OperandType::TmpVar,
-                                )
+                                .with_op1(Operand::tmp_var(innermost_tmp), OperandType::TmpVar)
                                 .with_op2(k_r.operand, k_r.op_type)
-                                .with_result(
-                                    Operand::tmp_var(result_tmp),
-                                    OperandType::TmpVar,
-                                ),
+                                .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
                         );
                     } else {
                         self.op_array.emit(
                             ZOp::new(ZOpcode::AssignDim, line)
-                                .with_op1(
-                                    Operand::tmp_var(innermost_tmp),
-                                    OperandType::TmpVar,
-                                )
-                                .with_result(
-                                    Operand::tmp_var(result_tmp),
-                                    OperandType::TmpVar,
-                                ),
+                                .with_op1(Operand::tmp_var(innermost_tmp), OperandType::TmpVar)
+                                .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
                         );
                     }
                     // OP_DATA with the assigned value
@@ -1360,15 +1329,9 @@ impl Compiler {
                             let k_r = self.compile_expr(k);
                             self.op_array.emit(
                                 ZOp::new(ZOpcode::AssignDim, line)
-                                    .with_op1(
-                                        Operand::tmp_var(outer_tmp),
-                                        OperandType::TmpVar,
-                                    )
+                                    .with_op1(Operand::tmp_var(outer_tmp), OperandType::TmpVar)
                                     .with_op2(k_r.operand, k_r.op_type)
-                                    .with_result(
-                                        Operand::tmp_var(wb_result),
-                                        OperandType::TmpVar,
-                                    ),
+                                    .with_result(Operand::tmp_var(wb_result), OperandType::TmpVar),
                             );
                         }
                         self.op_array.emit(
@@ -1540,14 +1503,8 @@ impl Compiler {
                             self.op_array.emit(
                                 ZOp::new(ZOpcode::Assign, line)
                                     .with_op1(Operand::cv(cv), OperandType::Cv)
-                                    .with_op2(
-                                        Operand::tmp_var(fetch_tmp),
-                                        OperandType::TmpVar,
-                                    )
-                                    .with_result(
-                                        Operand::tmp_var(assign_tmp),
-                                        OperandType::TmpVar,
-                                    ),
+                                    .with_op2(Operand::tmp_var(fetch_tmp), OperandType::TmpVar)
+                                    .with_result(Operand::tmp_var(assign_tmp), OperandType::TmpVar),
                             );
                         }
                         Expression::ArrayLiteral {
@@ -1555,10 +1512,8 @@ impl Compiler {
                         } => {
                             // Nested array destructuring [$a, [$b, $c]] = expr
                             let fetch_result = ExprResult::tmp(fetch_tmp);
-                            let nested_elems: Vec<Option<Expression>> = nested
-                                .iter()
-                                .map(|e| Some(e.value.clone()))
-                                .collect();
+                            let nested_elems: Vec<Option<Expression>> =
+                                nested.iter().map(|e| Some(e.value.clone())).collect();
                             self.compile_list_destructure(&nested_elems, fetch_result, line);
                         }
                         _ => {
@@ -1567,14 +1522,8 @@ impl Compiler {
                             self.op_array.emit(
                                 ZOp::new(ZOpcode::Assign, line)
                                     .with_op1(lhs_result.operand, lhs_result.op_type)
-                                    .with_op2(
-                                        Operand::tmp_var(fetch_tmp),
-                                        OperandType::TmpVar,
-                                    )
-                                    .with_result(
-                                        Operand::tmp_var(assign_tmp),
-                                        OperandType::TmpVar,
-                                    ),
+                                    .with_op2(Operand::tmp_var(fetch_tmp), OperandType::TmpVar)
+                                    .with_result(Operand::tmp_var(assign_tmp), OperandType::TmpVar),
                             );
                         }
                     }
@@ -3065,16 +3014,22 @@ impl Compiler {
             // Strip leading $ from parameter name to match variable reference CVs
             let cv_name = param.name.strip_prefix('$').unwrap_or(&param.name);
             func_oa.lookup_cv(cv_name);
-            let default_lit = param.default.as_ref().and_then(|expr| Self::expr_to_literal(expr));
+            let default_lit = param
+                .default
+                .as_ref()
+                .and_then(|expr| Self::expr_to_literal(expr));
             // Extract type hint name if available
-            let type_name = param.param_type.as_ref().and_then(|t| Self::extract_type_name(t));
+            let type_name = param
+                .param_type
+                .as_ref()
+                .and_then(|t| Self::extract_type_name(t));
             // Qualify the type name with the current namespace
             let type_name = type_name.map(|t| {
                 match t.as_str() {
                     // Built-in types: don't qualify
-                    "int" | "float" | "string" | "bool" | "array" | "callable" |
-                    "iterable" | "object" | "mixed" | "void" | "never" | "null" |
-                    "false" | "true" | "self" | "static" | "parent" => t,
+                    "int" | "float" | "string" | "bool" | "array" | "callable" | "iterable"
+                    | "object" | "mixed" | "void" | "never" | "null" | "false" | "true"
+                    | "self" | "static" | "parent" => t,
                     // Class types: qualify with namespace
                     _ => self.qualify_name(&t),
                 }
@@ -3513,7 +3468,9 @@ impl Compiler {
         let fq_name = self.qualify_name(name);
 
         // Set current class context for self::/parent:: resolution
-        let parent_name = extends.as_ref().map(|p| self.qualify_name(&name_parts_to_string(&p.parts)));
+        let parent_name = extends
+            .as_ref()
+            .map(|p| self.qualify_name(&name_parts_to_string(&p.parts)));
         self.current_class = Some(fq_name.clone());
         self.current_class_parent = parent_name.clone();
 
@@ -3568,9 +3525,7 @@ impl Compiler {
                     ..
                 } => {
                     let is_static = prop_mods.contains(&Modifier::Static);
-                    let default_lit = default
-                        .as_ref()
-                        .and_then(|e| Self::try_expr_to_literal(e));
+                    let default_lit = default.as_ref().and_then(|e| Self::try_expr_to_literal(e));
                     if default_lit.is_some() || default.is_none() {
                         // Simple literal or no default — use metadata
                         metadata.properties.push(ClassPropertyInfo {
@@ -3633,10 +3588,14 @@ impl Compiler {
                     if method_name == "__construct" {
                         for param in params {
                             let has_visibility = param.modifiers.iter().any(|m| {
-                                matches!(m, Modifier::Public | Modifier::Protected | Modifier::Private)
+                                matches!(
+                                    m,
+                                    Modifier::Public | Modifier::Protected | Modifier::Private
+                                )
                             });
                             if has_visibility {
-                                let param_name_stripped = param.name.strip_prefix('$').unwrap_or(&param.name);
+                                let param_name_stripped =
+                                    param.name.strip_prefix('$').unwrap_or(&param.name);
                                 // Also register as a class property
                                 metadata.properties.push(ClassPropertyInfo {
                                     name: param_name_stripped.to_string(),
@@ -3646,7 +3605,9 @@ impl Compiler {
                                 // Emit: $this->paramName = $paramName
                                 let this_cv = sub.op_array.lookup_cv("this");
                                 let param_cv = sub.op_array.lookup_cv(param_name_stripped);
-                                let prop_lit = sub.op_array.add_literal(Literal::String(param_name_stripped.to_string()));
+                                let prop_lit = sub
+                                    .op_array
+                                    .add_literal(Literal::String(param_name_stripped.to_string()));
                                 let tmp = sub.op_array.alloc_temp();
                                 sub.op_array.emit(
                                     ZOp::new(ZOpcode::AssignObj, line)
@@ -3675,7 +3636,9 @@ impl Compiler {
                 }
                 ClassMember::TraitUse { traits, .. } => {
                     for trait_name in traits {
-                        metadata.traits.push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                        metadata
+                            .traits
+                            .push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
                     }
                 }
                 _ => {} // abstract methods, etc.
@@ -3683,7 +3646,9 @@ impl Compiler {
         }
 
         // Store class metadata in op_array
-        self.op_array.class_metadata.insert(fq_name.clone(), metadata);
+        self.op_array
+            .class_metadata
+            .insert(fq_name.clone(), metadata);
 
         // Emit runtime initialization opcodes for complex property defaults
         for dp in deferred_props {
@@ -3738,8 +3703,7 @@ impl Compiler {
                     .with_extended_value(2), // flag: class constant
             );
             self.op_array.emit(
-                ZOp::new(ZOpcode::OpData, line)
-                    .with_op1(val_result.operand, val_result.op_type),
+                ZOp::new(ZOpcode::OpData, line).with_op1(val_result.operand, val_result.op_type),
             );
         }
 
@@ -3856,9 +3820,7 @@ impl Compiler {
                     ..
                 } => {
                     let is_static = prop_mods.contains(&Modifier::Static);
-                    let default_lit = default
-                        .as_ref()
-                        .and_then(|e| Self::try_expr_to_literal(e));
+                    let default_lit = default.as_ref().and_then(|e| Self::try_expr_to_literal(e));
                     metadata.properties.push(ClassPropertyInfo {
                         name: prop_name.clone(),
                         default: default_lit,
@@ -3876,7 +3838,9 @@ impl Compiler {
                 }
                 ClassMember::TraitUse { traits, .. } => {
                     for trait_name in traits {
-                        metadata.traits.push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                        metadata
+                            .traits
+                            .push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
                     }
                 }
                 _ => {} // abstract methods, etc.
@@ -3921,10 +3885,15 @@ impl Compiler {
 
         for member in members {
             match member {
-                EnumMember::Case { name: case_name, value, .. } => {
+                EnumMember::Case {
+                    name: case_name,
+                    value,
+                    ..
+                } => {
                     // Store enum case as a class constant
                     let lit = if let Some(val_expr) = value {
-                        Self::try_expr_to_literal(val_expr).unwrap_or(Literal::String(case_name.clone()))
+                        Self::try_expr_to_literal(val_expr)
+                            .unwrap_or(Literal::String(case_name.clone()))
                     } else {
                         // Unit enum case — store name as value
                         Literal::String(case_name.clone())
@@ -3959,14 +3928,18 @@ impl Compiler {
                 }
                 EnumMember::ClassMember(ClassMember::TraitUse { traits, .. }) => {
                     for trait_name in traits {
-                        metadata.traits.push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
+                        metadata
+                            .traits
+                            .push(self.qualify_name(&name_parts_to_string(&trait_name.parts)));
                     }
                 }
                 _ => {}
             }
         }
 
-        self.op_array.class_metadata.insert(fq_name.clone(), metadata);
+        self.op_array
+            .class_metadata
+            .insert(fq_name.clone(), metadata);
         self.current_class = None;
     }
 

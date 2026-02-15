@@ -292,10 +292,22 @@ fn execute_php_request(
 
     // Build superglobals map: CV name (without $) → Value::Array
     let mut superglobals: HashMap<String, Value> = HashMap::new();
-    superglobals.insert("_SERVER".into(), Value::Array(PhpArray::from_string_map(&server_vars)));
-    superglobals.insert("_GET".into(), Value::Array(PhpArray::from_string_map(&get_vars)));
-    superglobals.insert("_POST".into(), Value::Array(PhpArray::from_string_map(&post_vars)));
-    superglobals.insert("_REQUEST".into(), Value::Array(PhpArray::from_string_map(&request_vars)));
+    superglobals.insert(
+        "_SERVER".into(),
+        Value::Array(PhpArray::from_string_map(&server_vars)),
+    );
+    superglobals.insert(
+        "_GET".into(),
+        Value::Array(PhpArray::from_string_map(&get_vars)),
+    );
+    superglobals.insert(
+        "_POST".into(),
+        Value::Array(PhpArray::from_string_map(&post_vars)),
+    );
+    superglobals.insert(
+        "_REQUEST".into(),
+        Value::Array(PhpArray::from_string_map(&request_vars)),
+    );
     // Raw POST body for JSON APIs (since php://input isn't available yet)
     superglobals.insert("_BODY".into(), Value::String(raw_body));
 

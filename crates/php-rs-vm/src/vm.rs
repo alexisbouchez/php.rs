@@ -304,26 +304,60 @@ impl Vm {
             call_stack: Vec::new(),
             constants: {
                 let mut c = HashMap::new();
-                c.insert("DIRECTORY_SEPARATOR".to_string(), Value::String("/".to_string()));
+                c.insert(
+                    "DIRECTORY_SEPARATOR".to_string(),
+                    Value::String("/".to_string()),
+                );
                 c.insert("PATH_SEPARATOR".to_string(), Value::String(":".to_string()));
                 c.insert("PHP_EOL".to_string(), Value::String("\n".to_string()));
                 c.insert("PHP_INT_MAX".to_string(), Value::Long(i64::MAX));
                 c.insert("PHP_INT_MIN".to_string(), Value::Long(i64::MIN));
                 c.insert("PHP_INT_SIZE".to_string(), Value::Long(8));
                 c.insert("PHP_FLOAT_MAX".to_string(), Value::Double(f64::MAX));
-                c.insert("PHP_FLOAT_MIN".to_string(), Value::Double(f64::MIN_POSITIVE));
+                c.insert(
+                    "PHP_FLOAT_MIN".to_string(),
+                    Value::Double(f64::MIN_POSITIVE),
+                );
                 c.insert("PHP_FLOAT_EPSILON".to_string(), Value::Double(f64::EPSILON));
                 c.insert("PHP_MAJOR_VERSION".to_string(), Value::Long(8));
                 c.insert("PHP_MINOR_VERSION".to_string(), Value::Long(6));
                 c.insert("PHP_RELEASE_VERSION".to_string(), Value::Long(0));
-                c.insert("PHP_VERSION".to_string(), Value::String("8.6.0".to_string()));
+                c.insert(
+                    "PHP_VERSION".to_string(),
+                    Value::String("8.6.0".to_string()),
+                );
                 c.insert("PHP_VERSION_ID".to_string(), Value::Long(80600));
                 c.insert("PHP_MAXPATHLEN".to_string(), Value::Long(1024));
-                c.insert("PHP_OS".to_string(), Value::String(if cfg!(target_os = "macos") { "Darwin" } else if cfg!(target_os = "windows") { "WINNT" } else { "Linux" }.to_string()));
-                c.insert("PHP_OS_FAMILY".to_string(), Value::String(if cfg!(target_os = "windows") { "Windows" } else { "Unix" }.to_string()));
+                c.insert(
+                    "PHP_OS".to_string(),
+                    Value::String(
+                        if cfg!(target_os = "macos") {
+                            "Darwin"
+                        } else if cfg!(target_os = "windows") {
+                            "WINNT"
+                        } else {
+                            "Linux"
+                        }
+                        .to_string(),
+                    ),
+                );
+                c.insert(
+                    "PHP_OS_FAMILY".to_string(),
+                    Value::String(
+                        if cfg!(target_os = "windows") {
+                            "Windows"
+                        } else {
+                            "Unix"
+                        }
+                        .to_string(),
+                    ),
+                );
                 c.insert("PHP_SAPI".to_string(), Value::String("cli".to_string()));
                 c.insert("PHP_PREFIX".to_string(), Value::String("/usr".to_string()));
-                c.insert("PHP_BINDIR".to_string(), Value::String("/usr/bin".to_string()));
+                c.insert(
+                    "PHP_BINDIR".to_string(),
+                    Value::String("/usr/bin".to_string()),
+                );
                 c.insert("TRUE".to_string(), Value::Bool(true));
                 c.insert("FALSE".to_string(), Value::Bool(false));
                 c.insert("NULL".to_string(), Value::Null);
@@ -675,7 +709,9 @@ impl Vm {
             // Handle exceptions: look for catch blocks, unwinding call stack
             let result = match result {
                 Err(VmError::Thrown(ref exception_val)) => {
-                    if let Some(catch_target) = self.find_catch_block(op_array_idx, ip, exception_val) {
+                    if let Some(catch_target) =
+                        self.find_catch_block(op_array_idx, ip, exception_val)
+                    {
                         self.current_exception = Some(exception_val.clone());
                         Ok(DispatchSignal::Jump(catch_target))
                     } else {
@@ -690,7 +726,9 @@ impl Vm {
                             if let Some(caller) = self.call_stack.last() {
                                 let caller_oa_idx = caller.op_array_idx;
                                 let caller_ip = caller.ip;
-                                if let Some(catch_target) = self.find_catch_block(caller_oa_idx, caller_ip, exception_val) {
+                                if let Some(catch_target) =
+                                    self.find_catch_block(caller_oa_idx, caller_ip, exception_val)
+                                {
                                     self.current_exception = Some(exception_val.clone());
                                     self.call_stack.last_mut().unwrap().ip = catch_target;
                                     found_catch = true;
@@ -868,7 +906,10 @@ impl Vm {
                     self.call_stack.last_mut().unwrap().ip += 1;
                     // Call offsetSet($key, $value)
                     let method_name = format!("{}::offsetSet", class_name);
-                    self.invoke_user_callback(&method_name, vec![Value::Object(obj_clone), k, val])?;
+                    self.invoke_user_callback(
+                        &method_name,
+                        vec![Value::Object(obj_clone), k, val],
+                    )?;
                     return Ok(DispatchSignal::Next);
                 }
                 // Ensure it's an array
@@ -891,7 +932,9 @@ impl Vm {
                 // Write-back to static property if this temp was from FETCH_STATIC_PROP_W
                 if matches!(arr_op1_type, OperandType::TmpVar | OperandType::Var) {
                     let frame = self.call_stack.last().unwrap();
-                    let wb: Option<(String, String)> = frame.static_prop_write_back.iter()
+                    let wb: Option<(String, String)> = frame
+                        .static_prop_write_back
+                        .iter()
                         .find(|(slot, _, _)| *slot == arr_idx)
                         .map(|(_, class, prop)| (class.clone(), prop.clone()));
                     if let Some((class_name, prop_name)) = wb {
@@ -914,10 +957,18 @@ impl Vm {
                 let frame = self.call_stack.last_mut().unwrap();
                 let lhs = match op.op1_type {
                     OperandType::Cv => {
-                        if idx < frame.cvs.len() { frame.cvs[idx].clone() } else { Value::Null }
+                        if idx < frame.cvs.len() {
+                            frame.cvs[idx].clone()
+                        } else {
+                            Value::Null
+                        }
                     }
                     OperandType::TmpVar | OperandType::Var => {
-                        if idx < frame.temps.len() { frame.temps[idx].clone() } else { Value::Null }
+                        if idx < frame.temps.len() {
+                            frame.temps[idx].clone()
+                        } else {
+                            Value::Null
+                        }
                     }
                     _ => Value::Null,
                 };
@@ -934,10 +985,14 @@ impl Vm {
                 let frame = self.call_stack.last_mut().unwrap();
                 match op.op1_type {
                     OperandType::Cv => {
-                        if idx < frame.cvs.len() { frame.cvs[idx] = result.clone(); }
+                        if idx < frame.cvs.len() {
+                            frame.cvs[idx] = result.clone();
+                        }
                     }
                     OperandType::TmpVar | OperandType::Var => {
-                        if idx >= frame.temps.len() { frame.temps.resize(idx + 1, Value::Null); }
+                        if idx >= frame.temps.len() {
+                            frame.temps.resize(idx + 1, Value::Null);
+                        }
                         frame.temps[idx] = result.clone();
                     }
                     _ => {}
@@ -1027,9 +1082,11 @@ impl Vm {
                     // ArrayAccess: call offsetGet($key) on the object
                     let class = obj.class_name();
                     let method = format!("{}::offsetGet", class);
-                    let method_idx = self.functions.get(&method).copied().or_else(|| {
-                        self.resolve_method(&class, "offsetGet")
-                    });
+                    let method_idx = self
+                        .functions
+                        .get(&method)
+                        .copied()
+                        .or_else(|| self.resolve_method(&class, "offsetGet"));
                     if let Some(oa_idx) = method_idx {
                         let saved_depth = self.call_stack.len();
                         let func_oa = &self.op_arrays[oa_idx];
@@ -1044,7 +1101,10 @@ impl Vm {
                         }
                         // Set first param CV
                         if !func_oa.arg_info.is_empty() && !frame.cvs.is_empty() {
-                            let param_cv = func_oa.vars.iter().position(|v| *v == func_oa.arg_info[0].name)
+                            let param_cv = func_oa
+                                .vars
+                                .iter()
+                                .position(|v| *v == func_oa.arg_info[0].name)
                                 .unwrap_or(0);
                             if param_cv < frame.cvs.len() {
                                 frame.cvs[param_cv] = key.clone();
@@ -1494,7 +1554,9 @@ impl Vm {
                     // Record CV source for all variable args so builtins can write back
                     // (e.g., preg_match $matches). Builtins decide which args to write back to.
                     if op.op1_type == OperandType::Cv {
-                        pending.ref_args.push((pending.args.len(), op.op1_type, op.op1.val));
+                        pending
+                            .ref_args
+                            .push((pending.args.len(), op.op1_type, op.op1.val));
                     }
                     pending.args.push(val);
                     pending.arg_names.push(arg_name);
@@ -1681,7 +1743,10 @@ impl Vm {
                     let short = name.rsplit('\\').next().unwrap_or(name);
                     self.constants.get(short).cloned().unwrap_or_else(|| {
                         if name.contains("DIRECTORY") || name.contains("SEPARATOR") {
-                            eprintln!("DEBUG FetchConstant: raw={} name={} short={} NOT FOUND", raw_name, name, short);
+                            eprintln!(
+                                "DEBUG FetchConstant: raw={} name={} short={} NOT FOUND",
+                                raw_name, name, short
+                            );
                         }
                         Value::Null
                     })
@@ -1788,13 +1853,11 @@ impl Vm {
                 self.write_result(op, oa_idx, name)?;
                 Ok(DispatchSignal::Next)
             }
-            ZOpcode::FetchStaticPropR
-            | ZOpcode::FetchStaticPropIs => {
+            ZOpcode::FetchStaticPropR | ZOpcode::FetchStaticPropIs => {
                 self.handle_fetch_static_prop(op, oa_idx, false)?;
                 Ok(DispatchSignal::Next)
             }
-            ZOpcode::FetchStaticPropW
-            | ZOpcode::FetchStaticPropRw => {
+            ZOpcode::FetchStaticPropW | ZOpcode::FetchStaticPropRw => {
                 self.handle_fetch_static_prop(op, oa_idx, true)?;
                 Ok(DispatchSignal::Next)
             }
@@ -1845,15 +1908,38 @@ impl Vm {
             ZOpcode::Throw => {
                 let val = self.read_operand(op, 1, oa_idx)?;
                 {
-                    let class = if let Value::Object(ref o) = val { o.class_name() } else { "non-object".to_string() };
-                    let msg = if let Value::Object(ref o) = val { o.get_property("message").map(|v| v.to_php_string()).unwrap_or_default() } else { format!("{:?}", val) };
-                    let stack: Vec<String> = self.call_stack.iter().rev().map(|f| {
-                        let name = self.op_arrays.get(f.op_array_idx)
-                            .and_then(|oa| oa.function_name.as_deref())
-                            .unwrap_or("<main>");
-                        format!("{}@ip{}", name, f.ip)
-                    }).collect();
-                    eprintln!("[THROW] {} at {} line {}: {}", class, stack.join(" -> "), op.lineno, msg);
+                    let class = if let Value::Object(ref o) = val {
+                        o.class_name()
+                    } else {
+                        "non-object".to_string()
+                    };
+                    let msg = if let Value::Object(ref o) = val {
+                        o.get_property("message")
+                            .map(|v| v.to_php_string())
+                            .unwrap_or_default()
+                    } else {
+                        format!("{:?}", val)
+                    };
+                    let stack: Vec<String> = self
+                        .call_stack
+                        .iter()
+                        .rev()
+                        .map(|f| {
+                            let name = self
+                                .op_arrays
+                                .get(f.op_array_idx)
+                                .and_then(|oa| oa.function_name.as_deref())
+                                .unwrap_or("<main>");
+                            format!("{}@ip{}", name, f.ip)
+                        })
+                        .collect();
+                    eprintln!(
+                        "[THROW] {} at {} line {}: {}",
+                        class,
+                        stack.join(" -> "),
+                        op.lineno,
+                        msg
+                    );
                 }
                 Err(VmError::Thrown(val))
             }
@@ -1983,22 +2069,35 @@ impl Vm {
             // Direct match (full name or short name)
             if exception_class == *catch_class
                 || exception_class == catch_short
-                || exception_class.rsplit('\\').next().unwrap_or(&exception_class) == catch_short
+                || exception_class
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(&exception_class)
+                    == catch_short
             {
                 return true;
             }
             // Catch-all types
             if catch_short == "Throwable" || catch_short == "Exception" || catch_short == "Error" {
                 // Check if exception is an exception/error type
-                let ex_short = exception_class.rsplit('\\').next().unwrap_or(&exception_class);
-                if ex_short.contains("Exception") || ex_short.contains("Error") || ex_short == "Throwable" {
+                let ex_short = exception_class
+                    .rsplit('\\')
+                    .next()
+                    .unwrap_or(&exception_class);
+                if ex_short.contains("Exception")
+                    || ex_short.contains("Error")
+                    || ex_short == "Throwable"
+                {
                     if catch_short == "Throwable" {
                         return true;
                     }
                     if catch_short == "Exception" && ex_short.contains("Exception") {
                         return true;
                     }
-                    if catch_short == "Error" && ex_short.contains("Error") && !ex_short.contains("Exception") {
+                    if catch_short == "Error"
+                        && ex_short.contains("Error")
+                        && !ex_short.contains("Exception")
+                    {
                         return true;
                     }
                 }
@@ -2027,11 +2126,10 @@ impl Vm {
     /// Handles both Closure objects (new style) and plain strings (legacy).
     fn extract_closure_name(val: &Value) -> String {
         match val {
-            Value::Object(o) if o.class_name() == "Closure" => {
-                o.get_property("__closure_name")
-                    .map(|v| v.to_php_string())
-                    .unwrap_or_default()
-            }
+            Value::Object(o) if o.class_name() == "Closure" => o
+                .get_property("__closure_name")
+                .map(|v| v.to_php_string())
+                .unwrap_or_default(),
             other => other.to_php_string(),
         }
     }
@@ -2106,7 +2204,9 @@ impl Vm {
                                 }
                             }
                         }
-                        oa.function_name.as_ref().and_then(|f| f.split("::").next().map(|s| s.to_string()))
+                        oa.function_name
+                            .as_ref()
+                            .and_then(|f| f.split("::").next().map(|s| s.to_string()))
                     });
                     if let Some(class) = current_class {
                         if let Some(class_def) = self.classes.get(&class) {
@@ -2250,9 +2350,13 @@ impl Vm {
                     None => Value::Null,
                 };
                 if prop_info.is_static {
-                    class_def.static_properties.insert(prop_info.name.clone(), default_val);
+                    class_def
+                        .static_properties
+                        .insert(prop_info.name.clone(), default_val);
                 } else {
-                    class_def.default_properties.insert(prop_info.name.clone(), default_val);
+                    class_def
+                        .default_properties
+                        .insert(prop_info.name.clone(), default_val);
                 }
             }
             for (const_name, lit) in &metadata.constants {
@@ -2261,9 +2365,7 @@ impl Vm {
                     Literal::Bool(b) => Value::Bool(*b),
                     Literal::Long(n) => Value::Long(*n),
                     Literal::Double(f) => Value::Double(*f),
-                    Literal::String(s) if s == "__EMPTY_ARRAY__" => {
-                        Value::Array(PhpArray::new())
-                    }
+                    Literal::String(s) if s == "__EMPTY_ARRAY__" => Value::Array(PhpArray::new()),
                     Literal::String(s) => Value::String(s.clone()),
                     Literal::ClassConst(class_ref, cname) => {
                         let resolved_class = if class_ref == "self" || class_ref == "static" {
@@ -2298,13 +2400,17 @@ impl Vm {
                 // Copy parent constants that aren't overridden
                 for (const_name, val) in &parent_def.class_constants {
                     if !class_def.class_constants.contains_key(const_name) {
-                        class_def.class_constants.insert(const_name.clone(), val.clone());
+                        class_def
+                            .class_constants
+                            .insert(const_name.clone(), val.clone());
                     }
                 }
                 // Copy parent default properties that aren't overridden
                 for (prop_name, val) in &parent_def.default_properties {
                     if !class_def.default_properties.contains_key(prop_name) {
-                        class_def.default_properties.insert(prop_name.clone(), val.clone());
+                        class_def
+                            .default_properties
+                            .insert(prop_name.clone(), val.clone());
                     }
                 }
                 // NOTE: Do NOT copy parent static properties — they are shared
@@ -2334,20 +2440,28 @@ impl Vm {
                     // Copy trait default properties that aren't overridden
                     for (prop_name, val) in &trait_def.default_properties {
                         if !class_def.default_properties.contains_key(prop_name) {
-                            class_def.default_properties.insert(prop_name.clone(), val.clone());
+                            class_def
+                                .default_properties
+                                .insert(prop_name.clone(), val.clone());
                         }
                     }
                     // Copy trait constants that aren't overridden
                     for (const_name, val) in &trait_def.class_constants {
-                        if const_name != "class" && !class_def.class_constants.contains_key(const_name) {
-                            class_def.class_constants.insert(const_name.clone(), val.clone());
+                        if const_name != "class"
+                            && !class_def.class_constants.contains_key(const_name)
+                        {
+                            class_def
+                                .class_constants
+                                .insert(const_name.clone(), val.clone());
                         }
                     }
                     // Copy trait static properties that aren't overridden
                     // (Traits DO get copied, unlike parent classes which share)
                     for (prop_name, val) in &trait_def.static_properties {
                         if !class_def.static_properties.contains_key(prop_name) {
-                            class_def.static_properties.insert(prop_name.clone(), val.clone());
+                            class_def
+                                .static_properties
+                                .insert(prop_name.clone(), val.clone());
                         }
                     }
                 }
@@ -2366,7 +2480,9 @@ impl Vm {
         }
 
         // Add `class` pseudo-constant (ClassName::class)
-        class_def.class_constants.insert("class".to_string(), Value::String(name.clone()));
+        class_def
+            .class_constants
+            .insert("class".to_string(), Value::String(name.clone()));
 
         self.classes.insert(name, class_def);
         Ok(())
@@ -2427,8 +2543,7 @@ impl Vm {
                     let param_names: Vec<&str> = oa.vars.iter().map(|s| s.as_str()).collect();
                     if let Some(class_param_idx) = param_names.iter().position(|&v| v == "class") {
                         if class_param_idx < frame.cvs.len() {
-                            frame.cvs[class_param_idx] =
-                                Value::String(class_name.to_string());
+                            frame.cvs[class_param_idx] = Value::String(class_name.to_string());
                         }
                     } else {
                         // Fallback: put class name in first non-$this CV
@@ -2684,7 +2799,9 @@ impl Vm {
         let frame = self.call_stack.last().unwrap();
         let obj_val = match op.op1_type {
             OperandType::Cv => frame.cvs.get(obj_cv).cloned().unwrap_or(Value::Null),
-            OperandType::TmpVar | OperandType::Var => frame.temps.get(obj_cv).cloned().unwrap_or(Value::Null),
+            OperandType::TmpVar | OperandType::Var => {
+                frame.temps.get(obj_cv).cloned().unwrap_or(Value::Null)
+            }
             _ => Value::Null,
         };
         if let Value::Object(ref obj) = obj_val {
@@ -2719,17 +2836,22 @@ impl Vm {
                     Value::Array(_) => "array",
                     _ => "unknown",
                 };
-                let current_func = self.call_stack.last()
+                let current_func = self
+                    .call_stack
+                    .last()
                     .and_then(|f| self.op_arrays.get(f.op_array_idx))
                     .and_then(|oa| oa.function_name.as_deref())
                     .unwrap_or("<main>");
                 let val_preview = match &obj {
-                    Value::String(s) => format!("string(\"{}\")", if s.len() > 50 { &s[..50] } else { s }),
+                    Value::String(s) => {
+                        format!("string(\"{}\")", if s.len() > 50 { &s[..50] } else { s })
+                    }
                     _ => val_type.to_string(),
                 };
-                return Err(VmError::TypeError(
-                    format!("Call to a member function {}() on {} (in {})", method_name, val_preview, current_func),
-                ));
+                return Err(VmError::TypeError(format!(
+                    "Call to a member function {}() on {} (in {})",
+                    method_name, val_preview, current_func
+                )));
             }
         };
 
@@ -3041,7 +3163,12 @@ impl Vm {
     }
 
     /// Handle FETCH_STATIC_PROP_* — read/write static properties.
-    fn handle_fetch_static_prop(&mut self, op: &ZOp, oa_idx: usize, write_mode: bool) -> VmResult<()> {
+    fn handle_fetch_static_prop(
+        &mut self,
+        op: &ZOp,
+        oa_idx: usize,
+        write_mode: bool,
+    ) -> VmResult<()> {
         let prop_name = self.read_operand(op, 1, oa_idx)?.to_php_string();
         let raw_class = self.read_operand(op, 2, oa_idx)?.to_php_string();
         let class_name = self.resolve_class_name(&raw_class);
@@ -3073,7 +3200,9 @@ impl Vm {
             if let OperandType::TmpVar | OperandType::Var = op.result_type {
                 let slot = op.result.val as usize;
                 let frame = self.call_stack.last_mut().unwrap();
-                frame.static_prop_write_back.push((slot, owner_class, prop_name));
+                frame
+                    .static_prop_write_back
+                    .push((slot, owner_class, prop_name));
             }
         }
 
@@ -3310,7 +3439,10 @@ impl Vm {
                 let class = o.class_name();
                 let base = class.rsplit('\\').next().unwrap_or(&class);
                 if base.contains("Exception") || base.contains("Error") || base == "Throwable" {
-                    let msg = args.first().cloned().unwrap_or(Value::String(String::new()));
+                    let msg = args
+                        .first()
+                        .cloned()
+                        .unwrap_or(Value::String(String::new()));
                     let code = args.get(1).cloned().unwrap_or(Value::Long(0));
                     let previous = args.get(2).cloned().unwrap_or(Value::Null);
                     o.set_property("message".to_string(), msg);
@@ -3337,7 +3469,10 @@ impl Vm {
                     // If class still not found, throw ReflectionException
                     if !self.classes.contains_key(&reflected_name) {
                         let ex_obj = PhpObject::new("ReflectionException".to_string());
-                        ex_obj.set_property("message".to_string(), Value::String(format!("Class \"{}\" does not exist", reflected_name)));
+                        ex_obj.set_property(
+                            "message".to_string(),
+                            Value::String(format!("Class \"{}\" does not exist", reflected_name)),
+                        );
                         return Err(VmError::Thrown(Value::Object(ex_obj)));
                     }
 
@@ -3374,18 +3509,24 @@ impl Vm {
             let base_class = class_part.rsplit('\\').next().unwrap_or(class_part);
 
             // DateTime/DateTimeImmutable/DateTimeZone constructors
-            if base_class == "DateTime" || base_class == "DateTimeImmutable"
-                || base_class == "DateTimeZone" || base_class == "CarbonTimeZone"
+            if base_class == "DateTime"
+                || base_class == "DateTimeImmutable"
+                || base_class == "DateTimeZone"
+                || base_class == "CarbonTimeZone"
             {
                 if let Some(Value::Object(ref obj)) = args.first() {
-                    let time_str = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "now".to_string());
+                    let time_str = args
+                        .get(1)
+                        .map(|v| v.to_php_string())
+                        .unwrap_or_else(|| "now".to_string());
                     obj.set_property("__datetime_value".to_string(), Value::String(time_str));
                 }
                 return Ok(DispatchSignal::Next);
             }
 
             // Exception/Error constructors: set message, code, previous properties
-            if base_class.contains("Exception") || base_class.contains("Error")
+            if base_class.contains("Exception")
+                || base_class.contains("Error")
                 || base_class == "Throwable"
             {
                 if let Some(Value::Object(ref obj)) = args.first() {
@@ -3711,14 +3852,20 @@ impl Vm {
                 let method_part = &func_name[sep + 2..];
 
                 // Determine if this is a static call or instance call
-                let has_this = args.first().map(|a| matches!(a, Value::Object(_))).unwrap_or(false);
+                let has_this = args
+                    .first()
+                    .map(|a| matches!(a, Value::Object(_)))
+                    .unwrap_or(false);
 
                 if has_this {
                     // Instance __call: $obj->method() where method doesn't exist
                     let magic_name = format!("{}::__call", class_part);
-                    if let Some(oa_idx) = self.functions.get(&magic_name).copied().or_else(|| {
-                        self.resolve_method(class_part, "__call")
-                    }) {
+                    if let Some(oa_idx) = self
+                        .functions
+                        .get(&magic_name)
+                        .copied()
+                        .or_else(|| self.resolve_method(class_part, "__call"))
+                    {
                         // Build args: $this, method_name, args_array
                         let this_val = args[0].clone();
                         let remaining_args: Vec<Value> = args[1..].to_vec();
@@ -3732,7 +3879,10 @@ impl Vm {
                         let mut new_frame = Frame::new(func_oa);
                         new_frame.op_array_idx = oa_idx;
                         new_frame.static_class = Some(class_part.to_string());
-                        new_frame.args = vec![Value::String(method_part.to_string()), Value::Array(args_arr)];
+                        new_frame.args = vec![
+                            Value::String(method_part.to_string()),
+                            Value::Array(args_arr),
+                        ];
                         // Bind $this
                         if let Some(this_idx) = func_oa.vars.iter().position(|v| v == "this") {
                             if this_idx < new_frame.cvs.len() {
@@ -3755,9 +3905,12 @@ impl Vm {
 
                 // Static __callStatic
                 let magic_name = format!("{}::__callStatic", class_part);
-                if let Some(oa_idx) = self.functions.get(&magic_name).copied().or_else(|| {
-                    self.resolve_method(class_part, "__callStatic")
-                }) {
+                if let Some(oa_idx) = self
+                    .functions
+                    .get(&magic_name)
+                    .copied()
+                    .or_else(|| self.resolve_method(class_part, "__callStatic"))
+                {
                     // Remove $this from args if present (static calls)
                     let actual_args = if has_this { &args[1..] } else { &args[..] };
                     let mut args_arr = PhpArray::new();
@@ -3770,7 +3923,10 @@ impl Vm {
                     let mut new_frame = Frame::new(func_oa);
                     new_frame.op_array_idx = oa_idx;
                     new_frame.static_class = Some(class_part.to_string());
-                    new_frame.args = vec![Value::String(method_part.to_string()), Value::Array(args_arr)];
+                    new_frame.args = vec![
+                        Value::String(method_part.to_string()),
+                        Value::Array(args_arr),
+                    ];
                     // Bind params
                     for i in 0..func_oa.arg_info.len().min(new_frame.args.len()) {
                         if i < new_frame.cvs.len() {
@@ -4747,30 +4903,45 @@ impl Vm {
         };
         match method_name {
             "isAnonymous" => {
-                let name = obj.get_property("name").unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(name.contains("{closure}") || name.is_empty())))
+                let name = obj
+                    .get_property("name")
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                Ok(Some(Value::Bool(
+                    name.contains("{closure}") || name.is_empty(),
+                )))
             }
             "getClosureScopeClass" => {
                 // Return a ReflectionClass-like object with a `name` property, or null
                 Ok(Some(Value::Null))
             }
             "getName" => {
-                let name = obj.get_property("name").unwrap_or(Value::String(String::new()));
+                let name = obj
+                    .get_property("name")
+                    .unwrap_or(Value::String(String::new()));
                 Ok(Some(name))
             }
             "getParameters" => {
                 // Look up the function's op_array to get arg_info
-                let func_n = obj.get_property("name").unwrap_or(Value::Null).to_php_string();
+                let func_n = obj
+                    .get_property("name")
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
                 let oa_idx = self.functions.get(&func_n).copied();
                 let mut params = PhpArray::new();
                 if let Some(idx) = oa_idx {
                     let arg_info = &self.op_arrays[idx].arg_info;
                     for (i, info) in arg_info.iter().enumerate() {
                         let param_obj = PhpObject::new("ReflectionParameter".to_string());
-                        param_obj.set_property("name".to_string(), Value::String(info.name.clone()));
+                        param_obj
+                            .set_property("name".to_string(), Value::String(info.name.clone()));
                         param_obj.set_property("position".to_string(), Value::Long(i as i64));
-                        param_obj.set_property("isVariadic".to_string(), Value::Bool(info.is_variadic));
-                        param_obj.set_property("hasDefault".to_string(), Value::Bool(info.default.is_some()));
+                        param_obj
+                            .set_property("isVariadic".to_string(), Value::Bool(info.is_variadic));
+                        param_obj.set_property(
+                            "hasDefault".to_string(),
+                            Value::Bool(info.default.is_some()),
+                        );
                         if let Some(ref default) = info.default {
                             let default_val = match default {
                                 Literal::Null => Value::Null,
@@ -4782,7 +4953,9 @@ impl Vm {
                                 }
                                 Literal::String(s) => Value::String(s.clone()),
                                 Literal::ClassConst(class_ref, cname) => {
-                                    let resolved_class = if class_ref == "self" || class_ref == "static" {
+                                    let resolved_class = if class_ref == "self"
+                                        || class_ref == "static"
+                                    {
                                         func_n.rsplit("::").nth(1).unwrap_or(class_ref).to_string()
                                     } else {
                                         class_ref.clone()
@@ -4794,9 +4967,11 @@ impl Vm {
                             param_obj.set_property("defaultValue".to_string(), default_val);
                         }
                         let type_name = info.type_name.clone();
-                        param_obj.set_property("hasType".to_string(), Value::Bool(type_name.is_some()));
+                        param_obj
+                            .set_property("hasType".to_string(), Value::Bool(type_name.is_some()));
                         if let Some(ref tn) = type_name {
-                            param_obj.set_property("typeName".to_string(), Value::String(tn.clone()));
+                            param_obj
+                                .set_property("typeName".to_string(), Value::String(tn.clone()));
                         }
                         params.push(Value::Object(param_obj));
                     }
@@ -4804,8 +4979,13 @@ impl Vm {
                 Ok(Some(Value::Array(params)))
             }
             "getNumberOfParameters" | "getNumberOfRequiredParameters" => {
-                let func_n = obj.get_property("name").unwrap_or(Value::Null).to_php_string();
-                let count = self.functions.get(&func_n)
+                let func_n = obj
+                    .get_property("name")
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+                let count = self
+                    .functions
+                    .get(&func_n)
                     .map(|&idx| self.op_arrays[idx].arg_info.len() as i64)
                     .unwrap_or(0);
                 Ok(Some(Value::Long(count)))
@@ -4833,7 +5013,11 @@ impl Vm {
 
         // Get the ReflectionClass object ($this is first arg)
         let obj = match args.first() {
-            Some(Value::Object(o)) if o.internal() == crate::value::InternalState::ReflectionClass => o.clone(),
+            Some(Value::Object(o))
+                if o.internal() == crate::value::InternalState::ReflectionClass =>
+            {
+                o.clone()
+            }
             _ => return Ok(None),
         };
 
@@ -4891,7 +5075,8 @@ impl Vm {
                 if self.functions.contains_key(&ctor_name) {
                     // Return a simple object representing the constructor
                     let method_obj = PhpObject::new("ReflectionMethod".to_string());
-                    method_obj.set_property("name".to_string(), Value::String("__construct".to_string()));
+                    method_obj
+                        .set_property("name".to_string(), Value::String("__construct".to_string()));
                     method_obj.set_property("class".to_string(), Value::String(reflected_name));
                     Ok(Some(Value::Object(method_obj)))
                 } else {
@@ -4951,8 +5136,14 @@ impl Vm {
             _ => return Ok(None),
         };
 
-        let class_name = obj.get_property("class").map(|v| v.to_php_string()).unwrap_or_default();
-        let method_n = obj.get_property("name").map(|v| v.to_php_string()).unwrap_or_default();
+        let class_name = obj
+            .get_property("class")
+            .map(|v| v.to_php_string())
+            .unwrap_or_default();
+        let method_n = obj
+            .get_property("name")
+            .map(|v| v.to_php_string())
+            .unwrap_or_default();
 
         match method_name {
             "getName" => Ok(Some(Value::String(method_n))),
@@ -4960,20 +5151,29 @@ impl Vm {
             "getParameters" => {
                 // Look up the function op_array to get arg_info
                 let full_name = format!("{}::{}", class_name, method_n);
-                let oa_idx = self.functions.get(&full_name).copied().or_else(|| {
-                    self.resolve_method(&class_name, &method_n)
-                });
+                let oa_idx = self
+                    .functions
+                    .get(&full_name)
+                    .copied()
+                    .or_else(|| self.resolve_method(&class_name, &method_n));
                 let mut params = PhpArray::new();
                 if let Some(idx) = oa_idx {
                     let arg_info = self.op_arrays[idx].arg_info.clone();
                     for (i, info) in arg_info.iter().enumerate() {
                         let param_obj = PhpObject::new("ReflectionParameter".to_string());
-                        param_obj.set_property("name".to_string(), Value::String(info.name.clone()));
+                        param_obj
+                            .set_property("name".to_string(), Value::String(info.name.clone()));
                         param_obj.set_property("position".to_string(), Value::Long(i as i64));
-                        param_obj.set_property("class".to_string(), Value::String(class_name.clone()));
-                        param_obj.set_property("method".to_string(), Value::String(method_n.clone()));
-                        param_obj.set_property("isVariadic".to_string(), Value::Bool(info.is_variadic));
-                        param_obj.set_property("hasDefault".to_string(), Value::Bool(info.default.is_some()));
+                        param_obj
+                            .set_property("class".to_string(), Value::String(class_name.clone()));
+                        param_obj
+                            .set_property("method".to_string(), Value::String(method_n.clone()));
+                        param_obj
+                            .set_property("isVariadic".to_string(), Value::Bool(info.is_variadic));
+                        param_obj.set_property(
+                            "hasDefault".to_string(),
+                            Value::Bool(info.default.is_some()),
+                        );
                         if let Some(ref default) = info.default {
                             let default_val = match default {
                                 Literal::Null => Value::Null,
@@ -4985,11 +5185,12 @@ impl Vm {
                                 }
                                 Literal::String(s) => Value::String(s.clone()),
                                 Literal::ClassConst(class_ref, cname) => {
-                                    let resolved_class = if class_ref == "self" || class_ref == "static" {
-                                        class_name.clone()
-                                    } else {
-                                        class_ref.clone()
-                                    };
+                                    let resolved_class =
+                                        if class_ref == "self" || class_ref == "static" {
+                                            class_name.clone()
+                                        } else {
+                                            class_ref.clone()
+                                        };
                                     self.resolve_class_constant(&resolved_class, cname)
                                         .unwrap_or(Value::Null)
                                 }
@@ -4997,11 +5198,15 @@ impl Vm {
                             param_obj.set_property("defaultValue".to_string(), default_val);
                         }
                         // Type info from compile-time type hints
-                        let type_name = self.op_arrays[idx].arg_info.get(i)
+                        let type_name = self.op_arrays[idx]
+                            .arg_info
+                            .get(i)
                             .and_then(|a| a.type_name.clone());
-                        param_obj.set_property("hasType".to_string(), Value::Bool(type_name.is_some()));
+                        param_obj
+                            .set_property("hasType".to_string(), Value::Bool(type_name.is_some()));
                         if let Some(ref tn) = type_name {
-                            param_obj.set_property("typeName".to_string(), Value::String(tn.clone()));
+                            param_obj
+                                .set_property("typeName".to_string(), Value::String(tn.clone()));
                         }
                         params.push(Value::Object(param_obj));
                     }
@@ -5034,19 +5239,24 @@ impl Vm {
 
         match method_name {
             "getName" => {
-                let name = obj.get_property("name").map(|v| v.to_php_string()).unwrap_or_default();
+                let name = obj
+                    .get_property("name")
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
                 Ok(Some(Value::String(name)))
             }
 
             "isVariadic" => {
-                let v = obj.get_property("isVariadic")
+                let v = obj
+                    .get_property("isVariadic")
                     .map(|v| v.to_bool())
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(v)))
             }
 
             "hasType" => {
-                let v = obj.get_property("hasType")
+                let v = obj
+                    .get_property("hasType")
                     .map(|v| v.to_bool())
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(v)))
@@ -5054,17 +5264,32 @@ impl Vm {
 
             "getType" => {
                 // Return null if no type hint (causes Util::getParameterClassName to return null)
-                let has_type = obj.get_property("hasType")
+                let has_type = obj
+                    .get_property("hasType")
                     .map(|v| v.to_bool())
                     .unwrap_or(false);
                 if has_type {
-                    let type_name = obj.get_property("typeName")
+                    let type_name = obj
+                        .get_property("typeName")
                         .map(|v| v.to_php_string())
                         .unwrap_or_default();
                     let type_obj = PhpObject::new("ReflectionNamedType".to_string());
-                    let is_builtin = matches!(type_name.as_str(),
-                        "int" | "float" | "string" | "bool" | "array" | "callable" |
-                        "iterable" | "object" | "mixed" | "void" | "never" | "null" | "false" | "true"
+                    let is_builtin = matches!(
+                        type_name.as_str(),
+                        "int"
+                            | "float"
+                            | "string"
+                            | "bool"
+                            | "array"
+                            | "callable"
+                            | "iterable"
+                            | "object"
+                            | "mixed"
+                            | "void"
+                            | "never"
+                            | "null"
+                            | "false"
+                            | "true"
                     );
                     type_obj.set_property("name".to_string(), Value::String(type_name));
                     type_obj.set_property("isBuiltin".to_string(), Value::Bool(is_builtin));
@@ -5076,7 +5301,8 @@ impl Vm {
             }
 
             "isDefaultValueAvailable" => {
-                let v = obj.get_property("hasDefault")
+                let v = obj
+                    .get_property("hasDefault")
                     .map(|v| v.to_bool())
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(v)))
@@ -5093,7 +5319,10 @@ impl Vm {
             }
 
             "getDeclaringClass" => {
-                let class_name = obj.get_property("class").map(|v| v.to_php_string()).unwrap_or_default();
+                let class_name = obj
+                    .get_property("class")
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
                 if !class_name.is_empty() {
                     let refl_obj = PhpObject::new("ReflectionClass".to_string());
                     refl_obj.set_property("name".to_string(), Value::String(class_name.clone()));
@@ -5133,15 +5362,24 @@ impl Vm {
 
         match method_name {
             "getName" => {
-                let name = obj.get_property("name").map(|v| v.to_php_string()).unwrap_or_default();
+                let name = obj
+                    .get_property("name")
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
                 Ok(Some(Value::String(name)))
             }
             "isBuiltin" => {
-                let v = obj.get_property("isBuiltin").map(|v| v.to_bool()).unwrap_or(false);
+                let v = obj
+                    .get_property("isBuiltin")
+                    .map(|v| v.to_bool())
+                    .unwrap_or(false);
                 Ok(Some(Value::Bool(v)))
             }
             "allowsNull" => {
-                let v = obj.get_property("allowsNull").map(|v| v.to_bool()).unwrap_or(false);
+                let v = obj
+                    .get_property("allowsNull")
+                    .map(|v| v.to_bool())
+                    .unwrap_or(false);
                 Ok(Some(Value::Bool(v)))
             }
             _ => Ok(None),
@@ -5212,29 +5450,24 @@ impl Vm {
             return None;
         }
         match method {
-            "getMessage" => {
-                Some(obj.get_property("message").unwrap_or(Value::String(String::new())))
-            }
-            "getCode" => {
-                Some(obj.get_property("code").unwrap_or(Value::Long(0)))
-            }
-            "getPrevious" => {
-                Some(obj.get_property("previous").unwrap_or(Value::Null))
-            }
-            "getFile" => {
-                Some(obj.get_property("file").unwrap_or(Value::String(String::new())))
-            }
-            "getLine" => {
-                Some(obj.get_property("line").unwrap_or(Value::Long(0)))
-            }
-            "getTrace" => {
-                Some(Value::Array(PhpArray::new()))
-            }
-            "getTraceAsString" => {
-                Some(Value::String(String::new()))
-            }
+            "getMessage" => Some(
+                obj.get_property("message")
+                    .unwrap_or(Value::String(String::new())),
+            ),
+            "getCode" => Some(obj.get_property("code").unwrap_or(Value::Long(0))),
+            "getPrevious" => Some(obj.get_property("previous").unwrap_or(Value::Null)),
+            "getFile" => Some(
+                obj.get_property("file")
+                    .unwrap_or(Value::String(String::new())),
+            ),
+            "getLine" => Some(obj.get_property("line").unwrap_or(Value::Long(0))),
+            "getTrace" => Some(Value::Array(PhpArray::new())),
+            "getTraceAsString" => Some(Value::String(String::new())),
             "__toString" => {
-                let msg = obj.get_property("message").unwrap_or(Value::String(String::new())).to_php_string();
+                let msg = obj
+                    .get_property("message")
+                    .unwrap_or(Value::String(String::new()))
+                    .to_php_string();
                 Some(Value::String(msg))
             }
             _ => None,
@@ -5248,7 +5481,8 @@ impl Vm {
         let base_class = class_part.rsplit('\\').next().unwrap_or(class_part);
 
         // Check if this is a DateTime/DateTimeZone family method
-        let is_datetime = matches!(base_class,
+        let is_datetime = matches!(
+            base_class,
             "DateTime" | "DateTimeImmutable" | "DateTimeZone" | "CarbonTimeZone"
         );
 
@@ -5262,13 +5496,17 @@ impl Vm {
                 let tz_obj = PhpObject::new("DateTimeZone".to_string());
                 tz_obj.set_object_id(self.next_object_id);
                 self.next_object_id += 1;
-                tz_obj.set_property("__datetime_value".to_string(), Value::String("UTC".to_string()));
+                tz_obj.set_property(
+                    "__datetime_value".to_string(),
+                    Value::String("UTC".to_string()),
+                );
                 Ok(Some(Value::Object(tz_obj)))
             }
             "getName" | "getTimezoneName" => {
                 // Return timezone name from object
                 if let Some(Value::Object(ref obj)) = args.first() {
-                    let name = obj.get_property("__datetime_value")
+                    let name = obj
+                        .get_property("__datetime_value")
                         .map(|v| v.to_php_string())
                         .unwrap_or_else(|| "UTC".to_string());
                     Ok(Some(Value::String(name)))
@@ -5277,7 +5515,10 @@ impl Vm {
                 }
             }
             "format" => {
-                let fmt = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "Y-m-d H:i:s".to_string());
+                let fmt = args
+                    .get(1)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| "Y-m-d H:i:s".to_string());
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -5308,7 +5549,10 @@ impl Vm {
                 let obj = PhpObject::new(class_part.to_string());
                 obj.set_object_id(self.next_object_id);
                 self.next_object_id += 1;
-                let time_str = args.first().map(|v| v.to_php_string()).unwrap_or_else(|| "now".to_string());
+                let time_str = args
+                    .first()
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| "now".to_string());
                 obj.set_property("__datetime_value".to_string(), Value::String(time_str));
                 Ok(Some(Value::Object(obj)))
             }
@@ -5348,7 +5592,12 @@ impl Vm {
     }
 
     /// Call a built-in function. Returns Some(Value) if handled, None if not a built-in.
-    fn call_builtin(&mut self, name: &str, args: &[Value], ref_args: &[(usize, OperandType, u32)]) -> VmResult<Option<Value>> {
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        args: &[Value],
+        ref_args: &[(usize, OperandType, u32)],
+    ) -> VmResult<Option<Value>> {
         // Check disable_functions
         if self
             .config
@@ -6241,7 +6490,8 @@ impl Vm {
                 }
             }
             "register_shutdown_function" => {
-                let func_name = Self::extract_closure_name(&args.first().cloned().unwrap_or(Value::Null));
+                let func_name =
+                    Self::extract_closure_name(&args.first().cloned().unwrap_or(Value::Null));
                 if !func_name.is_empty() {
                     self.shutdown_functions.push(func_name);
                 }
@@ -6292,12 +6542,15 @@ impl Vm {
                                     }
                                     // Write $matches back via ref_args (arg index 2)
                                     if args.len() > 2 {
-                                        if let Some((_arg_idx, op_type, op_val)) = ref_args.iter().find(|(idx, _, _)| *idx == 2) {
+                                        if let Some((_arg_idx, op_type, op_val)) =
+                                            ref_args.iter().find(|(idx, _, _)| *idx == 2)
+                                        {
                                             if *op_type == OperandType::Cv {
                                                 if let Some(frame) = self.call_stack.last_mut() {
                                                     let cv_idx = *op_val as usize;
                                                     if cv_idx < frame.cvs.len() {
-                                                        frame.cvs[cv_idx] = Value::Array(matches_arr);
+                                                        frame.cvs[cv_idx] =
+                                                            Value::Array(matches_arr);
                                                     }
                                                 }
                                             }
@@ -6317,18 +6570,25 @@ impl Vm {
                                             let num_groups = caps.len();
                                             for i in 0..num_groups {
                                                 if let Some(m) = caps.get(i) {
-                                                    matches_arr.push(Value::String(m.as_str().to_string()));
+                                                    matches_arr.push(Value::String(
+                                                        m.as_str().to_string(),
+                                                    ));
                                                 } else {
                                                     matches_arr.push(Value::String(String::new()));
                                                 }
                                             }
                                             if args.len() > 2 {
-                                                if let Some((_arg_idx, op_type, op_val)) = ref_args.iter().find(|(idx, _, _)| *idx == 2) {
+                                                if let Some((_arg_idx, op_type, op_val)) =
+                                                    ref_args.iter().find(|(idx, _, _)| *idx == 2)
+                                                {
                                                     if *op_type == OperandType::Cv {
-                                                        if let Some(frame) = self.call_stack.last_mut() {
+                                                        if let Some(frame) =
+                                                            self.call_stack.last_mut()
+                                                        {
                                                             let cv_idx = *op_val as usize;
                                                             if cv_idx < frame.cvs.len() {
-                                                                frame.cvs[cv_idx] = Value::Array(matches_arr);
+                                                                frame.cvs[cv_idx] =
+                                                                    Value::Array(matches_arr);
                                                             }
                                                         }
                                                     }
@@ -7977,7 +8237,8 @@ impl Vm {
             }
             "array_reduce" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
-                let callback = Self::extract_closure_name(&args.get(1).cloned().unwrap_or(Value::Null));
+                let callback =
+                    Self::extract_closure_name(&args.get(1).cloned().unwrap_or(Value::Null));
                 let mut carry = args.get(2).cloned().unwrap_or(Value::Null);
                 if let Value::Array(ref a) = arr {
                     let entries: Vec<_> = a.entries().iter().cloned().collect();
@@ -8040,7 +8301,8 @@ impl Vm {
             }
             "array_walk" => {
                 let arr = args.first().cloned().unwrap_or(Value::Null);
-                let callback = Self::extract_closure_name(&args.get(1).cloned().unwrap_or(Value::Null));
+                let callback =
+                    Self::extract_closure_name(&args.get(1).cloned().unwrap_or(Value::Null));
                 let extra = args.get(2).cloned();
                 if let Value::Array(ref a) = arr {
                     let entries: Vec<_> = a.entries().iter().cloned().collect();
@@ -8077,7 +8339,8 @@ impl Vm {
             "usort" | "uasort" | "uksort" => {
                 let sort_type = name.to_string();
                 let arr = args.first().cloned().unwrap_or(Value::Null);
-                let callback = Self::extract_closure_name(&args.get(1).cloned().unwrap_or(Value::Null));
+                let callback =
+                    Self::extract_closure_name(&args.get(1).cloned().unwrap_or(Value::Null));
                 if let Value::Array(ref a) = arr {
                     let mut entries: Vec<(ArrayKey, Value)> = a.entries().iter().cloned().collect();
                     // Insertion sort to allow callback invocation between comparisons
@@ -10348,10 +10611,12 @@ impl Vm {
                 let callback_name = match &raw {
                     Value::Array(arr) => {
                         // [ClassName, 'methodName'] or [$obj, 'methodName']
-                        let class = arr.get_int(0)
+                        let class = arr
+                            .get_int(0)
                             .map(|v: &Value| v.to_php_string())
                             .unwrap_or_default();
-                        let method = arr.get_int(1)
+                        let method = arr
+                            .get_int(1)
                             .map(|v: &Value| v.to_php_string())
                             .unwrap_or_default();
                         format!("{}::{}", class, method)
