@@ -463,40 +463,34 @@ impl Vm {
             classes: {
                 let mut cls = HashMap::new();
                 // Register built-in SPL classes with their constants
-                let make_class = |name: &str,
-                                  parent: Option<&str>,
-                                  constants: Vec<(&str, i64)>|
-                 -> ClassDef {
-                    let mut cc = HashMap::new();
-                    for (k, v) in constants {
-                        cc.insert(k.to_string(), Value::Long(v));
-                    }
-                    ClassDef {
-                        _name: name.to_string(),
-                        parent: parent.map(|s| s.to_string()),
-                        interfaces: Vec::new(),
-                        traits: Vec::new(),
-                        is_abstract: false,
-                        is_interface: false,
-                        is_enum: false,
-                        methods: HashMap::new(),
-                        default_properties: HashMap::new(),
-                        class_constants: cc,
-                        static_properties: HashMap::new(),
-                        attributes: Vec::new(),
-                    }
-                };
+                let make_class =
+                    |name: &str, parent: Option<&str>, constants: Vec<(&str, i64)>| -> ClassDef {
+                        let mut cc = HashMap::new();
+                        for (k, v) in constants {
+                            cc.insert(k.to_string(), Value::Long(v));
+                        }
+                        ClassDef {
+                            _name: name.to_string(),
+                            parent: parent.map(|s| s.to_string()),
+                            interfaces: Vec::new(),
+                            traits: Vec::new(),
+                            is_abstract: false,
+                            is_interface: false,
+                            is_enum: false,
+                            methods: HashMap::new(),
+                            default_properties: HashMap::new(),
+                            class_constants: cc,
+                            static_properties: HashMap::new(),
+                            attributes: Vec::new(),
+                        }
+                    };
                 cls.insert(
                     "SplFileInfo".to_string(),
                     make_class("SplFileInfo", None, vec![]),
                 );
                 cls.insert(
                     "DirectoryIterator".to_string(),
-                    make_class(
-                        "DirectoryIterator",
-                        Some("SplFileInfo"),
-                        vec![],
-                    ),
+                    make_class("DirectoryIterator", Some("SplFileInfo"), vec![]),
                 );
                 cls.insert(
                     "FilesystemIterator".to_string(),
@@ -544,11 +538,7 @@ impl Vm {
                 );
                 cls.insert(
                     "RecursiveFilterIterator".to_string(),
-                    make_class(
-                        "RecursiveFilterIterator",
-                        Some("FilterIterator"),
-                        vec![],
-                    ),
+                    make_class("RecursiveFilterIterator", Some("FilterIterator"), vec![]),
                 );
                 cls.insert(
                     "IteratorIterator".to_string(),
@@ -575,11 +565,7 @@ impl Vm {
                 );
                 cls.insert(
                     "RecursiveRegexIterator".to_string(),
-                    make_class(
-                        "RecursiveRegexIterator",
-                        Some("RegexIterator"),
-                        vec![],
-                    ),
+                    make_class("RecursiveRegexIterator", Some("RegexIterator"), vec![]),
                 );
                 cls
             },
@@ -901,10 +887,8 @@ impl Vm {
                 }
                 // Convert DivisionByZero to DivisionByZeroError exception
                 Err(VmError::DivisionByZero) => {
-                    let exception_val = self.create_error_object(
-                        "DivisionByZeroError",
-                        "Division by zero".to_string(),
-                    );
+                    let exception_val = self
+                        .create_error_object("DivisionByZeroError", "Division by zero".to_string());
                     Err(VmError::Thrown(exception_val))
                 }
                 // Convert MatchError to Error exception
@@ -977,12 +961,7 @@ impl Vm {
                             {
                                 if callee_cv_idx < frame.cvs.len() {
                                     let val = frame.cvs[callee_cv_idx].clone();
-                                    Self::write_to_slot(
-                                        caller,
-                                        caller_op_type,
-                                        caller_slot,
-                                        val,
-                                    );
+                                    Self::write_to_slot(caller, caller_op_type, caller_slot, val);
                                 }
                             }
                         }
@@ -1095,9 +1074,13 @@ impl Vm {
 
                 // Check if the RHS temp came from indexing into a Reference
                 // (e.g., $array = &$array[$key] where $array is a Reference)
-                let dim_ref_info = if matches!(op.op2_type, OperandType::TmpVar | OperandType::Var) {
+                let dim_ref_info = if matches!(op.op2_type, OperandType::TmpVar | OperandType::Var)
+                {
                     let frame = self.call_stack.last().unwrap();
-                    frame.temp_dim_ref_source.get(&(op.op2.val as usize)).cloned()
+                    frame
+                        .temp_dim_ref_source
+                        .get(&(op.op2.val as usize))
+                        .cloned()
                 } else {
                     None
                 };
@@ -1414,10 +1397,9 @@ impl Vm {
                 if let Value::Reference(ref rc) = arr_raw {
                     if matches!(op.result_type, OperandType::TmpVar | OperandType::Var) {
                         let frame = self.call_stack.last_mut().unwrap();
-                        frame.temp_dim_ref_source.insert(
-                            op.result.val as usize,
-                            (rc.clone(), key.clone()),
-                        );
+                        frame
+                            .temp_dim_ref_source
+                            .insert(op.result.val as usize, (rc.clone(), key.clone()));
                     }
                 }
 
@@ -1673,35 +1655,35 @@ impl Vm {
                             || o.get_property("__inner_iterator").is_some()
                             || o.get_property("__array_data").is_some();
                         // Check for getIterator (IteratorAggregate)
-                        let iter_obj =
-                            if self.resolve_method(&class_name, "getIterator").is_some() {
-                                match self.call_method_sync(&arr, "getIterator") {
-                                    Ok(Value::Object(it)) => it,
-                                    Ok(_) => {
-                                        return Ok(DispatchSignal::Jump(op.op2.val as usize));
-                                    }
-                                    Err(_) => {
-                                        return Ok(DispatchSignal::Jump(op.op2.val as usize));
-                                    }
+                        let iter_obj = if self.resolve_method(&class_name, "getIterator").is_some()
+                        {
+                            match self.call_method_sync(&arr, "getIterator") {
+                                Ok(Value::Object(it)) => it,
+                                Ok(_) => {
+                                    return Ok(DispatchSignal::Jump(op.op2.val as usize));
                                 }
-                            } else if is_builtin_iterator
-                                || self.resolve_method(&class_name, "current").is_some()
-                            {
-                                // Direct Iterator (user-defined or builtin)
-                                o.clone()
-                            } else {
-                                // Not iterable — iterate over public properties as an array
-                                let mut arr_val = PhpArray::new();
-                                for (k, v) in o.properties() {
-                                    arr_val.set_string(k, v);
+                                Err(_) => {
+                                    return Ok(DispatchSignal::Jump(op.op2.val as usize));
                                 }
-                                let iter = Value::_Iterator {
-                                    array: arr_val,
-                                    index: 0,
-                                };
-                                self.write_result(op, oa_idx, iter)?;
-                                return Ok(DispatchSignal::Next);
+                            }
+                        } else if is_builtin_iterator
+                            || self.resolve_method(&class_name, "current").is_some()
+                        {
+                            // Direct Iterator (user-defined or builtin)
+                            o.clone()
+                        } else {
+                            // Not iterable — iterate over public properties as an array
+                            let mut arr_val = PhpArray::new();
+                            for (k, v) in o.properties() {
+                                arr_val.set_string(k, v);
+                            }
+                            let iter = Value::_Iterator {
+                                array: arr_val,
+                                index: 0,
                             };
+                            self.write_result(op, oa_idx, iter)?;
+                            return Ok(DispatchSignal::Next);
+                        };
                         // Call rewind() on the iterator
                         let iter_val = Value::Object(iter_obj.clone());
                         let _ = self.call_method_sync(&iter_val, "rewind");
@@ -1716,10 +1698,7 @@ impl Vm {
                         // Dereference and handle
                         let inner = rc.borrow().deref_value();
                         if let Value::Array(a) = inner {
-                            let iter = Value::_Iterator {
-                                array: a,
-                                index: 0,
-                            };
+                            let iter = Value::_Iterator { array: a, index: 0 };
                             self.write_result(op, oa_idx, iter)?;
                             Ok(DispatchSignal::Next)
                         } else {
@@ -1842,7 +1821,11 @@ impl Vm {
 
                         Ok(DispatchSignal::Next)
                     }
-                } else if let Value::_ObjectIterator { ref iterator, first } = iter {
+                } else if let Value::_ObjectIterator {
+                    ref iterator,
+                    first,
+                } = iter
+                {
                     let iter_val = Value::Object(iterator.clone());
                     // Advance on subsequent fetches (not the first)
                     if !first {
@@ -2734,16 +2717,13 @@ impl Vm {
                 // 3. Fall back to static_class or $this
                 if let Some(frame) = self.call_stack.last() {
                     let oa = &self.op_arrays[frame.op_array_idx];
-                    let defining_class = oa
-                        .function_name
-                        .as_ref()
-                        .and_then(|f| {
-                            if f.contains("::") && !f.contains("{closure}") {
-                                f.split("::").next().map(|s| s.to_string())
-                            } else {
-                                None
-                            }
-                        });
+                    let defining_class = oa.function_name.as_ref().and_then(|f| {
+                        if f.contains("::") && !f.contains("{closure}") {
+                            f.split("::").next().map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    });
 
                     // First try the defining class (works for normal methods)
                     if let Some(ref dc) = defining_class {
@@ -2861,7 +2841,9 @@ impl Vm {
         // Parse class attributes
         let mut class_attributes = Vec::new();
         for attr_section in &attr_sections {
-            if attr_section.is_empty() { continue; }
+            if attr_section.is_empty() {
+                continue;
+            }
             let mut attr_parts: Vec<&str> = attr_section.split('\x02').collect();
             let attr_name = attr_parts.remove(0).to_string();
             let mut args = Vec::new();
@@ -3789,7 +3771,11 @@ impl Vm {
                         return Ok(result.to_php_string());
                     }
                     // Try parent class
-                    if let Some(parent) = self.classes.get(&search_class).and_then(|c| c.parent.clone()) {
+                    if let Some(parent) = self
+                        .classes
+                        .get(&search_class)
+                        .and_then(|c| c.parent.clone())
+                    {
                         search_class = parent;
                     } else {
                         break;
@@ -3955,14 +3941,28 @@ impl Vm {
     fn is_exception_class(&self, class_name: &str) -> bool {
         let short = class_name.rsplit('\\').next().unwrap_or(class_name);
         // Known built-in exception/error base classes
-        if matches!(short,
-            "Exception" | "Error" | "Throwable"
-            | "RuntimeException" | "LogicException" | "InvalidArgumentException"
-            | "BadMethodCallException" | "BadFunctionCallException"
-            | "OutOfRangeException" | "OverflowException" | "UnderflowException"
-            | "LengthException" | "DomainException" | "RangeException"
-            | "UnexpectedValueException" | "TypeError" | "ValueError"
-            | "ArithmeticError" | "DivisionByZeroError" | "ParseError"
+        if matches!(
+            short,
+            "Exception"
+                | "Error"
+                | "Throwable"
+                | "RuntimeException"
+                | "LogicException"
+                | "InvalidArgumentException"
+                | "BadMethodCallException"
+                | "BadFunctionCallException"
+                | "OutOfRangeException"
+                | "OverflowException"
+                | "UnderflowException"
+                | "LengthException"
+                | "DomainException"
+                | "RangeException"
+                | "UnexpectedValueException"
+                | "TypeError"
+                | "ValueError"
+                | "ArithmeticError"
+                | "DivisionByZeroError"
+                | "ParseError"
         ) {
             return true;
         }
@@ -3972,13 +3972,28 @@ impl Vm {
             if let Some(class_def) = self.classes.get(&current) {
                 if let Some(ref parent) = class_def.parent {
                     let parent_short = parent.rsplit('\\').next().unwrap_or(parent);
-                    if matches!(parent_short, "Exception" | "Error" | "Throwable"
-                        | "RuntimeException" | "LogicException" | "InvalidArgumentException"
-                        | "BadMethodCallException" | "BadFunctionCallException"
-                        | "OutOfRangeException" | "OverflowException" | "UnderflowException"
-                        | "LengthException" | "DomainException" | "RangeException"
-                        | "UnexpectedValueException" | "TypeError" | "ValueError"
-                        | "ArithmeticError" | "DivisionByZeroError" | "ParseError"
+                    if matches!(
+                        parent_short,
+                        "Exception"
+                            | "Error"
+                            | "Throwable"
+                            | "RuntimeException"
+                            | "LogicException"
+                            | "InvalidArgumentException"
+                            | "BadMethodCallException"
+                            | "BadFunctionCallException"
+                            | "OutOfRangeException"
+                            | "OverflowException"
+                            | "UnderflowException"
+                            | "LengthException"
+                            | "DomainException"
+                            | "RangeException"
+                            | "UnexpectedValueException"
+                            | "TypeError"
+                            | "ValueError"
+                            | "ArithmeticError"
+                            | "DivisionByZeroError"
+                            | "ParseError"
                     ) {
                         return true;
                     }
@@ -4228,9 +4243,7 @@ impl Vm {
                 }
                 if matches!(
                     base_class,
-                    "RecursiveDirectoryIterator"
-                        | "FilesystemIterator"
-                        | "DirectoryIterator"
+                    "RecursiveDirectoryIterator" | "FilesystemIterator" | "DirectoryIterator"
                 ) {
                     let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                     // Read directory entries
@@ -4267,7 +4280,10 @@ impl Vm {
 
                 // For ArrayIterator / ArrayObject
                 if matches!(base_class, "ArrayIterator" | "ArrayObject") {
-                    let data = args.first().cloned().unwrap_or(Value::Array(PhpArray::new()));
+                    let data = args
+                        .first()
+                        .cloned()
+                        .unwrap_or(Value::Array(PhpArray::new()));
                     if let Value::Array(a) = data {
                         o.set_property("__array_data".to_string(), Value::Array(a));
                     } else {
@@ -4294,7 +4310,9 @@ impl Vm {
         }
 
         // Handle ReflectionClass/ReflectionObject constructor
-        if func_name == "ReflectionClass::__construct" || func_name == "ReflectionObject::__construct" {
+        if func_name == "ReflectionClass::__construct"
+            || func_name == "ReflectionObject::__construct"
+        {
             // args[0] is $this (the ReflectionClass/Object), args[1] is the class name or object
             if let Some(Value::Object(ref obj)) = args.first() {
                 if obj.internal() == crate::value::InternalState::ReflectionClass {
@@ -4348,7 +4366,11 @@ impl Vm {
                 let declaring_class = {
                     let full_method = format!("{}::{}", class_name, method_name);
                     if let Some(&oa_idx) = self.functions.get(&full_method) {
-                        if let Some(ref fname) = self.op_arrays.get(oa_idx).and_then(|oa| oa.function_name.as_ref()) {
+                        if let Some(ref fname) = self
+                            .op_arrays
+                            .get(oa_idx)
+                            .and_then(|oa| oa.function_name.as_ref())
+                        {
                             // function_name is like "OriginalClass::method"
                             if let Some(class_part) = fname.rsplit_once("::").map(|(c, _)| c) {
                                 class_part.to_string()
@@ -4431,7 +4453,10 @@ impl Vm {
                         );
                         ex_obj.set_property(
                             "code".to_string(),
-                            e.code.as_ref().map(|c| Value::String(c.clone())).unwrap_or(Value::Long(0)),
+                            e.code
+                                .as_ref()
+                                .map(|c| Value::String(c.clone()))
+                                .unwrap_or(Value::Long(0)),
                         );
                         return Err(VmError::Thrown(Value::Object(ex_obj)));
                     }
@@ -4531,7 +4556,9 @@ impl Vm {
 
         // For non-method calls, check builtins
         if !func_name.contains("::") {
-            if let Some(result) = self.call_builtin(simple_name, &args, &ref_args, &ref_prop_args)? {
+            if let Some(result) =
+                self.call_builtin(simple_name, &args, &ref_args, &ref_prop_args)?
+            {
                 if op.result_type != OperandType::Unused {
                     self.write_result(op, caller_oa_idx, result)?;
                 }
@@ -4607,16 +4634,18 @@ impl Vm {
             if let Some(Value::Object(ref attr_obj)) = args.first() {
                 if attr_obj.class_name() == "ReflectionAttribute" {
                     let result = match method {
-                        "getName" => {
-                            attr_obj.get_property("name").unwrap_or(Value::String(String::new()))
-                        }
-                        "getArguments" => {
-                            attr_obj.get_property("arguments").unwrap_or(Value::Array(PhpArray::new()))
-                        }
+                        "getName" => attr_obj
+                            .get_property("name")
+                            .unwrap_or(Value::String(String::new())),
+                        "getArguments" => attr_obj
+                            .get_property("arguments")
+                            .unwrap_or(Value::Array(PhpArray::new())),
                         "newInstance" => {
                             // Create an instance of the attribute class
-                            let attr_name = attr_obj.get_property("name")
-                                .map(|v| v.to_php_string()).unwrap_or_default();
+                            let attr_name = attr_obj
+                                .get_property("name")
+                                .map(|v| v.to_php_string())
+                                .unwrap_or_default();
                             let attr_args = attr_obj.get_property("arguments");
                             let instance = PhpObject::new(attr_name.clone());
                             instance.set_object_id(self.next_object_id);
@@ -4681,10 +4710,18 @@ impl Vm {
 
             // Advance caller's IP past DO_FCALL BEFORE pushing new frame
             if self.call_stack.len() > 200 {
-                let stack: Vec<String> = self.call_stack.iter().rev().take(20)
-                    .map(|f| self.op_arrays.get(f.op_array_idx)
-                        .and_then(|oa| oa.function_name.as_deref())
-                        .unwrap_or("<main>").to_string())
+                let stack: Vec<String> = self
+                    .call_stack
+                    .iter()
+                    .rev()
+                    .take(20)
+                    .map(|f| {
+                        self.op_arrays
+                            .get(f.op_array_idx)
+                            .and_then(|oa| oa.function_name.as_deref())
+                            .unwrap_or("<main>")
+                            .to_string()
+                    })
                     .collect();
                 return Err(VmError::FatalError(format!(
                     "Maximum function nesting level of 200 reached, aborting! Stack (top 20): {}",
@@ -4894,7 +4931,9 @@ impl Vm {
             }
 
             // Fall back to non-prefixed builtin function (e.g. namespace-qualified calls)
-            if let Some(result) = self.call_builtin(simple_name, &args, &ref_args, &ref_prop_args)? {
+            if let Some(result) =
+                self.call_builtin(simple_name, &args, &ref_args, &ref_prop_args)?
+            {
                 if op.result_type != OperandType::Unused {
                     self.write_result(op, caller_oa_idx, result)?;
                 }
@@ -6315,22 +6354,27 @@ impl Vm {
                 Ok(Some(Value::Bool(true)))
             }
 
-            "isStatic" => {
-                Ok(Some(Value::Bool(false)))
-            }
+            "isStatic" => Ok(Some(Value::Bool(false))),
 
             "getNumberOfParameters" | "getNumberOfRequiredParameters" => {
                 let full_name = format!("{}::{}", class_name, method_n);
-                let oa_idx = self.functions.get(&full_name).copied()
+                let oa_idx = self
+                    .functions
+                    .get(&full_name)
+                    .copied()
                     .or_else(|| self.resolve_method(&class_name, &method_n));
                 let count = if let Some(idx) = oa_idx {
                     let info = &self.op_arrays[idx].arg_info;
                     if method_name == "getNumberOfRequiredParameters" {
-                        info.iter().filter(|a| a.default.is_none() && !a.is_variadic).count()
+                        info.iter()
+                            .filter(|a| a.default.is_none() && !a.is_variadic)
+                            .count()
                     } else {
                         info.len()
                     }
-                } else { 0 };
+                } else {
+                    0
+                };
                 Ok(Some(Value::Long(count as i64)))
             }
 
@@ -6691,7 +6735,10 @@ impl Vm {
 
         match method {
             "__construct" => {
-                let data = args.get(1).cloned().unwrap_or(Value::Array(PhpArray::new()));
+                let data = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Array(PhpArray::new()));
                 if let Value::Array(a) = data {
                     obj.set_property("__array_data".to_string(), Value::Array(a));
                 } else {
@@ -6705,7 +6752,10 @@ impl Vm {
                 Ok(Some(Value::Null))
             }
             "valid" => {
-                let index = obj.get_property("__array_index").map(|v| v.to_long()).unwrap_or(0) as usize;
+                let index = obj
+                    .get_property("__array_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
                 let len = match obj.get_property("__array_data") {
                     Some(Value::Array(ref a)) => a.len(),
                     _ => 0,
@@ -6713,7 +6763,10 @@ impl Vm {
                 Ok(Some(Value::Bool(index < len)))
             }
             "current" => {
-                let index = obj.get_property("__array_index").map(|v| v.to_long()).unwrap_or(0) as usize;
+                let index = obj
+                    .get_property("__array_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
                 if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
                     if let Some((_, val)) = a.entry_at(index) {
                         return Ok(Some(val.clone()));
@@ -6722,7 +6775,10 @@ impl Vm {
                 Ok(Some(Value::Bool(false)))
             }
             "key" => {
-                let index = obj.get_property("__array_index").map(|v| v.to_long()).unwrap_or(0) as usize;
+                let index = obj
+                    .get_property("__array_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0) as usize;
                 if let Some(Value::Array(ref a)) = obj.get_property("__array_data") {
                     if let Some((key, _)) = a.entry_at(index) {
                         let key_val = match key {
@@ -6735,7 +6791,10 @@ impl Vm {
                 Ok(Some(Value::Null))
             }
             "next" => {
-                let index = obj.get_property("__array_index").map(|v| v.to_long()).unwrap_or(0);
+                let index = obj
+                    .get_property("__array_index")
+                    .map(|v| v.to_long())
+                    .unwrap_or(0);
                 obj.set_property("__array_index".to_string(), Value::Long(index + 1));
                 Ok(Some(Value::Null))
             }
@@ -6795,7 +6854,9 @@ impl Vm {
                 Ok(Some(Value::Null))
             }
             "getArrayCopy" => {
-                let data = obj.get_property("__array_data").unwrap_or(Value::Array(PhpArray::new()));
+                let data = obj
+                    .get_property("__array_data")
+                    .unwrap_or(Value::Array(PhpArray::new()));
                 Ok(Some(data))
             }
             _ => Ok(None),
@@ -6824,28 +6885,20 @@ impl Vm {
                 Ok(Some(Value::Null))
             }
             "getInnerIterator" => {
-                let inner = obj
-                    .get_property("__inner_iterator")
-                    .unwrap_or(Value::Null);
+                let inner = obj.get_property("__inner_iterator").unwrap_or(Value::Null);
                 Ok(Some(inner))
             }
             "rewind" => {
-                let inner = obj
-                    .get_property("__inner_iterator")
-                    .unwrap_or(Value::Null);
+                let inner = obj.get_property("__inner_iterator").unwrap_or(Value::Null);
                 if let Value::Object(_) = &inner {
                     let _ = self.call_method_sync(&inner, "rewind");
                 }
                 // FilterIterator: skip to first accepted element
                 let this_val = Value::Object(obj.clone());
-                let has_accept = self
-                    .resolve_method(&obj.class_name(), "accept")
-                    .is_some();
+                let has_accept = self.resolve_method(&obj.class_name(), "accept").is_some();
                 if has_accept {
                     for _ in 0..10000 {
-                        let inner = obj
-                            .get_property("__inner_iterator")
-                            .unwrap_or(Value::Null);
+                        let inner = obj.get_property("__inner_iterator").unwrap_or(Value::Null);
                         let valid = if let Value::Object(_) = &inner {
                             self.call_method_sync(&inner, "valid")
                                 .unwrap_or(Value::Bool(false))
@@ -6871,9 +6924,7 @@ impl Vm {
                 Ok(Some(Value::Null))
             }
             "valid" => {
-                let inner = obj
-                    .get_property("__inner_iterator")
-                    .unwrap_or(Value::Null);
+                let inner = obj.get_property("__inner_iterator").unwrap_or(Value::Null);
                 if let Value::Object(_) = &inner {
                     match self.call_method_sync(&inner, "valid") {
                         Ok(v) => Ok(Some(v)),
@@ -6884,22 +6935,16 @@ impl Vm {
                 }
             }
             "next" => {
-                let inner = obj
-                    .get_property("__inner_iterator")
-                    .unwrap_or(Value::Null);
+                let inner = obj.get_property("__inner_iterator").unwrap_or(Value::Null);
                 if let Value::Object(_) = &inner {
                     let _ = self.call_method_sync(&inner, "next");
                 }
                 // FilterIterator: skip non-accepted elements
                 let this_val = Value::Object(obj.clone());
-                let has_accept = self
-                    .resolve_method(&obj.class_name(), "accept")
-                    .is_some();
+                let has_accept = self.resolve_method(&obj.class_name(), "accept").is_some();
                 if has_accept {
                     for _ in 0..10000 {
-                        let inner = obj
-                            .get_property("__inner_iterator")
-                            .unwrap_or(Value::Null);
+                        let inner = obj.get_property("__inner_iterator").unwrap_or(Value::Null);
                         let valid = if let Value::Object(_) = &inner {
                             self.call_method_sync(&inner, "valid")
                                 .unwrap_or(Value::Bool(false))
@@ -6925,9 +6970,7 @@ impl Vm {
                 Ok(Some(Value::Null))
             }
             "current" => {
-                let inner = obj
-                    .get_property("__inner_iterator")
-                    .unwrap_or(Value::Null);
+                let inner = obj.get_property("__inner_iterator").unwrap_or(Value::Null);
                 if let Value::Object(_) = &inner {
                     match self.call_method_sync(&inner, "current") {
                         Ok(v) => Ok(Some(v)),
@@ -6938,9 +6981,7 @@ impl Vm {
                 }
             }
             "key" => {
-                let inner = obj
-                    .get_property("__inner_iterator")
-                    .unwrap_or(Value::Null);
+                let inner = obj.get_property("__inner_iterator").unwrap_or(Value::Null);
                 if let Value::Object(_) = &inner {
                     match self.call_method_sync(&inner, "key") {
                         Ok(v) => Ok(Some(v)),
@@ -7063,10 +7104,7 @@ impl Vm {
                             let fi = PhpObject::new("SplFileInfo".to_string());
                             fi.set_object_id(self.next_object_id);
                             self.next_object_id += 1;
-                            fi.set_property(
-                                "__spl_path".to_string(),
-                                Value::String(full_path),
-                            );
+                            fi.set_property("__spl_path".to_string(), Value::String(full_path));
                             return Ok(Some(Value::Object(fi)));
                         }
                     }
@@ -7108,42 +7146,28 @@ impl Vm {
                                 .map(|v| v.to_php_string())
                                 .unwrap_or_default();
                             // Create a new RecursiveDirectoryIterator for the subdirectory
-                            let child_obj =
-                                PhpObject::new(obj.class_name().to_string());
+                            let child_obj = PhpObject::new(obj.class_name().to_string());
                             child_obj.set_object_id(self.next_object_id);
                             self.next_object_id += 1;
                             // Initialize child's entries
                             let mut child_entries = PhpArray::new();
                             if let Ok(read_dir) = std::fs::read_dir(&full_path) {
                                 for entry in read_dir.flatten() {
-                                    let name =
-                                        entry.file_name().to_string_lossy().to_string();
-                                    let full =
-                                        entry.path().to_string_lossy().to_string();
+                                    let name = entry.file_name().to_string_lossy().to_string();
+                                    let full = entry.path().to_string_lossy().to_string();
                                     let mut ei = PhpArray::new();
-                                    ei.set_string(
-                                        "name".to_string(),
-                                        Value::String(name),
-                                    );
-                                    ei.set_string(
-                                        "path".to_string(),
-                                        Value::String(full),
-                                    );
+                                    ei.set_string("name".to_string(), Value::String(name));
+                                    ei.set_string("path".to_string(), Value::String(full));
                                     child_entries.push(Value::Array(ei));
                                 }
                             }
-                            child_obj.set_property(
-                                "__dir_path".to_string(),
-                                Value::String(full_path),
-                            );
+                            child_obj
+                                .set_property("__dir_path".to_string(), Value::String(full_path));
                             child_obj.set_property(
                                 "__dir_entries".to_string(),
                                 Value::Array(child_entries),
                             );
-                            child_obj.set_property(
-                                "__dir_index".to_string(),
-                                Value::Long(0),
-                            );
+                            child_obj.set_property("__dir_index".to_string(), Value::Long(0));
                             child_obj.set_property(
                                 "__dir_sub_path".to_string(),
                                 Value::String(String::new()),
@@ -7235,12 +7259,10 @@ impl Vm {
             "isDir" => Ok(Some(Value::Bool(p.is_dir()))),
             "isLink" => Ok(Some(Value::Bool(p.is_symlink()))),
             "isReadable" | "isWritable" => Ok(Some(Value::Bool(p.exists()))),
-            "getRealPath" => {
-                match std::fs::canonicalize(p) {
-                    Ok(real) => Ok(Some(Value::String(real.to_string_lossy().to_string()))),
-                    Err(_) => Ok(Some(Value::Bool(false))),
-                }
-            }
+            "getRealPath" => match std::fs::canonicalize(p) {
+                Ok(real) => Ok(Some(Value::String(real.to_string_lossy().to_string()))),
+                Err(_) => Ok(Some(Value::Bool(false))),
+            },
             "getPathname" => Ok(Some(Value::String(path.clone()))),
             "getFilename" => {
                 let fname = p
@@ -7333,7 +7355,11 @@ impl Vm {
         // Check if this is a SplFileInfo family method
         let is_spl_file_info = matches!(
             base_class,
-            "SplFileInfo" | "DirectoryIterator" | "FilesystemIterator" | "RecursiveDirectoryIterator" | "SplFileObject"
+            "SplFileInfo"
+                | "DirectoryIterator"
+                | "FilesystemIterator"
+                | "RecursiveDirectoryIterator"
+                | "SplFileObject"
         );
 
         if is_spl_file_info {
@@ -7370,9 +7396,7 @@ impl Vm {
                         | "IteratorIterator"
                         | "RecursiveIteratorIterator"
                 ) {
-                    if let Some(result) =
-                        self.call_wrapper_iterator_method(method, args)?
-                    {
+                    if let Some(result) = self.call_wrapper_iterator_method(method, args)? {
                         return Ok(Some(result));
                     }
                 }
@@ -7622,7 +7646,11 @@ impl Vm {
     }
 
     /// Call a PDOStatement method.
-    fn call_pdo_statement_method(&mut self, method: &str, args: &[Value]) -> VmResult<Option<Value>> {
+    fn call_pdo_statement_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
         use php_rs_ext_pdo::{FetchMode, PdoValue};
 
         let stmt_obj = match args.first() {
@@ -7903,7 +7931,9 @@ impl Vm {
                     Value::Object(_) => "object",
                     Value::Resource(_, _) => "resource",
                     Value::Reference(_) => unreachable!(),
-                    Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => "unknown type",
+                    Value::_Iterator { .. }
+                    | Value::_GeneratorIterator { .. }
+                    | Value::_ObjectIterator { .. } => "unknown type",
                 };
                 Ok(Some(Value::String(t.to_string())))
             }
@@ -8579,9 +8609,13 @@ impl Vm {
             "sort" | "rsort" | "asort" | "arsort" | "ksort" | "krsort" => {
                 let arr_val = args.first().cloned().unwrap_or(Value::Null);
                 let cmp_ord = |r: i64| -> std::cmp::Ordering {
-                    if r < 0 { std::cmp::Ordering::Less }
-                    else if r > 0 { std::cmp::Ordering::Greater }
-                    else { std::cmp::Ordering::Equal }
+                    if r < 0 {
+                        std::cmp::Ordering::Less
+                    } else if r > 0 {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
                 };
                 let sort_fn = |a: &mut PhpArray, cmp_ord: &dyn Fn(i64) -> std::cmp::Ordering| {
                     let mut entries = a.entries().to_vec();
@@ -8956,8 +8990,8 @@ impl Vm {
                     // If call_builtin returns Ok(Some(...)) or Err(...), it exists
                     // If it returns Ok(None), it doesn't exist
                     match self.call_builtin(&fname, &[], &[], &[]) {
-                        Ok(None) => false,  // Unknown function
-                        _ => true,  // Either exists (Ok(Some)) or disabled/error (Err)
+                        Ok(None) => false, // Unknown function
+                        _ => true,         // Either exists (Ok(Some)) or disabled/error (Err)
                     }
                 };
                 Ok(Some(Value::Bool(exists)))
@@ -9002,7 +9036,7 @@ impl Vm {
                                             if let Some(Some(name)) = names.get(i) {
                                                 matches_arr.set(
                                                     &Value::String(name.to_string()),
-                                                    Value::String(match_str.clone())
+                                                    Value::String(match_str.clone()),
                                                 );
                                             }
                                             // Then add numeric index
@@ -9011,7 +9045,12 @@ impl Vm {
                                     }
                                     // Write $matches back via ref_args (arg index 2)
                                     if args.len() > 2 {
-                                        self.write_back_arg(2, Value::Array(matches_arr), ref_args, ref_prop_args);
+                                        self.write_back_arg(
+                                            2,
+                                            Value::Array(matches_arr),
+                                            ref_args,
+                                            ref_prop_args,
+                                        );
                                     }
                                     true
                                 } else {
@@ -9026,7 +9065,8 @@ impl Vm {
                                             let mut matches_arr = PhpArray::new();
                                             let num_groups = caps.len();
                                             // Collect group names
-                                            let names: Vec<Option<&str>> = r.capture_names().collect();
+                                            let names: Vec<Option<&str>> =
+                                                r.capture_names().collect();
                                             // Add numeric indices and interleave named groups
                                             for i in 0..num_groups {
                                                 if let Some(m) = caps.get(i) {
@@ -9035,7 +9075,7 @@ impl Vm {
                                                     if let Some(Some(name)) = names.get(i) {
                                                         matches_arr.set(
                                                             &Value::String(name.to_string()),
-                                                            Value::String(match_str.clone())
+                                                            Value::String(match_str.clone()),
                                                         );
                                                     }
                                                     // Then add numeric index
@@ -9043,7 +9083,12 @@ impl Vm {
                                                 }
                                             }
                                             if args.len() > 2 {
-                                                self.write_back_arg(2, Value::Array(matches_arr), ref_args, ref_prop_args);
+                                                self.write_back_arg(
+                                                    2,
+                                                    Value::Array(matches_arr),
+                                                    ref_args,
+                                                    ref_prop_args,
+                                                );
                                             }
                                             true
                                         } else {
@@ -9087,7 +9132,8 @@ impl Vm {
                                     let mut this_match = Vec::new();
                                     for g in 0..num_groups {
                                         if let Some(m) = caps.get(g) {
-                                            this_match.push(Some((m.as_str().to_string(), m.start())));
+                                            this_match
+                                                .push(Some((m.as_str().to_string(), m.start())));
                                         } else {
                                             this_match.push(None);
                                         }
@@ -9215,24 +9261,26 @@ impl Vm {
                 let flags = args.get(3).map(|v| v.to_long()).unwrap_or(0);
                 let no_empty = flags & 1 != 0; // PREG_SPLIT_NO_EMPTY = 1
                 match parse_php_regex(&pat) {
-                    Some((re, re_flags)) => match regex::Regex::new(&apply_regex_flags(&re, &re_flags)) {
-                        Ok(r) => {
-                            let mut arr = PhpArray::new();
-                            let parts: Vec<&str> = if limit > 0 {
-                                r.splitn(&subj, limit as usize).collect()
-                            } else {
-                                r.split(&subj).collect()
-                            };
-                            for part in parts {
-                                if no_empty && part.is_empty() {
-                                    continue;
+                    Some((re, re_flags)) => {
+                        match regex::Regex::new(&apply_regex_flags(&re, &re_flags)) {
+                            Ok(r) => {
+                                let mut arr = PhpArray::new();
+                                let parts: Vec<&str> = if limit > 0 {
+                                    r.splitn(&subj, limit as usize).collect()
+                                } else {
+                                    r.split(&subj).collect()
+                                };
+                                for part in parts {
+                                    if no_empty && part.is_empty() {
+                                        continue;
+                                    }
+                                    arr.push(Value::String(part.to_string()));
                                 }
-                                arr.push(Value::String(part.to_string()));
+                                Ok(Some(Value::Array(arr)))
                             }
-                            Ok(Some(Value::Array(arr)))
+                            Err(_) => Ok(Some(Value::Bool(false))),
                         }
-                        Err(_) => Ok(Some(Value::Bool(false))),
-                    },
+                    }
                     None => Ok(Some(Value::Bool(false))),
                 }
             }
@@ -9551,7 +9599,10 @@ impl Vm {
                             if let Some(env_idx) = oa.vars.iter().position(|v| v == "_ENV") {
                                 if env_idx < frame.cvs.len() {
                                     if let Value::Array(ref mut env_arr) = frame.cvs[env_idx] {
-                                        env_arr.set_string(key.to_string(), Value::String(value.to_string()));
+                                        env_arr.set_string(
+                                            key.to_string(),
+                                            Value::String(value.to_string()),
+                                        );
                                     }
                                 }
                             }
@@ -13451,17 +13502,15 @@ impl Vm {
                         Ok(Some(Value::Resource(1, "stream".to_string())))
                     }
                     "php://stderr" => Ok(Some(Value::Resource(2, "stream".to_string()))),
-                    _ => {
-                        match php_rs_ext_standard::file::FileHandle::open(&filename, &mode) {
-                            Ok(handle) => {
-                                let id = self.next_resource_id;
-                                self.next_resource_id += 1;
-                                self.file_handles.insert(id, handle);
-                                Ok(Some(Value::Resource(id, "stream".to_string())))
-                            }
-                            Err(_) => Ok(Some(Value::Bool(false))),
+                    _ => match php_rs_ext_standard::file::FileHandle::open(&filename, &mode) {
+                        Ok(handle) => {
+                            let id = self.next_resource_id;
+                            self.next_resource_id += 1;
+                            self.file_handles.insert(id, handle);
+                            Ok(Some(Value::Resource(id, "stream".to_string())))
                         }
-                    }
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    },
                 }
             }
             "fclose" => {
@@ -17487,11 +17536,7 @@ impl Vm {
                 let user = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let pass = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
                 let db = args.get(3).cloned().unwrap_or(Value::Null).to_php_string();
-                let port = args
-                    .get(4)
-                    .cloned()
-                    .unwrap_or(Value::Long(3306))
-                    .to_long() as u16;
+                let port = args.get(4).cloned().unwrap_or(Value::Long(3306)).to_long() as u16;
 
                 let opts = mysql::OptsBuilder::new()
                     .ip_or_hostname(Some(host))
@@ -17663,7 +17708,8 @@ impl Vm {
 
                             let result_id = self.next_resource_id;
                             self.next_resource_id += 1;
-                            self.mysqli_results.insert(result_id, (rows, 0, field_names));
+                            self.mysqli_results
+                                .insert(result_id, (rows, 0, field_names));
                             Ok(Some(Value::Resource(
                                 result_id,
                                 "mysqli_result".to_string(),
@@ -17834,11 +17880,7 @@ impl Vm {
                     _ => return Ok(Some(Value::Bool(false))),
                 };
 
-                let dbname = args
-                    .get(1)
-                    .cloned()
-                    .unwrap_or(Value::Null)
-                    .to_php_string();
+                let dbname = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
 
                 if let Some(conn) = self.mysqli_connections.get_mut(&conn_id) {
                     let query = format!("USE `{}`", dbname.replace("`", "``"));
@@ -17902,11 +17944,7 @@ impl Vm {
                     Value::Resource(id, _) => id,
                     _ => return Ok(Some(Value::Null)),
                 };
-                let mode = args
-                    .get(1)
-                    .cloned()
-                    .unwrap_or(Value::Long(3))
-                    .to_long(); // MYSQLI_BOTH = 3
+                let mode = args.get(1).cloned().unwrap_or(Value::Long(3)).to_long(); // MYSQLI_BOTH = 3
 
                 let result_data = match self.mysqli_results.get_mut(&result_id) {
                     Some(data) => data,
@@ -18503,9 +18541,10 @@ impl Vm {
                     Ok(Some(Value::Bool(false)))
                 }
             }
-            "grapheme_extract" | "grapheme_stripos" | "grapheme_stristr"
-            | "grapheme_strripos" | "grapheme_strrpos" | "grapheme_strstr"
-            | "grapheme_str_split" => Ok(Some(Value::Bool(false))),
+            "grapheme_extract" | "grapheme_stripos" | "grapheme_stristr" | "grapheme_strripos"
+            | "grapheme_strrpos" | "grapheme_strstr" | "grapheme_str_split" => {
+                Ok(Some(Value::Bool(false)))
+            }
             "idn_to_ascii" | "idn_to_utf8" => {
                 let domain = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 Ok(Some(Value::String(domain)))
@@ -18685,7 +18724,9 @@ impl Vm {
 
     /// Convert a VM Value to a JsonValue for encoding.
     fn value_to_json(val: &Value) -> JsonValue {
-        if let Value::Reference(rc) = val { return Self::value_to_json(&rc.borrow()); }
+        if let Value::Reference(rc) = val {
+            return Self::value_to_json(&rc.borrow());
+        }
         match val {
             Value::Null => JsonValue::Null,
             Value::Bool(b) => JsonValue::Bool(*b),
@@ -18734,7 +18775,9 @@ impl Vm {
             }
             Value::Resource(_, _) => JsonValue::Null,
             Value::Reference(_) => unreachable!("Reference handled above"),
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => JsonValue::Null,
+            Value::_Iterator { .. }
+            | Value::_GeneratorIterator { .. }
+            | Value::_ObjectIterator { .. } => JsonValue::Null,
         }
     }
 
@@ -18778,7 +18821,10 @@ impl Vm {
     // =========================================================================
 
     fn var_dump(&mut self, val: &Value, depth: usize) {
-        if let Value::Reference(rc) = val { let inner = rc.borrow().clone(); return self.var_dump(&inner, depth); }
+        if let Value::Reference(rc) = val {
+            let inner = rc.borrow().clone();
+            return self.var_dump(&inner, depth);
+        }
         let indent = "  ".repeat(depth);
         match val {
             Value::Null => {
@@ -18835,14 +18881,18 @@ impl Vm {
                     .push_str(&format!("{}resource({}) of type (stream)\n", indent, id));
             }
             Value::Reference(_) => unreachable!("Reference handled above"),
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => {
+            Value::_Iterator { .. }
+            | Value::_GeneratorIterator { .. }
+            | Value::_ObjectIterator { .. } => {
                 self.output.push_str(&format!("{}NULL\n", indent));
             }
         }
     }
 
     fn print_r_string(&self, val: &Value, depth: usize) -> String {
-        if let Value::Reference(rc) = val { return self.print_r_string(&rc.borrow(), depth); }
+        if let Value::Reference(rc) = val {
+            return self.print_r_string(&rc.borrow(), depth);
+        }
         let indent = "    ".repeat(depth);
         match val {
             Value::Null => String::new(),
@@ -18880,12 +18930,16 @@ impl Vm {
             }
             Value::Resource(id, _) => format!("Resource id #{}", id),
             Value::Reference(_) => unreachable!("Reference handled above"),
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => String::new(),
+            Value::_Iterator { .. }
+            | Value::_GeneratorIterator { .. }
+            | Value::_ObjectIterator { .. } => String::new(),
         }
     }
 
     fn var_export_string(&self, val: &Value) -> String {
-        if let Value::Reference(rc) = val { return self.var_export_string(&rc.borrow()); }
+        if let Value::Reference(rc) = val {
+            return self.var_export_string(&rc.borrow());
+        }
         match val {
             Value::Null => "NULL".to_string(),
             Value::Bool(true) => "true".to_string(),
@@ -18914,7 +18968,9 @@ impl Vm {
             }
             Value::Resource(_, _) => "NULL".to_string(),
             Value::Reference(_) => unreachable!("Reference handled above"),
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => "NULL".to_string(),
+            Value::_Iterator { .. }
+            | Value::_GeneratorIterator { .. }
+            | Value::_ObjectIterator { .. } => "NULL".to_string(),
         }
     }
 
@@ -19169,7 +19225,9 @@ fn apply_regex_flags(pattern: &str, flags: &str) -> String {
 /// Convert a VM Value to a SerializableValue for PHP serialize().
 fn value_to_serializable(val: &Value) -> php_rs_ext_standard::variables::SerializableValue {
     use php_rs_ext_standard::variables::SerializableValue as SV;
-    if let Value::Reference(rc) = val { return value_to_serializable(&rc.borrow()); }
+    if let Value::Reference(rc) = val {
+        return value_to_serializable(&rc.borrow());
+    }
     match val {
         Value::Null => SV::Null,
         Value::Bool(b) => SV::Bool(*b),
@@ -19193,7 +19251,9 @@ fn value_to_serializable(val: &Value) -> php_rs_ext_standard::variables::Seriali
         Value::Object(_) => SV::Null, // Simplified: objects serialize as null for now
         Value::Resource(id, _) => SV::Int(*id),
         Value::Reference(_) => unreachable!("Reference handled above"),
-        Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => SV::Null,
+        Value::_Iterator { .. }
+        | Value::_GeneratorIterator { .. }
+        | Value::_ObjectIterator { .. } => SV::Null,
     }
 }
 
@@ -19788,7 +19848,11 @@ fn pdo_value_to_value(pdo_val: &php_rs_ext_pdo::PdoValue) -> Value {
 }
 
 /// Convert a PdoRow to a VM Value based on fetch mode.
-fn pdo_row_to_value(row: &php_rs_ext_pdo::PdoRow, fetch_mode: php_rs_ext_pdo::FetchMode, vm: &mut Vm) -> Value {
+fn pdo_row_to_value(
+    row: &php_rs_ext_pdo::PdoRow,
+    fetch_mode: php_rs_ext_pdo::FetchMode,
+    vm: &mut Vm,
+) -> Value {
     use php_rs_ext_pdo::FetchMode;
 
     match fetch_mode {
@@ -19831,7 +19895,10 @@ fn pdo_row_to_value(row: &php_rs_ext_pdo::PdoRow, fetch_mode: php_rs_ext_pdo::Fe
         }
         FetchMode::Column => {
             // Return first column value
-            row.values.first().map(pdo_value_to_value).unwrap_or(Value::Null)
+            row.values
+                .first()
+                .map(pdo_value_to_value)
+                .unwrap_or(Value::Null)
         }
     }
 }

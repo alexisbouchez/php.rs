@@ -422,7 +422,9 @@ impl Compiler {
                 attributes,
                 ..
             } => {
-                self.compile_class_decl(name, modifiers, extends, implements, members, attributes, span);
+                self.compile_class_decl(
+                    name, modifiers, extends, implements, members, attributes, span,
+                );
             }
 
             // --- Interface declaration ---
@@ -977,20 +979,12 @@ impl Compiler {
                                 self.op_array.emit(
                                     ZOp::new(ZOpcode::FetchClassConstant, span.line as u32)
                                         .with_op1(Operand::constant(lit), OperandType::Const)
-                                        .with_op2(
-                                            Operand::constant(const_lit),
-                                            OperandType::Const,
-                                        )
-                                        .with_result(
-                                            Operand::tmp_var(tmp),
-                                            OperandType::TmpVar,
-                                        ),
+                                        .with_op2(Operand::constant(const_lit), OperandType::Const)
+                                        .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
                                 );
                                 return ExprResult::tmp(tmp);
                             }
-                            "self" => {
-                                self.current_class.clone().unwrap_or_else(|| name.clone())
-                            }
+                            "self" => self.current_class.clone().unwrap_or_else(|| name.clone()),
                             "parent" => self
                                 .current_class_parent
                                 .clone()
@@ -1447,7 +1441,10 @@ impl Compiler {
                                     ZOp::new(ZOpcode::FetchDimR, line)
                                         .with_op1(Operand::tmp_var(prev_tmp), OperandType::TmpVar)
                                         .with_op2(k_r.operand, k_r.op_type)
-                                        .with_result(Operand::tmp_var(next_tmp), OperandType::TmpVar),
+                                        .with_result(
+                                            Operand::tmp_var(next_tmp),
+                                            OperandType::TmpVar,
+                                        ),
                                 );
                             }
                             temps.push(next_tmp);
@@ -1488,7 +1485,10 @@ impl Compiler {
                                     ZOp::new(ZOpcode::AssignDim, line)
                                         .with_op1(Operand::tmp_var(outer_tmp), OperandType::TmpVar)
                                         .with_op2(k_r.operand, k_r.op_type)
-                                        .with_result(Operand::tmp_var(wb_result), OperandType::TmpVar),
+                                        .with_result(
+                                            Operand::tmp_var(wb_result),
+                                            OperandType::TmpVar,
+                                        ),
                                 );
                             }
                             self.op_array.emit(
@@ -3817,7 +3817,9 @@ impl Compiler {
                     Expression::ArrayLiteral { elements, .. } => {
                         class_info.push_str("[");
                         for (i, el) in elements.iter().enumerate() {
-                            if i > 0 { class_info.push_str(","); }
+                            if i > 0 {
+                                class_info.push_str(",");
+                            }
                             if let Some(ref key) = el.key {
                                 if let Expression::StringLiteral { value, .. } = key {
                                     class_info.push_str(value);
@@ -3980,9 +3982,7 @@ impl Compiler {
                 }
                 ClassMember::TraitUse { traits, .. } => {
                     for trait_name in traits {
-                        metadata
-                            .traits
-                            .push(self.qualify_parsed_name(trait_name));
+                        metadata.traits.push(self.qualify_parsed_name(trait_name));
                     }
                 }
                 _ => {} // abstract methods, etc.
@@ -4182,9 +4182,7 @@ impl Compiler {
                 }
                 ClassMember::TraitUse { traits, .. } => {
                     for trait_name in traits {
-                        metadata
-                            .traits
-                            .push(self.qualify_parsed_name(trait_name));
+                        metadata.traits.push(self.qualify_parsed_name(trait_name));
                     }
                 }
                 _ => {} // abstract methods, etc.
@@ -4272,9 +4270,7 @@ impl Compiler {
                 }
                 EnumMember::ClassMember(ClassMember::TraitUse { traits, .. }) => {
                     for trait_name in traits {
-                        metadata
-                            .traits
-                            .push(self.qualify_parsed_name(trait_name));
+                        metadata.traits.push(self.qualify_parsed_name(trait_name));
                     }
                 }
                 _ => {}

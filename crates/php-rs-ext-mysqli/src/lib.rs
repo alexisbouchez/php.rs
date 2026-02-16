@@ -3,12 +3,9 @@
 //! Implements the mysqli_* family of functions for MySQL database access.
 //! Uses the mysqlnd driver for real MySQL network connections.
 
+use php_rs_ext_mysqlnd::{mysqlnd_close, mysqlnd_connect, mysqlnd_query, MysqlndConnection};
 use std::collections::HashMap;
 use std::fmt;
-use php_rs_ext_mysqlnd::{
-    MysqlndConnection,
-    mysqlnd_connect, mysqlnd_query, mysqlnd_close,
-};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -309,10 +306,7 @@ pub fn mysqli_connect(
     let mysqlnd_conn = match mysqlnd_connect(host, user, password, database, port_val) {
         Ok(conn) => conn,
         Err(e) => {
-            return Err(MysqliError::new(
-                2002,
-                &format!("Connection failed: {}", e),
-            ));
+            return Err(MysqliError::new(2002, &format!("Connection failed: {}", e)));
         }
     };
 
@@ -339,15 +333,14 @@ pub fn mysqli_connect(
 ///
 /// Equivalent to PHP's `mysqli_query()`.
 /// Executes a real SQL query against the MySQL server.
-pub fn mysqli_query(
-    conn: &mut MysqliConnection,
-    query: &str,
-) -> Result<MysqliResult, MysqliError> {
+pub fn mysqli_query(conn: &mut MysqliConnection, query: &str) -> Result<MysqliResult, MysqliError> {
     if !conn.connected {
         return Err(MysqliError::new(2006, "MySQL server has gone away"));
     }
 
-    let mysqlnd_conn = conn.mysqlnd_conn.as_mut()
+    let mysqlnd_conn = conn
+        .mysqlnd_conn
+        .as_mut()
         .ok_or_else(|| MysqliError::new(2006, "No active connection"))?;
 
     // Execute the query

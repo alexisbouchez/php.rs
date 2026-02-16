@@ -109,7 +109,9 @@ impl Value {
             }
             Value::Object(_) => 1,
             Value::Resource(id, _) => *id,
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => 0,
+            Value::_Iterator { .. }
+            | Value::_GeneratorIterator { .. }
+            | Value::_ObjectIterator { .. } => 0,
         }
     }
 
@@ -132,7 +134,9 @@ impl Value {
             }
             Value::Object(_) => 1.0,
             Value::Resource(id, _) => *id as f64,
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => 0.0,
+            Value::_Iterator { .. }
+            | Value::_GeneratorIterator { .. }
+            | Value::_ObjectIterator { .. } => 0.0,
         }
     }
 
@@ -148,7 +152,9 @@ impl Value {
             Value::Array(a) => !a.is_empty(),
             Value::Object(_) => true,
             Value::Resource(_, _) => true,
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => true,
+            Value::_Iterator { .. }
+            | Value::_GeneratorIterator { .. }
+            | Value::_ObjectIterator { .. } => true,
         }
     }
 
@@ -189,7 +195,9 @@ impl Value {
                 format!("{} Object", o.class_name())
             }
             Value::Resource(id, _) => format!("Resource id #{}", id),
-            Value::_Iterator { .. } | Value::_GeneratorIterator { .. } | Value::_ObjectIterator { .. } => String::new(),
+            Value::_Iterator { .. }
+            | Value::_GeneratorIterator { .. }
+            | Value::_ObjectIterator { .. } => String::new(),
         }
     }
 
@@ -306,8 +314,12 @@ impl Value {
 
     /// PHP spaceship operator (<=>).
     pub fn spaceship(&self, other: &Value) -> i64 {
-        if let Value::Reference(rc) = self { return rc.borrow().spaceship(other); }
-        if let Value::Reference(rc) = other { return self.spaceship(&rc.borrow()); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().spaceship(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.spaceship(&rc.borrow());
+        }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => {
                 if a < b {
@@ -334,8 +346,12 @@ impl Value {
 
     /// PHP less-than comparison.
     pub fn is_smaller(&self, other: &Value) -> bool {
-        if let Value::Reference(rc) = self { return rc.borrow().is_smaller(other); }
-        if let Value::Reference(rc) = other { return self.is_smaller(&rc.borrow()); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().is_smaller(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.is_smaller(&rc.borrow());
+        }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => a < b,
             (Value::Double(a), Value::Double(b)) => a < b,
@@ -350,8 +366,12 @@ impl Value {
     // =========================================================================
 
     pub fn add(&self, other: &Value) -> Value {
-        if let Value::Reference(rc) = self { return rc.borrow().add(other); }
-        if let Value::Reference(rc) = other { return self.add(&rc.borrow()); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().add(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.add(&rc.borrow());
+        }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => match a.checked_add(*b) {
                 Some(r) => Value::Long(r),
@@ -370,8 +390,12 @@ impl Value {
     }
 
     pub fn sub(&self, other: &Value) -> Value {
-        if let Value::Reference(rc) = self { return rc.borrow().sub(other); }
-        if let Value::Reference(rc) = other { return self.sub(&rc.borrow()); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().sub(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.sub(&rc.borrow());
+        }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => match a.checked_sub(*b) {
                 Some(r) => Value::Long(r),
@@ -389,8 +413,12 @@ impl Value {
     }
 
     pub fn mul(&self, other: &Value) -> Value {
-        if let Value::Reference(rc) = self { return rc.borrow().mul(other); }
-        if let Value::Reference(rc) = other { return self.mul(&rc.borrow()); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().mul(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.mul(&rc.borrow());
+        }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) => match a.checked_mul(*b) {
                 Some(r) => Value::Long(r),
@@ -408,8 +436,12 @@ impl Value {
     }
 
     pub fn div(&self, other: &Value) -> Value {
-        if let Value::Reference(rc) = self { return rc.borrow().div(other); }
-        if let Value::Reference(rc) = other { return self.div(&rc.borrow()); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().div(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.div(&rc.borrow());
+        }
         let b_val = match other {
             Value::Long(0) => return Value::Bool(false), // Division by zero
             Value::Double(f) if *f == 0.0 => return Value::Bool(false),
@@ -449,8 +481,12 @@ impl Value {
     }
 
     pub fn pow(&self, other: &Value) -> Value {
-        if let Value::Reference(rc) = self { return rc.borrow().pow(other); }
-        if let Value::Reference(rc) = other { return self.pow(&rc.borrow()); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().pow(other);
+        }
+        if let Value::Reference(rc) = other {
+            return self.pow(&rc.borrow());
+        }
         match (self, other) {
             (Value::Long(a), Value::Long(b)) if *b >= 0 => match a.checked_pow(*b as u32) {
                 Some(r) => Value::Long(r),
@@ -504,7 +540,9 @@ impl Value {
 
     /// Increment (++$a).
     pub fn increment(&self) -> Value {
-        if let Value::Reference(rc) = self { return rc.borrow().increment(); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().increment();
+        }
         match self {
             Value::Long(n) => match n.checked_add(1) {
                 Some(r) => Value::Long(r),
@@ -533,7 +571,9 @@ impl Value {
 
     /// Decrement (--$a).
     pub fn decrement(&self) -> Value {
-        if let Value::Reference(rc) = self { return rc.borrow().decrement(); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().decrement();
+        }
         match self {
             Value::Long(n) => match n.checked_sub(1) {
                 Some(r) => Value::Long(r),
@@ -558,7 +598,9 @@ impl Value {
 
     /// Cast to a specific PHP type.
     pub fn cast(&self, type_code: u32) -> Value {
-        if let Value::Reference(rc) = self { return rc.borrow().cast(type_code); }
+        if let Value::Reference(rc) = self {
+            return rc.borrow().cast(type_code);
+        }
         match type_code {
             4 => Value::Long(self.to_long()),         // IS_LONG
             5 => Value::Double(self.to_double()),     // IS_DOUBLE

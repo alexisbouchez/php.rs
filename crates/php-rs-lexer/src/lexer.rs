@@ -930,7 +930,7 @@ impl<'src> Lexer<'src> {
                             let brace_line = self.line;
                             let brace_column = self.column;
                             self.consume(); // consume `{`
-                            // Push current state and switch to InScripting
+                                            // Push current state and switch to InScripting
                             self.state_stack.push(State::DoubleQuotes);
                             self.curly_brace_depth = 1;
                             self.state = State::InScripting;

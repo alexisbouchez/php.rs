@@ -2239,9 +2239,17 @@ impl<'a> Parser<'a> {
             let mut depth = 1;
             while depth > 0 && self.current_token != Token::End {
                 match self.current_token {
-                    Token::LBracket => { depth += 1; self.advance(); }
-                    Token::RBracket => { depth -= 1; self.advance(); }
-                    _ => { self.advance(); }
+                    Token::LBracket => {
+                        depth += 1;
+                        self.advance();
+                    }
+                    Token::RBracket => {
+                        depth -= 1;
+                        self.advance();
+                    }
+                    _ => {
+                        self.advance();
+                    }
                 }
             }
         }
@@ -2467,7 +2475,7 @@ impl<'a> Parser<'a> {
             | Token::Private   // private:
             | Token::Protected // protected:
             | Token::Public    // public:
-            | Token::Readonly  // readonly:
+            | Token::Readonly // readonly:
         )
     }
 
@@ -3715,7 +3723,8 @@ impl<'a> Parser<'a> {
                             if self.current_token == Token::ObjectOperator {
                                 self.advance();
                                 if let Token::String = self.current_token {
-                                    let prop = self.lexer.source_text(&self.current_span).to_string();
+                                    let prop =
+                                        self.lexer.source_text(&self.current_span).to_string();
                                     let prop_span = self.current_span.clone();
                                     self.advance();
                                     expr = Expression::PropertyAccess {
@@ -4490,7 +4499,9 @@ impl<'a> Parser<'a> {
                     self.expect(Token::RParen)?;
                     // For $obj->method(...), convert to Closure::fromCallable([$obj, 'method'])
                     let callable = match left {
-                        Expression::PropertyAccess { object, property, .. } => {
+                        Expression::PropertyAccess {
+                            object, property, ..
+                        } => {
                             // Extract method name from property expression
                             let method_name = match *property {
                                 Expression::StringLiteral { value, .. } => value,
@@ -4498,8 +4509,21 @@ impl<'a> Parser<'a> {
                             };
                             Expression::ArrayLiteral {
                                 elements: vec![
-                                    ArrayElement { key: None, value: *object, unpack: false, by_ref: false },
-                                    ArrayElement { key: None, value: Expression::StringLiteral { value: method_name, span }, unpack: false, by_ref: false },
+                                    ArrayElement {
+                                        key: None,
+                                        value: *object,
+                                        unpack: false,
+                                        by_ref: false,
+                                    },
+                                    ArrayElement {
+                                        key: None,
+                                        value: Expression::StringLiteral {
+                                            value: method_name,
+                                            span,
+                                        },
+                                        unpack: false,
+                                        by_ref: false,
+                                    },
                                 ],
                                 span,
                             }

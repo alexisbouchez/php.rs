@@ -4,9 +4,9 @@
 //! This crate provides real MySQL wire protocol implementation with actual
 //! network connections to MySQL servers.
 
-use std::fmt;
-use mysql::{Pool, OptsBuilder};
 use mysql::prelude::*;
+use mysql::{OptsBuilder, Pool};
+use std::fmt;
 
 // ---------------------------------------------------------------------------
 // Constants — MySQL protocol command bytes
@@ -566,9 +566,9 @@ pub fn mysqlnd_connect(
     };
 
     // Try to get a connection to verify it works
-    let mut conn = pool.get_conn().map_err(|e| {
-        MysqlndError::new(2002, &format!("Failed to get connection: {}", e))
-    })?;
+    let mut conn = pool
+        .get_conn()
+        .map_err(|e| MysqlndError::new(2002, &format!("Failed to get connection: {}", e)))?;
 
     // Get server version
     let server_version: String = conn
@@ -615,15 +615,19 @@ pub fn mysqlnd_query(
         return Err(MysqlndError::new(2006, "MySQL server has gone away"));
     }
 
-    let pool = conn.pool.as_ref()
+    let pool = conn
+        .pool
+        .as_ref()
         .ok_or_else(|| MysqlndError::new(2006, "No active connection"))?;
 
-    let mut pool_conn = pool.get_conn()
+    let mut pool_conn = pool
+        .get_conn()
         .map_err(|e| MysqlndError::new(2006, &format!("Failed to get connection: {}", e)))?;
 
     conn.stats.queries_sent += 1;
 
-    let rows: Vec<mysql::Row> = pool_conn.query(query)
+    let rows: Vec<mysql::Row> = pool_conn
+        .query(query)
         .map_err(|e| MysqlndError::new(1064, &format!("Query error: {}", e)))?;
 
     conn.stats.result_sets_received += 1;

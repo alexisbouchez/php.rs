@@ -3,14 +3,13 @@
 //! Implements the PDO_pgsql driver, which provides PostgreSQL-specific DSN
 //! parsing, attributes, and connection configuration.
 
+use php_rs_ext_pdo::{
+    PdoDriver, PdoDriverConnection, PdoDriverStatement, PdoError, PdoParam, PdoRow, PdoValue,
+};
+use postgres::{Client, NoTls, Row};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
-use php_rs_ext_pdo::{
-    PdoDriver, PdoDriverConnection, PdoDriverStatement,
-    PdoError, PdoValue, PdoRow, PdoParam,
-};
-use postgres::{Client, NoTls, Row};
 
 // ---------------------------------------------------------------------------
 // Constants — PDO PostgreSQL attributes
@@ -169,9 +168,8 @@ impl PdoDriver for PdoPgsqlDriver {
         username: Option<&str>,
         password: Option<&str>,
     ) -> Result<Box<dyn PdoDriverConnection>, PdoError> {
-        let mut config = parse_dsn(dsn_params).map_err(|e| {
-            PdoError::new("08006", None, &format!("Invalid DSN: {}", e.message))
-        })?;
+        let mut config = parse_dsn(dsn_params)
+            .map_err(|e| PdoError::new("08006", None, &format!("Invalid DSN: {}", e.message)))?;
 
         // Override config with explicit username/password if provided
         if let Some(u) = username {
@@ -201,9 +199,8 @@ impl PdoDriver for PdoPgsqlDriver {
         let conn_string = conn_params.join(" ");
 
         // Connect to PostgreSQL
-        let client = Client::connect(&conn_string, NoTls).map_err(|e| {
-            PdoError::new("08006", None, &format!("Connection failed: {}", e))
-        })?;
+        let client = Client::connect(&conn_string, NoTls)
+            .map_err(|e| PdoError::new("08006", None, &format!("Connection failed: {}", e)))?;
 
         Ok(Box::new(PgsqlConnection {
             client: RefCell::new(client),
