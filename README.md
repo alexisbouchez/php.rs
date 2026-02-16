@@ -35,7 +35,7 @@
 
 ## Why?
 
-PHP powers millions of websites worldwide and has a mature ecosystem. **php.rs** reimagines the PHP interpreter using modern systems programming practices.
+PHP powers millions of websites worldwide and has a mature ecosystem. **php.rs** reimagines the PHP interpreter using Rust.
 
 **Goals:**
 
