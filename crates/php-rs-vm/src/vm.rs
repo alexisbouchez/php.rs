@@ -300,6 +300,16 @@ pub struct Vm {
     response_headers: Vec<String>,
     /// HTTP response code set by http_response_code().
     response_code: Option<u16>,
+    /// MySQLi connections: connection_id → mysql::Conn.
+    mysqli_connections: HashMap<i64, mysql::Conn>,
+    /// MySQLi query results: result_id → (rows, current_position, field_names).
+    mysqli_results: HashMap<i64, (Vec<mysql::Row>, usize, Vec<String>)>,
+    /// MySQLi connection metadata: connection_id → (last_insert_id, affected_rows, error, errno).
+    mysqli_conn_meta: HashMap<i64, (u64, u64, String, u16)>,
+    /// PDO connections: object_id → PdoConnection.
+    pdo_connections: HashMap<u64, php_rs_ext_pdo::PdoConnection>,
+    /// PDO prepared statements: object_id → PdoStatement.
+    pdo_statements: HashMap<u64, php_rs_ext_pdo::PdoStatement>,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -601,6 +611,11 @@ impl Vm {
             autoloading_classes: HashSet::new(),
             response_headers: Vec::new(),
             response_code: None,
+            mysqli_connections: HashMap::new(),
+            mysqli_results: HashMap::new(),
+            mysqli_conn_meta: HashMap::new(),
+            pdo_connections: HashMap::new(),
+            pdo_statements: HashMap::new(),
         }
     }
 
@@ -836,6 +851,13 @@ impl Vm {
         }
     }
 
+    /// Create an error/exception object for throwing.
+    fn create_error_object(&self, class_name: &str, message: String) -> Value {
+        let ex_obj = PhpObject::new(class_name.to_string());
+        ex_obj.set_property("message".to_string(), Value::String(message));
+        Value::Object(ex_obj)
+    }
+
     /// Main dispatch loop.
     fn dispatch_loop(&mut self) -> VmResult<()> {
         self.dispatch_loop_until(0)
@@ -870,7 +892,33 @@ impl Vm {
 
             let result = self.dispatch_op(&op, op_array_idx);
 
-            // Handle exceptions: look for catch blocks, unwinding call stack
+            // Convert runtime errors to catchable exceptions
+            let result = match result {
+                // Convert TypeError to a catchable exception
+                Err(VmError::TypeError(msg)) => {
+                    let exception_val = self.create_error_object("TypeError", msg);
+                    Err(VmError::Thrown(exception_val))
+                }
+                // Convert DivisionByZero to DivisionByZeroError exception
+                Err(VmError::DivisionByZero) => {
+                    let exception_val = self.create_error_object(
+                        "DivisionByZeroError",
+                        "Division by zero".to_string(),
+                    );
+                    Err(VmError::Thrown(exception_val))
+                }
+                // Convert MatchError to Error exception
+                Err(VmError::MatchError) => {
+                    let exception_val = self.create_error_object(
+                        "UnhandledMatchError",
+                        "Unhandled match case".to_string(),
+                    );
+                    Err(VmError::Thrown(exception_val))
+                }
+                other => other,
+            };
+
+            // Handle thrown exceptions: look for catch blocks, unwinding call stack
             let result = match result {
                 Err(VmError::Thrown(ref exception_val)) => {
                     if let Some(catch_target) =
@@ -2176,21 +2224,21 @@ impl Vm {
             // Declarations
             // =====================================================================
             ZOpcode::DeclareFunction => {
-                // op1 = function name (Const) — register it
-                let name_val = self.read_operand(op, 1, oa_idx)?;
+                // op1 = function index in dynamic_func_defs (Const)
+                // op2 = function name (Const)
+                let func_idx_val = self.read_operand(op, 1, oa_idx)?;
+                let func_idx = func_idx_val.to_long() as usize;
+                let name_val = self.read_operand(op, 2, oa_idx)?;
                 let name = name_val.to_php_string();
-                // The function's op_array is in dynamic_func_defs
-                // It should already be registered from register_dynamic_func_defs
+
+                // Register the function if not already registered
                 if !self.functions.contains_key(&name) {
-                    // Try to find it in dynamic_func_defs
                     let defs = &self.op_arrays[oa_idx].dynamic_func_defs;
-                    for def in defs {
-                        if def.function_name.as_deref() == Some(name.as_str()) {
-                            let idx = self.op_arrays.len();
-                            self.op_arrays.push(def.clone());
-                            self.functions.insert(name, idx);
-                            break;
-                        }
+                    if func_idx < defs.len() {
+                        let def = &defs[func_idx];
+                        let idx = self.op_arrays.len();
+                        self.op_arrays.push(def.clone());
+                        self.functions.insert(name, idx);
                     }
                 }
                 Ok(DispatchSignal::Next)
@@ -2600,6 +2648,33 @@ impl Vm {
                 .unwrap_or_default(),
             other => other.to_php_string(),
         }
+    }
+
+    /// Convert a MySQL value from a row to a PHP Value (static version).
+    fn mysqli_value_to_php_value_static(row: &mysql::Row, index: usize) -> Value {
+        use mysql::prelude::FromValue;
+
+        let mysql_val = match row.as_ref(index) {
+            Some(val) => val,
+            None => return Value::Null,
+        };
+
+        // Try different types in order
+        if let Ok(s) = String::from_value_opt(mysql_val.clone()) {
+            return Value::String(s);
+        }
+        if let Ok(i) = i64::from_value_opt(mysql_val.clone()) {
+            return Value::Long(i);
+        }
+        if let Ok(f) = f64::from_value_opt(mysql_val.clone()) {
+            return Value::Double(f);
+        }
+        if let Ok(bytes) = Vec::<u8>::from_value_opt(mysql_val.clone()) {
+            // Convert bytes to string
+            return Value::String(String::from_utf8_lossy(&bytes).to_string());
+        }
+
+        Value::Null
     }
 
     /// Resolve "self", "parent", "static" to the actual class name.
@@ -3232,6 +3307,38 @@ impl Vm {
             return Ok(());
         }
 
+        // Special handling for PDO
+        if class_name == "PDO" {
+            let obj = PhpObject::new("PDO".to_string());
+            obj.set_object_id(self.next_object_id);
+            self.next_object_id += 1;
+            let obj_val = Value::Object(obj);
+            self.write_result(op, oa_idx, obj_val.clone())?;
+
+            let frame = self.call_stack.last_mut().unwrap();
+            frame.call_stack_pending.push(PendingCall {
+                name: "PDO::__construct".to_string(),
+                args: vec![obj_val],
+                arg_names: Vec::new(),
+                this_source: Some((op.result_type, op.result.val)),
+                static_class: None,
+                forwarded_this: None,
+                ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
+            });
+            return Ok(());
+        }
+
+        // Special handling for PDOStatement
+        if class_name == "PDOStatement" {
+            let obj = PhpObject::new("PDOStatement".to_string());
+            obj.set_object_id(self.next_object_id);
+            self.next_object_id += 1;
+            let obj_val = Value::Object(obj);
+            self.write_result(op, oa_idx, obj_val)?;
+            return Ok(());
+        }
+
         // Try autoloading if the class isn't found
         if !self.classes.contains_key(&class_name) {
             self.try_autoload_class(&class_name);
@@ -3393,6 +3500,9 @@ impl Vm {
     fn handle_init_method_call(&mut self, op: &ZOp, oa_idx: usize) -> VmResult<()> {
         let obj = self.read_operand(op, 1, oa_idx)?;
         let method_name = self.read_operand(op, 2, oa_idx)?.to_php_string();
+
+        // Dereference in case it's a Reference wrapping an object
+        let obj = obj.deref_value();
 
         let class_name = match &obj {
             Value::Object(o) => o.class_name(),
@@ -3962,7 +4072,8 @@ impl Vm {
                 self.call_stack.push(new_frame);
                 Ok(DispatchSignal::CallPushed)
             }
-            Err(_e) => {
+            Err(e) => {
+                eprintln!("COMPILE ERROR for {:?}: {:?}", file_path, e);
                 if mode == 0 {
                     return Err(VmError::FatalError("eval(): syntax error".to_string()));
                 }
@@ -4274,6 +4385,57 @@ impl Vm {
                 };
                 obj.set_property("name".to_string(), Value::String(func_name_str));
                 obj.set_property("_reflected_callable".to_string(), func_val);
+            }
+            return Ok(DispatchSignal::Next);
+        }
+
+        // Handle PDO constructor
+        if func_name == "PDO::__construct" {
+            // args[0] is $this (PDO object), args[1] is DSN, args[2] is username, args[3] is password
+            if let Some(Value::Object(ref obj)) = args.first() {
+                let dsn = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let username = args.get(2).and_then(|v| {
+                    if matches!(v, Value::Null) {
+                        None
+                    } else {
+                        Some(v.to_php_string())
+                    }
+                });
+                let password = args.get(3).and_then(|v| {
+                    if matches!(v, Value::Null) {
+                        None
+                    } else {
+                        Some(v.to_php_string())
+                    }
+                });
+
+                // Create PDO connection
+                let conn = php_rs_ext_pdo::PdoConnection::new(
+                    &dsn,
+                    username.as_deref(),
+                    password.as_deref(),
+                );
+
+                match conn {
+                    Ok(pdo_conn) => {
+                        let obj_id = obj.object_id();
+                        self.pdo_connections.insert(obj_id, pdo_conn);
+                        obj.set_property("__pdo_connected".to_string(), Value::Bool(true));
+                    }
+                    Err(e) => {
+                        // Throw PDOException
+                        let ex_obj = PhpObject::new("PDOException".to_string());
+                        ex_obj.set_property(
+                            "message".to_string(),
+                            Value::String(format!("SQLSTATE[{}]: {}", e.sqlstate, e.message)),
+                        );
+                        ex_obj.set_property(
+                            "code".to_string(),
+                            e.code.as_ref().map(|c| Value::String(c.clone())).unwrap_or(Value::Long(0)),
+                        );
+                        return Err(VmError::Thrown(Value::Object(ex_obj)));
+                    }
+                }
             }
             return Ok(DispatchSignal::Next);
         }
@@ -7234,6 +7396,16 @@ impl Vm {
             };
         }
 
+        // Check if this is a PDO method
+        if base_class == "PDO" {
+            return self.call_pdo_method(method, args);
+        }
+
+        // Check if this is a PDOStatement method
+        if base_class == "PDOStatement" {
+            return self.call_pdo_statement_method(method, args);
+        }
+
         // Check if this is a DateTime/DateTimeZone family method
         let is_datetime = matches!(
             base_class,
@@ -7316,6 +7488,249 @@ impl Vm {
                     Ok(Some(v.clone()))
                 } else {
                     Ok(Some(Value::Null))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Call a PDO method.
+    fn call_pdo_method(&mut self, method: &str, args: &[Value]) -> VmResult<Option<Value>> {
+        use php_rs_ext_pdo::{FetchMode, PdoValue};
+
+        let pdo_obj = match args.first() {
+            Some(Value::Object(o)) => o,
+            _ => return Ok(None),
+        };
+        let obj_id = pdo_obj.object_id();
+
+        match method {
+            "prepare" => {
+                // $pdo->prepare($sql)
+                let sql = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+
+                if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
+                    match conn.prepare(&sql) {
+                        Ok(stmt) => {
+                            let stmt_obj = PhpObject::new("PDOStatement".to_string());
+                            stmt_obj.set_object_id(self.next_object_id);
+                            self.next_object_id += 1;
+                            let stmt_obj_id = stmt_obj.object_id();
+                            self.pdo_statements.insert(stmt_obj_id, stmt);
+                            Ok(Some(Value::Object(stmt_obj)))
+                        }
+                        Err(e) => {
+                            let ex_obj = PhpObject::new("PDOException".to_string());
+                            ex_obj.set_property(
+                                "message".to_string(),
+                                Value::String(format!("SQLSTATE[{}]: {}", e.sqlstate, e.message)),
+                            );
+                            Err(VmError::Thrown(Value::Object(ex_obj)))
+                        }
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "query" => {
+                // $pdo->query($sql)
+                let sql = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+
+                if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
+                    match conn.query(&sql) {
+                        Ok(stmt) => {
+                            let stmt_obj = PhpObject::new("PDOStatement".to_string());
+                            stmt_obj.set_object_id(self.next_object_id);
+                            self.next_object_id += 1;
+                            let stmt_obj_id = stmt_obj.object_id();
+                            self.pdo_statements.insert(stmt_obj_id, stmt);
+                            Ok(Some(Value::Object(stmt_obj)))
+                        }
+                        Err(e) => {
+                            let ex_obj = PhpObject::new("PDOException".to_string());
+                            ex_obj.set_property(
+                                "message".to_string(),
+                                Value::String(format!("SQLSTATE[{}]: {}", e.sqlstate, e.message)),
+                            );
+                            Err(VmError::Thrown(Value::Object(ex_obj)))
+                        }
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "exec" => {
+                // $pdo->exec($sql)
+                let sql = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+
+                if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
+                    match conn.exec(&sql) {
+                        Ok(affected) => Ok(Some(Value::Long(affected as i64))),
+                        Err(e) => {
+                            let ex_obj = PhpObject::new("PDOException".to_string());
+                            ex_obj.set_property(
+                                "message".to_string(),
+                                Value::String(format!("SQLSTATE[{}]: {}", e.sqlstate, e.message)),
+                            );
+                            Err(VmError::Thrown(Value::Object(ex_obj)))
+                        }
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "beginTransaction" => {
+                if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
+                    match conn.begin_transaction() {
+                        Ok(_) => Ok(Some(Value::Bool(true))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "commit" => {
+                if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
+                    match conn.commit() {
+                        Ok(_) => Ok(Some(Value::Bool(true))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "rollBack" => {
+                if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
+                    match conn.rollback() {
+                        Ok(_) => Ok(Some(Value::Bool(true))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "lastInsertId" => {
+                if let Some(conn) = self.pdo_connections.get(&obj_id) {
+                    let id = conn.last_insert_id();
+                    Ok(Some(Value::String(id)))
+                } else {
+                    Ok(Some(Value::String(String::new())))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Call a PDOStatement method.
+    fn call_pdo_statement_method(&mut self, method: &str, args: &[Value]) -> VmResult<Option<Value>> {
+        use php_rs_ext_pdo::{FetchMode, PdoValue};
+
+        let stmt_obj = match args.first() {
+            Some(Value::Object(o)) => o,
+            _ => return Ok(None),
+        };
+        let obj_id = stmt_obj.object_id();
+
+        match method {
+            "execute" => {
+                // $stmt->execute([$params])
+                let params_val = args.get(1).cloned().unwrap_or(Value::Null);
+                let params = if let Value::Array(ref a) = params_val {
+                    Some(
+                        a.entries()
+                            .iter()
+                            .map(|(_, v)| value_to_pdo_value(v))
+                            .collect::<Vec<_>>(),
+                    )
+                } else {
+                    None
+                };
+
+                if let Some(stmt) = self.pdo_statements.get_mut(&obj_id) {
+                    match stmt.execute(params.as_deref()) {
+                        Ok(_) => Ok(Some(Value::Bool(true))),
+                        Err(e) => {
+                            let ex_obj = PhpObject::new("PDOException".to_string());
+                            ex_obj.set_property(
+                                "message".to_string(),
+                                Value::String(format!("SQLSTATE[{}]: {}", e.sqlstate, e.message)),
+                            );
+                            Err(VmError::Thrown(Value::Object(ex_obj)))
+                        }
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "fetch" => {
+                // $stmt->fetch($fetch_mode = PDO::FETCH_BOTH)
+                let fetch_mode_val = args.get(1).map(|v| v.to_long()).unwrap_or(3); // FETCH_BOTH = 3
+                let fetch_mode = match fetch_mode_val {
+                    1 => FetchMode::Assoc,  // FETCH_ASSOC
+                    2 => FetchMode::Num,    // FETCH_NUM
+                    5 => FetchMode::Obj,    // FETCH_OBJ
+                    7 => FetchMode::Column, // FETCH_COLUMN
+                    _ => FetchMode::Both,   // FETCH_BOTH (default)
+                };
+
+                if let Some(stmt) = self.pdo_statements.get_mut(&obj_id) {
+                    if let Some(row) = stmt.fetch(fetch_mode) {
+                        Ok(Some(pdo_row_to_value(&row, fetch_mode, self)))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "fetchAll" => {
+                // $stmt->fetchAll($fetch_mode = PDO::FETCH_BOTH)
+                let fetch_mode_val = args.get(1).map(|v| v.to_long()).unwrap_or(3);
+                let fetch_mode = match fetch_mode_val {
+                    1 => FetchMode::Assoc,
+                    2 => FetchMode::Num,
+                    5 => FetchMode::Obj,
+                    7 => FetchMode::Column,
+                    _ => FetchMode::Both,
+                };
+
+                if let Some(stmt) = self.pdo_statements.get_mut(&obj_id) {
+                    let rows = stmt.fetch_all(fetch_mode);
+                    let mut result = PhpArray::new();
+                    for row in rows {
+                        result.push(pdo_row_to_value(&row, fetch_mode, self));
+                    }
+                    Ok(Some(Value::Array(result)))
+                } else {
+                    Ok(Some(Value::Array(PhpArray::new())))
+                }
+            }
+            "fetchColumn" => {
+                // $stmt->fetchColumn($column_number = 0)
+                let col_num = args.get(1).map(|v| v.to_long() as usize).unwrap_or(0);
+
+                if let Some(stmt) = self.pdo_statements.get_mut(&obj_id) {
+                    if let Some(val) = stmt.fetch_column(col_num) {
+                        Ok(Some(pdo_value_to_value(&val)))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "rowCount" => {
+                if let Some(stmt) = self.pdo_statements.get(&obj_id) {
+                    Ok(Some(Value::Long(stmt.row_count() as i64)))
+                } else {
+                    Ok(Some(Value::Long(0)))
+                }
+            }
+            "columnCount" => {
+                if let Some(stmt) = self.pdo_statements.get(&obj_id) {
+                    Ok(Some(Value::Long(stmt.column_count() as i64)))
+                } else {
+                    Ok(Some(Value::Long(0)))
                 }
             }
             _ => Ok(None),
@@ -7494,6 +7909,7 @@ impl Vm {
             }
             "get_class" => {
                 let v = args.first().cloned().unwrap_or(Value::Null);
+                let v = v.deref_value(); // Dereference in case it's a Reference
                 match v {
                     Value::Object(ref o) => Ok(Some(Value::String(o.class_name()))),
                     _ => Ok(Some(Value::Bool(false))),
@@ -8532,7 +8948,19 @@ impl Vm {
             "ignore_user_abort" => Ok(Some(Value::Long(0))),
             "function_exists" => {
                 let fname = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(self.functions.contains_key(&fname))))
+                // Check user-defined functions first
+                let exists = if self.functions.contains_key(&fname) {
+                    true
+                } else {
+                    // Check if it's a builtin by attempting to call it with no args
+                    // If call_builtin returns Ok(Some(...)) or Err(...), it exists
+                    // If it returns Ok(None), it doesn't exist
+                    match self.call_builtin(&fname, &[], &[], &[]) {
+                        Ok(None) => false,  // Unknown function
+                        _ => true,  // Either exists (Ok(Some)) or disabled/error (Err)
+                    }
+                };
+                Ok(Some(Value::Bool(exists)))
             }
             "is_callable" => {
                 let v = args.first().cloned().unwrap_or(Value::Null);
@@ -8564,11 +8992,21 @@ impl Vm {
                             Ok(r) => {
                                 if let Some(caps) = r.captures(search_subj) {
                                     let mut matches_arr = PhpArray::new();
+                                    // Collect group names
+                                    let names: Vec<Option<&str>> = r.capture_names().collect();
+                                    // Add numeric indices and interleave named groups
                                     for i in 0..caps.len() {
                                         if let Some(m) = caps.get(i) {
-                                            matches_arr.push(Value::String(m.as_str().to_string()));
-                                        } else {
-                                            matches_arr.push(Value::String(String::new()));
+                                            let match_str = m.as_str().to_string();
+                                            // Add named group first (if present)
+                                            if let Some(Some(name)) = names.get(i) {
+                                                matches_arr.set(
+                                                    &Value::String(name.to_string()),
+                                                    Value::String(match_str.clone())
+                                                );
+                                            }
+                                            // Then add numeric index
+                                            matches_arr.push(Value::String(match_str));
                                         }
                                     }
                                     // Write $matches back via ref_args (arg index 2)
@@ -8587,13 +9025,21 @@ impl Vm {
                                         if let Ok(Some(caps)) = r.captures(search_subj) {
                                             let mut matches_arr = PhpArray::new();
                                             let num_groups = caps.len();
+                                            // Collect group names
+                                            let names: Vec<Option<&str>> = r.capture_names().collect();
+                                            // Add numeric indices and interleave named groups
                                             for i in 0..num_groups {
                                                 if let Some(m) = caps.get(i) {
-                                                    matches_arr.push(Value::String(
-                                                        m.as_str().to_string(),
-                                                    ));
-                                                } else {
-                                                    matches_arr.push(Value::String(String::new()));
+                                                    let match_str = m.as_str().to_string();
+                                                    // Add named group first (if present)
+                                                    if let Some(Some(name)) = names.get(i) {
+                                                        matches_arr.set(
+                                                            &Value::String(name.to_string()),
+                                                            Value::String(match_str.clone())
+                                                        );
+                                                    }
+                                                    // Then add numeric index
+                                                    matches_arr.push(Value::String(match_str));
                                                 }
                                             }
                                             if args.len() > 2 {
@@ -17024,14 +17470,220 @@ impl Vm {
                 Ok(Some(Value::String(s)))
             }
 
-            // === mysqli (106 functions) — stubs ===
-            "mysqli_connect" | "mysqli_init" | "mysqli_real_connect" => {
-                Ok(Some(Value::Bool(false)))
+            // === mysqli (106 functions) ===
+            "mysqli_connect" => {
+                // mysqli_connect($host, $user, $pass, $db, $port = 3306)
+                let host_val = args.first().cloned().unwrap_or(Value::Null);
+                let host = if matches!(host_val, Value::Null) {
+                    "127.0.0.1".to_string()
+                } else {
+                    let h = host_val.to_php_string();
+                    if h.is_empty() || h == "localhost" {
+                        "127.0.0.1".to_string()
+                    } else {
+                        h
+                    }
+                };
+                let user = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+                let pass = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
+                let db = args.get(3).cloned().unwrap_or(Value::Null).to_php_string();
+                let port = args
+                    .get(4)
+                    .cloned()
+                    .unwrap_or(Value::Long(3306))
+                    .to_long() as u16;
+
+                let opts = mysql::OptsBuilder::new()
+                    .ip_or_hostname(Some(host))
+                    .user(Some(user))
+                    .pass(Some(pass))
+                    .db_name(Some(db))
+                    .tcp_port(port);
+
+                match mysql::Conn::new(opts) {
+                    Ok(conn) => {
+                        let conn_id = self.next_resource_id;
+                        self.next_resource_id += 1;
+                        self.mysqli_connections.insert(conn_id, conn);
+                        self.mysqli_conn_meta
+                            .insert(conn_id, (0, 0, String::new(), 0));
+                        Ok(Some(Value::Resource(conn_id, "mysqli".to_string())))
+                    }
+                    Err(e) => {
+                        // Set global connection error
+                        eprintln!("MySQLi connection error: {}", e);
+                        Ok(Some(Value::Bool(false)))
+                    }
+                }
             }
-            "mysqli_close" | "mysqli_kill" | "mysqli_ping" => Ok(Some(Value::Bool(false))),
-            "mysqli_query"
-            | "mysqli_real_query"
-            | "mysqli_multi_query"
+            "mysqli_init" => {
+                // mysqli_init() — just return a new resource ID for OO-style usage
+                let conn_id = self.next_resource_id;
+                self.next_resource_id += 1;
+                Ok(Some(Value::Resource(conn_id, "mysqli_init".to_string())))
+            }
+            "mysqli_real_connect" => {
+                // mysqli_real_connect($link, $host, $user, $pass, $db, $port, $socket, $flags)
+                // Extract link resource ID from first argument
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => {
+                        // If no valid link, create a new one
+                        let id = self.next_resource_id;
+                        self.next_resource_id += 1;
+                        id
+                    }
+                };
+
+                // Extract connection parameters, handling NULL values
+                let host_val = args.get(1).cloned().unwrap_or(Value::Null);
+                let host = if matches!(host_val, Value::Null) {
+                    "127.0.0.1".to_string()
+                } else {
+                    let h = host_val.to_php_string();
+                    if h.is_empty() || h == "localhost" {
+                        // Force IPv4 since MySQL often only listens on 127.0.0.1
+                        "127.0.0.1".to_string()
+                    } else {
+                        h
+                    }
+                };
+
+                let user_val = args.get(2).cloned().unwrap_or(Value::Null);
+                let user = if matches!(user_val, Value::Null) {
+                    "".to_string()
+                } else {
+                    user_val.to_php_string()
+                };
+
+                let pass_val = args.get(3).cloned().unwrap_or(Value::Null);
+                let pass = if matches!(pass_val, Value::Null) {
+                    "".to_string()
+                } else {
+                    pass_val.to_php_string()
+                };
+
+                let db_val = args.get(4).cloned().unwrap_or(Value::Null);
+                let db_opt = if matches!(db_val, Value::Null) {
+                    None
+                } else {
+                    Some(db_val.to_php_string())
+                };
+
+                let port_val = args.get(5).cloned().unwrap_or(Value::Long(3306));
+                let port = if matches!(port_val, Value::Null) {
+                    3306
+                } else {
+                    let p = port_val.to_long() as u16;
+                    if p == 0 {
+                        3306
+                    } else {
+                        p
+                    }
+                };
+
+                let mut opts = mysql::OptsBuilder::new()
+                    .ip_or_hostname(Some(host))
+                    .user(Some(user))
+                    .pass(Some(pass))
+                    .tcp_port(port);
+
+                if let Some(db) = db_opt {
+                    opts = opts.db_name(Some(db));
+                }
+
+                match mysql::Conn::new(opts) {
+                    Ok(conn) => {
+                        self.mysqli_connections.insert(conn_id, conn);
+                        self.mysqli_conn_meta
+                            .insert(conn_id, (0, 0, String::new(), 0));
+                        Ok(Some(Value::Bool(true)))
+                    }
+                    Err(e) => {
+                        eprintln!("MySQLi connection error: {}", e);
+                        Ok(Some(Value::Bool(false)))
+                    }
+                }
+            }
+            "mysqli_close" => {
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Bool(false))),
+                };
+
+                if self.mysqli_connections.remove(&conn_id).is_some() {
+                    self.mysqli_conn_meta.remove(&conn_id);
+                    Ok(Some(Value::Bool(true)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "mysqli_kill" | "mysqli_ping" => Ok(Some(Value::Bool(false))),
+            "mysqli_query" | "mysqli_real_query" => {
+                // mysqli_query($conn, $sql)
+                use mysql::prelude::Queryable;
+
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Bool(false))),
+                };
+                let sql = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+
+                let conn = match self.mysqli_connections.get_mut(&conn_id) {
+                    Some(c) => c,
+                    None => return Ok(Some(Value::Bool(false))),
+                };
+
+                // For SELECT queries, use exec to get rows directly
+                // For other queries (INSERT/UPDATE/DELETE), just execute
+                let rows_result: Result<Vec<mysql::Row>, mysql::Error> = conn.query(sql.clone());
+
+                match rows_result {
+                    Ok(mut rows) => {
+                        // Get connection metadata
+                        let affected = conn.affected_rows();
+                        let insert_id = conn.last_insert_id();
+
+                        // Update connection metadata
+                        if let Some(meta) = self.mysqli_conn_meta.get_mut(&conn_id) {
+                            meta.0 = insert_id;
+                            meta.1 = affected;
+                            meta.2.clear();
+                            meta.3 = 0;
+                        }
+
+                        // If we have rows, we need to extract field names
+                        if !rows.is_empty() {
+                            // Get column names from the first row
+                            let field_names: Vec<String> = rows[0]
+                                .columns_ref()
+                                .iter()
+                                .map(|c| c.name_str().to_string())
+                                .collect();
+
+                            let result_id = self.next_resource_id;
+                            self.next_resource_id += 1;
+                            self.mysqli_results.insert(result_id, (rows, 0, field_names));
+                            Ok(Some(Value::Resource(
+                                result_id,
+                                "mysqli_result".to_string(),
+                            )))
+                        } else {
+                            // No rows returned - this was an INSERT/UPDATE/DELETE
+                            Ok(Some(Value::Bool(true)))
+                        }
+                    }
+                    Err(e) => {
+                        // Update error state
+                        if let Some(meta) = self.mysqli_conn_meta.get_mut(&conn_id) {
+                            meta.2 = format!("{}", e);
+                            meta.3 = 1;
+                        }
+                        Ok(Some(Value::Bool(false)))
+                    }
+                }
+            }
+            "mysqli_multi_query"
             | "mysqli_next_result"
             | "mysqli_more_results"
             | "mysqli_store_result"
@@ -17062,15 +17714,80 @@ impl Vm {
             | "mysqli_stmt_result_metadata"
             | "mysqli_stmt_attr_get"
             | "mysqli_stmt_attr_set" => Ok(Some(Value::Bool(false))),
-            "mysqli_affected_rows"
-            | "mysqli_insert_id"
-            | "mysqli_num_rows"
-            | "mysqli_num_fields"
-            | "mysqli_field_count"
-            | "mysqli_thread_id" => Ok(Some(Value::Long(0))),
-            "mysqli_errno" => Ok(Some(Value::Long(0))),
-            "mysqli_error"
-            | "mysqli_sqlstate"
+            "mysqli_affected_rows" => {
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Long(-1))),
+                };
+
+                if let Some(meta) = self.mysqli_conn_meta.get(&conn_id) {
+                    Ok(Some(Value::Long(meta.1 as i64)))
+                } else {
+                    Ok(Some(Value::Long(-1)))
+                }
+            }
+            "mysqli_insert_id" => {
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Long(0))),
+                };
+
+                if let Some(meta) = self.mysqli_conn_meta.get(&conn_id) {
+                    Ok(Some(Value::Long(meta.0 as i64)))
+                } else {
+                    Ok(Some(Value::Long(0)))
+                }
+            }
+            "mysqli_num_rows" => {
+                let result_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Long(0))),
+                };
+
+                if let Some((rows, _, _)) = self.mysqli_results.get(&result_id) {
+                    Ok(Some(Value::Long(rows.len() as i64)))
+                } else {
+                    Ok(Some(Value::Long(0)))
+                }
+            }
+            "mysqli_num_fields" | "mysqli_field_count" => {
+                let result_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Long(0))),
+                };
+
+                if let Some((_, _, field_names)) = self.mysqli_results.get(&result_id) {
+                    Ok(Some(Value::Long(field_names.len() as i64)))
+                } else {
+                    Ok(Some(Value::Long(0)))
+                }
+            }
+            "mysqli_thread_id" => Ok(Some(Value::Long(0))),
+            "mysqli_errno" => {
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Long(0))),
+                };
+
+                if let Some(meta) = self.mysqli_conn_meta.get(&conn_id) {
+                    Ok(Some(Value::Long(meta.3 as i64)))
+                } else {
+                    Ok(Some(Value::Long(0)))
+                }
+            }
+            "mysqli_error" => {
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::String(String::new()))),
+                };
+
+                if let Some(meta) = self.mysqli_conn_meta.get(&conn_id) {
+                    Ok(Some(Value::String(meta.2.clone())))
+                } else {
+                    Ok(Some(Value::String(String::new())))
+                }
+            }
+            "mysqli_sqlstate"
             | "mysqli_info"
             | "mysqli_stat"
             | "mysqli_get_host_info"
@@ -17087,25 +17804,191 @@ impl Vm {
             | "mysqli_rollback"
             | "mysqli_savepoint"
             | "mysqli_release_savepoint" => Ok(Some(Value::Bool(false))),
-            "mysqli_select_db"
-            | "mysqli_set_charset"
-            | "mysqli_options"
+            "mysqli_set_charset" => {
+                // mysqli_set_charset($conn, $charset)
+                use mysql::prelude::Queryable;
+
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Bool(false))),
+                };
+                let charset = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+
+                let conn = match self.mysqli_connections.get_mut(&conn_id) {
+                    Some(c) => c,
+                    None => return Ok(Some(Value::Bool(false))),
+                };
+
+                // Execute SET NAMES query
+                match conn.query_drop(format!("SET NAMES '{}'", charset)) {
+                    Ok(_) => Ok(Some(Value::Bool(true))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "mysqli_select_db" => {
+                // mysqli_select_db($conn, $dbname)
+                use mysql::prelude::Queryable;
+
+                let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Bool(false))),
+                };
+
+                let dbname = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Null)
+                    .to_php_string();
+
+                if let Some(conn) = self.mysqli_connections.get_mut(&conn_id) {
+                    let query = format!("USE `{}`", dbname.replace("`", "``"));
+                    let result: Result<Vec<mysql::Row>, mysql::Error> = conn.query(query);
+                    match result {
+                        Ok(_) => Ok(Some(Value::Bool(true))),
+                        Err(e) => {
+                            if let Some((_, _, err_msg, err_no)) =
+                                self.mysqli_conn_meta.get_mut(&conn_id)
+                            {
+                                *err_msg = format!("{:?}", e);
+                                *err_no = 1;
+                            }
+                            Ok(Some(Value::Bool(false)))
+                        }
+                    }
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "mysqli_options"
             | "mysqli_ssl_set"
             | "mysqli_change_user"
             | "mysqli_dump_debug_info"
             | "mysqli_refresh" => Ok(Some(Value::Bool(false))),
-            "mysqli_fetch_array"
-            | "mysqli_fetch_assoc"
-            | "mysqli_fetch_row"
-            | "mysqli_fetch_object"
-            | "mysqli_fetch_column" => Ok(Some(Value::Bool(false))),
+            "mysqli_fetch_assoc" => {
+                // mysqli_fetch_assoc($result) → array|null
+                let result_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Null)),
+                };
+
+                let result_data = match self.mysqli_results.get_mut(&result_id) {
+                    Some(data) => data,
+                    None => return Ok(Some(Value::Null)),
+                };
+
+                let (rows, position, field_names) = result_data;
+
+                if *position >= rows.len() {
+                    return Ok(Some(Value::Null));
+                }
+
+                let current_position = *position;
+                *position += 1;
+                let row = rows[current_position].clone();
+                let field_names_clone = field_names.clone();
+
+                // Build associative array
+                let mut arr = PhpArray::new();
+                for (i, field_name) in field_names_clone.iter().enumerate() {
+                    let value = Self::mysqli_value_to_php_value_static(&row, i);
+                    arr.set_string(field_name.clone(), value);
+                }
+
+                Ok(Some(Value::Array(arr)))
+            }
+            "mysqli_fetch_array" => {
+                // mysqli_fetch_array($result, $mode = MYSQLI_BOTH) → array|null
+                let result_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Null)),
+                };
+                let mode = args
+                    .get(1)
+                    .cloned()
+                    .unwrap_or(Value::Long(3))
+                    .to_long(); // MYSQLI_BOTH = 3
+
+                let result_data = match self.mysqli_results.get_mut(&result_id) {
+                    Some(data) => data,
+                    None => return Ok(Some(Value::Null)),
+                };
+
+                let (rows, position, field_names) = result_data;
+
+                if *position >= rows.len() {
+                    return Ok(Some(Value::Null));
+                }
+
+                let current_position = *position;
+                *position += 1;
+                let row = rows[current_position].clone();
+                let field_names_clone = field_names.clone();
+
+                // Build array based on mode
+                let mut arr = PhpArray::new();
+                for (i, field_name) in field_names_clone.iter().enumerate() {
+                    let value = Self::mysqli_value_to_php_value_static(&row, i);
+                    // MYSQLI_NUM = 2, MYSQLI_ASSOC = 1, MYSQLI_BOTH = 3
+                    if mode & 2 != 0 {
+                        // Include numeric keys
+                        arr.set_int(i as i64, value.clone());
+                    }
+                    if mode & 1 != 0 {
+                        // Include associative keys
+                        arr.set_string(field_name.clone(), value);
+                    }
+                }
+
+                Ok(Some(Value::Array(arr)))
+            }
+            "mysqli_fetch_row" => {
+                // mysqli_fetch_row($result) → array|null
+                let result_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Null)),
+                };
+
+                let result_data = match self.mysqli_results.get_mut(&result_id) {
+                    Some(data) => data,
+                    None => return Ok(Some(Value::Null)),
+                };
+
+                let (rows, position, field_names) = result_data;
+
+                if *position >= rows.len() {
+                    return Ok(Some(Value::Null));
+                }
+
+                let current_position = *position;
+                *position += 1;
+                let row = rows[current_position].clone();
+                let num_fields = field_names.len();
+
+                // Build indexed array
+                let mut arr = PhpArray::new();
+                for i in 0..num_fields {
+                    let value = Self::mysqli_value_to_php_value_static(&row, i);
+                    arr.set_int(i as i64, value);
+                }
+
+                Ok(Some(Value::Array(arr)))
+            }
+            "mysqli_fetch_object" | "mysqli_fetch_column" => Ok(Some(Value::Bool(false))),
             "mysqli_fetch_all" => Ok(Some(Value::Array(PhpArray::new()))),
             "mysqli_fetch_field" | "mysqli_fetch_field_direct" => Ok(Some(Value::Bool(false))),
             "mysqli_fetch_fields" | "mysqli_fetch_lengths" => {
                 Ok(Some(Value::Array(PhpArray::new())))
             }
             "mysqli_data_seek" | "mysqli_field_seek" => Ok(Some(Value::Bool(false))),
-            "mysqli_free_result" => Ok(Some(Value::Null)),
+            "mysqli_free_result" => {
+                let result_id = match args.first().cloned().unwrap_or(Value::Null) {
+                    Value::Resource(id, _) => id,
+                    _ => return Ok(Some(Value::Null)),
+                };
+
+                self.mysqli_results.remove(&result_id);
+                Ok(Some(Value::Null))
+            }
             "mysqli_get_connection_stats" | "mysqli_get_client_stats" => {
                 Ok(Some(Value::Array(PhpArray::new())))
             }
@@ -18868,6 +19751,88 @@ fn value_to_curl_value(value: &Value) -> php_rs_ext_curl::CurlValue {
             php_rs_ext_curl::CurlValue::Array(strings)
         }
         _ => php_rs_ext_curl::CurlValue::Null,
+    }
+}
+
+// ===========================================================================
+// PDO helper functions
+// ===========================================================================
+
+/// Convert a VM Value to a PdoValue for PDO parameter binding.
+fn value_to_pdo_value(value: &Value) -> php_rs_ext_pdo::PdoValue {
+    use php_rs_ext_pdo::PdoValue;
+
+    match value {
+        Value::Null => PdoValue::Null,
+        Value::Bool(b) => PdoValue::Bool(*b),
+        Value::Long(i) => PdoValue::Int(*i),
+        Value::Double(f) => PdoValue::Float(*f),
+        Value::String(s) => PdoValue::Str(s.clone()),
+        Value::Reference(rc) => value_to_pdo_value(&rc.borrow()),
+        _ => PdoValue::Str(value.to_php_string()),
+    }
+}
+
+/// Convert a PdoValue to a VM Value.
+fn pdo_value_to_value(pdo_val: &php_rs_ext_pdo::PdoValue) -> Value {
+    use php_rs_ext_pdo::PdoValue;
+
+    match pdo_val {
+        PdoValue::Null => Value::Null,
+        PdoValue::Bool(b) => Value::Bool(*b),
+        PdoValue::Int(i) => Value::Long(*i),
+        PdoValue::Float(f) => Value::Double(*f),
+        PdoValue::Str(s) => Value::String(s.clone()),
+        PdoValue::Blob(b) => Value::String(String::from_utf8_lossy(b).to_string()),
+    }
+}
+
+/// Convert a PdoRow to a VM Value based on fetch mode.
+fn pdo_row_to_value(row: &php_rs_ext_pdo::PdoRow, fetch_mode: php_rs_ext_pdo::FetchMode, vm: &mut Vm) -> Value {
+    use php_rs_ext_pdo::FetchMode;
+
+    match fetch_mode {
+        FetchMode::Assoc => {
+            let mut arr = PhpArray::new();
+            for (i, col) in row.columns.iter().enumerate() {
+                if let Some(val) = row.values.get(i) {
+                    arr.set_string(col.clone(), pdo_value_to_value(val));
+                }
+            }
+            Value::Array(arr)
+        }
+        FetchMode::Num => {
+            let mut arr = PhpArray::new();
+            for (i, val) in row.values.iter().enumerate() {
+                arr.set_int(i as i64, pdo_value_to_value(val));
+            }
+            Value::Array(arr)
+        }
+        FetchMode::Both => {
+            let mut arr = PhpArray::new();
+            for (i, val) in row.values.iter().enumerate() {
+                arr.set_int(i as i64, pdo_value_to_value(val));
+                if let Some(col) = row.columns.get(i) {
+                    arr.set_string(col.clone(), pdo_value_to_value(val));
+                }
+            }
+            Value::Array(arr)
+        }
+        FetchMode::Obj => {
+            let obj = PhpObject::new("stdClass".to_string());
+            obj.set_object_id(vm.next_object_id);
+            vm.next_object_id += 1;
+            for (i, col) in row.columns.iter().enumerate() {
+                if let Some(val) = row.values.get(i) {
+                    obj.set_property(col.clone(), pdo_value_to_value(val));
+                }
+            }
+            Value::Object(obj)
+        }
+        FetchMode::Column => {
+            // Return first column value
+            row.values.first().map(pdo_value_to_value).unwrap_or(Value::Null)
+        }
     }
 }
 

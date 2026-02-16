@@ -5,6 +5,31 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
+
+type DriverFactory = Box<dyn Fn() -> Box<dyn PdoDriver> + Send + Sync>;
+
+static DRIVER_REGISTRY: OnceLock<Mutex<HashMap<String, DriverFactory>>> = OnceLock::new();
+
+/// Register a PDO driver factory.
+///
+/// This allows external crates to register their drivers with the PDO system.
+/// The factory function will be called each time a connection is created.
+pub fn register_pdo_driver<F>(name: &str, factory: F)
+where
+    F: Fn() -> Box<dyn PdoDriver> + Send + Sync + 'static,
+{
+    let registry = DRIVER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut registry = registry.lock().unwrap();
+    registry.insert(name.to_string(), Box::new(factory));
+}
+
+fn get_driver(name: &str) -> Option<Box<dyn PdoDriver>> {
+    let registry = DRIVER_REGISTRY.get()?;
+    let registry = registry.lock().unwrap();
+    let factory = registry.get(name)?;
+    Some(factory())
+}
 
 // ---------------------------------------------------------------------------
 // PdoValue — Represents a typed value flowing through PDO
@@ -287,15 +312,18 @@ impl PdoConnection {
             .split_once(':')
             .ok_or_else(|| PdoError::general("Invalid DSN: missing driver prefix"))?;
 
-        let driver: Box<dyn PdoDriver> = match driver_name {
-            "sqlite" => Box::new(SqliteDriver),
-            other => {
-                return Err(PdoError::new(
-                    "HY000",
-                    None,
-                    &format!("could not find driver: {}", other),
-                ))
-            }
+        let driver: Box<dyn PdoDriver> = if driver_name == "sqlite" {
+            // Built-in SQLite driver
+            Box::new(SqliteDriver)
+        } else if let Some(driver) = get_driver(driver_name) {
+            // Driver from registry (e.g., pgsql, mysql)
+            driver
+        } else {
+            return Err(PdoError::new(
+                "HY000",
+                None,
+                &format!("could not find driver: {}", driver_name),
+            ));
         };
 
         let conn = driver.connect(params, username, password)?;

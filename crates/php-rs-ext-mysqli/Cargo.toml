@@ -7,5 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+php-rs-ext-mysqlnd = { path = "../php-rs-ext-mysqlnd" }
+mysql = "25"
 
 [dev-dependencies]

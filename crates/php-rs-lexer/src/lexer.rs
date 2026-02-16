@@ -1332,10 +1332,16 @@ impl<'src> Lexer<'src> {
             return None;
         }
 
-        // Consume until newline or EOF
+        // Consume until newline, ?>, or EOF
+        // In PHP, single-line comments end at newline OR ?> (whichever comes first)
         while let Some(ch) = self.peek() {
             if ch == '\n' {
                 // Don't consume the newline - leave it for whitespace handling
+                break;
+            }
+            // Check for ?> which also terminates single-line comments
+            if self.peek_str(2) == "?>" {
+                // Don't consume the ?> - leave it for the next token
                 break;
             }
             self.consume();

@@ -1,11 +1,12 @@
 //! MySQL native driver (mysqlnd) extension for php.rs
 //!
 //! Implements the protocol-level driver used internally by mysqli and PDO_mysql.
-//! This crate models the MySQL client/server wire protocol, including packet
-//! structures, command types, column type definitions, and connection state
-//! machine. No actual network I/O is performed.
+//! This crate provides real MySQL wire protocol implementation with actual
+//! network connections to MySQL servers.
 
 use std::fmt;
+use mysql::{Pool, OptsBuilder};
+use mysql::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Constants — MySQL protocol command bytes
@@ -473,7 +474,6 @@ impl MysqlndStat {
 // ---------------------------------------------------------------------------
 
 /// Represents a protocol-level MySQL connection.
-#[derive(Debug, Clone)]
 pub struct MysqlndConnection {
     /// Current protocol state.
     pub state: ConnectionState,
@@ -495,15 +495,47 @@ pub struct MysqlndConnection {
     pub username: String,
     /// Current database.
     pub database: String,
+    /// Actual MySQL connection pool.
+    pool: Option<Pool>,
 }
 
-/// Create a new mysqlnd connection (in disconnected state).
+impl std::fmt::Debug for MysqlndConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MysqlndConnection")
+            .field("state", &self.state)
+            .field("server_version", &self.server_version)
+            .field("connection_id", &self.connection_id)
+            .field("username", &self.username)
+            .field("database", &self.database)
+            .finish()
+    }
+}
+
+impl Clone for MysqlndConnection {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state,
+            server_version: self.server_version.clone(),
+            connection_id: self.connection_id,
+            server_capabilities: self.server_capabilities,
+            client_capabilities: self.client_capabilities,
+            character_set: self.character_set,
+            server_status: self.server_status,
+            stats: self.stats.clone(),
+            username: self.username.clone(),
+            database: self.database.clone(),
+            pool: None, // Can't clone pool, create new connection if needed
+        }
+    }
+}
+
+/// Create a new mysqlnd connection with real MySQL network connection.
 pub fn mysqlnd_connect(
     host: &str,
     user: &str,
-    _password: &str,
+    password: &str,
     database: &str,
-    _port: u16,
+    port: u16,
 ) -> Result<MysqlndConnection, MysqlndError> {
     if host.is_empty() {
         return Err(MysqlndError::new(2002, "No hostname provided"));
@@ -512,11 +544,50 @@ pub fn mysqlnd_connect(
         return Err(MysqlndError::new(1045, "No username provided"));
     }
 
-    // Simulate receiving a handshake and completing authentication.
+    // Build MySQL connection URL
+    let port_to_use = if port == 0 { 3306 } else { port };
+
+    // Try to create a real MySQL connection
+    let opts = OptsBuilder::new()
+        .ip_or_hostname(Some(host))
+        .tcp_port(port_to_use)
+        .user(Some(user))
+        .pass(Some(password))
+        .db_name(Some(database));
+
+    let pool = match Pool::new(opts) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(MysqlndError::new(
+                2002,
+                &format!("Connection failed: {}", e),
+            ));
+        }
+    };
+
+    // Try to get a connection to verify it works
+    let mut conn = pool.get_conn().map_err(|e| {
+        MysqlndError::new(2002, &format!("Failed to get connection: {}", e))
+    })?;
+
+    // Get server version
+    let server_version: String = conn
+        .query_first("SELECT VERSION()")
+        .map_err(|e| MysqlndError::new(2002, &format!("Failed to get version: {}", e)))?
+        .unwrap_or_else(|| "8.0.0".to_string());
+
+    // Get connection ID
+    let connection_id: u32 = conn
+        .query_first("SELECT CONNECTION_ID()")
+        .map_err(|e| MysqlndError::new(2002, &format!("Failed to get connection ID: {}", e)))?
+        .unwrap_or(1);
+
+    drop(conn); // Return connection to pool
+
     Ok(MysqlndConnection {
         state: ConnectionState::Ready,
-        server_version: "8.0.32-mysqlnd".to_string(),
-        connection_id: 1,
+        server_version,
+        connection_id,
         server_capabilities: CLIENT_PROTOCOL_41
             | CLIENT_SECURE_CONNECTION
             | CLIENT_PLUGIN_AUTH
@@ -531,7 +602,39 @@ pub fn mysqlnd_connect(
         stats: MysqlndStat::new(),
         username: user.to_string(),
         database: database.to_string(),
+        pool: Some(pool),
     })
+}
+
+/// Execute a query and return raw results.
+pub fn mysqlnd_query(
+    conn: &mut MysqlndConnection,
+    query: &str,
+) -> Result<Vec<mysql::Row>, MysqlndError> {
+    if conn.state != ConnectionState::Ready {
+        return Err(MysqlndError::new(2006, "MySQL server has gone away"));
+    }
+
+    let pool = conn.pool.as_ref()
+        .ok_or_else(|| MysqlndError::new(2006, "No active connection"))?;
+
+    let mut pool_conn = pool.get_conn()
+        .map_err(|e| MysqlndError::new(2006, &format!("Failed to get connection: {}", e)))?;
+
+    conn.stats.queries_sent += 1;
+
+    let rows: Vec<mysql::Row> = pool_conn.query(query)
+        .map_err(|e| MysqlndError::new(1064, &format!("Query error: {}", e)))?;
+
+    conn.stats.result_sets_received += 1;
+
+    Ok(rows)
+}
+
+/// Close the mysqlnd connection.
+pub fn mysqlnd_close(conn: &mut MysqlndConnection) {
+    conn.pool = None;
+    conn.state = ConnectionState::Closed;
 }
 
 // ===========================================================================
@@ -543,13 +646,14 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore] // Requires real MySQL server
     fn test_connect_success() {
         let conn = mysqlnd_connect("localhost", "root", "pass", "testdb", 3306)
             .expect("connect should succeed");
         assert_eq!(conn.state, ConnectionState::Ready);
         assert_eq!(conn.username, "root");
         assert_eq!(conn.database, "testdb");
-        assert!(conn.server_version.contains("mysqlnd"));
+        assert!(!conn.server_version.is_empty());
     }
 
     #[test]
@@ -691,6 +795,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Requires real MySQL server
     fn test_server_capability_flags() {
         let conn = mysqlnd_connect("localhost", "root", "pass", "db", 3306).unwrap();
         assert!(conn.server_capabilities & CLIENT_PROTOCOL_41 != 0);

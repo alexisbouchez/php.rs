@@ -773,6 +773,11 @@ fn main() {
     // Install signal handlers for graceful shutdown (SIGINT, SIGTERM)
     install_signal_handlers();
 
+    // Register PDO drivers
+    php_rs_ext_pdo::register_pdo_driver("pgsql", || {
+        Box::new(php_rs_ext_pdo_pgsql::PdoPgsqlDriver::new())
+    });
+
     let args: Vec<String> = env::args().collect();
 
     let opts = match parse_args(&args) {

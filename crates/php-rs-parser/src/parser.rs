@@ -278,7 +278,27 @@ impl<'a> Parser<'a> {
             Token::OpenTag => {
                 // Re-entering PHP mode after ?>
                 self.advance();
-                self.parse_statement()
+                // Check if we're re-entering at a block terminator or alternative syntax closing keyword
+                // (endif, endwhile, endfor, endforeach, endswitch, } for closing blocks)
+                // If so, don't try to parse it as a statement - return empty statement
+                // and let the parent loop/handler deal with it
+                if matches!(
+                    self.current_token,
+                    Token::Endif
+                        | Token::Endwhile
+                        | Token::Endfor
+                        | Token::Endforeach
+                        | Token::Endswitch
+                        | Token::RBrace
+                ) {
+                    // Return empty statement - the parent loop will see the terminator and handle it
+                    Ok(Statement::Block {
+                        statements: vec![],
+                        span: self.current_span,
+                    })
+                } else {
+                    self.parse_statement()
+                }
             }
             Token::OpenTagWithEcho => {
                 // <?= shorthand for echo
