@@ -1945,6 +1945,31 @@ impl Vm {
                         }
                     }
                 }
+
+                // Handle objects with __invoke() method
+                if let Value::Object(ref obj) = name_val {
+                    let class_name = obj.class_name().to_string();
+                    // Check if this is a Closure object (already handled by extract_closure_name)
+                    if class_name != "Closure" {
+                        // Check if the class has an __invoke method
+                        if self.has_method(&class_name, "__invoke") {
+                            let full_name = format!("{}::__invoke", class_name);
+                            let frame = self.call_stack.last_mut().unwrap();
+                            frame.call_stack_pending.push(PendingCall {
+                                name: full_name,
+                                args: vec![name_val.clone()],
+                                arg_names: Vec::new(),
+                                this_source: Some((op.op1_type, op.op1.val)),
+                                static_class: Some(class_name),
+                                forwarded_this: None,
+                                ref_args: Vec::new(),
+                                ref_prop_args: Vec::new(),
+                            });
+                            return Ok(DispatchSignal::Next);
+                        }
+                    }
+                }
+
                 let name = Self::extract_closure_name(&name_val);
                 let frame = self.call_stack.last_mut().unwrap();
                 frame.call_stack_pending.push(PendingCall {
@@ -2737,6 +2762,11 @@ impl Vm {
             break;
         }
         None
+    }
+
+    /// Check if a class has a method (including inherited from parent classes).
+    fn has_method(&self, class_name: &str, method_name: &str) -> bool {
+        self.resolve_method(class_name, method_name).is_some()
     }
 
     /// Handle DECLARE_CLASS — register a class in the class table.
@@ -7685,15 +7715,30 @@ impl Vm {
             }
             "trim" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(s.trim().to_string())))
+                let mask = args
+                    .get(1)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| " \t\n\r\0\x0B".to_string());
+                let trimmed = s.trim_matches(|c| mask.contains(c));
+                Ok(Some(Value::String(trimmed.to_string())))
             }
             "ltrim" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(s.trim_start().to_string())))
+                let mask = args
+                    .get(1)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| " \t\n\r\0\x0B".to_string());
+                let trimmed = s.trim_start_matches(|c| mask.contains(c));
+                Ok(Some(Value::String(trimmed.to_string())))
             }
             "rtrim" | "chop" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::String(s.trim_end().to_string())))
+                let mask = args
+                    .get(1)
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| " \t\n\r\0\x0B".to_string());
+                let trimmed = s.trim_end_matches(|c| mask.contains(c));
+                Ok(Some(Value::String(trimmed.to_string())))
             }
             "str_contains" => {
                 let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -8573,51 +8618,35 @@ impl Vm {
                 let subj = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let preg_flags = args.get(3).map(|v| v.to_long()).unwrap_or(0);
                 let offset_capture = preg_flags & 256 != 0; // PREG_OFFSET_CAPTURE
+                let set_order = preg_flags & 2 != 0; // PREG_SET_ORDER
 
                 match parse_php_regex(&pat) {
                     Some((re, flags)) => {
                         let pattern = apply_regex_flags(&re, &flags);
 
-                        // Helper: collect all captures from a match into group-indexed arrays.
-                        // We use fancy_regex which handles both normal and lookahead patterns.
                         let fr = match fancy_regex::Regex::new(&pattern) {
                             Ok(r) => r,
                             Err(_) => return Ok(Some(Value::Bool(false))),
                         };
 
                         let num_groups = fr.captures_len();
-                        // Build per-group arrays (PHP default: PREG_PATTERN_ORDER)
-                        let mut group_arrays: Vec<PhpArray> =
-                            (0..num_groups).map(|_| PhpArray::new()).collect();
+                        let mut all_matches: Vec<Vec<Option<(String, usize)>>> = Vec::new();
                         let mut match_count: i64 = 0;
 
+                        // Collect all matches first
                         for cap_result in fr.captures_iter(&subj) {
                             match cap_result {
                                 Ok(caps) => {
                                     match_count += 1;
+                                    let mut this_match = Vec::new();
                                     for g in 0..num_groups {
                                         if let Some(m) = caps.get(g) {
-                                            let val = if offset_capture {
-                                                let mut pair = PhpArray::new();
-                                                pair.push(Value::String(m.as_str().to_string()));
-                                                pair.push(Value::Long(m.start() as i64));
-                                                Value::Array(pair)
-                                            } else {
-                                                Value::String(m.as_str().to_string())
-                                            };
-                                            group_arrays[g].push(val);
+                                            this_match.push(Some((m.as_str().to_string(), m.start())));
                                         } else {
-                                            let val = if offset_capture {
-                                                let mut pair = PhpArray::new();
-                                                pair.push(Value::String(String::new()));
-                                                pair.push(Value::Long(-1));
-                                                Value::Array(pair)
-                                            } else {
-                                                Value::String(String::new())
-                                            };
-                                            group_arrays[g].push(val);
+                                            this_match.push(None);
                                         }
                                     }
+                                    all_matches.push(this_match);
                                 }
                                 Err(_) => break,
                             }
@@ -8625,10 +8654,82 @@ impl Vm {
 
                         // Write $matches back (arg index 2)
                         if args.len() > 2 {
-                            let mut matches_arr = PhpArray::new();
-                            for ga in group_arrays {
-                                matches_arr.push(Value::Array(ga));
-                            }
+                            let matches_arr = if match_count == 0 {
+                                // No matches - return empty array
+                                PhpArray::new()
+                            } else if set_order {
+                                // PREG_SET_ORDER: [[match0_g0, match0_g1...], [match1_g0, match1_g1...]]
+                                let mut arr = PhpArray::new();
+                                for match_groups in all_matches {
+                                    let mut match_arr = PhpArray::new();
+                                    for opt_capture in match_groups {
+                                        let val = match opt_capture {
+                                            Some((text, pos)) => {
+                                                if offset_capture {
+                                                    let mut pair = PhpArray::new();
+                                                    pair.push(Value::String(text));
+                                                    pair.push(Value::Long(pos as i64));
+                                                    Value::Array(pair)
+                                                } else {
+                                                    Value::String(text)
+                                                }
+                                            }
+                                            None => {
+                                                if offset_capture {
+                                                    let mut pair = PhpArray::new();
+                                                    pair.push(Value::String(String::new()));
+                                                    pair.push(Value::Long(-1));
+                                                    Value::Array(pair)
+                                                } else {
+                                                    Value::String(String::new())
+                                                }
+                                            }
+                                        };
+                                        match_arr.push(val);
+                                    }
+                                    arr.push(Value::Array(match_arr));
+                                }
+                                arr
+                            } else {
+                                // PREG_PATTERN_ORDER (default): [[all_g0...], [all_g1...]]
+                                let mut group_arrays: Vec<PhpArray> =
+                                    (0..num_groups).map(|_| PhpArray::new()).collect();
+
+                                for match_groups in all_matches {
+                                    for (g, opt_capture) in match_groups.into_iter().enumerate() {
+                                        let val = match opt_capture {
+                                            Some((text, pos)) => {
+                                                if offset_capture {
+                                                    let mut pair = PhpArray::new();
+                                                    pair.push(Value::String(text));
+                                                    pair.push(Value::Long(pos as i64));
+                                                    Value::Array(pair)
+                                                } else {
+                                                    Value::String(text)
+                                                }
+                                            }
+                                            None => {
+                                                if offset_capture {
+                                                    let mut pair = PhpArray::new();
+                                                    pair.push(Value::String(String::new()));
+                                                    pair.push(Value::Long(-1));
+                                                    Value::Array(pair)
+                                                } else {
+                                                    Value::String(String::new())
+                                                }
+                                            }
+                                        };
+                                        group_arrays[g].push(val);
+                                    }
+                                }
+
+                                let mut arr = PhpArray::new();
+                                for ga in group_arrays {
+                                    arr.push(Value::Array(ga));
+                                }
+                                arr
+                            };
+
                             self.write_back_arg(
                                 2,
                                 Value::Array(matches_arr),
@@ -8993,7 +9094,23 @@ impl Vm {
             "putenv" => {
                 let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 if let Some(eq) = s.find('=') {
-                    std::env::set_var(&s[..eq], &s[eq + 1..]);
+                    let key = &s[..eq];
+                    let value = &s[eq + 1..];
+                    std::env::set_var(key, value);
+
+                    // Also update $_ENV superglobal if it exists in current frame
+                    if let Some(frame) = self.call_stack.last_mut() {
+                        // Find _ENV CV (superglobals use CV names without $)
+                        if let Some(oa) = self.op_arrays.get(frame.op_array_idx) {
+                            if let Some(env_idx) = oa.vars.iter().position(|v| v == "_ENV") {
+                                if env_idx < frame.cvs.len() {
+                                    if let Value::Array(ref mut env_arr) = frame.cvs[env_idx] {
+                                        env_arr.set_string(key.to_string(), Value::String(value.to_string()));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(Some(Value::Bool(true)))
             }
