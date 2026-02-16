@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # php.rs interpreter
+  php-rs:
+    build: .
+    image: php-rs:latest
+    container_name: php-rs
+    volumes:
+      - ./examples:/var/www
+    command: /var/www/test_pdo_pgsql.php
+    depends_on:
+      - postgres
+    networks:
+      - php-rs-net
+
+  # PostgreSQL database for testing
+  postgres:
+    image: postgres:16-alpine
+    container_name: php-rs-postgres
+    environment:
+      POSTGRES_USER: phpuser
+      POSTGRES_PASSWORD: phppass
+      POSTGRES_DB: phpdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - php-rs-net
+
+  # MySQL database for testing
+  mysql:
+    image: mysql:8.0
+    container_name: php-rs-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: phpdb
+      MYSQL_USER: phpuser
+      MYSQL_PASSWORD: phppass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - php-rs-net
+
+volumes:
+  postgres-data:
+  mysql-data:
+
+networks:
+  php-rs-net:
+    driver: bridge

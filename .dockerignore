@@ -1,0 +1,34 @@
+# Ignore build artifacts
+target/
+*/target/
+
+# Ignore git files
+.git/
+.gitignore
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore test files
+tests/
+*/tests/
+*.phpt
+
+# Ignore documentation (except essential)
+*.md
+!README.md
+!CLAUDE.md
+
+# Ignore examples and demos
+examples/
+scripts/
+wordpress-test/
+DEMO*.sh
+*_DEMO.sh
+
+# Ignore temporary files
+*.tmp
+*.log

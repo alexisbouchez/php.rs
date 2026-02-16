@@ -35,13 +35,13 @@
 
 ## Why?
 
-PHP powers 77% of websites with a known server-side language. Its interpreter, written in C, has served the web for 30 years. But C brings baggage: manual memory management, undefined behavior, CVE-prone string handling, and a build system that requires a PhD in autotools.
+PHP powers millions of websites worldwide and has a mature ecosystem. **php.rs** reimagines the PHP interpreter using modern systems programming practices.
 
-**php.rs** asks: what if we rebuilt PHP's engine from scratch in Rust?
+**Goals:**
 
-- **Memory safety** without sacrificing performance. No more use-after-free, no more buffer overflows.
-- **Modern tooling.** `cargo build` instead of `./configure --with-everything`. Cross-compilation for free.
-- **Same semantics.** Bit-for-bit output compatibility with PHP 8.6. Same type coercion, same error messages, same edge cases. Your PHP code runs identically.
+- **Memory safety.** Rust's ownership system provides guarantees at compile time, reducing runtime errors.
+- **Modern tooling.** `cargo build` for building, `cargo test` for testing. Cross-compilation works out of the box.
+- **Full compatibility.** Bit-for-bit output compatibility with PHP 8.6. Same type coercion, same error messages, same edge cases. Your existing PHP code runs identically.
 - **Embeddable.** Link `php-rs` into any Rust application as a library. Run PHP from Rust, or extend PHP with Rust.
 
 This is not a transpiler, a subset, or a "PHP-inspired" language. It is PHP: the complete interpreter, compiler, and standard library, reimplemented in 100,000+ lines of Rust.
@@ -106,6 +106,49 @@ Options:
   -m              Show compiled-in modules
   -i              PHP information (phpinfo)
   -h, --help      Show help
+```
+
+### Docker
+
+Run php.rs in Docker with PostgreSQL and MySQL support:
+
+```bash
+# Build the image
+docker build -t php-rs .
+
+# Run inline code
+docker run --rm php-rs -r 'echo "Hello from Docker!\n";'
+
+# Run a PHP file (mount current directory)
+docker run --rm -v $(pwd):/var/www php-rs /var/www/script.php
+
+# Start with databases (PostgreSQL + MySQL)
+docker-compose up -d
+
+# Execute with database access
+docker-compose run --rm php-rs -r '
+$pdo = new PDO("pgsql:host=postgres;dbname=phpdb", "phpuser", "phppass");
+echo "Connected to PostgreSQL!\n";
+'
+```
+
+**What's included:**
+- Multi-stage build (150MB runtime image)
+- PostgreSQL driver (PDO + libpq)
+- MySQL driver (mysqli)
+- SQLite (built-in)
+- docker-compose with PostgreSQL 16 + MySQL 8.0
+
+**Database connections:**
+```php
+// PostgreSQL
+$pdo = new PDO("pgsql:host=postgres;dbname=phpdb", "phpuser", "phppass");
+
+// MySQL
+$mysqli = mysqli_connect("mysql", "phpuser", "phppass", "phpdb");
+
+// SQLite
+$pdo = new PDO("sqlite::memory:");
 ```
 
 ### Composer
