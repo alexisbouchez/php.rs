@@ -160,13 +160,13 @@ pub fn php_rand(min: i64, max: i64) -> i64 {
     }
     // Simple random using system entropy
     let mut buf = [0u8; 8];
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", feature = "native-io"))]
     {
         unsafe {
             libc::arc4random_buf(buf.as_mut_ptr() as *mut libc::c_void, 8);
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(all(target_os = "macos", feature = "native-io")))]
     {
         use std::time::SystemTime;
         let seed = SystemTime::now()

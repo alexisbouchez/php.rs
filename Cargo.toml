@@ -68,6 +68,7 @@ members = [
     "crates/php-rs-sapi-cli",
     "crates/php-rs-sapi-fpm",
     "crates/php-rs-sapi-embed",
+    "crates/php-rs-sapi-wasm",
     "crates/php-rs-composer",
 ]
 

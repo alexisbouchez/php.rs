@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use php_rs_compiler::op::{OperandType, ZOp};
@@ -14,6 +15,22 @@ use php_rs_compiler::opcode::ZOpcode;
 use php_rs_ext_json::{self, JsonValue};
 
 use crate::value::{ArrayKey, PhpArray, PhpObject, Value};
+
+/// Get current time in milliseconds for execution timeout tracking.
+#[cfg(not(target_arch = "wasm32"))]
+fn now_millis() -> u64 {
+    use std::time::SystemTime;
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// WASM stub: timeout is disabled.
+#[cfg(target_arch = "wasm32")]
+fn now_millis() -> u64 {
+    0
+}
 
 /// Global flag set by signal handlers (SIGINT/SIGTERM) for graceful shutdown.
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -280,16 +297,19 @@ pub struct Vm {
     /// Declaring class scope for closures: closure_name → class_name.
     /// Used so `static::` inside closures resolves to the declaring class.
     closure_scopes: HashMap<String, String>,
+    /// Optional virtual filesystem (used in WASM or testing; None = use real fs).
+    vfs: Option<std::sync::Arc<std::sync::RwLock<php_rs_runtime::VirtualFileSystem>>>,
     /// Open file handles: resource_id → FileHandle.
     file_handles: HashMap<i64, php_rs_ext_standard::file::FileHandle>,
     /// Open curl handles: resource_id → CurlHandle.
+    #[cfg(feature = "native-io")]
     curl_handles: HashMap<i64, php_rs_ext_curl::CurlHandle>,
     /// Next resource ID for file/curl handles.
     next_resource_id: i64,
     /// Execution limits and security config.
     config: VmConfig,
-    /// Execution start time (for max_execution_time enforcement).
-    execution_start: Option<Instant>,
+    /// Execution start time in milliseconds (for max_execution_time enforcement).
+    execution_start_millis: Option<u64>,
     /// Opcode counter for periodic limit checks (avoids checking clock on every op).
     opcode_counter: u64,
     /// Registered SPL autoload callbacks (function name, optional $this object).
@@ -301,14 +321,19 @@ pub struct Vm {
     /// HTTP response code set by http_response_code().
     response_code: Option<u16>,
     /// MySQLi connections: connection_id → mysql::Conn.
+    #[cfg(feature = "native-io")]
     mysqli_connections: HashMap<i64, mysql::Conn>,
     /// MySQLi query results: result_id → (rows, current_position, field_names).
+    #[cfg(feature = "native-io")]
     mysqli_results: HashMap<i64, (Vec<mysql::Row>, usize, Vec<String>)>,
     /// MySQLi connection metadata: connection_id → (last_insert_id, affected_rows, error, errno).
+    #[cfg(feature = "native-io")]
     mysqli_conn_meta: HashMap<i64, (u64, u64, String, u16)>,
     /// PDO connections: object_id → PdoConnection.
+    #[cfg(feature = "native-io")]
     pdo_connections: HashMap<u64, php_rs_ext_pdo::PdoConnection>,
     /// PDO prepared statements: object_id → PdoStatement.
+    #[cfg(feature = "native-io")]
     pdo_statements: HashMap<u64, php_rs_ext_pdo::PdoStatement>,
 }
 
@@ -368,7 +393,9 @@ impl Vm {
                 c.insert(
                     "PHP_OS".to_string(),
                     Value::String(
-                        if cfg!(target_os = "macos") {
+                        if cfg!(target_arch = "wasm32") {
+                            "WASM"
+                        } else if cfg!(target_os = "macos") {
                             "Darwin"
                         } else if cfg!(target_os = "windows") {
                             "WINNT"
@@ -381,7 +408,9 @@ impl Vm {
                 c.insert(
                     "PHP_OS_FAMILY".to_string(),
                     Value::String(
-                        if cfg!(target_os = "windows") {
+                        if cfg!(target_arch = "wasm32") {
+                            "WASM"
+                        } else if cfg!(target_os = "windows") {
                             "Windows"
                         } else {
                             "Unix"
@@ -389,7 +418,17 @@ impl Vm {
                         .to_string(),
                     ),
                 );
-                c.insert("PHP_SAPI".to_string(), Value::String("cli".to_string()));
+                c.insert(
+                    "PHP_SAPI".to_string(),
+                    Value::String(
+                        if cfg!(target_arch = "wasm32") {
+                            "wasm"
+                        } else {
+                            "cli"
+                        }
+                        .to_string(),
+                    ),
+                );
                 c.insert("PHP_PREFIX".to_string(), Value::String("/usr".to_string()));
                 c.insert(
                     "PHP_BINDIR".to_string(),
@@ -581,6 +620,7 @@ impl Vm {
             next_closure_id: 0,
             closure_bindings: HashMap::new(),
             closure_scopes: HashMap::new(),
+            vfs: None,
             file_handles: {
                 let mut fh = HashMap::new();
                 fh.insert(0, php_rs_ext_standard::file::FileHandle::stdin());
@@ -588,19 +628,25 @@ impl Vm {
                 fh.insert(2, php_rs_ext_standard::file::FileHandle::stderr());
                 fh
             },
+            #[cfg(feature = "native-io")]
             curl_handles: HashMap::new(),
             next_resource_id: 3,
             config,
-            execution_start: None,
+            execution_start_millis: None,
             opcode_counter: 0,
             autoload_callbacks: Vec::new(),
             autoloading_classes: HashSet::new(),
             response_headers: Vec::new(),
             response_code: None,
+            #[cfg(feature = "native-io")]
             mysqli_connections: HashMap::new(),
+            #[cfg(feature = "native-io")]
             mysqli_results: HashMap::new(),
+            #[cfg(feature = "native-io")]
             mysqli_conn_meta: HashMap::new(),
+            #[cfg(feature = "native-io")]
             pdo_connections: HashMap::new(),
+            #[cfg(feature = "native-io")]
             pdo_statements: HashMap::new(),
         }
     }
@@ -628,6 +674,7 @@ impl Vm {
         }
 
         // Canonicalize the target path (resolve symlinks, .., etc.)
+        #[cfg(not(target_arch = "wasm32"))]
         let canonical = std::fs::canonicalize(path)
             .or_else(|_| {
                 // If file doesn't exist yet, canonicalize the parent directory
@@ -643,12 +690,17 @@ impl Vm {
                 }
             })
             .unwrap_or_else(|_| std::path::PathBuf::from(path));
+        #[cfg(target_arch = "wasm32")]
+        let canonical = std::path::PathBuf::from(path);
 
         let canonical_str = canonical.to_string_lossy();
 
         for base in &self.config.open_basedir {
+            #[cfg(not(target_arch = "wasm32"))]
             let base_canonical =
                 std::fs::canonicalize(base).unwrap_or_else(|_| std::path::PathBuf::from(base));
+            #[cfg(target_arch = "wasm32")]
+            let base_canonical = std::path::PathBuf::from(base);
             let base_str = base_canonical.to_string_lossy();
             // Path must start with the base directory
             if canonical_str.starts_with(base_str.as_ref()) {
@@ -696,9 +748,9 @@ impl Vm {
 
         // Start execution timer
         if self.config.max_execution_time > 0 {
-            self.execution_start = Some(Instant::now());
+            self.execution_start_millis = Some(now_millis());
         } else {
-            self.execution_start = None;
+            self.execution_start_millis = None;
         }
 
         // Pre-register any nested function definitions from dynamic_func_defs
@@ -732,6 +784,276 @@ impl Vm {
         }
 
         Ok(self.output.clone())
+    }
+
+    /// Set a virtual filesystem for this VM instance.
+    /// When set, all file operations will use the VFS instead of the real filesystem.
+    pub fn set_vfs(
+        &mut self,
+        vfs: std::sync::Arc<std::sync::RwLock<php_rs_runtime::VirtualFileSystem>>,
+    ) {
+        self.vfs = Some(vfs);
+    }
+
+    /// Get a reference to the VFS if set.
+    pub fn vfs(
+        &self,
+    ) -> Option<&std::sync::Arc<std::sync::RwLock<php_rs_runtime::VirtualFileSystem>>> {
+        self.vfs.as_ref()
+    }
+
+    // === Filesystem helper methods ===
+    // These delegate to VFS when available, otherwise to std::fs (native only).
+
+    /// Read a file's contents as bytes.
+    fn vm_read_file(&self, path: &str) -> std::io::Result<Vec<u8>> {
+        if let Some(ref vfs) = self.vfs {
+            let vfs = vfs
+                .read()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "VFS lock poisoned"))?;
+            Ok(vfs.read_file(path)?.to_vec())
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::fs::read(path)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "No filesystem available",
+                ))
+            }
+        }
+    }
+
+    /// Read a file's contents as a string.
+    fn vm_read_to_string(&self, path: &str) -> std::io::Result<String> {
+        let bytes = self.vm_read_file(path)?;
+        String::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// Write data to a file.
+    fn vm_write_file(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
+        if let Some(ref vfs) = self.vfs {
+            let mut vfs = vfs.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "VFS lock poisoned")
+            })?;
+            vfs.write_file(path, data)
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::fs::write(path, data)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "No filesystem available",
+                ))
+            }
+        }
+    }
+
+    /// Check if a path exists.
+    fn vm_file_exists(&self, path: &str) -> bool {
+        if let Some(ref vfs) = self.vfs {
+            if let Ok(vfs) = vfs.read() {
+                return vfs.exists(path);
+            }
+            false
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::path::Path::new(path).exists()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                false
+            }
+        }
+    }
+
+    /// Check if a path is a file.
+    fn vm_is_file(&self, path: &str) -> bool {
+        if let Some(ref vfs) = self.vfs {
+            if let Ok(vfs) = vfs.read() {
+                return vfs.is_file(path);
+            }
+            false
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::path::Path::new(path).is_file()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                false
+            }
+        }
+    }
+
+    /// Check if a path is a directory.
+    fn vm_is_dir(&self, path: &str) -> bool {
+        if let Some(ref vfs) = self.vfs {
+            if let Ok(vfs) = vfs.read() {
+                return vfs.is_dir(path);
+            }
+            false
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::path::Path::new(path).is_dir()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                false
+            }
+        }
+    }
+
+    /// Read directory entries.
+    fn vm_read_dir(&self, path: &str) -> std::io::Result<Vec<String>> {
+        if let Some(ref vfs) = self.vfs {
+            let vfs = vfs
+                .read()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "VFS lock poisoned"))?;
+            vfs.read_dir(path)
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let mut entries = Vec::new();
+                for entry in std::fs::read_dir(path)? {
+                    let entry = entry?;
+                    if let Some(name) = entry.file_name().to_str() {
+                        entries.push(name.to_string());
+                    }
+                }
+                Ok(entries)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "No filesystem available",
+                ))
+            }
+        }
+    }
+
+    /// Remove a file.
+    fn vm_remove_file(&self, path: &str) -> std::io::Result<()> {
+        if let Some(ref vfs) = self.vfs {
+            let mut vfs = vfs.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "VFS lock poisoned")
+            })?;
+            vfs.remove_file(path)
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::fs::remove_file(path)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "No filesystem available",
+                ))
+            }
+        }
+    }
+
+    /// Create a directory.
+    fn vm_mkdir(&self, path: &str, recursive: bool) -> std::io::Result<()> {
+        if let Some(ref vfs) = self.vfs {
+            let mut vfs = vfs.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "VFS lock poisoned")
+            })?;
+            vfs.mkdir(path, recursive)
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if recursive {
+                    std::fs::create_dir_all(path)
+                } else {
+                    std::fs::create_dir(path)
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "No filesystem available",
+                ))
+            }
+        }
+    }
+
+    /// Remove a directory.
+    fn vm_rmdir(&self, path: &str) -> std::io::Result<()> {
+        if let Some(ref vfs) = self.vfs {
+            let mut vfs = vfs.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "VFS lock poisoned")
+            })?;
+            vfs.rmdir(path)
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::fs::remove_dir(path)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "No filesystem available",
+                ))
+            }
+        }
+    }
+
+    /// Rename a file or directory.
+    fn vm_rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        if let Some(ref vfs) = self.vfs {
+            let mut vfs = vfs.write().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::Other, "VFS lock poisoned")
+            })?;
+            vfs.rename(from, to)
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                std::fs::rename(from, to)
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "No filesystem available",
+                ))
+            }
+        }
+    }
+
+    /// Get file metadata (size).
+    fn vm_file_size(&self, path: &str) -> std::io::Result<u64> {
+        if let Some(ref vfs) = self.vfs {
+            let vfs = vfs
+                .read()
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "VFS lock poisoned"))?;
+            vfs.file_size(path)
+        } else {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                Ok(std::fs::metadata(path)?.len())
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "No filesystem available",
+                ))
+            }
+        }
     }
 
     /// Get partial output accumulated so far (useful for displaying output even on error).
@@ -768,9 +1090,10 @@ impl Vm {
         }
 
         // Check execution time limit
-        if let Some(start) = self.execution_start {
-            let elapsed = start.elapsed().as_secs();
-            if elapsed >= self.config.max_execution_time {
+        if let Some(start_ms) = self.execution_start_millis {
+            let now_ms = now_millis();
+            let elapsed_secs = (now_ms.saturating_sub(start_ms)) / 1000;
+            if elapsed_secs >= self.config.max_execution_time {
                 return Err(VmError::TimeLimitExceeded(format!(
                     "Maximum execution time of {} seconds exceeded",
                     self.config.max_execution_time
@@ -2634,6 +2957,7 @@ impl Vm {
     }
 
     /// Convert a MySQL value from a row to a PHP Value (static version).
+    #[cfg(feature = "native-io")]
     fn mysqli_value_to_php_value_static(row: &mysql::Row, index: usize) -> Value {
         use mysql::prelude::FromValue;
 
@@ -4034,7 +4358,7 @@ impl Vm {
                     return Ok(DispatchSignal::Next);
                 }
 
-                match std::fs::read(&path) {
+                match self.vm_read_file(&path) {
                     Ok(bytes) => {
                         // PHP files may use ISO-8859-1 or other non-UTF-8 encodings;
                         // convert lossily so we can still parse them.
@@ -4248,10 +4572,13 @@ impl Vm {
                     let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                     // Read directory entries
                     let mut entries = PhpArray::new();
-                    if let Ok(read_dir) = std::fs::read_dir(&path) {
-                        for entry in read_dir.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            let full = entry.path().to_string_lossy().to_string();
+                    if let Ok(names) = self.vm_read_dir(&path) {
+                        for name in names {
+                            let full = if path.ends_with('/') || path.ends_with('\\') {
+                                format!("{}{}", path, name)
+                            } else {
+                                format!("{}/{}", path, name)
+                            };
                             let mut info = PhpArray::new();
                             info.set_string("name".to_string(), Value::String(name));
                             info.set_string("path".to_string(), Value::String(full));
@@ -4413,7 +4740,7 @@ impl Vm {
 
         // Handle PDO constructor
         if func_name == "PDO::__construct" {
-            // args[0] is $this (PDO object), args[1] is DSN, args[2] is username, args[3] is password
+            #[cfg(feature = "native-io")]
             if let Some(Value::Object(ref obj)) = args.first() {
                 let dsn = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
                 let username = args.get(2).and_then(|v| {
@@ -7035,10 +7362,13 @@ impl Vm {
                 if is_dir_iterator {
                     // Directory iterator: read directory entries
                     let mut entries = PhpArray::new();
-                    if let Ok(read_dir) = std::fs::read_dir(&path) {
-                        for entry in read_dir.flatten() {
-                            let name = entry.file_name().to_string_lossy().to_string();
-                            let full = entry.path().to_string_lossy().to_string();
+                    if let Ok(names) = self.vm_read_dir(&path) {
+                        for name in names {
+                            let full = if path.ends_with('/') || path.ends_with('\\') {
+                                format!("{}{}", path, name)
+                            } else {
+                                format!("{}/{}", path, name)
+                            };
                             let mut info = PhpArray::new();
                             info.set_string("name".to_string(), Value::String(name));
                             info.set_string("path".to_string(), Value::String(full));
@@ -7151,10 +7481,13 @@ impl Vm {
                             self.next_object_id += 1;
                             // Initialize child's entries
                             let mut child_entries = PhpArray::new();
-                            if let Ok(read_dir) = std::fs::read_dir(&full_path) {
-                                for entry in read_dir.flatten() {
-                                    let name = entry.file_name().to_string_lossy().to_string();
-                                    let full = entry.path().to_string_lossy().to_string();
+                            if let Ok(names) = self.vm_read_dir(&full_path) {
+                                for name in names {
+                                    let full = if full_path.ends_with('/') || full_path.ends_with('\\') {
+                                        format!("{}{}", full_path, name)
+                                    } else {
+                                        format!("{}/{}", full_path, name)
+                                    };
                                     let mut ei = PhpArray::new();
                                     ei.set_string("name".to_string(), Value::String(name));
                                     ei.set_string("path".to_string(), Value::String(full));
@@ -7255,14 +7588,27 @@ impl Vm {
         };
         let p = std::path::Path::new(&path);
         match method {
-            "isFile" => Ok(Some(Value::Bool(p.is_file()))),
-            "isDir" => Ok(Some(Value::Bool(p.is_dir()))),
+            "isFile" => Ok(Some(Value::Bool(self.vm_is_file(&path)))),
+            "isDir" => Ok(Some(Value::Bool(self.vm_is_dir(&path)))),
             "isLink" => Ok(Some(Value::Bool(p.is_symlink()))),
-            "isReadable" | "isWritable" => Ok(Some(Value::Bool(p.exists()))),
-            "getRealPath" => match std::fs::canonicalize(p) {
-                Ok(real) => Ok(Some(Value::String(real.to_string_lossy().to_string()))),
-                Err(_) => Ok(Some(Value::Bool(false))),
-            },
+            "isReadable" | "isWritable" => Ok(Some(Value::Bool(self.vm_file_exists(&path)))),
+            "getRealPath" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match std::fs::canonicalize(p) {
+                        Ok(real) => Ok(Some(Value::String(real.to_string_lossy().to_string()))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if self.vm_file_exists(&path) {
+                        Ok(Some(Value::String(path.clone())))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
+                }
+            }
             "getPathname" => Ok(Some(Value::String(path.clone()))),
             "getFilename" => {
                 let fname = p
@@ -7299,34 +7645,44 @@ impl Vm {
                     .unwrap_or_default();
                 Ok(Some(Value::String(ext)))
             }
-            "getSize" => match std::fs::metadata(p) {
-                Ok(m) => Ok(Some(Value::Long(m.len() as i64))),
+            "getSize" => match self.vm_file_size(&path) {
+                Ok(size) => Ok(Some(Value::Long(size as i64))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             },
-            "getMTime" | "getCTime" | "getATime" => match std::fs::metadata(p) {
-                Ok(m) => {
-                    let time = match method {
-                        "getMTime" => m.modified(),
-                        "getCTime" | "getATime" => m.modified(), // fallback to mtime
-                        _ => m.modified(),
-                    };
-                    match time {
-                        Ok(t) => {
-                            let secs = t
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs() as i64;
-                            Ok(Some(Value::Long(secs)))
+            "getMTime" | "getCTime" | "getATime" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match std::fs::metadata(p) {
+                        Ok(m) => {
+                            let time = match method {
+                                "getMTime" => m.modified(),
+                                "getCTime" | "getATime" => m.modified(), // fallback to mtime
+                                _ => m.modified(),
+                            };
+                            match time {
+                                Ok(t) => {
+                                    let secs = t
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs() as i64;
+                                    Ok(Some(Value::Long(secs)))
+                                }
+                                Err(_) => Ok(Some(Value::Long(0))),
+                            }
                         }
-                        Err(_) => Ok(Some(Value::Long(0))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
                     }
                 }
-                Err(_) => Ok(Some(Value::Bool(false))),
-            },
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = p;
+                    Ok(Some(Value::Long(0)))
+                }
+            }
             "getType" => {
-                if p.is_file() {
+                if self.vm_is_file(&path) {
                     Ok(Some(Value::String("file".to_string())))
-                } else if p.is_dir() {
+                } else if self.vm_is_dir(&path) {
                     Ok(Some(Value::String("dir".to_string())))
                 } else if p.is_symlink() {
                     Ok(Some(Value::String("link".to_string())))
@@ -7334,7 +7690,7 @@ impl Vm {
                     Ok(Some(Value::String("unknown".to_string())))
                 }
             }
-            "getContents" => match std::fs::read_to_string(p) {
+            "getContents" => match self.vm_read_to_string(&path) {
                 Ok(s) => Ok(Some(Value::String(s))),
                 Err(e) => Err(VmError::FatalError(format!(
                     "SplFileInfo::getContents(): Unable to read file: {}",
@@ -7421,11 +7777,13 @@ impl Vm {
         }
 
         // Check if this is a PDO method
+        #[cfg(feature = "native-io")]
         if base_class == "PDO" {
             return self.call_pdo_method(method, args);
         }
 
         // Check if this is a PDOStatement method
+        #[cfg(feature = "native-io")]
         if base_class == "PDOStatement" {
             return self.call_pdo_statement_method(method, args);
         }
@@ -7519,6 +7877,7 @@ impl Vm {
     }
 
     /// Call a PDO method.
+    #[cfg(feature = "native-io")]
     fn call_pdo_method(&mut self, method: &str, args: &[Value]) -> VmResult<Option<Value>> {
         use php_rs_ext_pdo::{FetchMode, PdoValue};
 
@@ -7646,6 +8005,7 @@ impl Vm {
     }
 
     /// Call a PDOStatement method.
+    #[cfg(feature = "native-io")]
     fn call_pdo_statement_method(
         &mut self,
         method: &str,
@@ -9614,7 +9974,7 @@ impl Vm {
             "file_get_contents" => {
                 let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&f)?;
-                match std::fs::read_to_string(&f) {
+                match self.vm_read_to_string(&f) {
                     Ok(c) => Ok(Some(Value::String(c))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
@@ -9623,7 +9983,7 @@ impl Vm {
                 let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&f)?;
                 let d = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
-                match std::fs::write(&f, &d) {
+                match self.vm_write_file(&f, d.as_bytes()) {
                     Ok(()) => Ok(Some(Value::Long(d.len() as i64))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
@@ -9631,17 +9991,17 @@ impl Vm {
             "file_exists" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                Ok(Some(Value::Bool(std::path::Path::new(&p).exists())))
+                Ok(Some(Value::Bool(self.vm_file_exists(&p))))
             }
             "is_file" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                Ok(Some(Value::Bool(std::path::Path::new(&p).is_file())))
+                Ok(Some(Value::Bool(self.vm_is_file(&p))))
             }
             "is_dir" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                Ok(Some(Value::Bool(std::path::Path::new(&p).is_dir())))
+                Ok(Some(Value::Bool(self.vm_is_dir(&p))))
             }
             "dirname" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -9669,9 +10029,20 @@ impl Vm {
             "realpath" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                match std::fs::canonicalize(&p) {
-                    Ok(rp) => Ok(Some(Value::String(rp.to_string_lossy().to_string()))),
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match std::fs::canonicalize(&p) {
+                        Ok(rp) => Ok(Some(Value::String(rp.to_string_lossy().to_string()))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if self.vm_file_exists(&p) {
+                        Ok(Some(Value::String(p)))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
                 }
             }
 
@@ -11132,7 +11503,7 @@ impl Vm {
             "file" => {
                 let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&f)?;
-                match std::fs::read_to_string(&f) {
+                match self.vm_read_to_string(&f) {
                     Ok(content) => {
                         let mut arr = PhpArray::new();
                         for line in content.lines() {
@@ -11148,36 +11519,36 @@ impl Vm {
                 self.check_open_basedir(&path)?;
                 let _mode = args.get(1).cloned().unwrap_or(Value::Long(0o777));
                 let recursive = args.get(2).is_some_and(|v| v.to_bool());
-                let result = if recursive {
-                    std::fs::create_dir_all(&path)
-                } else {
-                    std::fs::create_dir(&path)
-                };
+                let result = self.vm_mkdir(&path, recursive);
                 Ok(Some(Value::Bool(result.is_ok())))
             }
             "rmdir" => {
                 let path = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&path)?;
-                Ok(Some(Value::Bool(std::fs::remove_dir(&path).is_ok())))
+                Ok(Some(Value::Bool(self.vm_rmdir(&path).is_ok())))
             }
             "unlink" => {
                 let path = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&path)?;
-                Ok(Some(Value::Bool(std::fs::remove_file(&path).is_ok())))
+                Ok(Some(Value::Bool(self.vm_remove_file(&path).is_ok())))
             }
             "rename" => {
                 let from = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let to = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&from)?;
                 self.check_open_basedir(&to)?;
-                Ok(Some(Value::Bool(std::fs::rename(&from, &to).is_ok())))
+                Ok(Some(Value::Bool(self.vm_rename(&from, &to).is_ok())))
             }
             "copy" => {
                 let from = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let to = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&from)?;
                 self.check_open_basedir(&to)?;
-                Ok(Some(Value::Bool(std::fs::copy(&from, &to).is_ok())))
+                // Implement copy via VFS: read source then write to dest
+                match self.vm_read_file(&from) {
+                    Ok(data) => Ok(Some(Value::Bool(self.vm_write_file(&to, &data).is_ok()))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
             }
             "tempnam" => {
                 let dir = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -11193,26 +11564,22 @@ impl Vm {
             "filesize" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                match std::fs::metadata(&p) {
-                    Ok(m) => Ok(Some(Value::Long(m.len() as i64))),
+                match self.vm_file_size(&p) {
+                    Ok(size) => Ok(Some(Value::Long(size as i64))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
             "filetype" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                match std::fs::metadata(&p) {
-                    Ok(m) => {
-                        let t = if m.is_file() {
-                            "file"
-                        } else if m.is_dir() {
-                            "dir"
-                        } else {
-                            "unknown"
-                        };
-                        Ok(Some(Value::String(t.to_string())))
-                    }
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                if self.vm_is_file(&p) {
+                    Ok(Some(Value::String("file".to_string())))
+                } else if self.vm_is_dir(&p) {
+                    Ok(Some(Value::String("dir".to_string())))
+                } else if self.vm_file_exists(&p) {
+                    Ok(Some(Value::String("unknown".to_string())))
+                } else {
+                    Ok(Some(Value::Bool(false)))
                 }
             }
             "filemtime" => {
@@ -11226,50 +11593,80 @@ impl Vm {
             "fileatime" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                match std::fs::metadata(&p) {
-                    Ok(m) => {
-                        let t = m
-                            .accessed()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        Ok(Some(Value::Long(t)))
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match std::fs::metadata(&p) {
+                        Ok(m) => {
+                            let t = m
+                                .accessed()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            Ok(Some(Value::Long(t)))
+                        }
+                        Err(_) => Ok(Some(Value::Bool(false))),
                     }
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if self.vm_file_exists(&p) {
+                        Ok(Some(Value::Long(0)))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
                 }
             }
             "filectime" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                match std::fs::metadata(&p) {
-                    Ok(m) => {
-                        let t = m
-                            .created()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        Ok(Some(Value::Long(t)))
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match std::fs::metadata(&p) {
+                        Ok(m) => {
+                            let t = m
+                                .created()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0);
+                            Ok(Some(Value::Long(t)))
+                        }
+                        Err(_) => Ok(Some(Value::Bool(false))),
                     }
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if self.vm_file_exists(&p) {
+                        Ok(Some(Value::Long(0)))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
                 }
             }
             "is_readable" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                Ok(Some(Value::Bool(std::fs::File::open(&p).is_ok())))
+                Ok(Some(Value::Bool(self.vm_file_exists(&p))))
             }
             "is_writable" | "is_writeable" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 self.check_open_basedir(&p)?;
-                let writable = if let Ok(meta) = std::fs::metadata(&p) {
-                    // On Unix, check write permission
-                    !meta.permissions().readonly()
-                } else {
-                    false
-                };
-                Ok(Some(Value::Bool(writable)))
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let writable = if let Ok(meta) = std::fs::metadata(&p) {
+                        // On Unix, check write permission
+                        !meta.permissions().readonly()
+                    } else {
+                        false
+                    };
+                    Ok(Some(Value::Bool(writable)))
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // In WASM with VFS, files are always writable if they exist
+                    Ok(Some(Value::Bool(self.vm_file_exists(&p))))
+                }
             }
             "is_executable" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -11335,7 +11732,7 @@ impl Vm {
                 }
             }
             "glob" => {
-                // Basic glob using std::fs::read_dir with pattern matching
+                // Basic glob using vm_read_dir with pattern matching
                 let pattern = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let mut arr = PhpArray::new();
                 // Extract directory part
@@ -11347,9 +11744,8 @@ impl Vm {
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
-                if let Ok(entries) = std::fs::read_dir(&dir) {
-                    for entry in entries.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
+                if let Ok(names) = self.vm_read_dir(&dir) {
+                    for name in names {
                         // Simple wildcard matching: * matches anything
                         if file_pattern.contains('*') {
                             let parts: Vec<&str> = file_pattern.split('*').collect();
@@ -11373,17 +11769,25 @@ impl Vm {
             }
             "is_link" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                Ok(Some(Value::Bool(
-                    std::fs::symlink_metadata(&p)
-                        .map(|m| m.file_type().is_symlink())
-                        .unwrap_or(false),
-                )))
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    Ok(Some(Value::Bool(
+                        std::fs::symlink_metadata(&p)
+                            .map(|m| m.file_type().is_symlink())
+                            .unwrap_or(false),
+                    )))
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = &p;
+                    Ok(Some(Value::Bool(false)))
+                }
             }
             "touch" => {
                 let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 // Create file if doesn't exist, otherwise just return true
-                if !std::path::Path::new(&p).exists() {
-                    let _ = std::fs::File::create(&p);
+                if !self.vm_file_exists(&p) {
+                    let _ = self.vm_write_file(&p, &[]);
                 }
                 Ok(Some(Value::Bool(true)))
             }
@@ -12173,13 +12577,13 @@ impl Vm {
                     let seed = SystemTime::now()
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .subsec_nanos() as usize;
+                        .subsec_nanos() as u64;
                     let mut rng = seed;
                     for i in (1..values.len()).rev() {
                         rng = rng
-                            .wrapping_mul(6364136223846793005)
-                            .wrapping_add(1442695040888963407);
-                        let j = rng % (i + 1);
+                            .wrapping_mul(6364136223846793005u64)
+                            .wrapping_add(1442695040888963407u64);
+                        let j = (rng % (i as u64 + 1)) as usize;
                         values.swap(i, j);
                     }
                     let mut result = PhpArray::new();
@@ -13758,7 +14162,7 @@ impl Vm {
             }
             "readfile" => {
                 let filename = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::fs::read_to_string(&filename) {
+                match self.vm_read_to_string(&filename) {
                     Ok(contents) => {
                         let len = contents.len();
                         self.output.push_str(&contents);
@@ -13771,72 +14175,89 @@ impl Vm {
             // === File system functions ===
             "stat" | "lstat" => {
                 let filename = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                let meta = if name == "lstat" {
-                    std::fs::symlink_metadata(&filename)
+                if !self.vm_file_exists(&filename) && !self.vm_is_dir(&filename) {
+                    Ok(Some(Value::Bool(false)))
                 } else {
-                    std::fs::metadata(&filename)
-                };
-                match meta {
-                    Ok(m) => {
-                        let mut arr = PhpArray::new();
-                        let size = m.len() as i64;
-                        let is_dir = m.is_dir();
-                        let mode: i64 = if is_dir { 0o40755 } else { 0o100644 };
-                        arr.set_string("dev".into(), Value::Long(0));
-                        arr.set_string("ino".into(), Value::Long(0));
-                        arr.set_string("mode".into(), Value::Long(mode));
-                        arr.set_string("nlink".into(), Value::Long(1));
-                        arr.set_string("uid".into(), Value::Long(0));
-                        arr.set_string("gid".into(), Value::Long(0));
-                        arr.set_string("rdev".into(), Value::Long(0));
-                        arr.set_string("size".into(), Value::Long(size));
-                        let mtime = m
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
-                        arr.set_string("atime".into(), Value::Long(mtime));
-                        arr.set_string("mtime".into(), Value::Long(mtime));
-                        arr.set_string("ctime".into(), Value::Long(mtime));
-                        arr.set_string("blksize".into(), Value::Long(4096));
-                        arr.set_string("blocks".into(), Value::Long((size + 511) / 512));
-                        // Numeric indices too
-                        arr.set_int(0, Value::Long(0)); // dev
-                        arr.set_int(1, Value::Long(0)); // ino
-                        arr.set_int(2, Value::Long(mode));
-                        arr.set_int(3, Value::Long(1)); // nlink
-                        arr.set_int(4, Value::Long(0)); // uid
-                        arr.set_int(5, Value::Long(0)); // gid
-                        arr.set_int(6, Value::Long(0)); // rdev
-                        arr.set_int(7, Value::Long(size));
-                        arr.set_int(8, Value::Long(mtime));
-                        arr.set_int(9, Value::Long(mtime));
-                        arr.set_int(10, Value::Long(mtime));
-                        arr.set_int(11, Value::Long(4096));
-                        arr.set_int(12, Value::Long((size + 511) / 512));
-                        Ok(Some(Value::Array(arr)))
-                    }
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                    let size = self.vm_file_size(&filename).unwrap_or(0) as i64;
+                    let is_dir = self.vm_is_dir(&filename);
+                    let mode: i64 = if is_dir { 0o40755 } else { 0o100644 };
+                    let mtime: i64 = {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let meta = if name == "lstat" {
+                                std::fs::symlink_metadata(&filename)
+                            } else {
+                                std::fs::metadata(&filename)
+                            };
+                            meta.ok()
+                                .and_then(|m| m.modified().ok())
+                                .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs() as i64)
+                                .unwrap_or(0)
+                        }
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            0
+                        }
+                    };
+                    let mut arr = PhpArray::new();
+                    arr.set_string("dev".into(), Value::Long(0));
+                    arr.set_string("ino".into(), Value::Long(0));
+                    arr.set_string("mode".into(), Value::Long(mode));
+                    arr.set_string("nlink".into(), Value::Long(1));
+                    arr.set_string("uid".into(), Value::Long(0));
+                    arr.set_string("gid".into(), Value::Long(0));
+                    arr.set_string("rdev".into(), Value::Long(0));
+                    arr.set_string("size".into(), Value::Long(size));
+                    arr.set_string("atime".into(), Value::Long(mtime));
+                    arr.set_string("mtime".into(), Value::Long(mtime));
+                    arr.set_string("ctime".into(), Value::Long(mtime));
+                    arr.set_string("blksize".into(), Value::Long(4096));
+                    arr.set_string("blocks".into(), Value::Long((size + 511) / 512));
+                    // Numeric indices too
+                    arr.set_int(0, Value::Long(0)); // dev
+                    arr.set_int(1, Value::Long(0)); // ino
+                    arr.set_int(2, Value::Long(mode));
+                    arr.set_int(3, Value::Long(1)); // nlink
+                    arr.set_int(4, Value::Long(0)); // uid
+                    arr.set_int(5, Value::Long(0)); // gid
+                    arr.set_int(6, Value::Long(0)); // rdev
+                    arr.set_int(7, Value::Long(size));
+                    arr.set_int(8, Value::Long(mtime));
+                    arr.set_int(9, Value::Long(mtime));
+                    arr.set_int(10, Value::Long(mtime));
+                    arr.set_int(11, Value::Long(4096));
+                    arr.set_int(12, Value::Long((size + 511) / 512));
+                    Ok(Some(Value::Array(arr)))
                 }
             }
             "clearstatcache" => Ok(Some(Value::Null)),
             "fileperms" => {
                 let filename = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::fs::metadata(&filename) {
-                    Ok(m) => {
-                        let mode: i64 = if m.is_dir() { 0o40755 } else { 0o100644 };
-                        Ok(Some(Value::Long(mode)))
-                    }
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                if self.vm_file_exists(&filename) || self.vm_is_dir(&filename) {
+                    let mode: i64 = if self.vm_is_dir(&filename) { 0o40755 } else { 0o100644 };
+                    Ok(Some(Value::Long(mode)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
                 }
             }
             "fileowner" | "filegroup" | "fileinode" => Ok(Some(Value::Long(0))),
             "linkinfo" => {
                 let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::fs::symlink_metadata(&path) {
-                    Ok(_) => Ok(Some(Value::Long(0))),
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(_) => Ok(Some(Value::Long(0))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    if self.vm_file_exists(&path) {
+                        Ok(Some(Value::Long(0)))
+                    } else {
+                        Ok(Some(Value::Bool(false)))
+                    }
                 }
             }
             "symlink" => {
@@ -13858,16 +14279,35 @@ impl Vm {
             "link" => {
                 let target = args.first().map(|v| v.to_php_string()).unwrap_or_default();
                 let link = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
-                match std::fs::hard_link(&target, &link) {
-                    Ok(_) => Ok(Some(Value::Bool(true))),
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match std::fs::hard_link(&target, &link) {
+                        Ok(_) => Ok(Some(Value::Bool(true))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    // Hard links not supported in VFS; emulate by copying
+                    match self.vm_read_file(&target) {
+                        Ok(data) => Ok(Some(Value::Bool(self.vm_write_file(&link, &data).is_ok()))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
                 }
             }
             "readlink" => {
                 let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::fs::read_link(&path) {
-                    Ok(target) => Ok(Some(Value::String(target.to_string_lossy().to_string()))),
-                    Err(_) => Ok(Some(Value::Bool(false))),
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    match std::fs::read_link(&path) {
+                        Ok(target) => Ok(Some(Value::String(target.to_string_lossy().to_string()))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = &path;
+                    Ok(Some(Value::Bool(false)))
                 }
             }
             "umask" => {
@@ -13889,25 +14329,12 @@ impl Vm {
             // === Directory functions ===
             "opendir" => {
                 let path = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::fs::read_dir(&path) {
-                    Ok(entries) => {
-                        let names: Vec<String> = entries
-                            .flatten()
-                            .map(|e| e.file_name().to_string_lossy().to_string())
-                            .collect();
+                match self.vm_read_dir(&path) {
+                    Ok(names) => {
                         let id = self.next_resource_id;
                         self.next_resource_id += 1;
-                        // Store directory entries as a special "file handle" with the data pre-read
-                        // We'll use a string buffer approach: join names with newlines
                         let data = names.join("\n");
-                        if let Ok(handle) =
-                            php_rs_ext_standard::file::FileHandle::open("/dev/null", "r")
-                        {
-                            // Actually, let's use a different approach: store entries in a temp vec
-                            // For simplicity, store the dir listing in the output temporarily
-                            let _ = handle;
-                        }
-                        // Simpler approach: store as serialized string in constants
+                        // Store as serialized string in constants
                         self.constants
                             .insert(format!("__dir_entries_{}", id), Value::String(data));
                         self.constants
@@ -14138,7 +14565,7 @@ impl Vm {
             }
             "md5_file" => {
                 let filename = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::fs::read_to_string(&filename) {
+                match self.vm_read_to_string(&filename) {
                     Ok(contents) => Ok(Some(Value::String(php_rs_ext_standard::strings::php_md5(
                         &contents,
                     )))),
@@ -14147,7 +14574,7 @@ impl Vm {
             }
             "sha1_file" => {
                 let filename = args.first().map(|v| v.to_php_string()).unwrap_or_default();
-                match std::fs::read_to_string(&filename) {
+                match self.vm_read_to_string(&filename) {
                     Ok(contents) => Ok(Some(Value::String(
                         php_rs_ext_standard::strings::php_sha1(&contents),
                     ))),
@@ -14956,7 +15383,7 @@ impl Vm {
                     .to_lowercase();
                 let filename = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let raw = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
-                if let Ok(data) = std::fs::read(&filename) {
+                if let Ok(data) = self.vm_read_file(&filename) {
                     let s = String::from_utf8_lossy(&data);
                     match php_rs_ext_hash::php_hash(&algo, &s) {
                         Some(hash_result) => {
@@ -14989,7 +15416,7 @@ impl Vm {
                     .to_lowercase();
                 let filename = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
                 let key = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
-                if let Ok(data) = std::fs::read_to_string(&filename) {
+                if let Ok(data) = self.vm_read_to_string(&filename) {
                     match php_rs_ext_hash::php_hash_hmac(&algo, &data, &key) {
                         Some(result) => Ok(Some(Value::String(result))),
                         None => Ok(Some(Value::Bool(false))),
@@ -16563,7 +16990,7 @@ impl Vm {
             // === Exif (4 functions) ===
             "exif_imagetype" => {
                 let filename = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-                if let Ok(data) = std::fs::read(&filename) {
+                if let Ok(data) = self.vm_read_file(&filename) {
                     if data.len() >= 3 {
                         let img_type = if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
                             2
@@ -16825,7 +17252,7 @@ impl Vm {
             "parse_ini_file" => {
                 let filename = args.first().cloned().unwrap_or(Value::Null).to_php_string();
                 let process_sections = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
-                if let Ok(content) = std::fs::read_to_string(&filename) {
+                if let Ok(content) = self.vm_read_to_string(&filename) {
                     Ok(Some(Value::Array(parse_ini_to_array(
                         &content,
                         process_sections,
@@ -17118,7 +17545,29 @@ impl Vm {
             }
             "ftp_alloc" => Ok(Some(Value::Bool(false))),
 
-            // === curl extension (35 functions) ===
+            // === curl extension ===
+            // Note: curl_init, curl_close, curl_copy_handle, curl_exec, curl_getinfo,
+            // curl_setopt, curl_setopt_array, curl_errno, curl_error, curl_reset
+            // are handled in call_builtin_native_io() when native-io feature is enabled.
+            #[cfg(not(feature = "native-io"))]
+            "curl_init" => {
+                let id = self.next_resource_id;
+                self.next_resource_id += 1;
+                Ok(Some(Value::Resource(id, "curl".to_string())))
+            }
+            #[cfg(not(feature = "native-io"))]
+            "curl_close" | "curl_reset" => Ok(Some(Value::Null)),
+            #[cfg(not(feature = "native-io"))]
+            "curl_copy_handle" | "curl_exec" | "curl_setopt" | "curl_setopt_array" => {
+                Ok(Some(Value::Bool(false)))
+            }
+            #[cfg(not(feature = "native-io"))]
+            "curl_getinfo" => Ok(Some(Value::Bool(false))),
+            #[cfg(not(feature = "native-io"))]
+            "curl_errno" => Ok(Some(Value::Long(0))),
+            #[cfg(not(feature = "native-io"))]
+            "curl_error" => Ok(Some(Value::String(String::new()))),
+            #[cfg(feature = "native-io")]
             "curl_init" => {
                 let url = args.first().and_then(|v| match v {
                     Value::Null => None,
@@ -17130,6 +17579,7 @@ impl Vm {
                 self.curl_handles.insert(id, handle);
                 Ok(Some(Value::Resource(id, "curl".to_string())))
             }
+            #[cfg(feature = "native-io")]
             "curl_close" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if let Some(handle) = self.curl_handles.get_mut(&id) {
@@ -17138,6 +17588,7 @@ impl Vm {
                 self.curl_handles.remove(&id);
                 Ok(Some(Value::Null))
             }
+            #[cfg(feature = "native-io")]
             "curl_copy_handle" => {
                 let id = args.first().map(|v| v.resource_id()).unwrap_or(0);
                 if let Some(handle) = self.curl_handles.get(&id) {
@@ -17150,13 +17601,13 @@ impl Vm {
                     Ok(Some(Value::Bool(false)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "curl_exec" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if let Some(handle) = self.curl_handles.get_mut(&id) {
                     match php_rs_ext_curl::curl_exec(handle) {
                         php_rs_ext_curl::CurlResult::Body(body) => Ok(Some(Value::String(body))),
                         php_rs_ext_curl::CurlResult::Bool(b) => {
-                            // When not returning transfer, output body directly
                             if b {
                                 self.output.push_str(&handle.response_body);
                             }
@@ -17168,6 +17619,7 @@ impl Vm {
                     Ok(Some(Value::Bool(false)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "curl_getinfo" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if let Some(handle) = self.curl_handles.get(&id) {
@@ -17179,7 +17631,6 @@ impl Vm {
                         None => None,
                     };
                     if let Some(opt_const) = opt_val {
-                        // Specific info option requested
                         if let Some(opt) =
                             php_rs_ext_curl::CurlInfoOpt::from_constant(opt_const as u32)
                         {
@@ -17196,7 +17647,6 @@ impl Vm {
                             Ok(Some(Value::Bool(false)))
                         }
                     } else {
-                        // Return full info array
                         let mut arr = PhpArray::new();
                         arr.set_string(
                             "url".into(),
@@ -17220,9 +17670,9 @@ impl Vm {
                     Ok(Some(Value::Bool(false)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "curl_setopt" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
-                // Handle both numeric and string constant names (e.g. CURLOPT_RETURNTRANSFER)
                 let opt_const = match args.get(1) {
                     Some(Value::String(s)) => php_rs_ext_curl::constants::from_name(s)
                         .unwrap_or_else(|| s.parse::<u32>().unwrap_or(0)),
@@ -17243,6 +17693,7 @@ impl Vm {
                     Ok(Some(Value::Bool(false)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "curl_setopt_array" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 let opts = args.get(1).cloned().unwrap_or(Value::Null);
@@ -17267,6 +17718,7 @@ impl Vm {
                     Ok(Some(Value::Bool(false)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "curl_errno" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if let Some(handle) = self.curl_handles.get(&id) {
@@ -17277,6 +17729,7 @@ impl Vm {
                     Ok(Some(Value::Long(0)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "curl_error" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if let Some(handle) = self.curl_handles.get(&id) {
@@ -17285,6 +17738,7 @@ impl Vm {
                     Ok(Some(Value::String(String::new())))
                 }
             }
+            #[cfg(feature = "native-io")]
             "curl_reset" => {
                 let id = args.first().map(|v| v.to_long()).unwrap_or(0);
                 if self.curl_handles.contains_key(&id) {
@@ -17520,6 +17974,31 @@ impl Vm {
             }
 
             // === mysqli (106 functions) ===
+            // Note: mysqli_connect, mysqli_real_connect, mysqli_close, mysqli_query,
+            // mysqli_set_charset, mysqli_select_db, and fetch functions with real database
+            // interactions are handled in call_builtin_native_io() when native-io is enabled.
+            #[cfg(not(feature = "native-io"))]
+            "mysqli_connect" | "mysqli_real_connect" => Ok(Some(Value::Bool(false))),
+            #[cfg(not(feature = "native-io"))]
+            "mysqli_close" => Ok(Some(Value::Bool(false))),
+            #[cfg(not(feature = "native-io"))]
+            "mysqli_query" | "mysqli_real_query" => Ok(Some(Value::Bool(false))),
+            #[cfg(not(feature = "native-io"))]
+            "mysqli_set_charset" | "mysqli_select_db" => Ok(Some(Value::Bool(false))),
+            #[cfg(not(feature = "native-io"))]
+            "mysqli_affected_rows" | "mysqli_insert_id" | "mysqli_num_rows"
+            | "mysqli_num_fields" | "mysqli_field_count" | "mysqli_errno" => {
+                Ok(Some(Value::Long(0)))
+            }
+            #[cfg(not(feature = "native-io"))]
+            "mysqli_error" => Ok(Some(Value::String(String::new()))),
+            #[cfg(not(feature = "native-io"))]
+            "mysqli_fetch_assoc" | "mysqli_fetch_array" | "mysqli_fetch_row" => {
+                Ok(Some(Value::Null))
+            }
+            #[cfg(not(feature = "native-io"))]
+            "mysqli_free_result" => Ok(Some(Value::Null)),
+            #[cfg(feature = "native-io")]
             "mysqli_connect" => {
                 // mysqli_connect($host, $user, $pass, $db, $port = 3306)
                 let host_val = args.first().cloned().unwrap_or(Value::Null);
@@ -17555,7 +18034,6 @@ impl Vm {
                         Ok(Some(Value::Resource(conn_id, "mysqli".to_string())))
                     }
                     Err(e) => {
-                        // Set global connection error
                         eprintln!("MySQLi connection error: {}", e);
                         Ok(Some(Value::Bool(false)))
                     }
@@ -17567,6 +18045,7 @@ impl Vm {
                 self.next_resource_id += 1;
                 Ok(Some(Value::Resource(conn_id, "mysqli_init".to_string())))
             }
+            #[cfg(feature = "native-io")]
             "mysqli_real_connect" => {
                 // mysqli_real_connect($link, $host, $user, $pass, $db, $port, $socket, $flags)
                 // Extract link resource ID from first argument
@@ -17650,6 +18129,7 @@ impl Vm {
                     }
                 }
             }
+            #[cfg(feature = "native-io")]
             "mysqli_close" => {
                 let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
                     Value::Resource(id, _) => id,
@@ -17664,6 +18144,7 @@ impl Vm {
                 }
             }
             "mysqli_kill" | "mysqli_ping" => Ok(Some(Value::Bool(false))),
+            #[cfg(feature = "native-io")]
             "mysqli_query" | "mysqli_real_query" => {
                 // mysqli_query($conn, $sql)
                 use mysql::prelude::Queryable;
@@ -17760,6 +18241,7 @@ impl Vm {
             | "mysqli_stmt_result_metadata"
             | "mysqli_stmt_attr_get"
             | "mysqli_stmt_attr_set" => Ok(Some(Value::Bool(false))),
+            #[cfg(feature = "native-io")]
             "mysqli_affected_rows" => {
                 let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
                     Value::Resource(id, _) => id,
@@ -17772,6 +18254,7 @@ impl Vm {
                     Ok(Some(Value::Long(-1)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "mysqli_insert_id" => {
                 let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
                     Value::Resource(id, _) => id,
@@ -17784,6 +18267,7 @@ impl Vm {
                     Ok(Some(Value::Long(0)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "mysqli_num_rows" => {
                 let result_id = match args.first().cloned().unwrap_or(Value::Null) {
                     Value::Resource(id, _) => id,
@@ -17796,6 +18280,7 @@ impl Vm {
                     Ok(Some(Value::Long(0)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "mysqli_num_fields" | "mysqli_field_count" => {
                 let result_id = match args.first().cloned().unwrap_or(Value::Null) {
                     Value::Resource(id, _) => id,
@@ -17809,6 +18294,7 @@ impl Vm {
                 }
             }
             "mysqli_thread_id" => Ok(Some(Value::Long(0))),
+            #[cfg(feature = "native-io")]
             "mysqli_errno" => {
                 let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
                     Value::Resource(id, _) => id,
@@ -17821,6 +18307,7 @@ impl Vm {
                     Ok(Some(Value::Long(0)))
                 }
             }
+            #[cfg(feature = "native-io")]
             "mysqli_error" => {
                 let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
                     Value::Resource(id, _) => id,
@@ -17850,6 +18337,7 @@ impl Vm {
             | "mysqli_rollback"
             | "mysqli_savepoint"
             | "mysqli_release_savepoint" => Ok(Some(Value::Bool(false))),
+            #[cfg(feature = "native-io")]
             "mysqli_set_charset" => {
                 // mysqli_set_charset($conn, $charset)
                 use mysql::prelude::Queryable;
@@ -17871,6 +18359,7 @@ impl Vm {
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }
             }
+            #[cfg(feature = "native-io")]
             "mysqli_select_db" => {
                 // mysqli_select_db($conn, $dbname)
                 use mysql::prelude::Queryable;
@@ -17906,6 +18395,7 @@ impl Vm {
             | "mysqli_change_user"
             | "mysqli_dump_debug_info"
             | "mysqli_refresh" => Ok(Some(Value::Bool(false))),
+            #[cfg(feature = "native-io")]
             "mysqli_fetch_assoc" => {
                 // mysqli_fetch_assoc($result) → array|null
                 let result_id = match args.first().cloned().unwrap_or(Value::Null) {
@@ -17938,6 +18428,7 @@ impl Vm {
 
                 Ok(Some(Value::Array(arr)))
             }
+            #[cfg(feature = "native-io")]
             "mysqli_fetch_array" => {
                 // mysqli_fetch_array($result, $mode = MYSQLI_BOTH) → array|null
                 let result_id = match args.first().cloned().unwrap_or(Value::Null) {
@@ -17979,6 +18470,7 @@ impl Vm {
 
                 Ok(Some(Value::Array(arr)))
             }
+            #[cfg(feature = "native-io")]
             "mysqli_fetch_row" => {
                 // mysqli_fetch_row($result) → array|null
                 let result_id = match args.first().cloned().unwrap_or(Value::Null) {
@@ -18018,6 +18510,7 @@ impl Vm {
                 Ok(Some(Value::Array(PhpArray::new())))
             }
             "mysqli_data_seek" | "mysqli_field_seek" => Ok(Some(Value::Bool(false))),
+            #[cfg(feature = "native-io")]
             "mysqli_free_result" => {
                 let result_id = match args.first().cloned().unwrap_or(Value::Null) {
                     Value::Resource(id, _) => id,
@@ -19796,6 +20289,7 @@ fn parse_relative_time(s: &str, base: i64) -> Option<i64> {
 }
 
 /// Convert a VM Value to a curl CurlValue for use with curl_setopt.
+#[cfg(feature = "native-io")]
 fn value_to_curl_value(value: &Value) -> php_rs_ext_curl::CurlValue {
     match value {
         Value::Bool(b) => php_rs_ext_curl::CurlValue::Bool(*b),
@@ -19819,6 +20313,7 @@ fn value_to_curl_value(value: &Value) -> php_rs_ext_curl::CurlValue {
 // ===========================================================================
 
 /// Convert a VM Value to a PdoValue for PDO parameter binding.
+#[cfg(feature = "native-io")]
 fn value_to_pdo_value(value: &Value) -> php_rs_ext_pdo::PdoValue {
     use php_rs_ext_pdo::PdoValue;
 
@@ -19834,6 +20329,7 @@ fn value_to_pdo_value(value: &Value) -> php_rs_ext_pdo::PdoValue {
 }
 
 /// Convert a PdoValue to a VM Value.
+#[cfg(feature = "native-io")]
 fn pdo_value_to_value(pdo_val: &php_rs_ext_pdo::PdoValue) -> Value {
     use php_rs_ext_pdo::PdoValue;
 
@@ -19848,6 +20344,7 @@ fn pdo_value_to_value(pdo_val: &php_rs_ext_pdo::PdoValue) -> Value {
 }
 
 /// Convert a PdoRow to a VM Value based on fetch mode.
+#[cfg(feature = "native-io")]
 fn pdo_row_to_value(
     row: &php_rs_ext_pdo::PdoRow,
     fetch_mode: php_rs_ext_pdo::FetchMode,

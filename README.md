@@ -15,6 +15,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick Start</a> &middot;
+  <a href="#wasm-playground">WASM Playground</a> &middot;
   <a href="#composer">Composer</a> &middot;
   <a href="#architecture">Architecture</a> &middot;
   <a href="#features">Features</a> &middot;
@@ -151,6 +152,61 @@ $mysqli = mysqli_connect("mysql", "phpuser", "phppass", "phpdb");
 $pdo = new PDO("sqlite::memory:");
 ```
 
+### WASM Playground
+
+Run PHP directly in the browser — no server required. php.rs compiles to WebAssembly:
+
+```bash
+# Install wasm-pack
+cargo install wasm-pack
+
+# Build the WASM binary
+wasm-pack build crates/php-rs-sapi-wasm --target web --release --out-dir ../../pkg
+
+# Serve the playground
+npx serve .
+# Open http://localhost:3000/examples/playground/
+```
+
+**Using from JavaScript/TypeScript:**
+
+```js
+import init, { PhpWasm } from '@php-rs/wasm';
+
+await init();
+const php = new PhpWasm();
+
+// Execute PHP code
+const output = php.eval('<?php echo "Hello from WASM!";');
+console.log(output); // "Hello from WASM!"
+
+// Virtual filesystem
+php.write_file('/app.php', new TextEncoder().encode('<?php echo 42 + 8;'));
+const result = php.exec_file('/app.php');
+console.log(result); // "50"
+
+// Tokenize PHP for editor tooling
+const tokens = JSON.parse(php.tokenize('<?php echo "hi";'));
+
+// Parse PHP to AST
+const ast = php.parse('<?php $x = 1 + 2;');
+
+// Reset VM state (keeps VFS)
+php.reset();
+```
+
+**What's included in the WASM build:**
+- Full PHP interpreter (~3 MB `.wasm`)
+- In-memory virtual filesystem
+- Tokenizer and parser for editor tooling
+- INI and environment variable configuration
+- 20 pure-Rust extensions (json, hash, pcre, mbstring, date, spl, bcmath, zlib, and more)
+
+**What's excluded (requires native I/O):**
+- Network extensions (curl, mysqli, pdo, sockets)
+- Process control (pcntl, posix)
+- System extensions (shmop, sysvmsg)
+
 ### Composer
 
 php.rs includes a built-in Composer-compatible package manager:
@@ -239,13 +295,14 @@ The project is organized as a Cargo workspace with **68 crates** across 4 layers
 
 Every PHP extension is its own crate: `php-rs-ext-standard`, `php-rs-ext-json`, `php-rs-ext-curl`, etc. See [Extensions](#extensions) for the full list.
 
-#### Server APIs (3 crates)
+#### Server APIs (4 crates)
 
 | Crate | Purpose |
 |-------|---------|
 | `php-rs-sapi-cli` | Command-line interface, built-in web server, REPL |
 | `php-rs-sapi-fpm` | FastCGI Process Manager |
 | `php-rs-sapi-embed` | Embeddable library for Rust applications |
+| `php-rs-sapi-wasm` | WebAssembly target for browsers and Node.js |
 
 #### Tooling (2 crates)
 
@@ -610,7 +667,7 @@ fn main() {
 - 212 VM opcodes implemented
 - 56 extensions with 1,500+ built-in functions
 - 1,039 unit tests passing
-- CLI, FPM, and Embed SAPIs available
+- CLI, FPM, Embed, and WASM SAPIs available
 - Built-in development web server
 - PHPT compatibility testing against official PHP test suite
 - CI with tests, linting, Miri, and AddressSanitizer

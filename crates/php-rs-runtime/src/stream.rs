@@ -89,6 +89,18 @@ impl PhpStream {
         }
     }
 
+    /// Create an in-memory stream with pre-loaded data.
+    pub fn from_memory(uri: String, data: Vec<u8>, mode: StreamMode) -> Self {
+        Self {
+            wrapper: "vfs".to_string(),
+            uri,
+            mode,
+            storage: StreamStorage::Memory(data),
+            position: 0,
+            eof: false,
+        }
+    }
+
     /// Create a stream from a file.
     pub fn from_file(uri: String, file: std::fs::File, mode: StreamMode) -> Self {
         Self {
@@ -413,6 +425,121 @@ impl StreamRegistry {
 impl Default for StreamRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Stream wrapper backed by a VirtualFileSystem.
+///
+/// Implements the file:// scheme for WASM environments where the real filesystem
+/// is not available, delegating all operations to an in-memory VFS.
+pub struct VfsStreamWrapper {
+    vfs: std::sync::Arc<std::sync::RwLock<crate::vfs::VirtualFileSystem>>,
+}
+
+impl VfsStreamWrapper {
+    /// Create a new VFS-backed stream wrapper.
+    pub fn new(vfs: std::sync::Arc<std::sync::RwLock<crate::vfs::VirtualFileSystem>>) -> Self {
+        Self { vfs }
+    }
+}
+
+impl StreamWrapper for VfsStreamWrapper {
+    fn scheme(&self) -> &str {
+        "file"
+    }
+
+    fn open(&self, uri: &str, mode: StreamMode) -> io::Result<PhpStream> {
+        let path = uri.strip_prefix("file://").unwrap_or(uri);
+        let vfs = self
+            .vfs
+            .read()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "VFS lock poisoned"))?;
+
+        match mode {
+            StreamMode::Read => {
+                let data = vfs.read_file(path)?.to_vec();
+                Ok(PhpStream::from_memory(uri.to_string(), data, mode))
+            }
+            StreamMode::Write | StreamMode::ReadWriteCreate => {
+                // Start with empty buffer; caller writes then we flush on close
+                Ok(PhpStream::from_memory(uri.to_string(), Vec::new(), mode))
+            }
+            StreamMode::Append => {
+                let existing = vfs.read_file(path).unwrap_or(&[]).to_vec();
+                let mut stream = PhpStream::from_memory(uri.to_string(), existing.clone(), mode);
+                stream.position = existing.len();
+                Ok(stream)
+            }
+            StreamMode::ReadWrite => {
+                let data = vfs.read_file(path).unwrap_or(&[]).to_vec();
+                Ok(PhpStream::from_memory(uri.to_string(), data, mode))
+            }
+        }
+    }
+
+    fn stat(&self, uri: &str) -> io::Result<StreamStat> {
+        let path = uri.strip_prefix("file://").unwrap_or(uri);
+        let vfs = self
+            .vfs
+            .read()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "VFS lock poisoned"))?;
+
+        if !vfs.exists(path) {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Not found"));
+        }
+
+        let size = if vfs.is_file(path) {
+            vfs.file_size(path).unwrap_or(0)
+        } else {
+            0
+        };
+
+        Ok(StreamStat {
+            size,
+            is_dir: vfs.is_dir(path),
+            is_file: vfs.is_file(path),
+            mtime: 0,
+            atime: 0,
+            ctime: 0,
+            mode: 0o644,
+        })
+    }
+
+    fn unlink(&self, uri: &str) -> io::Result<()> {
+        let path = uri.strip_prefix("file://").unwrap_or(uri);
+        let mut vfs = self
+            .vfs
+            .write()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "VFS lock poisoned"))?;
+        vfs.remove_file(path)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        let from = from.strip_prefix("file://").unwrap_or(from);
+        let to = to.strip_prefix("file://").unwrap_or(to);
+        let mut vfs = self
+            .vfs
+            .write()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "VFS lock poisoned"))?;
+        vfs.rename(from, to)
+    }
+
+    fn mkdir(&self, uri: &str, recursive: bool) -> io::Result<()> {
+        let path = uri.strip_prefix("file://").unwrap_or(uri);
+        let mut vfs = self
+            .vfs
+            .write()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "VFS lock poisoned"))?;
+        vfs.mkdir(path, recursive)
+    }
+
+    fn rmdir(&self, uri: &str) -> io::Result<()> {
+        let path = uri.strip_prefix("file://").unwrap_or(uri);
+        let mut vfs = self
+            .vfs
+            .write()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "VFS lock poisoned"))?;
+        vfs.rmdir(path)
     }
 }
 

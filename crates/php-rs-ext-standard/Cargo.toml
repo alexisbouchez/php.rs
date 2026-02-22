@@ -6,7 +6,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["native-io"]
+native-io = ["dep:libc"]
+
 [dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]

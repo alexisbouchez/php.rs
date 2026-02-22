@@ -16,6 +16,7 @@ pub mod ini;
 pub mod output;
 pub mod stream;
 pub mod superglobals;
+pub mod vfs;
 
 pub use autoload::AutoloadQueue;
 pub use error::{ErrorHandler, ErrorLevel};
@@ -23,3 +24,4 @@ pub use ini::{IniEntry, IniPermission, IniSystem};
 pub use output::OutputBuffer;
 pub use stream::{PhpStream, StreamWrapper};
 pub use superglobals::Superglobals;
+pub use vfs::VirtualFileSystem;

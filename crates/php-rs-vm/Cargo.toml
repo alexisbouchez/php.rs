@@ -6,17 +6,22 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = ["native-io"]
+native-io = ["dep:mysql", "dep:php-rs-ext-curl", "dep:php-rs-ext-pdo"]
+
 [dependencies]
 php-rs-compiler = { path = "../php-rs-compiler" }
 php-rs-ext-json = { path = "../php-rs-ext-json" }
 php-rs-ext-hash = { path = "../php-rs-ext-hash" }
 php-rs-ext-standard = { path = "../php-rs-ext-standard" }
 php-rs-ext-zlib = { path = "../php-rs-ext-zlib" }
-php-rs-ext-curl = { path = "../php-rs-ext-curl" }
-php-rs-ext-pdo = { path = "../php-rs-ext-pdo" }
+php-rs-runtime = { path = "../php-rs-runtime" }
+php-rs-ext-curl = { path = "../php-rs-ext-curl", optional = true }
+php-rs-ext-pdo = { path = "../php-rs-ext-pdo", optional = true }
 regex = "1"
 fancy-regex = "0.14"
-mysql = "25.0"
+mysql = { version = "25.0", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"
