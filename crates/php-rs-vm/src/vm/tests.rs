@@ -13808,4 +13808,34 @@ unlink($tmp);
         );
         assert_eq!(output, "removed");
     }
+
+    // --- parse_url with component parameter ---
+
+    #[test]
+    fn test_parse_url_component_parameter() {
+        let output = run_php(
+            r#"<?php
+$url = "https://user:pass@example.com:8080/foo/bar?q=1#frag";
+echo parse_url($url, PHP_URL_SCHEME) . "|";
+echo parse_url($url, PHP_URL_HOST) . "|";
+echo parse_url($url, PHP_URL_PORT) . "|";
+echo parse_url($url, PHP_URL_USER) . "|";
+echo parse_url($url, PHP_URL_PASS) . "|";
+echo parse_url($url, PHP_URL_PATH) . "|";
+echo parse_url($url, PHP_URL_QUERY) . "|";
+echo parse_url($url, PHP_URL_FRAGMENT);
+?>"#,
+        );
+        assert_eq!(output, "https|example.com|8080|user|pass|/foo/bar|q=1|frag");
+    }
+
+    #[test]
+    fn test_parse_url_path_only() {
+        let output = run_php(
+            r#"<?php
+echo parse_url("/health", PHP_URL_PATH);
+?>"#,
+        );
+        assert_eq!(output, "/health");
+    }
 }

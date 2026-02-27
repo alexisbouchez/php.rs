@@ -3806,22 +3806,22 @@ fn php_parse_url(
             Some(p) => Value::Long(p),
             None => Value::Null,
         }),
-        5 => Ok(if user.is_empty() {
+        3 => Ok(if user.is_empty() {
             Value::Null
         } else {
             Value::String(user)
         }),
-        6 => Ok(if pass.is_empty() {
+        4 => Ok(if pass.is_empty() {
             Value::Null
         } else {
             Value::String(pass)
         }),
-        3 => Ok(if path.is_empty() {
+        5 => Ok(if path.is_empty() {
             Value::Null
         } else {
             Value::String(path)
         }),
-        4 => Ok(if query.is_empty() {
+        6 => Ok(if query.is_empty() {
             Value::Null
         } else {
             Value::String(query)
