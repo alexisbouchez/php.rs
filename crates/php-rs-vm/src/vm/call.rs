@@ -99,18 +99,32 @@ impl Vm {
                     new_frame.return_dest = Some((op.result_type, op.result.val));
                 }
 
-                // Inherit caller's scope: copy matching variables by name
-                // and build a map for write-back on return.
-                if let Some(caller) = self.call_stack.last() {
-                    let caller_oa = &self.op_arrays[caller.op_array_idx];
+                // Inherit scope from entire include chain: walk up through
+                // include frames so nested requires can see variables from
+                // grandparent scopes (e.g., index.php → page/[n].php → pages/index.php).
+                new_frame.is_include_frame = true;
+                {
                     let child_vars = &included_oa.vars;
-                    let caller_vars = &caller_oa.vars;
-                    for (child_idx, child_name) in child_vars.iter().enumerate() {
-                        if let Some(parent_idx) = caller_vars.iter().position(|v| v == child_name) {
-                            if parent_idx < caller.cvs.len() {
-                                new_frame.cvs[child_idx] = caller.cvs[parent_idx].clone();
-                                new_frame.include_scope_map.push((child_idx, parent_idx));
+                    let mut found: Vec<bool> = vec![false; child_vars.len()];
+                    // Walk up the call stack from nearest to farthest
+                    for stack_idx in (0..self.call_stack.len()).rev() {
+                        let ancestor = &self.call_stack[stack_idx];
+                        let ancestor_oa = &self.op_arrays[ancestor.op_array_idx];
+                        for (child_idx, child_name) in child_vars.iter().enumerate() {
+                            if found[child_idx] {
+                                continue;
                             }
+                            if let Some(anc_cv_idx) = ancestor_oa.vars.iter().position(|v| v == child_name) {
+                                if anc_cv_idx < ancestor.cvs.len() {
+                                    new_frame.cvs[child_idx] = ancestor.cvs[anc_cv_idx].clone();
+                                    new_frame.include_scope_map.push((child_idx, stack_idx, anc_cv_idx));
+                                    found[child_idx] = true;
+                                }
+                            }
+                        }
+                        // Stop at function call boundaries — only walk through include frames
+                        if !ancestor.is_include_frame && stack_idx < self.call_stack.len() - 1 {
+                            break;
                         }
                     }
                 }
