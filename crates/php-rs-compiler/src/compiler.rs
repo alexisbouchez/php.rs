@@ -3174,16 +3174,22 @@ impl Compiler {
         // FE_FETCH: fetch next element
         let fetch_start = self.op_array.next_opline();
 
-        let value_cv = if let Expression::Variable { name, .. } = value {
-            self.op_array.lookup_cv(name)
-        } else {
-            self.op_array.alloc_temp()
-        };
+        let needs_destructure =
+            matches!(value, Expression::ArrayLiteral { .. } | Expression::List { .. });
+
+        let (value_operand, value_op_type, value_slot) =
+            if let Expression::Variable { name, .. } = value {
+                let cv = self.op_array.lookup_cv(name);
+                (Operand::cv(cv), OperandType::Cv, cv)
+            } else {
+                let tmp = self.op_array.alloc_temp();
+                (Operand::tmp_var(tmp), OperandType::TmpVar, tmp)
+            };
 
         let fe_fetch_idx = self.op_array.emit(
             ZOp::new(fetch_opcode, line)
                 .with_op1(Operand::tmp_var(fe_tmp), OperandType::TmpVar)
-                .with_result(Operand::cv(value_cv), OperandType::Cv),
+                .with_result(value_operand, value_op_type),
         );
 
         // If key is specified, emit an OP_DATA for it
@@ -3194,6 +3200,85 @@ impl Compiler {
                     ZOp::new(ZOpcode::OpData, line)
                         .with_result(Operand::cv(key_cv), OperandType::Cv),
                 );
+            }
+        }
+
+        // Emit destructuring opcodes for array/list patterns in value
+        if needs_destructure {
+            let source = ExprResult::tmp(value_slot);
+            match value {
+                Expression::ArrayLiteral { elements, .. } => {
+                    for (i, elem) in elements.iter().enumerate() {
+                        let key_expr = if let Some(ref k) = elem.key {
+                            self.compile_expr(k)
+                        } else {
+                            let idx_lit =
+                                self.op_array.add_literal(Literal::Long(i as i64));
+                            ExprResult::constant(idx_lit)
+                        };
+                        let fetch_tmp = self.op_array.alloc_temp();
+                        self.op_array.emit(
+                            ZOp::new(ZOpcode::FetchDimR, line)
+                                .with_op1(source.operand, source.op_type)
+                                .with_op2(key_expr.operand, key_expr.op_type)
+                                .with_result(
+                                    Operand::tmp_var(fetch_tmp),
+                                    OperandType::TmpVar,
+                                ),
+                        );
+                        let target = &elem.value;
+                        match target {
+                            Expression::Variable { name, .. } => {
+                                let cv = self.op_array.lookup_cv(name);
+                                let assign_tmp = self.op_array.alloc_temp();
+                                self.op_array.emit(
+                                    ZOp::new(ZOpcode::Assign, line)
+                                        .with_op1(Operand::cv(cv), OperandType::Cv)
+                                        .with_op2(
+                                            Operand::tmp_var(fetch_tmp),
+                                            OperandType::TmpVar,
+                                        )
+                                        .with_result(
+                                            Operand::tmp_var(assign_tmp),
+                                            OperandType::TmpVar,
+                                        ),
+                                );
+                            }
+                            Expression::ArrayLiteral {
+                                elements: nested, ..
+                            } => {
+                                let fetch_result = ExprResult::tmp(fetch_tmp);
+                                let nested_elems: Vec<Option<Expression>> =
+                                    nested.iter().map(|e| Some(e.value.clone())).collect();
+                                self.compile_list_destructure(
+                                    &nested_elems,
+                                    fetch_result,
+                                    line,
+                                );
+                            }
+                            _ => {
+                                let lhs_result = self.compile_expr(target);
+                                let assign_tmp = self.op_array.alloc_temp();
+                                self.op_array.emit(
+                                    ZOp::new(ZOpcode::Assign, line)
+                                        .with_op1(lhs_result.operand, lhs_result.op_type)
+                                        .with_op2(
+                                            Operand::tmp_var(fetch_tmp),
+                                            OperandType::TmpVar,
+                                        )
+                                        .with_result(
+                                            Operand::tmp_var(assign_tmp),
+                                            OperandType::TmpVar,
+                                        ),
+                                );
+                            }
+                        }
+                    }
+                }
+                Expression::List { elements, .. } => {
+                    self.compile_list_destructure(elements, source, line);
+                }
+                _ => {}
             }
         }
 

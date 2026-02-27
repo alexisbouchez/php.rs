@@ -13884,4 +13884,43 @@ rmdir($dir);
         );
         assert_eq!(output, "1|[id].php");
     }
+
+    #[test]
+    fn test_foreach_array_destructuring() {
+        let output = run_php(
+            r#"<?php
+$items = [["bold", "**"], ["italic", "*"], ["code", "`"]];
+foreach ($items as [$label, $md]) {
+    echo "$label=$md\n";
+}
+?>"#,
+        );
+        assert_eq!(output, "bold=**\nitalic=*\ncode=`\n");
+    }
+
+    #[test]
+    fn test_foreach_list_destructuring() {
+        let output = run_php(
+            r#"<?php
+$items = [["a", 1], ["b", 2]];
+foreach ($items as list($k, $v)) {
+    echo "$k:$v ";
+}
+?>"#,
+        );
+        assert_eq!(output, "a:1 b:2 ");
+    }
+
+    #[test]
+    fn test_foreach_array_destructuring_with_key() {
+        let output = run_php(
+            r#"<?php
+$items = [["x", 10], ["y", 20]];
+foreach ($items as $i => [$name, $val]) {
+    echo "$i:$name=$val ";
+}
+?>"#,
+        );
+        assert_eq!(output, "0:x=10 1:y=20 ");
+    }
 }
