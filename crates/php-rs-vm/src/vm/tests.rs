@@ -13912,6 +13912,20 @@ foreach ($items as list($k, $v)) {
     }
 
     #[test]
+    fn test_password_hash_and_verify() {
+        let output = run_php(
+            r#"<?php
+$hash = password_hash("secret123", PASSWORD_BCRYPT);
+echo (str_starts_with($hash, "$2y$") ? "yes" : "no") . "\n";
+echo (password_verify("secret123", $hash) ? "yes" : "no") . "\n";
+echo (password_verify("wrong", $hash) ? "yes" : "no") . "\n";
+echo (password_needs_rehash($hash, PASSWORD_BCRYPT) ? "yes" : "no") . "\n";
+?>"#,
+        );
+        assert_eq!(output, "yes\nyes\nno\nno\n");
+    }
+
+    #[test]
     fn test_parse_str_with_result() {
         let output = run_php(
             r#"<?php

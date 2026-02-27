@@ -373,6 +373,11 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     r.insert("http_build_query", php_http_build_query);
     r.insert("getopt", php_getopt);
 
+    // -- Password hashing --
+    r.insert("password_hash", php_password_hash);
+    r.insert("password_verify", php_password_verify);
+    r.insert("password_needs_rehash", php_password_needs_rehash);
+
     // -- Misc --
     r.insert("crypt", php_crypt);
     r.insert("key", php_key);
@@ -3973,6 +3978,98 @@ fn php_getopt(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     Ok(Value::Bool(false))
+}
+
+// -- Password hashing --
+
+fn php_password_hash(
+    _vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let password = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let algo = args.get(1).map(|v| v.to_long()).unwrap_or(1); // PASSWORD_DEFAULT = 1
+    let cost = args
+        .get(2)
+        .and_then(|v| {
+            if let Value::Array(ref arr) = v {
+                arr.get_string("cost").map(|v| v.to_long() as u32)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(10);
+    match algo {
+        1 | 2 => {
+            // PASSWORD_DEFAULT (1) or PASSWORD_ARGON2I (2) — use bcrypt for both
+            #[cfg(feature = "native-io")]
+            {
+                match bcrypt::hash_with_result(&password, cost) {
+                    Ok(parts) => {
+                        let hash = parts.format_for_version(bcrypt::Version::TwoY);
+                        Ok(Value::String(hash))
+                    }
+                    Err(_) => Ok(Value::Bool(false)),
+                }
+            }
+            #[cfg(not(feature = "native-io"))]
+            Ok(Value::Bool(false))
+        }
+        _ => Ok(Value::Bool(false)),
+    }
+}
+
+fn php_password_verify(
+    _vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let password = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let hash = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+    #[cfg(feature = "native-io")]
+    {
+        // Normalize $2y$ to $2b$ for the bcrypt crate
+        let normalized = hash.replacen("$2y$", "$2b$", 1);
+        match bcrypt::verify(&password, &normalized) {
+            Ok(valid) => Ok(Value::Bool(valid)),
+            Err(_) => Ok(Value::Bool(false)),
+        }
+    }
+    #[cfg(not(feature = "native-io"))]
+    Ok(Value::Bool(false))
+}
+
+fn php_password_needs_rehash(
+    _vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let hash = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let algo = args.get(1).map(|v| v.to_long()).unwrap_or(1);
+    let cost = args
+        .get(2)
+        .and_then(|v| {
+            if let Value::Array(ref arr) = v {
+                arr.get_string("cost").map(|v| v.to_long() as u32)
+            } else {
+                None
+            }
+        })
+        .unwrap_or(10);
+    // Check if hash matches expected algo and cost
+    if algo == 1 && hash.starts_with("$2y$") {
+        // Extract cost from hash: $2y$XX$...
+        if let Some(hash_cost) = hash.get(4..6).and_then(|s| s.parse::<u32>().ok()) {
+            Ok(Value::Bool(hash_cost != cost))
+        } else {
+            Ok(Value::Bool(true))
+        }
+    } else {
+        Ok(Value::Bool(true))
+    }
 }
 
 // -- Misc --
