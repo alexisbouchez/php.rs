@@ -13864,4 +13864,24 @@ echo parse_url("/health", PHP_URL_PATH);
         );
         assert_eq!(output, "/health");
     }
+
+    #[test]
+    fn test_glob_character_class() {
+        // Create temp files to test glob with character class
+        let output = run_php(
+            r#"<?php
+$dir = sys_get_temp_dir() . "/phprs_glob_test_" . getmypid();
+mkdir($dir, 0755, true);
+file_put_contents($dir . "/[id].php", "");
+file_put_contents($dir . "/normal.php", "");
+$result = glob($dir . "/[[]*.php");
+echo count($result) . "|" . basename($result[0]);
+// Cleanup
+unlink($dir . "/[id].php");
+unlink($dir . "/normal.php");
+rmdir($dir);
+?>"#,
+        );
+        assert_eq!(output, "1|[id].php");
+    }
 }

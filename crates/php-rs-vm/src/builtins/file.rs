@@ -5,6 +5,96 @@ use crate::vm::{Vm, VmResult};
 use php_rs_compiler::op::OperandType;
 use std::net::ToSocketAddrs;
 
+/// Match a filename against a glob pattern supporting *, ?, and [...] character classes.
+/// PHP's glob uses [...] for character classes: [abc] matches a, b, or c.
+/// [[] matches a literal '['. [!abc] or [^abc] matches anything except a, b, c.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    glob_match_inner(&pat, &txt)
+}
+
+fn glob_match_inner(pat: &[char], txt: &[char]) -> bool {
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star_pi, mut star_ti) = (usize::MAX, usize::MAX);
+
+    while ti < txt.len() {
+        if pi < pat.len() && pat[pi] == '[' {
+            // Character class
+            if let Some((matched, end)) = match_char_class(&pat[pi..], txt[ti]) {
+                if matched {
+                    pi += end;
+                    ti += 1;
+                    continue;
+                }
+            }
+            // No match in char class
+            if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                star_ti += 1;
+                ti = star_ti;
+                continue;
+            }
+            return false;
+        } else if pi < pat.len() && (pat[pi] == '?' || pat[pi] == txt[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// Match a [...] character class at the start of `pat` against `ch`.
+/// Returns Some((matched, consumed_len)) or None if not a valid class.
+fn match_char_class(pat: &[char], ch: char) -> Option<(bool, usize)> {
+    if pat.is_empty() || pat[0] != '[' {
+        return None;
+    }
+    let mut i = 1;
+    let negate = if i < pat.len() && (pat[i] == '!' || pat[i] == '^') {
+        i += 1;
+        true
+    } else {
+        false
+    };
+    let mut matched = false;
+    // First char after [ (or [! / [^) can be ] and it's treated as literal
+    let start = i;
+    while i < pat.len() && (pat[i] != ']' || i == start) {
+        if i + 2 < pat.len() && pat[i + 1] == '-' && pat[i + 2] != ']' {
+            // Range: a-z
+            if ch >= pat[i] && ch <= pat[i + 2] {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if pat[i] == ch {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    if i >= pat.len() {
+        return None; // Unclosed bracket
+    }
+    // pat[i] == ']'
+    Some((if negate { !matched } else { matched }, i + 1))
+}
+
 /// Dispatch a built-in file function call.
 /// Returns `Ok(Some(value))` if handled, `Ok(None)` if not recognized.
 pub(crate) fn dispatch(
@@ -367,10 +457,12 @@ pub(crate) fn dispatch(
             }
         }
         "glob" => {
-            // Basic glob using vm_read_dir with pattern matching
+            // glob() with support for *, ?, and [...] character classes
             let pattern = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+            let flags = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+            let glob_onlydir = flags & 0x4000 != 0; // GLOB_ONLYDIR = 0x4000 (platform-dependent)
             let mut arr = PhpArray::new();
-            // Extract directory part
+            // Extract directory part and file pattern
             let dir = std::path::Path::new(&pattern)
                 .parent()
                 .map(|p| p.to_string_lossy().to_string())
@@ -380,24 +472,27 @@ pub(crate) fn dispatch(
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             if let Ok(names) = vm.vm_read_dir(&dir) {
+                let mut matched: Vec<String> = Vec::new();
                 for name in names {
-                    // Simple wildcard matching: * matches anything
-                    if file_pattern.contains('*') {
-                        let parts: Vec<&str> = file_pattern.split('*').collect();
-                        let matches = if parts.len() == 2 {
-                            name.starts_with(parts[0]) && name.ends_with(parts[1])
+                    if glob_match(&file_pattern, &name) {
+                        let full = if dir == "." {
+                            name.clone()
                         } else {
-                            true
+                            format!("{}/{}", dir, name)
                         };
-                        if matches {
-                            let full = if dir == "." {
-                                name
-                            } else {
-                                format!("{}/{}", dir, name)
-                            };
-                            arr.push(Value::String(full));
+                        // GLOB_ONLYDIR: only include directories
+                        if glob_onlydir {
+                            if std::path::Path::new(&full).is_dir() {
+                                matched.push(full);
+                            }
+                        } else {
+                            matched.push(full);
                         }
                     }
+                }
+                matched.sort();
+                for m in matched {
+                    arr.push(Value::String(m));
                 }
             }
             Ok(Some(Value::Array(arr)))
