@@ -228,10 +228,12 @@ pub enum ZOpcode {
     InitParentPropertyHookCall = 209,
     DeclareAttributedConst = 210,
     TypeAssert = 211,
+    /// exit/die — terminate entire script immediately.
+    Exit = 212,
 }
 
 /// The last valid opcode number.
-pub const ZEND_VM_LAST_OPCODE: u8 = 211;
+pub const ZEND_VM_LAST_OPCODE: u8 = 212;
 
 impl ZOpcode {
     /// Convert a raw opcode number to a ZOpcode.
@@ -462,6 +464,7 @@ impl ZOpcode {
             Self::InitParentPropertyHookCall => "ZEND_INIT_PARENT_PROPERTY_HOOK_CALL",
             Self::DeclareAttributedConst => "ZEND_DECLARE_ATTRIBUTED_CONST",
             Self::TypeAssert => "ZEND_TYPE_ASSERT",
+            Self::Exit => "ZEND_EXIT",
         }
     }
 }

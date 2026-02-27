@@ -1931,7 +1931,7 @@ pub(crate) fn dispatch(
             dk.truncate(dk_len);
             if raw_output {
                 Ok(Some(Value::String(
-                    String::from_utf8_lossy(&dk).to_string(),
+                    dk.iter().map(|&b| b as char).collect(),
                 )))
             } else {
                 Ok(Some(Value::String(

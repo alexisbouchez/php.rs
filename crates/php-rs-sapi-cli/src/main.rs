@@ -585,6 +585,14 @@ fn execute_php(source: &str, ini: &IniSystem, script_path: &str, argv: &[String]
             print!("{}", output);
             0
         }
+        Err(php_rs_vm::VmError::Exit(code)) => {
+            // exit() — print any output, use the exit code
+            let partial = vm.output_so_far();
+            if !partial.is_empty() {
+                print!("{}", partial);
+            }
+            code
+        }
         Err(e) => {
             // Print any partial output accumulated before the error
             let partial = vm.get_output();
@@ -635,6 +643,10 @@ fn execute_php_capture(
     let mut vm = php_rs_vm::Vm::with_config(config);
     match vm.execute(&op_array, Some(&sg_map)) {
         Ok(output) => (0, output),
+        Err(php_rs_vm::VmError::Exit(code)) => {
+            let output = vm.output_so_far();
+            (code, output)
+        }
         Err(e) => {
             eprintln!("Fatal error: {:?}", e);
             (255, String::new())
@@ -753,6 +765,12 @@ fn run_interactive() -> i32 {
                             if !output.ends_with('\n') {
                                 println!();
                             }
+                        }
+                    }
+                    Err(php_rs_vm::VmError::Exit(_)) => {
+                        let output = vm.output_so_far();
+                        if !output.is_empty() {
+                            print!("{}", output);
                         }
                     }
                     Err(e) => {

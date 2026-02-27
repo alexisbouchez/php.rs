@@ -1831,9 +1831,15 @@ impl Vm {
         // Run registered shutdown functions regardless of script result
         self.run_shutdown_functions();
 
-        // Propagate any error from dispatch (except Exit which is normal termination)
+        // Propagate any error from dispatch
         match dispatch_result {
-            Err(VmError::Exit(_)) => {}
+            Err(VmError::Exit(code)) => {
+                // Run shutdown functions already ran above; flush OB and propagate
+                while let Some(buf) = self.ob_stack.pop() {
+                    self.write_output(&buf);
+                }
+                return Err(VmError::Exit(code));
+            }
             Err(VmError::Thrown(ref exception_val)) => {
                 // Try user exception handler before propagating
                 if let Some(handler_name) = self.exception_handler.clone() {
@@ -5451,6 +5457,18 @@ impl Vm {
                     Ok(DispatchSignal::Jump(target))
                 } else {
                     Ok(DispatchSignal::Next)
+                }
+            }
+            ZOpcode::Exit => {
+                // exit/die — terminate entire script immediately.
+                let arg = self.read_operand(op, 1, oa_idx)?;
+                match arg {
+                    Value::String(s) => {
+                        self.write_output(&s);
+                        return Err(VmError::Exit(0));
+                    }
+                    Value::Long(n) => return Err(VmError::Exit(n as i32)),
+                    _ => return Err(VmError::Exit(0)),
                 }
             }
             ZOpcode::TypeAssert => {

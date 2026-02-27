@@ -379,15 +379,9 @@ fn execute_router_script(
             let extra_headers = vm.response_headers().to_vec();
             RouterResult::Handled(status, content_type, extra_headers, output.into_bytes())
         }
-        Err(php_rs_vm::VmError::Exit(_)) => {
+        Err(php_rs_vm::VmError::Exit(code)) => {
+            // exit() means the script handled the request — never fallthrough.
             let output = vm.output_so_far();
-
-            // If exit() with no output and false-like return, fallthrough
-            let last_return = vm.last_return_value();
-            if is_false_return(&last_return) && output.is_empty() {
-                return RouterResult::Fallthrough;
-            }
-
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
             let extra_headers = vm.response_headers().to_vec();

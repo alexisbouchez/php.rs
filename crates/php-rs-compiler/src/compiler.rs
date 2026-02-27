@@ -1050,19 +1050,24 @@ impl Compiler {
             Expression::Exit { expr, span } => {
                 if let Some(e) = expr {
                     let result = self.compile_expr(e);
+                    // Pass the expression as op1 so the VM can print strings
+                    // or use integers as exit codes.
                     self.op_array.emit(
-                        ZOp::new(ZOpcode::Echo, span.line as u32)
+                        ZOp::new(ZOpcode::Exit, span.line as u32)
                             .with_op1(result.operand, result.op_type),
                     );
+                    ExprResult {
+                        operand: result.operand,
+                        op_type: result.op_type,
+                    }
+                } else {
+                    let null_idx = self.op_array.add_literal(Literal::Null);
+                    self.op_array.emit(
+                        ZOp::new(ZOpcode::Exit, span.line as u32)
+                            .with_op1(Operand::constant(null_idx), OperandType::Const),
+                    );
+                    ExprResult::constant(null_idx)
                 }
-                // exit is compiled as a throw of a special exception
-                // For now, emit a return
-                let null_idx = self.op_array.add_literal(Literal::Null);
-                self.op_array.emit(
-                    ZOp::new(ZOpcode::Return, span.line as u32)
-                        .with_op1(Operand::constant(null_idx), OperandType::Const),
-                );
-                ExprResult::constant(null_idx)
             }
 
             // --- Match expression (in expression context) ---
