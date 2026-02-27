@@ -3801,7 +3801,9 @@ fn php_hash_builtin(
     let algo = args.first().map(|v| v.to_php_string()).unwrap_or_default().to_lowercase();
     let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
     let raw = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
-    match php_rs_ext_hash::php_hash(&algo, &data) {
+    // Convert Latin-1-encoded string to raw bytes for binary-safe hashing
+    let data_bytes: Vec<u8> = data.chars().map(|c| c as u8).collect();
+    match php_rs_ext_hash::php_hash_bytes(&algo, &data_bytes) {
         Some(hex) => {
             if raw {
                 let bytes: Vec<u8> = hex
@@ -3810,7 +3812,9 @@ fn php_hash_builtin(
                     .filter_map(|c| std::str::from_utf8(c).ok())
                     .filter_map(|s| u8::from_str_radix(s, 16).ok())
                     .collect();
-                Ok(Value::String(String::from_utf8_lossy(&bytes).to_string()))
+                // PHP strings are binary: map each byte to its Latin-1 codepoint
+                let s: String = bytes.iter().map(|&b| b as char).collect();
+                Ok(Value::String(s))
             } else {
                 Ok(Value::String(hex))
             }

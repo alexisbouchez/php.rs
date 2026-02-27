@@ -19,8 +19,29 @@ pub fn php_hash(algo: &str, data: &str) -> Option<String> {
     }
 }
 
+/// hash() variant that accepts raw bytes (for binary-safe PHP strings).
+pub fn php_hash_bytes(algo: &str, data: &[u8]) -> Option<String> {
+    match algo {
+        "md5" => Some(md5(data)),
+        "sha1" => Some(sha1(data)),
+        "sha256" => Some(sha256(data)),
+        "sha384" => Some(sha384(data)),
+        "sha512" => Some(sha512(data)),
+        "crc32" => Some(format!("{:08x}", crc32(data))),
+        "crc32b" => Some(format!("{:08x}", crc32(data))),
+        _ => None,
+    }
+}
+
 /// hash_hmac() — Generate a keyed hash value using the HMAC method.
 pub fn php_hash_hmac(algo: &str, data: &str, key: &str) -> Option<String> {
+    let data_bytes: Vec<u8> = data.chars().map(|c| c as u8).collect();
+    let key_bytes: Vec<u8> = key.chars().map(|c| c as u8).collect();
+    php_hash_hmac_bytes(algo, &data_bytes, &key_bytes)
+}
+
+/// hash_hmac() variant that accepts raw bytes.
+pub fn php_hash_hmac_bytes(algo: &str, data: &[u8], key: &[u8]) -> Option<String> {
     let hash_fn: fn(&[u8]) -> Vec<u8> = match algo {
         "md5" => |d| md5_raw(d),
         "sha1" => |d| sha1_raw(d),
@@ -36,7 +57,7 @@ pub fn php_hash_hmac(algo: &str, data: &str, key: &str) -> Option<String> {
         _ => return None,
     };
 
-    Some(hmac(hash_fn, block_size, key.as_bytes(), data.as_bytes()))
+    Some(hmac(hash_fn, block_size, key, data))
 }
 
 /// hash_equals() — Timing attack safe string comparison.

@@ -672,13 +672,14 @@ pub(crate) fn dispatch(
                 result.push((hi << 4) | lo);
                 i += 2;
             }
-            Ok(Some(Value::String(
-                String::from_utf8_lossy(&result).to_string(),
-            )))
+            // PHP strings are binary: map each byte to its Latin-1 codepoint
+            let s: String = result.iter().map(|&b| b as char).collect();
+            Ok(Some(Value::String(s)))
         }
         "bin2hex" => {
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            let hex: String = s.bytes().map(|b| format!("{:02x}", b)).collect();
+            // PHP strings are binary: each char's Unicode codepoint IS the byte value
+            let hex: String = s.chars().map(|c| format!("{:02x}", c as u32)).collect();
             Ok(Some(Value::String(hex)))
         }
         "str_split" => {

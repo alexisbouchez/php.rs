@@ -280,9 +280,9 @@ pub(crate) fn dispatch(
         "random_bytes" => {
             let len = args.first().map(|v| v.to_long()).unwrap_or(0) as usize;
             let bytes = php_rs_ext_random::SecureEngine::generate_bytes(len);
-            Ok(Some(Value::String(
-                String::from_utf8_lossy(&bytes).to_string(),
-            )))
+            // PHP strings are binary-safe: map each byte to its Latin-1 codepoint
+            let s: String = bytes.iter().map(|&b| b as char).collect();
+            Ok(Some(Value::String(s)))
         }
         // =====================================================================
         // bcmath — real arbitrary precision via php_rs_ext_bcmath crate
