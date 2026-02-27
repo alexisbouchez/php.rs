@@ -70,6 +70,30 @@ pub fn php_date(format: &str, timestamp: i64) -> String {
             'M' => result.push_str(&dt.month_name()[..3]),
             't' => result.push_str(&format!("{}", dt.days_in_month())),
             'L' => result.push_str(if dt.is_leap_year() { "1" } else { "0" }),
+            'P' | 'T' => result.push_str("+00:00"), // UTC offset
+            'e' => result.push_str("UTC"),
+            'O' => result.push_str("+0000"),
+            'Z' => result.push_str("0"), // UTC offset in seconds
+            'c' => {
+                // ISO 8601: 2004-02-12T15:19:21+00:00
+                result.push_str(&format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
+                    dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
+                ));
+            }
+            'r' => {
+                // RFC 2822: Thu, 21 Dec 2000 16:01:07 +0000
+                result.push_str(&format!(
+                    "{}, {:02} {} {:04} {:02}:{:02}:{:02} +0000",
+                    &dt.day_name()[..3],
+                    dt.day,
+                    &dt.month_name()[..3],
+                    dt.year,
+                    dt.hour,
+                    dt.minute,
+                    dt.second
+                ));
+            }
             _ => result.push(ch),
         }
     }
