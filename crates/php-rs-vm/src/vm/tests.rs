@@ -769,11 +769,7 @@ echo $x;
     fn test_require_inherits_parent_scope() {
         let dir = std::env::temp_dir();
         let path = dir.join("php_rs_test_scope_inherit.php");
-        std::fs::write(
-            &path,
-            r#"<?php echo "x=" . $x . " y=" . $y . "\n";"#,
-        )
-        .unwrap();
+        std::fs::write(&path, r#"<?php echo "x=" . $x . " y=" . $y . "\n";"#).unwrap();
 
         let source = format!(
             r#"<?php

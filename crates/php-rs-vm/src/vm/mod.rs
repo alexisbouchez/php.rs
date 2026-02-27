@@ -2244,11 +2244,8 @@ impl Vm {
                     if !frame.include_scope_map.is_empty() {
                         if let Some(caller) = self.call_stack.last_mut() {
                             for &(child_idx, parent_idx) in &frame.include_scope_map {
-                                if child_idx < frame.cvs.len()
-                                    && parent_idx < caller.cvs.len()
-                                {
-                                    caller.cvs[parent_idx] =
-                                        frame.cvs[child_idx].clone();
+                                if child_idx < frame.cvs.len() && parent_idx < caller.cvs.len() {
+                                    caller.cvs[parent_idx] = frame.cvs[child_idx].clone();
                                 }
                             }
                         }
