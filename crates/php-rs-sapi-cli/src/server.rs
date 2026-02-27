@@ -260,15 +260,27 @@ fn send_response(
     status: u16,
     status_text: &str,
     content_type: &str,
+    extra_headers: &[String],
     body: &[u8],
 ) {
-    let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let mut header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         status,
         status_text,
         content_type,
         body.len()
     );
+    for h in extra_headers {
+        // Skip Content-Type (already set above) to avoid duplicates
+        if let Some(colon) = h.find(':') {
+            if h[..colon].trim().eq_ignore_ascii_case("content-type") {
+                continue;
+            }
+        }
+        header.push_str(h);
+        header.push_str("\r\n");
+    }
+    header.push_str("\r\n");
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body);
     let _ = stream.flush();
@@ -287,6 +299,7 @@ fn send_404(stream: &mut std::net::TcpStream, path: &str) {
         404,
         "Not Found",
         "text/html; charset=UTF-8",
+        &[],
         body.as_bytes(),
     );
 }
@@ -304,6 +317,7 @@ fn send_500(stream: &mut std::net::TcpStream, message: &str) {
         500,
         "Internal Server Error",
         "text/html; charset=UTF-8",
+        &[],
         body.as_bytes(),
     );
 }
@@ -313,7 +327,8 @@ fn send_500(stream: &mut std::net::TcpStream, message: &str) {
 /// Result of a PHP router script execution.
 enum RouterResult {
     /// Router handled the request — send this response.
-    Handled(u16, String, Vec<u8>),
+    /// Fields: status, content_type, extra_headers, body
+    Handled(u16, String, Vec<String>, Vec<u8>),
     /// Router returned false — fall through to static file serving.
     Fallthrough,
     /// Router script error.
@@ -361,7 +376,8 @@ fn execute_router_script(
 
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
-            RouterResult::Handled(status, content_type, output.into_bytes())
+            let extra_headers = vm.response_headers().to_vec();
+            RouterResult::Handled(status, content_type, extra_headers, output.into_bytes())
         }
         Err(php_rs_vm::VmError::Exit(_)) => {
             let output = vm.output_so_far();
@@ -374,7 +390,8 @@ fn execute_router_script(
 
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
-            RouterResult::Handled(status, content_type, output.into_bytes())
+            let extra_headers = vm.response_headers().to_vec();
+            RouterResult::Handled(status, content_type, extra_headers, output.into_bytes())
         }
         Err(e) => RouterResult::Error(format!("{:?}", e)),
     }
@@ -402,11 +419,12 @@ fn extract_content_type(vm: &php_rs_vm::Vm) -> String {
 }
 
 /// Execute a PHP script for an HTTP request.
+/// Returns (status, content_type, extra_headers, body).
 fn execute_php_request(
     script_path: &Path,
     req: &HttpRequest,
     config: &ServerConfig,
-) -> Result<(u16, String, Vec<u8>), String> {
+) -> Result<(u16, String, Vec<String>, Vec<u8>), String> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("Failed to read {}: {}", script_path.display(), e))?;
 
@@ -427,13 +445,15 @@ fn execute_php_request(
         Ok(output) => {
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
-            Ok((status, content_type, output.into_bytes()))
+            let extra_headers = vm.response_headers().to_vec();
+            Ok((status, content_type, extra_headers, output.into_bytes()))
         }
         Err(php_rs_vm::VmError::Exit(_)) => {
             let status = vm.response_code().unwrap_or(200);
             let output = vm.output_so_far();
             let content_type = extract_content_type(&vm);
-            Ok((status, content_type, output.into_bytes()))
+            let extra_headers = vm.response_headers().to_vec();
+            Ok((status, content_type, extra_headers, output.into_bytes()))
         }
         Err(e) => Err(format!("{:?}", e)),
     }
@@ -656,8 +676,8 @@ fn handle_connection(
     if let Some(ref router) = config.router {
         if router.exists() {
             match execute_router_script(router, &req, config) {
-                RouterResult::Handled(status, content_type, body) => {
-                    send_response(stream, status, status_text(status), &content_type, &body);
+                RouterResult::Handled(status, content_type, extra_headers, body) => {
+                    send_response(stream, status, status_text(status), &content_type, &extra_headers, &body);
                     let elapsed = start.elapsed().as_millis();
                     log_access(remote_addr, &config.listen, status, &method, &uri, elapsed);
                     return Some((status, method, uri));
@@ -710,8 +730,8 @@ fn handle_connection(
 
     let status = if ext == "php" {
         match execute_php_request(&file_path, &req, config) {
-            Ok((status, content_type, body)) => {
-                send_response(stream, status, status_text(status), &content_type, &body);
+            Ok((status, content_type, extra_headers, body)) => {
+                send_response(stream, status, status_text(status), &content_type, &extra_headers, &body);
                 status
             }
             Err(msg) => {
@@ -724,7 +744,7 @@ fn handle_connection(
         match std::fs::read(&file_path) {
             Ok(contents) => {
                 let ct = mime_type(file_path.to_str().unwrap_or(""));
-                send_response(stream, 200, "OK", ct, &contents);
+                send_response(stream, 200, "OK", ct, &[], &contents);
                 200
             }
             Err(_) => {
@@ -983,7 +1003,7 @@ mod tests {
             docroot: dir.clone(),
             router: None,
         };
-        let (status, _ct, body) = execute_php_request(&php_file, &req, &config).unwrap();
+        let (status, _ct, _hdrs, body) = execute_php_request(&php_file, &req, &config).unwrap();
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body), "Hello from server!");
 
@@ -1038,7 +1058,7 @@ mod tests {
             docroot: dir.clone(),
             router: None,
         };
-        let (status, _, body) = execute_php_request(&index_php, &req, &config).unwrap();
+        let (status, _, _, body) = execute_php_request(&index_php, &req, &config).unwrap();
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body), "Index!");
 
@@ -1094,7 +1114,7 @@ mod tests {
             docroot: dir.clone(),
             router: None,
         };
-        let (status, _, body) = execute_php_request(&php_file, &req, &config).unwrap();
+        let (status, _, _, body) = execute_php_request(&php_file, &req, &config).unwrap();
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body), "GET world name=world");
 
@@ -1138,7 +1158,7 @@ mod tests {
             docroot: dir.clone(),
             router: None,
         };
-        let (status, _, body) = execute_php_request(&php_file, &req, &config).unwrap();
+        let (status, _, _, body) = execute_php_request(&php_file, &req, &config).unwrap();
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body), "admin:s3cr3t");
 
@@ -1174,7 +1194,7 @@ mod tests {
         };
 
         match execute_router_script(&router, &req, &config) {
-            RouterResult::Handled(status, _, body) => {
+            RouterResult::Handled(status, _, _, body) => {
                 assert_eq!(status, 200);
                 assert_eq!(String::from_utf8_lossy(&body), "Routed!");
             }
@@ -1213,7 +1233,7 @@ mod tests {
 
         match execute_router_script(&router, &req, &config) {
             RouterResult::Fallthrough => {} // Expected
-            RouterResult::Handled(_, _, body) => {
+            RouterResult::Handled(_, _, _, body) => {
                 panic!(
                     "Expected Fallthrough, got Handled with body: {}",
                     String::from_utf8_lossy(&body)
@@ -1253,7 +1273,7 @@ mod tests {
         };
 
         match execute_router_script(&router, &req, &config) {
-            RouterResult::Handled(_, _, body) => {
+            RouterResult::Handled(_, _, _, body) => {
                 assert_eq!(String::from_utf8_lossy(&body), "handled");
             }
             _ => panic!("Expected Handled (output present)"),
