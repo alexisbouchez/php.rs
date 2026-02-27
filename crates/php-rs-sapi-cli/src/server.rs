@@ -271,9 +271,12 @@ fn send_response(
         body.len()
     );
     for h in extra_headers {
-        // Skip Content-Type (already set above) to avoid duplicates
+        // Skip Content-Type and Content-Length (already set above) to avoid duplicates
         if let Some(colon) = h.find(':') {
-            if h[..colon].trim().eq_ignore_ascii_case("content-type") {
+            let name = h[..colon].trim();
+            if name.eq_ignore_ascii_case("content-type")
+                || name.eq_ignore_ascii_case("content-length")
+            {
                 continue;
             }
         }
@@ -377,7 +380,7 @@ fn execute_router_script(
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
             let extra_headers = vm.response_headers().to_vec();
-            RouterResult::Handled(status, content_type, extra_headers, output.into_bytes())
+            RouterResult::Handled(status, content_type, extra_headers, php_string_to_bytes(&output))
         }
         Err(php_rs_vm::VmError::Exit(code)) => {
             // exit() means the script handled the request — never fallthrough.
@@ -385,13 +388,20 @@ fn execute_router_script(
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
             let extra_headers = vm.response_headers().to_vec();
-            RouterResult::Handled(status, content_type, extra_headers, output.into_bytes())
+            RouterResult::Handled(status, content_type, extra_headers, php_string_to_bytes(&output))
         }
         Err(e) => RouterResult::Error(format!("{:?}", e)),
     }
 }
 
 /// Check if a VM return value represents `false` (for router fallthrough).
+/// Convert a PHP string (Latin-1 encoded in Rust String) back to raw bytes.
+/// PHP strings are byte arrays where each byte maps to Unicode codepoint 0-255.
+/// `String::into_bytes()` would produce UTF-8, corrupting bytes > 127.
+fn php_string_to_bytes(s: &str) -> Vec<u8> {
+    s.chars().map(|c| c as u8).collect()
+}
+
 fn is_false_return(value: &Option<Value>) -> bool {
     match value {
         Some(Value::Bool(false)) => true,
@@ -440,14 +450,14 @@ fn execute_php_request(
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
             let extra_headers = vm.response_headers().to_vec();
-            Ok((status, content_type, extra_headers, output.into_bytes()))
+            Ok((status, content_type, extra_headers, php_string_to_bytes(&output)))
         }
         Err(php_rs_vm::VmError::Exit(_)) => {
             let status = vm.response_code().unwrap_or(200);
             let output = vm.output_so_far();
             let content_type = extract_content_type(&vm);
             let extra_headers = vm.response_headers().to_vec();
-            Ok((status, content_type, extra_headers, output.into_bytes()))
+            Ok((status, content_type, extra_headers, php_string_to_bytes(&output)))
         }
         Err(e) => Err(format!("{:?}", e)),
     }

@@ -40,11 +40,11 @@ impl Vm {
         }
     }
 
-    /// Read a file's contents as a string.
+    /// Read a file's contents as a PHP string (binary-safe, Latin-1).
     pub(crate) fn vm_read_to_string(&self, path: &str) -> std::io::Result<String> {
         let bytes = self.vm_read_file(path)?;
-        String::from_utf8(bytes)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        // PHP strings are byte arrays — map each byte to its Latin-1 codepoint.
+        Ok(bytes.iter().map(|&b| b as char).collect())
     }
 
     /// Write data to a file.
