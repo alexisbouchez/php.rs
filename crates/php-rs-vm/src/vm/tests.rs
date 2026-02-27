@@ -11467,6 +11467,19 @@ echo ini_get('display_errors');
     }
 
     #[test]
+    fn test_php_url_and_file_constants() {
+        let output = run_php(
+            r#"<?php
+echo PHP_URL_SCHEME . "|" . PHP_URL_HOST . "|" . PHP_URL_PORT . "|";
+echo PHP_URL_USER . "|" . PHP_URL_PASS . "|" . PHP_URL_PATH . "|";
+echo PHP_URL_QUERY . "|" . PHP_URL_FRAGMENT . "|";
+echo FILE_APPEND . "|" . LOCK_EX;
+"#,
+        );
+        assert_eq!(output, "0|1|2|3|4|5|6|7|8|2");
+    }
+
+    #[test]
     fn test_php_ini_constants() {
         let output = run_php(
             r#"<?php

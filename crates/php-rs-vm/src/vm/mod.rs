@@ -892,6 +892,18 @@ impl Vm {
                 c.insert("FILTER_SANITIZE_URL".to_string(), Value::Long(523));
                 c.insert("FILTER_SANITIZE_ADD_SLASHES".to_string(), Value::Long(524));
                 c.insert("FILTER_DEFAULT".to_string(), Value::Long(516));
+                // PHP_URL_* constants (for parse_url component parameter)
+                c.insert("PHP_URL_SCHEME".to_string(), Value::Long(0));
+                c.insert("PHP_URL_HOST".to_string(), Value::Long(1));
+                c.insert("PHP_URL_PORT".to_string(), Value::Long(2));
+                c.insert("PHP_URL_USER".to_string(), Value::Long(3));
+                c.insert("PHP_URL_PASS".to_string(), Value::Long(4));
+                c.insert("PHP_URL_PATH".to_string(), Value::Long(5));
+                c.insert("PHP_URL_QUERY".to_string(), Value::Long(6));
+                c.insert("PHP_URL_FRAGMENT".to_string(), Value::Long(7));
+                // Filesystem constants
+                c.insert("FILE_APPEND".to_string(), Value::Long(8));
+                c.insert("LOCK_EX".to_string(), Value::Long(2));
                 // Calendar constants
                 c.insert("CAL_GREGORIAN".to_string(), Value::Long(0));
                 c.insert("CAL_JULIAN".to_string(), Value::Long(1));
