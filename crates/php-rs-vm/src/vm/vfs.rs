@@ -40,11 +40,15 @@ impl Vm {
         }
     }
 
-    /// Read a file's contents as a PHP string (binary-safe, Latin-1).
+    /// Read a file's contents as a PHP string (binary-safe).
+    /// Tries UTF-8 first (for source code, text files); falls back to Latin-1
+    /// mapping for binary files (images, etc.) so no data is lost.
     pub(crate) fn vm_read_to_string(&self, path: &str) -> std::io::Result<String> {
         let bytes = self.vm_read_file(path)?;
-        // PHP strings are byte arrays — map each byte to its Latin-1 codepoint.
-        Ok(bytes.iter().map(|&b| b as char).collect())
+        match String::from_utf8(bytes) {
+            Ok(s) => Ok(s),
+            Err(e) => Ok(e.into_bytes().iter().map(|&b| b as char).collect()),
+        }
     }
 
     /// Write data to a file.
