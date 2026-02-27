@@ -636,6 +636,10 @@ pub struct Vm {
     /// Opcode cache: file_path → (mtime_secs, compiled op_array).
     /// Avoids recompilation when the same file is executed multiple times.
     pub(crate) opcode_cache: HashMap<String, (u64, ZOpArray)>,
+    /// Superglobal values ($_GET, $_POST, $_COOKIE, $_SERVER, etc.).
+    /// Stored on the VM so they can be populated into every new function frame.
+    /// PHP superglobals are accessible inside functions without `global` declaration.
+    pub(crate) superglobals: HashMap<String, Value>,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -1624,6 +1628,46 @@ impl Vm {
             arena: php_rs_gc::Arena::new(),
             string_pool: php_rs_gc::StringPool::new(),
             opcode_cache: HashMap::new(),
+            superglobals: HashMap::new(),
+        }
+    }
+
+    /// PHP superglobal variable names (without leading $).
+    const SUPERGLOBAL_NAMES: &'static [&'static str] = &[
+        "_GET", "_POST", "_COOKIE", "_SERVER", "_REQUEST", "_FILES", "_ENV", "_SESSION",
+    ];
+
+    /// Populate superglobal CVs ($_GET, $_POST, $_COOKIE, $_SERVER, etc.) into a frame.
+    /// In PHP, superglobals are accessible inside any function without `global`.
+    /// First checks the VM's stored superglobals (from execute()), then falls back to
+    /// reading current values from the main frame (call_stack[0]) so that script-level
+    /// modifications to superglobals are also visible in function scope.
+    pub(crate) fn populate_superglobals(&self, frame: &mut Frame, op_array: &ZOpArray) {
+        // Step 1: Seed from VM's stored superglobals (initial HTTP request values)
+        for (name, value) in &self.superglobals {
+            if let Some(idx) = op_array.vars.iter().position(|v| v == name) {
+                frame.cvs[idx] = value.clone();
+            }
+        }
+
+        // Step 2: Override with values from the call stack frames.
+        // PHP superglobals are truly global — modifications by the main script or
+        // any calling frame should be visible in the new frame.
+        // We walk the call stack from bottom (main) to top (caller), so the
+        // most recent value wins.
+        for stack_frame in &self.call_stack {
+            let stack_oa = &self.op_arrays[stack_frame.op_array_idx];
+            for &sg_name in Self::SUPERGLOBAL_NAMES {
+                if let Some(new_idx) = op_array.vars.iter().position(|v| v == sg_name) {
+                    if let Some(stack_idx) = stack_oa.vars.iter().position(|v| v == sg_name) {
+                        if stack_idx < stack_frame.cvs.len()
+                            && !matches!(stack_frame.cvs[stack_idx], Value::Null)
+                        {
+                            frame.cvs[new_idx] = stack_frame.cvs[stack_idx].clone();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1761,18 +1805,19 @@ impl Vm {
             );
         }
 
-        // Create the main frame
-        let mut frame = Frame::new(op_array);
-        frame.op_array_idx = 0;
-
-        // Pre-fill superglobal CVs so $_GET, $_SERVER, etc. are available
+        // Store superglobals on VM so they can be populated into every function frame.
+        // PHP superglobals ($_GET, $_POST, $_COOKIE, $_SERVER, etc.) are accessible
+        // inside functions without `global` declaration.
         if let Some(sg) = superglobals {
             for (name, value) in sg {
-                if let Some(idx) = op_array.vars.iter().position(|v| v == name) {
-                    frame.cvs[idx] = value.clone();
-                }
+                self.superglobals.insert(name.clone(), value.clone());
             }
         }
+
+        // Create the main frame and populate superglobals
+        let mut frame = Frame::new(op_array);
+        frame.op_array_idx = 0;
+        self.populate_superglobals(&mut frame, op_array);
 
         self.call_stack.push(frame);
 
@@ -2011,6 +2056,7 @@ impl Vm {
                 let func_oa = &self.op_arrays[oa_idx];
                 let mut new_frame = Frame::new(func_oa);
                 new_frame.op_array_idx = oa_idx;
+                self.populate_superglobals(&mut new_frame, func_oa);
                 self.call_stack.push(new_frame);
                 // Ignore errors during shutdown
                 let _ = self.dispatch_loop();
@@ -3231,6 +3277,7 @@ impl Vm {
                             let func_oa = &self.op_arrays[oa_idx];
                             let mut frame = Frame::new(func_oa);
                             frame.op_array_idx = oa_idx;
+                            self.populate_superglobals(&mut frame, func_oa);
                             frame.args = vec![key.clone()];
                             // Set $this
                             if let Some(this_cv) = func_oa.vars.iter().position(|v| v == "this") {

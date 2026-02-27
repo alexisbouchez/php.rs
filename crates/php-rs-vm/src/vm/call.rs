@@ -94,6 +94,7 @@ impl Vm {
 
                 let mut new_frame = Frame::new(&included_oa);
                 new_frame.op_array_idx = base_idx;
+                self.populate_superglobals(&mut new_frame, &included_oa);
                 if op.result_type != OperandType::Unused {
                     new_frame.return_dest = Some((op.result_type, op.result.val));
                 }
@@ -1256,6 +1257,7 @@ impl Vm {
             let func_oa = &self.op_arrays[oa_idx];
             let mut new_frame = Frame::new(func_oa);
             new_frame.op_array_idx = oa_idx;
+            self.populate_superglobals(&mut new_frame, func_oa);
             new_frame.static_class = pending_static_class;
             new_frame.called_as = Some(func_name.clone());
 
@@ -1526,6 +1528,7 @@ impl Vm {
                         let func_oa = &self.op_arrays[oa_idx];
                         let mut new_frame = Frame::new(func_oa);
                         new_frame.op_array_idx = oa_idx;
+                        self.populate_superglobals(&mut new_frame, func_oa);
                         new_frame.static_class = Some(class_part.to_string());
                         new_frame.args = vec![
                             Value::String(method_part.to_string()),
@@ -1570,6 +1573,7 @@ impl Vm {
                     let func_oa = &self.op_arrays[oa_idx];
                     let mut new_frame = Frame::new(func_oa);
                     new_frame.op_array_idx = oa_idx;
+                    self.populate_superglobals(&mut new_frame, func_oa);
                     new_frame.static_class = Some(class_part.to_string());
                     new_frame.args = vec![
                         Value::String(method_part.to_string()),

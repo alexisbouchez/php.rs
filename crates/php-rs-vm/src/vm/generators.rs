@@ -756,6 +756,7 @@ impl Vm {
         let func_oa = &self.op_arrays[func_oa_idx];
         let mut new_frame = Frame::new(func_oa);
         new_frame.op_array_idx = func_oa_idx;
+        self.populate_superglobals(&mut new_frame, func_oa);
         new_frame.args = args.to_vec();
 
         // Bind parameters to CVs

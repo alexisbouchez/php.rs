@@ -409,6 +409,7 @@ impl Vm {
         let func_oa = &self.op_arrays[hook_oa_idx];
         let mut frame = Frame::new(func_oa);
         frame.op_array_idx = hook_oa_idx;
+        self.populate_superglobals(&mut frame, func_oa);
 
         // Set $this (CV 0)
         if let Some(this_idx) = func_oa.vars.iter().position(|v| v == "this") {
@@ -1305,6 +1306,7 @@ impl Vm {
                 let oa = self.op_arrays[oa_idx].clone();
                 let mut frame = Frame::new(&oa);
                 frame.op_array_idx = oa_idx;
+                self.populate_superglobals(&mut frame, &oa);
 
                 if callback_name.contains("::") {
                     // Method call: first arg is $this, second is class name
@@ -2176,6 +2178,7 @@ impl Vm {
             let func_oa = &self.op_arrays[oa_idx_val];
             let mut frame = Frame::new(func_oa);
             frame.op_array_idx = oa_idx_val;
+            self.populate_superglobals(&mut frame, func_oa);
             let this_cv = func_oa.vars.iter().position(|v| v == "this").unwrap_or(0);
             if this_cv < frame.cvs.len() {
                 frame.cvs[this_cv] = obj.clone();
@@ -2293,6 +2296,7 @@ impl Vm {
         let func_oa = &self.op_arrays[oa_idx];
         let mut frame = Frame::new(func_oa);
         frame.op_array_idx = oa_idx;
+        self.populate_superglobals(&mut frame, func_oa);
 
         // For method calls (Name::method), extract $this from first arg
         let mut actual_args = args;
