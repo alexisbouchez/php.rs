@@ -379,27 +379,40 @@ fn execute_router_script(
 
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
+            let body = php_output_to_bytes(&output, &content_type);
             let extra_headers = vm.response_headers().to_vec();
-            RouterResult::Handled(status, content_type, extra_headers, php_string_to_bytes(&output))
+            RouterResult::Handled(status, content_type, extra_headers, body)
         }
         Err(php_rs_vm::VmError::Exit(code)) => {
             // exit() means the script handled the request — never fallthrough.
             let output = vm.output_so_far();
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
+            let body = php_output_to_bytes(&output, &content_type);
             let extra_headers = vm.response_headers().to_vec();
-            RouterResult::Handled(status, content_type, extra_headers, php_string_to_bytes(&output))
+            RouterResult::Handled(status, content_type, extra_headers, body)
         }
         Err(e) => RouterResult::Error(format!("{:?}", e)),
     }
 }
 
-/// Check if a VM return value represents `false` (for router fallthrough).
-/// Convert a PHP string (Latin-1 encoded in Rust String) back to raw bytes.
-/// PHP strings are byte arrays where each byte maps to Unicode codepoint 0-255.
-/// `String::into_bytes()` would produce UTF-8, corrupting bytes > 127.
-fn php_string_to_bytes(s: &str) -> Vec<u8> {
-    s.chars().map(|c| c as u8).collect()
+/// Convert PHP output to response bytes, using the Content-Type to decide encoding.
+/// Text content (HTML, JSON, XML, etc.) uses UTF-8 (into_bytes).
+/// Binary content (images, octet-stream, etc.) uses Latin-1 (byte-per-char).
+fn php_output_to_bytes(s: &str, content_type: &str) -> Vec<u8> {
+    let ct = content_type.to_ascii_lowercase();
+    if ct.starts_with("text/")
+        || ct.starts_with("application/json")
+        || ct.starts_with("application/xml")
+        || ct.starts_with("application/xhtml")
+        || ct.starts_with("application/rss")
+        || ct.starts_with("application/atom")
+    {
+        s.as_bytes().to_vec()
+    } else {
+        // Binary content: each char is one byte (Latin-1 mapping)
+        s.chars().map(|c| c as u8).collect()
+    }
 }
 
 fn is_false_return(value: &Option<Value>) -> bool {
@@ -449,15 +462,17 @@ fn execute_php_request(
         Ok(output) => {
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
+            let body = php_output_to_bytes(&output, &content_type);
             let extra_headers = vm.response_headers().to_vec();
-            Ok((status, content_type, extra_headers, php_string_to_bytes(&output)))
+            Ok((status, content_type, extra_headers, body))
         }
         Err(php_rs_vm::VmError::Exit(_)) => {
             let status = vm.response_code().unwrap_or(200);
             let output = vm.output_so_far();
             let content_type = extract_content_type(&vm);
+            let body = php_output_to_bytes(&output, &content_type);
             let extra_headers = vm.response_headers().to_vec();
-            Ok((status, content_type, extra_headers, php_string_to_bytes(&output)))
+            Ok((status, content_type, extra_headers, body))
         }
         Err(e) => Err(format!("{:?}", e)),
     }
