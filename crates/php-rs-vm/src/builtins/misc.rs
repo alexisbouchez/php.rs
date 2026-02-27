@@ -3910,10 +3910,10 @@ fn php_parse_url(
 }
 
 fn php_parse_str(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     args: &[Value],
-    _ref_args: &[(usize, OperandType, u32)],
-    _ref_prop_args: &[(usize, Value, String)],
+    ref_args: &[(usize, OperandType, u32)],
+    ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
     let mut arr = PhpArray::new();
@@ -3928,7 +3928,13 @@ fn php_parse_str(
         let val = val.replace('+', " ");
         arr.set_string(key, Value::String(val));
     }
-    Ok(Value::Array(arr))
+    // PHP 8: parse_str($string, &$result) writes to $result and returns void
+    if args.len() >= 2 {
+        vm.write_back_arg(1, Value::Array(arr), ref_args, ref_prop_args);
+        Ok(Value::Null)
+    } else {
+        Ok(Value::Array(arr))
+    }
 }
 
 fn php_http_build_query(

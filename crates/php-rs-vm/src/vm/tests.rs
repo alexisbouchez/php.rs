@@ -13912,6 +13912,19 @@ foreach ($items as list($k, $v)) {
     }
 
     #[test]
+    fn test_parse_str_with_result() {
+        let output = run_php(
+            r#"<?php
+$qs = "v=FTEeFbnicO0&t=42";
+parse_str($qs, $result);
+echo $result['v'] . "\n";
+echo $result['t'] . "\n";
+?>"#,
+        );
+        assert_eq!(output, "FTEeFbnicO0\n42\n");
+    }
+
+    #[test]
     fn test_foreach_array_destructuring_with_key() {
         let output = run_php(
             r#"<?php
