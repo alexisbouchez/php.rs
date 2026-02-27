@@ -1905,12 +1905,82 @@ fn php_headers_list(
 }
 
 fn php_setcookie(
-    _vm: &mut Vm,
-    _args: &[Value],
+    vm: &mut Vm,
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Bool(false))
+    let name = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    if name.is_empty() {
+        return Ok(Value::Bool(false));
+    }
+
+    // PHP 8 array options form: setcookie($name, $value, $options_array)
+    // Legacy form: setcookie($name, $value, $expires, $path, $domain, $secure, $httponly)
+    let (value, expires, path, domain, secure, httponly, samesite) =
+        if let Some(Value::Array(ref opts)) = args.get(2) {
+            let value = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+            let expires = opts
+                .get_string("expires")
+                .map(|v| v.to_long())
+                .unwrap_or(0);
+            let path = opts
+                .get_string("path")
+                .map(|v| v.to_php_string())
+                .unwrap_or_default();
+            let domain = opts
+                .get_string("domain")
+                .map(|v| v.to_php_string())
+                .unwrap_or_default();
+            let secure = opts.get_string("secure").map(|v| v.to_bool()).unwrap_or(false);
+            let httponly = opts
+                .get_string("httponly")
+                .map(|v| v.to_bool())
+                .unwrap_or(false);
+            let samesite = opts
+                .get_string("samesite")
+                .map(|v| v.to_php_string())
+                .unwrap_or_default();
+            (value, expires, path, domain, secure, httponly, samesite)
+        } else {
+            let value = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+            let expires = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+            let path = args.get(3).map(|v| v.to_php_string()).unwrap_or_default();
+            let domain = args.get(4).map(|v| v.to_php_string()).unwrap_or_default();
+            let secure = args.get(5).map(|v| v.to_bool()).unwrap_or(false);
+            let httponly = args.get(6).map(|v| v.to_bool()).unwrap_or(false);
+            (value, expires, path, domain, secure, httponly, String::new())
+        };
+
+    let mut cookie = format!("{}={}", name, value);
+    if expires > 0 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let max_age = expires - now;
+        if max_age > 0 {
+            cookie.push_str(&format!("; Max-Age={}", max_age));
+        }
+    }
+    if !path.is_empty() {
+        cookie.push_str(&format!("; Path={}", path));
+    }
+    if !domain.is_empty() {
+        cookie.push_str(&format!("; Domain={}", domain));
+    }
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    if httponly {
+        cookie.push_str("; HttpOnly");
+    }
+    if !samesite.is_empty() {
+        cookie.push_str(&format!("; SameSite={}", samesite));
+    }
+
+    vm.response_headers.push(format!("Set-Cookie: {}", cookie));
+    Ok(Value::Bool(true))
 }
 
 fn php_http_clear_last_response_headers(
