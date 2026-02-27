@@ -17,7 +17,9 @@ pub(crate) fn dispatch(
     match name {
         "strlen" => {
             let s = args.first().cloned().unwrap_or(Value::Null);
-            Ok(Some(Value::Long(s.to_php_string().len() as i64)))
+            // PHP strings are binary — strlen counts bytes.
+            // With Latin-1 encoding, each PHP byte = one Rust char.
+            Ok(Some(Value::Long(s.to_php_string().chars().count() as i64)))
         }
         "implode" | "join" => {
             let (glue, pieces) = if args.len() >= 2 {
@@ -59,29 +61,33 @@ pub(crate) fn dispatch(
             let start = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
             let len = args.get(2).map(|v| v.to_long());
 
-            let slen = s.len() as i64;
+            // PHP strings are binary — substr operates on byte offsets.
+            // Since we use Latin-1 encoding (each PHP byte = one Rust char),
+            // we must count chars, not UTF-8 bytes.
+            let chars: Vec<char> = s.chars().collect();
+            let slen = chars.len() as i64;
             let start = if start < 0 {
                 (slen + start).max(0) as usize
             } else {
                 start.min(slen) as usize
             };
 
-            let result = match len {
+            let result: String = match len {
                 Some(l) if l < 0 => {
                     let end = (slen + l).max(0) as usize;
                     if start < end {
-                        &s[start..end]
+                        chars[start..end].iter().collect()
                     } else {
-                        ""
+                        String::new()
                     }
                 }
                 Some(l) => {
-                    let end = (start + l as usize).min(s.len());
-                    &s[start..end]
+                    let end = (start + l as usize).min(chars.len());
+                    chars[start..end].iter().collect()
                 }
-                None => &s[start..],
+                None => chars[start..].iter().collect(),
             };
-            Ok(Some(Value::String(result.to_string())))
+            Ok(Some(Value::String(result)))
         }
         "str_repeat" => {
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
