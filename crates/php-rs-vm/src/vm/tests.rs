@@ -13830,6 +13830,32 @@ echo parse_url($url, PHP_URL_FRAGMENT);
     }
 
     #[test]
+    fn test_hash_function() {
+        let output = run_php(
+            r#"<?php
+echo hash("sha256", "hello");
+?>"#,
+        );
+        assert_eq!(
+            output,
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
+
+    #[test]
+    fn test_hash_hmac_function() {
+        let output = run_php(
+            r#"<?php
+echo hash_hmac("sha256", "what do ya want for nothing?", "Jefe");
+?>"#,
+        );
+        assert_eq!(
+            output,
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
     fn test_parse_url_path_only() {
         let output = run_php(
             r#"<?php

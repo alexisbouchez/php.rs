@@ -361,6 +361,12 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     r.insert("pack", php_pack);
     r.insert("unpack", php_unpack);
 
+    // -- Hash --
+    r.insert("hash", php_hash_builtin);
+    r.insert("hash_hmac", php_hash_hmac_builtin);
+    r.insert("hash_equals", php_hash_equals_builtin);
+    r.insert("hash_algos", php_hash_algos_builtin);
+
     // -- URL --
     r.insert("parse_url", php_parse_url);
     r.insert("parse_str", php_parse_str);
@@ -3705,6 +3711,74 @@ fn php_unpack(
                 field_num += 1;
             }
         }
+    }
+    Ok(Value::Array(arr))
+}
+
+// -- Hash --
+
+fn php_hash_builtin(
+    _vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let algo = args.first().map(|v| v.to_php_string()).unwrap_or_default().to_lowercase();
+    let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+    let raw = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
+    match php_rs_ext_hash::php_hash(&algo, &data) {
+        Some(hex) => {
+            if raw {
+                let bytes: Vec<u8> = hex
+                    .as_bytes()
+                    .chunks(2)
+                    .filter_map(|c| std::str::from_utf8(c).ok())
+                    .filter_map(|s| u8::from_str_radix(s, 16).ok())
+                    .collect();
+                Ok(Value::String(String::from_utf8_lossy(&bytes).to_string()))
+            } else {
+                Ok(Value::String(hex))
+            }
+        }
+        None => Ok(Value::Bool(false)),
+    }
+}
+
+fn php_hash_hmac_builtin(
+    _vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let algo = args.first().map(|v| v.to_php_string()).unwrap_or_default().to_lowercase();
+    let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+    let key = args.get(2).map(|v| v.to_php_string()).unwrap_or_default();
+    match php_rs_ext_hash::php_hash_hmac(&algo, &data, &key) {
+        Some(hex) => Ok(Value::String(hex)),
+        None => Ok(Value::Bool(false)),
+    }
+}
+
+fn php_hash_equals_builtin(
+    _vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let known = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let user = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+    Ok(Value::Bool(php_rs_ext_hash::php_hash_equals(&known, &user)))
+}
+
+fn php_hash_algos_builtin(
+    _vm: &mut Vm,
+    _args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let mut arr = PhpArray::new();
+    for algo in php_rs_ext_hash::php_hash_algos() {
+        arr.push(Value::String(algo.to_string()));
     }
     Ok(Value::Array(arr))
 }
