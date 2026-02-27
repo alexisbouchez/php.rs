@@ -140,6 +140,109 @@ pub(crate) fn dispatch(
                 Ok(Some(Value::String(
                     String::from_utf8_lossy(&data).to_string(),
                 )))
+            } else if f.starts_with("http://") || f.starts_with("https://") {
+                #[cfg(feature = "native-io")]
+                {
+                    if vm.ini.get("allow_url_fopen") != "1" {
+                        vm.write_output("Warning: file_get_contents(): http:// wrapper is disabled in the server configuration by allow_url_fopen=0\n");
+                        return Ok(Some(Value::Bool(false)));
+                    }
+                    // Parse stream context options (arg index 2) for HTTP headers, method, content
+                    let (method, header_str, content) = if let Some(Value::Resource(ctx_id, _)) = args.get(2) {
+                        if let Some(ctx) = vm.stream_contexts.get(ctx_id) {
+                            if let Some(http_opts) = ctx.options.get("http") {
+                                let m = http_opts.get("method")
+                                    .map(|v| v.to_php_string())
+                                    .unwrap_or_default();
+                                let h = http_opts.get("header")
+                                    .map(|v| v.to_php_string())
+                                    .unwrap_or_default();
+                                let c = http_opts.get("content")
+                                    .map(|v| v.to_php_string())
+                                    .unwrap_or_default();
+                                (m, h, c)
+                            } else {
+                                (String::new(), String::new(), String::new())
+                            }
+                        } else {
+                            (String::new(), String::new(), String::new())
+                        }
+                    } else {
+                        (String::new(), String::new(), String::new())
+                    };
+
+                    let agent = ureq::Agent::new_with_config(
+                        ureq::Agent::config_builder()
+                            .http_status_as_error(false)
+                            .timeout_global(Some(std::time::Duration::from_secs(
+                                vm.ini.get("default_socket_timeout").parse::<u64>().unwrap_or(60),
+                            )))
+                            .build(),
+                    );
+
+                    let effective_method = if method.is_empty() {
+                        if content.is_empty() { "GET" } else { "POST" }
+                    } else {
+                        &method
+                    };
+
+                    // Helper closure to apply headers from stream context
+                    let apply_headers = |header_str: &str| -> Vec<(String, String)> {
+                        let mut headers = Vec::new();
+                        for line in header_str.lines() {
+                            let line = line.trim();
+                            if let Some(colon_pos) = line.find(':') {
+                                let key = line[..colon_pos].trim().to_string();
+                                let val = line[colon_pos + 1..].trim().to_string();
+                                if !key.is_empty() {
+                                    headers.push((key, val));
+                                }
+                            }
+                        }
+                        headers
+                    };
+
+                    let headers = apply_headers(&header_str);
+
+                    let result: Result<ureq::Body, ureq::Error> = match effective_method {
+                        "POST" | "PUT" | "PATCH" => {
+                            let mut req = match effective_method {
+                                "PUT" => agent.put(&f),
+                                "PATCH" => agent.patch(&f),
+                                _ => agent.post(&f),
+                            };
+                            for (k, v) in &headers {
+                                req = req.header(k, v);
+                            }
+                            req.send(content.as_bytes()).map(|r| r.into_body())
+                        }
+                        _ => {
+                            let mut req = match effective_method {
+                                "HEAD" => agent.head(&f),
+                                "DELETE" => agent.delete(&f),
+                                "OPTIONS" => agent.options(&f),
+                                _ => agent.get(&f),
+                            };
+                            for (k, v) in &headers {
+                                req = req.header(k, v);
+                            }
+                            req.call().map(|r| r.into_body())
+                        }
+                    };
+
+                    match result {
+                        Ok(mut body) => {
+                            let text = body.read_to_string().unwrap_or_default();
+                            Ok(Some(Value::String(text)))
+                        }
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                }
+                #[cfg(not(feature = "native-io"))]
+                {
+                    vm.write_output("Warning: file_get_contents(): https:// wrapper requires native-io feature\n");
+                    Ok(Some(Value::Bool(false)))
+                }
             } else {
                 vm.check_open_basedir(&f)?;
                 match vm.vm_read_to_string(&f) {
@@ -601,6 +704,40 @@ pub(crate) fn dispatch(
                     vm.next_resource_id += 1;
                     vm.file_handles.insert(id, handle);
                     Ok(Some(Value::Resource(id, "stream".to_string())))
+                }
+                _ if filename.starts_with("http://") || filename.starts_with("https://") => {
+                    #[cfg(feature = "native-io")]
+                    {
+                        if vm.ini.get("allow_url_fopen") != "1" {
+                            vm.write_output("Warning: fopen(): http:// wrapper is disabled in the server configuration by allow_url_fopen=0\n");
+                            return Ok(Some(Value::Bool(false)));
+                        }
+                        let agent = ureq::Agent::new_with_config(
+                            ureq::Agent::config_builder()
+                                .http_status_as_error(false)
+                                .timeout_global(Some(std::time::Duration::from_secs(
+                                    vm.ini.get("default_socket_timeout").parse::<u64>().unwrap_or(60),
+                                )))
+                                .build(),
+                        );
+                        match agent.get(&filename).call() {
+                            Ok(mut resp) => {
+                                let body = resp.body_mut().read_to_string().unwrap_or_default();
+                                let handle = php_rs_ext_standard::file::FileHandle::from_bytes(
+                                    body.into_bytes(),
+                                );
+                                let id = vm.next_resource_id;
+                                vm.next_resource_id += 1;
+                                vm.file_handles.insert(id, handle);
+                                Ok(Some(Value::Resource(id, "stream".to_string())))
+                            }
+                            Err(_) => Ok(Some(Value::Bool(false))),
+                        }
+                    }
+                    #[cfg(not(feature = "native-io"))]
+                    {
+                        Ok(Some(Value::Bool(false)))
+                    }
                 }
                 _ => match php_rs_ext_standard::file::FileHandle::open(&filename, &mode) {
                     Ok(handle) => {
