@@ -4019,8 +4019,6 @@ impl<'a> Parser<'a> {
                     match &self.current_token {
                         Token::EncapsedAndWhitespace => {
                             let text = self.lexer.source_text(&self.current_span);
-                            // Strip trailing " if this is the last part (closing quote)
-                            let text = text.strip_suffix('"').unwrap_or(text);
                             if !text.is_empty() {
                                 let value = unescape_double_quoted(text);
                                 parts.push(Expression::StringLiteral {
