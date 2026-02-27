@@ -51,6 +51,18 @@ This is not a transpiler, a subset, or a "PHP-inspired" language. It is PHP: the
 
 ## Quick Start
 
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/alexisbouchez/php-rs/main/scripts/install.sh | bash
+```
+
+This downloads the latest pre-built binary for your platform and installs it to `~/.php-rs/bin/php-rs`. Add it to your PATH:
+
+```bash
+export PATH="$HOME/.php-rs/bin:$PATH"
+```
+
 ### Install from source
 
 ```bash
