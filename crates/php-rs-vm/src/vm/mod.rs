@@ -181,6 +181,10 @@ pub(crate) struct Frame {
     /// Whether parent::__construct() has been called in this constructor frame.
     /// Used for parent constructor call tracking (PHP 8.2+).
     pub(crate) parent_ctor_called: bool,
+    /// Scope inheritance map for include/require/eval frames.
+    /// Each entry is (child_cv_idx, parent_cv_idx): on return, child CVs are
+    /// written back to the parent frame so that variable changes propagate.
+    pub(crate) include_scope_map: Vec<(usize, usize)>,
 }
 
 impl Frame {
@@ -216,6 +220,7 @@ impl Frame {
             static_cv_indices: Vec::new(),
             foreach_rw_state: HashMap::new(),
             parent_ctor_called: false,
+            include_scope_map: Vec::new(),
         }
     }
 }
@@ -2125,6 +2130,18 @@ impl Vm {
                 }
                 let frame = self.call_stack.pop().unwrap();
                 self.last_return_value = frame.return_value;
+
+                // Write back include scope variables to caller
+                if !frame.include_scope_map.is_empty() {
+                    if let Some(caller) = self.call_stack.last_mut() {
+                        for &(child_idx, parent_idx) in &frame.include_scope_map {
+                            if child_idx < frame.cvs.len() && parent_idx < caller.cvs.len() {
+                                caller.cvs[parent_idx] = frame.cvs[child_idx].clone();
+                            }
+                        }
+                    }
+                }
+
                 continue;
             }
 
@@ -2220,6 +2237,20 @@ impl Vm {
                         if *callee_cv_idx < frame.cvs.len() {
                             let val = frame.cvs[*callee_cv_idx].clone();
                             obj.set_property(prop_name.clone(), val);
+                        }
+                    }
+
+                    // Write back include scope variables to caller
+                    if !frame.include_scope_map.is_empty() {
+                        if let Some(caller) = self.call_stack.last_mut() {
+                            for &(child_idx, parent_idx) in &frame.include_scope_map {
+                                if child_idx < frame.cvs.len()
+                                    && parent_idx < caller.cvs.len()
+                                {
+                                    caller.cvs[parent_idx] =
+                                        frame.cvs[child_idx].clone();
+                                }
+                            }
                         }
                     }
 

@@ -98,6 +98,27 @@ impl Vm {
                     new_frame.return_dest = Some((op.result_type, op.result.val));
                 }
 
+                // Inherit caller's scope: copy matching variables by name
+                // and build a map for write-back on return.
+                if let Some(caller) = self.call_stack.last() {
+                    let caller_oa = &self.op_arrays[caller.op_array_idx];
+                    let child_vars = &included_oa.vars;
+                    let caller_vars = &caller_oa.vars;
+                    for (child_idx, child_name) in child_vars.iter().enumerate() {
+                        if let Some(parent_idx) =
+                            caller_vars.iter().position(|v| v == child_name)
+                        {
+                            if parent_idx < caller.cvs.len() {
+                                new_frame.cvs[child_idx] =
+                                    caller.cvs[parent_idx].clone();
+                                new_frame
+                                    .include_scope_map
+                                    .push((child_idx, parent_idx));
+                            }
+                        }
+                    }
+                }
+
                 self.call_stack.push(new_frame);
                 Ok(DispatchSignal::CallPushed)
             }
