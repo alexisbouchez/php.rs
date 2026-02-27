@@ -765,6 +765,50 @@ echo $x;
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn test_require_inherits_parent_scope() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("php_rs_test_scope_inherit.php");
+        std::fs::write(
+            &path,
+            r#"<?php echo "x=" . $x . " y=" . $y . "\n";"#,
+        )
+        .unwrap();
+
+        let source = format!(
+            r#"<?php
+$x = "hello";
+$y = 42;
+require '{}';
+"#,
+            path.to_str().unwrap().replace('\\', "\\\\")
+        );
+        let output = run_php(&source);
+        assert_eq!(output, "x=hello y=42\n");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_include_scope_writeback() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("php_rs_test_scope_writeback.php");
+        std::fs::write(&path, r#"<?php $x = "modified";"#).unwrap();
+
+        let source = format!(
+            r#"<?php
+$x = "original";
+include '{}';
+echo $x;
+"#,
+            path.to_str().unwrap().replace('\\', "\\\\")
+        );
+        let output = run_php(&source);
+        assert_eq!(output, "modified");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // =========================================================================
     // json_encode / json_decode
     // =========================================================================
