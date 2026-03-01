@@ -5,6 +5,42 @@ use crate::vm::{Vm, VmResult};
 use php_rs_compiler::op::OperandType;
 use php_rs_ext_json::{self, JsonValue};
 
+/// Expand PHP trim character mask range syntax (e.g., "a..z" → "abcdefghijklmnopqrstuvwxyz").
+fn expand_trim_mask(mask: &str) -> String {
+    let chars: Vec<char> = mask.chars().collect();
+    let mut result = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 2 < chars.len() && chars[i + 1] == '.' && i + 3 <= chars.len() {
+            if i + 3 <= chars.len() && chars.get(i + 2) == Some(&'.') {
+                // "X..Y" pattern
+                if let Some(&end_char) = chars.get(i + 3) {
+                    let start = chars[i] as u32;
+                    let end = end_char as u32;
+                    if start <= end {
+                        for c in start..=end {
+                            if let Some(ch) = char::from_u32(c) {
+                                result.push(ch);
+                            }
+                        }
+                    } else {
+                        for c in (end..=start).rev() {
+                            if let Some(ch) = char::from_u32(c) {
+                                result.push(ch);
+                            }
+                        }
+                    }
+                    i += 4;
+                    continue;
+                }
+            }
+        }
+        result.push(chars[i]);
+        i += 1;
+    }
+    result
+}
+
 /// Perform str_replace with support for array search/replace.
 fn str_replace_impl(search: &Value, replace: &Value, subject: &str) -> String {
     match search {
@@ -160,28 +196,31 @@ pub(crate) fn dispatch(
         }
         "trim" => {
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            let mask = args
+            let raw_mask = args
                 .get(1)
                 .map(|v| v.to_php_string())
                 .unwrap_or_else(|| " \t\n\r\0\x0B".to_string());
+            let mask = expand_trim_mask(&raw_mask);
             let trimmed = s.trim_matches(|c| mask.contains(c));
             Ok(Some(Value::String(trimmed.to_string())))
         }
         "ltrim" => {
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            let mask = args
+            let raw_mask = args
                 .get(1)
                 .map(|v| v.to_php_string())
                 .unwrap_or_else(|| " \t\n\r\0\x0B".to_string());
+            let mask = expand_trim_mask(&raw_mask);
             let trimmed = s.trim_start_matches(|c| mask.contains(c));
             Ok(Some(Value::String(trimmed.to_string())))
         }
         "rtrim" | "chop" => {
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            let mask = args
+            let raw_mask = args
                 .get(1)
                 .map(|v| v.to_php_string())
                 .unwrap_or_else(|| " \t\n\r\0\x0B".to_string());
+            let mask = expand_trim_mask(&raw_mask);
             let trimmed = s.trim_end_matches(|c| mask.contains(c));
             Ok(Some(Value::String(trimmed.to_string())))
         }
@@ -666,9 +705,25 @@ pub(crate) fn dispatch(
             let haystack = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             let needle = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
             if needle.is_empty() {
-                return Ok(Some(Value::Long(0)));
+                vm.emit_error(2, "substr_count(): Argument #2 ($needle) cannot be empty")?;
+                return Ok(Some(Value::Bool(false)));
             }
-            Ok(Some(Value::Long(haystack.matches(&needle).count() as i64)))
+            let hlen = haystack.len() as i64;
+            let offset = args.get(2).map(|v| v.to_long()).unwrap_or(0);
+            let offset = if offset < 0 { (hlen + offset).max(0) as usize } else { offset as usize };
+            let sub = if offset >= haystack.len() {
+                ""
+            } else if let Some(length) = args.get(3).map(|v| v.to_long()) {
+                let end = if length < 0 {
+                    ((hlen + length) as usize).max(offset)
+                } else {
+                    (offset + length as usize).min(haystack.len())
+                };
+                &haystack[offset..end]
+            } else {
+                &haystack[offset..]
+            };
+            Ok(Some(Value::Long(sub.matches(&needle).count() as i64)))
         }
         "substr_replace" => {
             let string = args.first().cloned().unwrap_or(Value::Null).to_php_string();

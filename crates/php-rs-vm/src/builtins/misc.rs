@@ -1670,13 +1670,22 @@ fn php_constant(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-    match vm.constants.get(&name) {
-        Some(v) => Ok(v.clone()),
-        None => Err(VmError::FatalError(format!(
-            "Undefined constant \"{}\"",
-            name
-        ))),
+    // Check runtime constants first
+    if let Some(v) = vm.constants.get(&name) {
+        return Ok(v.clone());
     }
+    // Support ClassName::CONST form
+    if let Some(sep) = name.find("::") {
+        let class_name = &name[..sep];
+        let const_name = &name[sep + 2..];
+        if let Some(val) = vm.resolve_class_constant(class_name, const_name) {
+            return Ok(val);
+        }
+    }
+    Err(VmError::FatalError(format!(
+        "Undefined constant \"{}\"",
+        name
+    )))
 }
 
 fn php_defined(
@@ -1686,7 +1695,18 @@ fn php_defined(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-    Ok(Value::Bool(vm.constants.contains_key(&name)))
+    if vm.constants.contains_key(&name) {
+        return Ok(Value::Bool(true));
+    }
+    // Support ClassName::CONST form
+    if let Some(sep) = name.find("::") {
+        let class_name = &name[..sep];
+        let const_name = &name[sep + 2..];
+        if vm.resolve_class_constant(class_name, const_name).is_some() {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
 }
 
 fn php_define(
@@ -2114,15 +2134,19 @@ fn php_method_exists(
         Value::String(s) => s,
         _ => String::new(),
     };
+    let method_lc = method.to_ascii_lowercase();
     let exists = vm
         .classes
         .get(&class_name)
-        .is_some_and(|c| c.methods.contains_key(&method));
+        .is_some_and(|c| {
+            c.methods.contains_key(&method)
+                || c.methods.keys().any(|k| k.to_ascii_lowercase() == method_lc)
+        });
     Ok(Value::Bool(exists))
 }
 
 fn php_property_exists(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
@@ -2131,6 +2155,11 @@ fn php_property_exists(
     let prop = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
     let exists = match obj {
         Value::Object(ref o) => o.has_property(&prop),
+        Value::String(ref class_name) => {
+            vm.classes.get(class_name).map_or(false, |c| {
+                c.default_properties.contains_key(&prop)
+            })
+        }
         _ => false,
     };
     Ok(Value::Bool(exists))
@@ -2272,7 +2301,8 @@ fn php_interface_exists(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let name = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-    Ok(Value::Bool(vm.classes.contains_key(&name)))
+    let exists = vm.classes.get(&name).map_or(false, |c| c.is_interface);
+    Ok(Value::Bool(exists))
 }
 
 fn php_class_alias(

@@ -544,7 +544,7 @@ pub(crate) fn dispatch(
         // ══════════════════════════════════════════════════════════════
         "is_numeric_string" | "ctype_digit" => {
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            Ok(Some(Value::Bool(s.chars().all(|c| c.is_ascii_digit()))))
+            Ok(Some(Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))))
         }
         "ctype_alpha" => {
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();

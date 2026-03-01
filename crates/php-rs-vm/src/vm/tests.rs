@@ -14809,4 +14809,87 @@ echo ($result["b"] === null ? "null" : "other");
 "#);
         assert_eq!(output, "3\nnull");
     }
+
+    #[test]
+    fn test_substr_count_offset_length() {
+        let output = run_php(r#"<?php
+echo substr_count("hello world hello", "hello") . "\n";
+echo substr_count("hello world hello", "hello", 5) . "\n";
+echo substr_count("hello world hello", "hello", 0, 5);
+"#);
+        assert_eq!(output, "2\n1\n1");
+    }
+
+    #[test]
+    fn test_trim_range_syntax() {
+        let output = run_php(r#"<?php
+echo trim("abcHELLOabc", "a..c") . "\n";
+echo ltrim("123hello", "0..9") . "\n";
+echo rtrim("hello!!!", "!..!");
+"#);
+        assert_eq!(output, "HELLO\nhello\nhello");
+    }
+
+    #[test]
+    fn test_ctype_digit_empty() {
+        let output = run_php(r#"<?php
+echo ctype_digit("") ? "true" : "false";
+echo "\n";
+echo ctype_digit("123") ? "true" : "false";
+"#);
+        assert_eq!(output, "false\ntrue");
+    }
+
+    #[test]
+    fn test_interface_exists_vs_class() {
+        let output = run_php(r#"<?php
+interface Foo {}
+class Bar implements Foo {}
+echo interface_exists("Foo") ? "true" : "false";
+echo "\n";
+echo interface_exists("Bar") ? "true" : "false";
+"#);
+        assert_eq!(output, "true\nfalse");
+    }
+
+    #[test]
+    fn test_method_exists_case_insensitive() {
+        let output = run_php(r#"<?php
+class MyClass {
+    public function myMethod() {}
+}
+echo method_exists("MyClass", "mymethod") ? "true" : "false";
+echo "\n";
+echo method_exists("MyClass", "MYMETHOD") ? "true" : "false";
+"#);
+        assert_eq!(output, "true\ntrue");
+    }
+
+    #[test]
+    fn test_property_exists_string_class() {
+        let output = run_php(r#"<?php
+class MyClass {
+    public $prop = 1;
+}
+echo property_exists("MyClass", "prop") ? "true" : "false";
+echo "\n";
+echo property_exists("MyClass", "nonexistent") ? "true" : "false";
+"#);
+        assert_eq!(output, "true\nfalse");
+    }
+
+    #[test]
+    fn test_defined_class_constant() {
+        let output = run_php(r#"<?php
+class Foo {
+    const BAR = 42;
+}
+echo defined("Foo::BAR") ? "true" : "false";
+echo "\n";
+echo defined("Foo::NOPE") ? "true" : "false";
+echo "\n";
+echo constant("Foo::BAR");
+"#);
+        assert_eq!(output, "true\nfalse\n42");
+    }
 }

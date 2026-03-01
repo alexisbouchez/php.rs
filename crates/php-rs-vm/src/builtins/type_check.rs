@@ -605,7 +605,9 @@ pub(crate) fn php_method_exists(
     let lc = class_name.to_lowercase();
 
     if let Some(def) = vm.classes.get(&lc).or_else(|| vm.classes.get(&class_name)) {
-        Ok(Value::Bool(def.methods.contains_key(&method)))
+        let found = def.methods.contains_key(&method)
+            || def.methods.keys().any(|k| k.to_ascii_lowercase() == method);
+        Ok(Value::Bool(found))
     } else {
         Ok(Value::Bool(false))
     }
@@ -650,9 +652,12 @@ pub(crate) fn php_interface_exists(
         .map(|v| deref(v).to_php_string())
         .unwrap_or_default();
     let lc = name.to_lowercase();
-    Ok(Value::Bool(
-        vm.classes.contains_key(&lc) || vm.classes.contains_key(&name),
-    ))
+    let exists = vm
+        .classes
+        .get(&lc)
+        .or_else(|| vm.classes.get(&name))
+        .map_or(false, |c| c.is_interface);
+    Ok(Value::Bool(exists))
 }
 
 pub(crate) fn php_trait_exists(
