@@ -124,19 +124,32 @@ fn php_count(
 // ---------------------------------------------------------------------------
 
 fn php_array_push(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     args: &[Value],
-    _ref_args: &[(usize, OperandType, u32)],
-    _ref_prop_args: &[(usize, Value, String)],
+    ref_args: &[(usize, OperandType, u32)],
+    ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    // Can't mutate args; return count
-    let arr = args.first().cloned().unwrap_or(Value::Null);
-    let count = if let Value::Array(ref a) = arr {
-        a.len() + args.len() - 1
-    } else {
-        0
-    };
-    Ok(Value::Long(count as i64))
+    let arr_val = args.first().cloned().unwrap_or(Value::Null);
+    if let Value::Reference(rc) = &arr_val {
+        let mut inner = rc.borrow_mut();
+        if let Value::Array(ref mut a) = *inner {
+            for val in &args[1..] {
+                a.push(val.clone());
+            }
+            return Ok(Value::Long(a.len() as i64));
+        }
+        return Ok(Value::Long(0));
+    }
+    if let Value::Array(ref a) = arr_val {
+        let mut new_arr = a.clone();
+        for val in &args[1..] {
+            new_arr.push(val.clone());
+        }
+        let count = new_arr.len() as i64;
+        vm.write_back_arg(0, Value::Array(new_arr), ref_args, ref_prop_args);
+        return Ok(Value::Long(count));
+    }
+    Ok(Value::Long(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,6 +1281,12 @@ fn sort_common(
     sort_name: &str,
 ) -> VmResult<Value> {
     let arr_val = args.first().cloned().unwrap_or(Value::Null);
+    let sort_flags = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+    // SORT_REGULAR=0, SORT_NUMERIC=1, SORT_STRING=2, SORT_NATURAL=6,
+    // SORT_FLAG_CASE=8 (can be ORed with SORT_STRING or SORT_NATURAL)
+    let case_insensitive = (sort_flags & 8) != 0;
+    let base_flag = sort_flags & !8;
+
     let cmp_ord = |r: i64| -> std::cmp::Ordering {
         if r < 0 {
             std::cmp::Ordering::Less
@@ -1277,11 +1296,52 @@ fn sort_common(
             std::cmp::Ordering::Equal
         }
     };
-    let sort_fn = |a: &mut PhpArray, cmp_ord: &dyn Fn(i64) -> std::cmp::Ordering| {
+
+    // Compare two values according to sort flags
+    let value_cmp = |a: &Value, b: &Value| -> std::cmp::Ordering {
+        match base_flag {
+            1 => {
+                // SORT_NUMERIC
+                let fa = a.to_double();
+                let fb = b.to_double();
+                fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+            }
+            2 => {
+                // SORT_STRING
+                let sa = a.to_php_string();
+                let sb = b.to_php_string();
+                if case_insensitive {
+                    sa.to_lowercase().cmp(&sb.to_lowercase())
+                } else {
+                    sa.cmp(&sb)
+                }
+            }
+            6 => {
+                // SORT_NATURAL (natural order: "img2" < "img10")
+                let sa = if case_insensitive {
+                    a.to_php_string().to_lowercase()
+                } else {
+                    a.to_php_string()
+                };
+                let sb = if case_insensitive {
+                    b.to_php_string().to_lowercase()
+                } else {
+                    b.to_php_string()
+                };
+                nat_cmp(&sa, &sb)
+            }
+            _ => {
+                // SORT_REGULAR (default) — use spaceship
+                cmp_ord(a.spaceship(b))
+            }
+        }
+    };
+
+    let sort_fn = |a: &mut PhpArray| {
         let mut entries = a.entries().to_vec();
         match sort_name {
             "sort" => {
-                entries.sort_by(|(_, a), (_, b)| cmp_ord(a.spaceship(b)));
+                entries.sort_by(|(_, a), (_, b)| value_cmp(a, b));
                 let sorted: Vec<(ArrayKey, Value)> = entries
                     .into_iter()
                     .enumerate()
@@ -1290,7 +1350,7 @@ fn sort_common(
                 *a = PhpArray::from_entries(sorted);
             }
             "rsort" => {
-                entries.sort_by(|(_, a), (_, b)| cmp_ord(b.spaceship(a)));
+                entries.sort_by(|(_, a), (_, b)| value_cmp(b, a));
                 let sorted: Vec<(ArrayKey, Value)> = entries
                     .into_iter()
                     .enumerate()
@@ -1299,11 +1359,11 @@ fn sort_common(
                 *a = PhpArray::from_entries(sorted);
             }
             "asort" => {
-                entries.sort_by(|(_, a), (_, b)| cmp_ord(a.spaceship(b)));
+                entries.sort_by(|(_, a), (_, b)| value_cmp(a, b));
                 *a = PhpArray::from_entries(entries);
             }
             "arsort" => {
-                entries.sort_by(|(_, a), (_, b)| cmp_ord(b.spaceship(a)));
+                entries.sort_by(|(_, a), (_, b)| value_cmp(b, a));
                 *a = PhpArray::from_entries(entries);
             }
             "ksort" => {
@@ -1316,7 +1376,7 @@ fn sort_common(
                         ArrayKey::Int(i) => Value::Long(*i),
                         ArrayKey::String(s) => Value::String(s.clone()),
                     };
-                    cmp_ord(a.spaceship(&b))
+                    value_cmp(&a, &b)
                 });
                 *a = PhpArray::from_entries(entries);
             }
@@ -1330,7 +1390,7 @@ fn sort_common(
                         ArrayKey::Int(i) => Value::Long(*i),
                         ArrayKey::String(s) => Value::String(s.clone()),
                     };
-                    cmp_ord(b.spaceship(&a))
+                    value_cmp(&b, &a)
                 });
                 *a = PhpArray::from_entries(entries);
             }
@@ -1340,11 +1400,11 @@ fn sort_common(
     if let Value::Reference(rc) = &arr_val {
         let mut inner = rc.borrow_mut();
         if let Value::Array(ref mut a) = *inner {
-            sort_fn(a, &cmp_ord);
+            sort_fn(a);
         }
     } else if let Value::Array(ref a) = arr_val {
         let mut arr_clone = a.clone();
-        sort_fn(&mut arr_clone, &cmp_ord);
+        sort_fn(&mut arr_clone);
         vm.write_back_arg(0, Value::Array(arr_clone), ref_args, ref_prop_args);
     }
     Ok(Value::Bool(true))
@@ -1751,14 +1811,71 @@ fn php_range(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    let low = args.first().cloned().unwrap_or(Value::Long(0)).to_long();
-    let high = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
-    let step = args
-        .get(2)
-        .cloned()
-        .unwrap_or(Value::Long(1))
-        .to_long()
-        .max(1);
+    let low_val = args.first().cloned().unwrap_or(Value::Long(0));
+    let high_val = args.get(1).cloned().unwrap_or(Value::Long(0));
+    let step_val = args.get(2).cloned().unwrap_or(Value::Long(1));
+
+    // Character range: both args are single-char strings
+    let is_char_range = matches!((&low_val, &high_val), (Value::String(a), Value::String(b)) if a.len() == 1 && b.len() == 1);
+
+    if is_char_range {
+        let low_c = low_val.to_php_string().chars().next().unwrap() as u32;
+        let high_c = high_val.to_php_string().chars().next().unwrap() as u32;
+        let step = step_val.to_long().unsigned_abs().max(1) as u32;
+        let mut arr = PhpArray::new();
+        if low_c <= high_c {
+            let mut i = low_c;
+            while i <= high_c {
+                if let Some(c) = char::from_u32(i) {
+                    arr.push(Value::String(c.to_string()));
+                }
+                i += step;
+            }
+        } else {
+            let mut i = low_c;
+            while i >= high_c {
+                if let Some(c) = char::from_u32(i) {
+                    arr.push(Value::String(c.to_string()));
+                }
+                if i < step {
+                    break;
+                }
+                i -= step;
+            }
+        }
+        return Ok(Value::Array(arr));
+    }
+
+    // Float range: if any arg is a float or step is fractional
+    let is_float = matches!(&low_val, Value::Double(_))
+        || matches!(&high_val, Value::Double(_))
+        || matches!(&step_val, Value::Double(_));
+
+    if is_float {
+        let low = low_val.to_double();
+        let high = high_val.to_double();
+        let step = step_val.to_double().abs().max(f64::EPSILON);
+        let mut arr = PhpArray::new();
+        if low <= high {
+            let mut i = low;
+            while i <= high + f64::EPSILON {
+                arr.push(Value::Double(i));
+                i += step;
+            }
+        } else {
+            let mut i = low;
+            while i >= high - f64::EPSILON {
+                arr.push(Value::Double(i));
+                i -= step;
+            }
+        }
+        return Ok(Value::Array(arr));
+    }
+
+    // Integer range
+    let low = low_val.to_long();
+    let high = high_val.to_long();
+    let step = step_val.to_long().unsigned_abs().max(1) as i64;
     let mut arr = PhpArray::new();
     if low <= high {
         let mut i = low;

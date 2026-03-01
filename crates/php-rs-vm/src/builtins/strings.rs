@@ -39,12 +39,36 @@ pub(crate) fn dispatch(
         "explode" => {
             let delimiter = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             let string = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+            let limit = args.get(2).map(|v| v.to_long());
             let mut arr = PhpArray::new();
             if delimiter.is_empty() {
                 return Ok(Some(Value::Bool(false)));
             }
-            for part in string.split(&delimiter) {
-                arr.push(Value::String(part.to_string()));
+            match limit {
+                Some(n) if n > 0 => {
+                    // Positive limit: return at most N elements
+                    for part in string.splitn(n as usize, &delimiter) {
+                        arr.push(Value::String(part.to_string()));
+                    }
+                }
+                Some(n) if n < 0 => {
+                    // Negative limit: return all except last |n| elements
+                    let parts: Vec<&str> = string.split(&delimiter).collect();
+                    let keep = (parts.len() as i64 + n).max(0) as usize;
+                    for part in parts.into_iter().take(keep) {
+                        arr.push(Value::String(part.to_string()));
+                    }
+                }
+                Some(_) => {
+                    // Zero limit: treated as 1 in PHP
+                    arr.push(Value::String(string));
+                }
+                None => {
+                    // No limit: return all parts
+                    for part in string.split(&delimiter) {
+                        arr.push(Value::String(part.to_string()));
+                    }
+                }
             }
             Ok(Some(Value::Array(arr)))
         }

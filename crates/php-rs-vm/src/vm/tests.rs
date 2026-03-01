@@ -14450,4 +14450,92 @@ echo $result['a'] . ',' . $result['b'] . ',' . $result['c'];
 "#);
         assert_eq!(output, "10,20,30");
     }
+
+    #[test]
+    fn test_array_push_modifies_array() {
+        let output = run_php(r#"<?php
+$arr = [1, 2];
+array_push($arr, 3, 4, 5);
+echo count($arr) . "\n";
+echo implode(",", $arr);
+"#);
+        assert_eq!(output, "5\n1,2,3,4,5");
+    }
+
+    #[test]
+    fn test_explode_positive_limit() {
+        let output = run_php(r#"<?php
+$parts = explode(",", "a,b,c,d", 3);
+echo implode("|", $parts);
+"#);
+        assert_eq!(output, "a|b|c,d");
+    }
+
+    #[test]
+    fn test_explode_negative_limit() {
+        let output = run_php(r#"<?php
+$parts = explode(",", "a,b,c,d,e", -2);
+echo implode("|", $parts);
+"#);
+        assert_eq!(output, "a|b|c");
+    }
+
+    #[test]
+    fn test_range_characters() {
+        let output = run_php(r#"<?php
+$letters = range('a', 'e');
+echo implode("", $letters);
+"#);
+        assert_eq!(output, "abcde");
+    }
+
+    #[test]
+    fn test_range_float() {
+        let output = run_php(r#"<?php
+$floats = range(0.0, 1.0, 0.5);
+echo count($floats) . "\n";
+echo $floats[0] . "," . $floats[1] . "," . $floats[2];
+"#);
+        assert_eq!(output, "3\n0,0.5,1");
+    }
+
+    #[test]
+    fn test_range_reverse() {
+        let output = run_php(r#"<?php
+$r = range(5, 1);
+echo implode(",", $r);
+"#);
+        assert_eq!(output, "5,4,3,2,1");
+    }
+
+    #[test]
+    fn test_sort_numeric_flag() {
+        let output = run_php(r#"<?php
+$arr = ["10", "9", "100", "2"];
+sort($arr, SORT_NUMERIC);
+echo implode(",", $arr);
+"#);
+        assert_eq!(output, "2,9,10,100");
+    }
+
+    #[test]
+    fn test_sort_string_flag() {
+        let output = run_php(r#"<?php
+$arr = [10, 9, 100, 2];
+sort($arr, SORT_STRING);
+echo implode(",", $arr);
+"#);
+        // String sort: "10" < "100" < "2" < "9"
+        assert_eq!(output, "10,100,2,9");
+    }
+
+    #[test]
+    fn test_sort_natural_flag() {
+        let output = run_php(r#"<?php
+$arr = ["img12", "img2", "img1", "img10"];
+sort($arr, SORT_NATURAL);
+echo implode(",", $arr);
+"#);
+        assert_eq!(output, "img1,img2,img10,img12");
+    }
 }
