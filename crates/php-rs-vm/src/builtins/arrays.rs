@@ -1491,71 +1491,96 @@ fn php_krsort(
 fn usort_common(
     vm: &mut Vm,
     args: &[Value],
-    _ref_args: &[(usize, OperandType, u32)],
-    _ref_prop_args: &[(usize, Value, String)],
+    ref_args: &[(usize, OperandType, u32)],
+    ref_prop_args: &[(usize, Value, String)],
     sort_type: &str,
 ) -> VmResult<Value> {
     let arr = args.first().cloned().unwrap_or(Value::Null);
     let callback = Vm::extract_closure_name(&args.get(1).cloned().unwrap_or(Value::Null));
+
+    if let Value::Reference(rc) = &arr {
+        let mut inner = rc.borrow_mut();
+        if let Value::Array(ref mut a) = *inner {
+            let mut entries: Vec<(ArrayKey, Value)> = a.entries().iter().cloned().collect();
+            usort_entries(vm, &mut entries, &callback, sort_type)?;
+            let mut result = PhpArray::new();
+            usort_build_result(&mut result, entries, sort_type);
+            *a = result;
+        }
+        return Ok(Value::Bool(true));
+    }
+
     if let Value::Array(ref a) = arr {
         let mut entries: Vec<(ArrayKey, Value)> = a.entries().iter().cloned().collect();
-        // Insertion sort to allow callback invocation between comparisons
-        let len = entries.len();
-        for i in 1..len {
-            let mut j = i;
-            while j > 0 {
-                let (a_val, b_val) = match sort_type {
-                    "uksort" => {
-                        let ka = match &entries[j - 1].0 {
-                            ArrayKey::Int(n) => Value::Long(*n),
-                            ArrayKey::String(s) => Value::String(s.clone()),
-                        };
-                        let kb = match &entries[j].0 {
-                            ArrayKey::Int(n) => Value::Long(*n),
-                            ArrayKey::String(s) => Value::String(s.clone()),
-                        };
-                        (ka, kb)
-                    }
-                    _ => (entries[j - 1].1.clone(), entries[j].1.clone()),
-                };
-                let cmp = vm
-                    .invoke_user_callback(&callback, vec![a_val, b_val])?
-                    .to_long();
-                if cmp > 0 {
-                    entries.swap(j - 1, j);
-                    j -= 1;
-                } else {
-                    break;
-                }
-            }
-        }
+        usort_entries(vm, &mut entries, &callback, sort_type)?;
         let mut result = PhpArray::new();
-        match sort_type {
-            "usort" => {
-                // usort: re-index with 0..n
-                for (_key, val) in entries {
-                    result.push(val);
+        usort_build_result(&mut result, entries, sort_type);
+        vm.write_back_arg(0, Value::Array(result), ref_args, ref_prop_args);
+        return Ok(Value::Bool(true));
+    }
+
+    Ok(Value::Bool(true))
+}
+
+fn usort_entries(
+    vm: &mut Vm,
+    entries: &mut Vec<(ArrayKey, Value)>,
+    callback: &str,
+    sort_type: &str,
+) -> VmResult<()> {
+    let len = entries.len();
+    for i in 1..len {
+        let mut j = i;
+        while j > 0 {
+            let (a_val, b_val) = match sort_type {
+                "uksort" => {
+                    let ka = match &entries[j - 1].0 {
+                        ArrayKey::Int(n) => Value::Long(*n),
+                        ArrayKey::String(s) => Value::String(s.clone()),
+                    };
+                    let kb = match &entries[j].0 {
+                        ArrayKey::Int(n) => Value::Long(*n),
+                        ArrayKey::String(s) => Value::String(s.clone()),
+                    };
+                    (ka, kb)
                 }
+                _ => (entries[j - 1].1.clone(), entries[j].1.clone()),
+            };
+            let cmp = vm
+                .invoke_user_callback(callback, vec![a_val, b_val])?
+                .to_long();
+            if cmp > 0 {
+                entries.swap(j - 1, j);
+                j -= 1;
+            } else {
+                break;
             }
-            _ => {
-                // uasort/uksort: preserve keys
-                for (key, val) in entries {
-                    match key {
-                        ArrayKey::Int(n) => result.set_int(n, val),
-                        ArrayKey::String(s) => result.set_string(s, val),
-                    }
+        }
+    }
+    Ok(())
+}
+
+fn usort_build_result(
+    result: &mut PhpArray,
+    entries: Vec<(ArrayKey, Value)>,
+    sort_type: &str,
+) {
+    match sort_type {
+        "usort" => {
+            // usort: re-index with 0..n
+            for (_key, val) in entries {
+                result.push(val);
+            }
+        }
+        _ => {
+            // uasort/uksort: preserve keys
+            for (key, val) in entries {
+                match key {
+                    ArrayKey::Int(n) => result.set_int(n, val),
+                    ArrayKey::String(s) => result.set_string(s, val),
                 }
             }
         }
-        // Write sorted array back to caller's variable
-        if let Some(caller) = vm.call_stack.last_mut() {
-            if !caller.args.is_empty() {
-                caller.args[0] = Value::Array(result);
-            }
-        }
-        Ok(Value::Bool(true))
-    } else {
-        Ok(Value::Bool(true))
     }
 }
 

@@ -14608,4 +14608,36 @@ echo implode(",", $arr);
 "#);
         assert_eq!(output, "a,b,c");
     }
+
+    #[test]
+    fn test_usort_modifies_array() {
+        let output = run_php(r#"<?php
+$arr = [3, 1, 4, 1, 5];
+usort($arr, function($a, $b) { return $a - $b; });
+echo implode(",", $arr);
+"#);
+        assert_eq!(output, "1,1,3,4,5");
+    }
+
+    #[test]
+    fn test_usort_reverse() {
+        let output = run_php(r#"<?php
+$arr = [3, 1, 4, 1, 5];
+usort($arr, function($a, $b) { return $b - $a; });
+echo implode(",", $arr);
+"#);
+        assert_eq!(output, "5,4,3,1,1");
+    }
+
+    #[test]
+    fn test_uasort_preserves_keys() {
+        let output = run_php(r#"<?php
+$arr = ['c' => 3, 'a' => 1, 'b' => 2];
+uasort($arr, function($a, $b) { return $a - $b; });
+$keys = array_keys($arr);
+echo implode(",", $keys) . "\n";
+echo implode(",", $arr);
+"#);
+        assert_eq!(output, "a,b,c\n1,2,3");
+    }
 }
