@@ -1981,7 +1981,7 @@ fn php_http_response_code(
             vm.response_code = Some(c);
             Ok(Value::Long(c as i64))
         }
-        _ => Ok(Value::Long(200)),
+        _ => Ok(Value::Long(vm.response_code.unwrap_or(200) as i64)),
     }
 }
 
@@ -1995,12 +1995,16 @@ fn php_header_register_callback(
 }
 
 fn php_headers_list(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     _args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Array(PhpArray::new()))
+    let mut arr = PhpArray::new();
+    for header in &vm.response_headers {
+        arr.push(Value::String(header.clone()));
+    }
+    Ok(Value::Array(arr))
 }
 
 fn php_setcookie(

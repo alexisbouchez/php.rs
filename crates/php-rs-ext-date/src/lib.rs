@@ -54,6 +54,16 @@ pub fn php_date(format: &str, timestamp: i64) -> String {
                 };
                 result.push_str(&format!("{}", h));
             }
+            'h' => {
+                let h = if dt.hour == 0 {
+                    12
+                } else if dt.hour > 12 {
+                    dt.hour - 12
+                } else {
+                    dt.hour
+                };
+                result.push_str(&format!("{:02}", h));
+            }
             'i' => result.push_str(&format!("{:02}", dt.minute)),
             's' => result.push_str(&format!("{:02}", dt.second)),
             'A' => result.push_str(if dt.hour < 12 { "AM" } else { "PM" }),
@@ -70,7 +80,8 @@ pub fn php_date(format: &str, timestamp: i64) -> String {
             'M' => result.push_str(&dt.month_name()[..3]),
             't' => result.push_str(&format!("{}", dt.days_in_month())),
             'L' => result.push_str(if dt.is_leap_year() { "1" } else { "0" }),
-            'P' | 'T' => result.push_str("+00:00"), // UTC offset
+            'P' => result.push_str("+00:00"), // UTC offset with colon
+            'T' => result.push_str("UTC"),  // Timezone abbreviation
             'e' => result.push_str("UTC"),
             'O' => result.push_str("+0000"),
             'Z' => result.push_str("0"), // UTC offset in seconds
@@ -184,6 +195,47 @@ pub fn php_strtotime(input: &str, base_time: Option<i64>) -> Option<i64> {
             second: 0,
         };
         return Some(tomorrow.to_timestamp());
+    }
+
+    // "midnight"
+    if input.eq_ignore_ascii_case("midnight") {
+        let dt = DateTime::from_timestamp(base);
+        return Some(DateTime { year: dt.year, month: dt.month, day: dt.day, hour: 0, minute: 0, second: 0 }.to_timestamp());
+    }
+
+    // "noon"
+    if input.eq_ignore_ascii_case("noon") {
+        let dt = DateTime::from_timestamp(base);
+        return Some(DateTime { year: dt.year, month: dt.month, day: dt.day, hour: 12, minute: 0, second: 0 }.to_timestamp());
+    }
+
+    // "last month", "next month", "last year", "next year"
+    {
+        let lower = input.to_ascii_lowercase();
+        let (sign, unit) = if let Some(u) = lower.strip_prefix("last ") {
+            (-1i64, u.trim())
+        } else if let Some(u) = lower.strip_prefix("next ") {
+            (1i64, u.trim())
+        } else {
+            (0, "")
+        };
+        if sign != 0 {
+            match unit {
+                "month" => return parse_relative_modifier(&format!("{}1 month", if sign < 0 { "-" } else { "+" }), base),
+                "year" => return parse_relative_modifier(&format!("{}1 year", if sign < 0 { "-" } else { "+" }), base),
+                "week" => return parse_relative_modifier(&format!("{}1 week", if sign < 0 { "-" } else { "+" }), base),
+                _ => {}
+            }
+        }
+    }
+
+    // "N unit ago" forms: "1 week ago", "2 days ago"
+    {
+        let lower = input.to_ascii_lowercase();
+        if lower.ends_with(" ago") {
+            let stripped = &lower[..lower.len() - 4];
+            return parse_relative_modifier(&format!("-{}", stripped), base);
+        }
     }
 
     // Relative modifier: "+1 day", "-2 weeks", "+3 months", "+1 year"

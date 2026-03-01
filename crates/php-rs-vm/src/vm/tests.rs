@@ -14892,4 +14892,59 @@ echo constant("Foo::BAR");
 "#);
         assert_eq!(output, "true\nfalse\n42");
     }
+
+    #[test]
+    fn test_strlen_counts_bytes() {
+        let output = run_php(r#"<?php
+echo strlen("hello") . "\n";
+echo mb_strlen("hello");
+"#);
+        assert_eq!(output, "5\n5");
+    }
+
+    #[test]
+    fn test_http_response_code_getter() {
+        let output = run_php(r#"<?php
+http_response_code(404);
+echo http_response_code();
+"#);
+        assert_eq!(output, "404");
+    }
+
+    #[test]
+    fn test_strtotime_ago() {
+        let output = run_php(r#"<?php
+$now = time();
+$week_ago = strtotime("1 week ago");
+echo ($week_ago < $now && $week_ago > $now - 700000) ? "ok" : "fail";
+"#);
+        assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn test_strtotime_midnight_noon() {
+        let output = run_php(r#"<?php
+$m = strtotime("midnight");
+$n = strtotime("noon");
+echo ($m !== false && $n !== false && $n > $m) ? "ok" : "fail";
+"#);
+        assert_eq!(output, "ok");
+    }
+
+    #[test]
+    fn test_date_h_format() {
+        let output = run_php(r#"<?php
+echo date("h", 0);
+"#);
+        // Epoch is midnight UTC, so 12-hour format = 12
+        assert_eq!(output, "12");
+    }
+
+    #[test]
+    fn test_date_t_timezone() {
+        let output = run_php(r#"<?php
+echo date("T");
+"#);
+        assert_eq!(output, "UTC");
+    }
 }

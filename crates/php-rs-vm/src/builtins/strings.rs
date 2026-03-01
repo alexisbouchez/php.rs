@@ -93,9 +93,8 @@ pub(crate) fn dispatch(
     match name {
         "strlen" => {
             let s = args.first().cloned().unwrap_or(Value::Null);
-            // PHP strings are binary — strlen counts bytes.
-            // With Latin-1 encoding, each PHP byte = one Rust char.
-            Ok(Some(Value::Long(s.to_php_string().chars().count() as i64)))
+            // PHP strings are binary — strlen counts bytes, not characters.
+            Ok(Some(Value::Long(s.to_php_string().len() as i64)))
         }
         "implode" | "join" => {
             let (glue, pieces) = if args.len() >= 2 {
