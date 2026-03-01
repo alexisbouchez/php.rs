@@ -442,6 +442,53 @@ impl VmConfig {
 /// call, clearing per-request state (variables, open handles, etc.).
 ///
 /// [`ZOpArray`]: php_rs_compiler::ZOpArray
+
+/// An incremental deflate (compression) context for deflate_init/deflate_add.
+pub struct DeflateContext {
+    /// Accumulated compressed output.
+    pub buffer: Vec<u8>,
+    /// Encoding mode: ZLIB_ENCODING_RAW(-15), ZLIB_ENCODING_GZIP(31), ZLIB_ENCODING_DEFLATE(15).
+    pub encoding: i32,
+    /// Compression level.
+    pub level: i32,
+}
+
+/// An incremental inflate (decompression) context for inflate_init/inflate_add.
+pub struct InflateContext {
+    /// Accumulated decompressed output.
+    pub buffer: Vec<u8>,
+    /// Encoding mode.
+    pub encoding: i32,
+    /// Total bytes read from input.
+    pub bytes_read: usize,
+}
+
+/// A bzip2 file handle for streaming bz* functions.
+pub struct BzFileHandle {
+    /// Decompressed data (for reading) or buffered data (for writing).
+    pub data: Vec<u8>,
+    /// Current read/write position.
+    pub pos: usize,
+    /// Whether the file was opened for writing ("w"/"wb").
+    pub writable: bool,
+    /// File path (for flushing on close when writing).
+    pub path: String,
+}
+
+/// A gzip file handle for streaming gz* functions.
+pub struct GzFileHandle {
+    /// Decompressed data (for reading) or buffered data (for writing).
+    pub data: Vec<u8>,
+    /// Current read/write position.
+    pub pos: usize,
+    /// Whether the file was opened for writing ("w"/"wb").
+    pub writable: bool,
+    /// File path (for flushing on close when writing).
+    pub path: String,
+    /// Compression level for writing.
+    pub level: i32,
+}
+
 pub struct Vm {
     /// Committed (non-buffered) output — what goes to the client.
     pub(crate) output: String,
@@ -496,6 +543,18 @@ pub struct Vm {
     pub(crate) vfs: Option<std::sync::Arc<std::sync::RwLock<php_rs_runtime::VirtualFileSystem>>>,
     /// Open file handles: resource_id → FileHandle.
     pub(crate) file_handles: HashMap<i64, php_rs_ext_standard::file::FileHandle>,
+    /// Open gzip file handles: resource_id → GzFileHandle.
+    pub(crate) gz_handles: HashMap<i64, GzFileHandle>,
+    /// DOM documents: doc_id → DomDocument.
+    pub(crate) dom_documents: HashMap<i64, php_rs_ext_dom::DomDocument>,
+    /// Next DOM document ID.
+    pub(crate) next_dom_id: i64,
+    /// Open bzip2 file handles: resource_id → BzFileHandle.
+    pub(crate) bz_handles: HashMap<i64, BzFileHandle>,
+    /// Deflate (compression) contexts: resource_id → DeflateContext.
+    pub(crate) deflate_contexts: HashMap<i64, DeflateContext>,
+    /// Inflate (decompression) contexts: resource_id → InflateContext.
+    pub(crate) inflate_contexts: HashMap<i64, InflateContext>,
     /// Open curl handles: resource_id → CurlHandle.
     #[cfg(feature = "native-io")]
     pub(crate) curl_handles: HashMap<i64, php_rs_ext_curl::CurlHandle>,
@@ -523,6 +582,13 @@ pub struct Vm {
     pub(crate) response_headers: Vec<String>,
     /// HTTP response code set by http_response_code().
     pub(crate) response_code: Option<u16>,
+    /// Whether HTTP headers have been sent (body output started without buffering).
+    pub(crate) headers_sent: bool,
+    /// File and line where headers were sent.
+    pub(crate) headers_sent_file: String,
+    pub(crate) headers_sent_line: u32,
+    /// Whether to ignore user abort (connection close).
+    pub(crate) ignore_user_abort: bool,
     /// MySQLi connections: connection_id → mysql::Conn.
     #[cfg(feature = "native-io")]
     pub(crate) mysqli_connections: HashMap<i64, mysql::Conn>,
@@ -532,6 +598,9 @@ pub struct Vm {
     /// MySQLi connection metadata: connection_id → (last_insert_id, affected_rows, error, errno).
     #[cfg(feature = "native-io")]
     pub(crate) mysqli_conn_meta: HashMap<i64, (u64, u64, String, u16)>,
+    /// MySQLi prepared statements: stmt_id → MysqliStmt.
+    #[cfg(feature = "native-io")]
+    pub(crate) mysqli_stmts: HashMap<i64, crate::builtins::mysqli::MysqliStmt>,
     /// PDO connections: object_id → PdoConnection.
     #[cfg(feature = "native-io")]
     pub(crate) pdo_connections: HashMap<u64, php_rs_ext_pdo::PdoConnection>,
@@ -554,6 +623,8 @@ pub struct Vm {
     pub(crate) mt_rng: php_rs_ext_random::Mt19937,
     /// GD image resources: resource_id → GdImage.
     pub(crate) gd_images: HashMap<i64, php_rs_ext_gd::GdImage>,
+    /// XMLWriter instances: resource_id → XmlWriterState.
+    pub(crate) xml_writers: HashMap<i64, crate::builtins::remaining::XmlWriterState>,
     /// Intl NumberFormatter resources: resource_id → NumberFormatter.
     pub(crate) intl_number_formatters: HashMap<i64, php_rs_ext_intl::NumberFormatter>,
     /// Intl Collator resources: resource_id → Collator.
@@ -608,6 +679,8 @@ pub struct Vm {
     pub(crate) error_handler: Option<String>,
     /// Stack of previous error handlers (for restore_error_handler).
     pub(crate) error_handler_stack: Vec<Option<String>>,
+    /// Last error info: (type, message, file, line).
+    pub(crate) last_error: Option<(i64, String, String, u32)>,
     /// User exception handler callback name (from set_exception_handler).
     pub(crate) exception_handler: Option<String>,
     /// Stack of previous exception handlers (for restore_exception_handler).
@@ -776,6 +849,12 @@ impl Vm {
                 fh.insert(2, php_rs_ext_standard::file::FileHandle::stderr());
                 fh
             },
+            gz_handles: HashMap::new(),
+            bz_handles: HashMap::new(),
+            dom_documents: HashMap::new(),
+            next_dom_id: 1,
+            deflate_contexts: HashMap::new(),
+            inflate_contexts: HashMap::new(),
             #[cfg(feature = "native-io")]
             curl_handles: HashMap::new(),
             #[cfg(feature = "native-io")]
@@ -791,12 +870,18 @@ impl Vm {
             autoloading_classes: HashSet::new(),
             response_headers: Vec::new(),
             response_code: None,
+            headers_sent: false,
+            headers_sent_file: String::new(),
+            headers_sent_line: 0,
+            ignore_user_abort: false,
             #[cfg(feature = "native-io")]
             mysqli_connections: HashMap::new(),
             #[cfg(feature = "native-io")]
             mysqli_results: HashMap::new(),
             #[cfg(feature = "native-io")]
             mysqli_conn_meta: HashMap::new(),
+            #[cfg(feature = "native-io")]
+            mysqli_stmts: HashMap::new(),
             #[cfg(feature = "native-io")]
             pdo_connections: HashMap::new(),
             #[cfg(feature = "native-io")]
@@ -811,6 +896,7 @@ impl Vm {
             openssl_keys: HashMap::new(),
             mt_rng: php_rs_ext_random::Mt19937::new(None),
             gd_images: HashMap::new(),
+            xml_writers: HashMap::new(),
             intl_number_formatters: HashMap::new(),
             intl_collators: HashMap::new(),
             intl_date_formatters: HashMap::new(),
@@ -838,6 +924,7 @@ impl Vm {
             silence_stack: Vec::new(),
             error_handler: None,
             error_handler_stack: Vec::new(),
+            last_error: None,
             exception_handler: None,
             exception_handler_stack: Vec::new(),
             tick_functions: Vec::new(),
@@ -869,6 +956,72 @@ impl Vm {
     const SUPERGLOBAL_NAMES: &'static [&'static str] = &[
         "_GET", "_POST", "_COOKIE", "_SERVER", "_REQUEST", "_FILES", "_ENV", "_SESSION",
     ];
+
+    /// Capture the current call stack as a PHP-compatible trace array.
+    /// Each frame is an array with keys: file, line, function, class, type, args
+    pub(crate) fn capture_stack_trace(&self) -> Value {
+        let mut trace = PhpArray::new();
+        let n = self.call_stack.len();
+
+        // PHP trace format: each entry pairs the CALLEE's function name
+        // with the CALLER's file:line (where the call was made).
+        //
+        // Call stack (bottom-to-top): [main, bar, foo]
+        // Trace output:
+        //   #0: function=foo, file/line from bar (where foo() was called)
+        //   #1: function=bar, file/line from main (where bar() was called)
+        //
+        // We iterate from top of stack (the function that threw) downward,
+        // stopping before {main} (which has no caller and no function name).
+
+        for entry_idx in 0..n {
+            let callee_idx = n - 1 - entry_idx; // top to bottom
+            let callee_frame = &self.call_stack[callee_idx];
+            let callee_oa = &self.op_arrays[callee_frame.op_array_idx];
+
+            // Get function name from callee's op_array
+            let func_name = callee_oa.function_name.as_deref().unwrap_or("");
+            if func_name.is_empty() {
+                // This is {main} — don't include in trace entries
+                break;
+            }
+
+            let mut entry = PhpArray::new();
+
+            // file/line come from the CALLER (one level below in call_stack)
+            if callee_idx > 0 {
+                let caller_frame = &self.call_stack[callee_idx - 1];
+                let caller_oa = &self.op_arrays[caller_frame.op_array_idx];
+
+                if let Some(ref filename) = caller_oa.filename {
+                    entry.set_string("file".to_string(), Value::String(filename.clone()));
+                }
+                // caller's IP points to the instruction AFTER the call (return point),
+                // so ip-1 is the DO_FCALL opcode on the same line as the call
+                let ip = if caller_frame.ip > 0 { caller_frame.ip - 1 } else { 0 };
+                if ip < caller_oa.opcodes.len() {
+                    entry.set_string("line".to_string(), Value::Long(caller_oa.opcodes[ip].lineno as i64));
+                }
+            }
+
+            // function name from callee
+            if func_name.contains("::") {
+                let parts: Vec<&str> = func_name.splitn(2, "::").collect();
+                entry.set_string("class".to_string(), Value::String(parts[0].to_string()));
+                entry.set_string("function".to_string(), Value::String(parts[1].to_string()));
+                entry.set_string("type".to_string(), Value::String("->".to_string()));
+            } else {
+                entry.set_string("function".to_string(), Value::String(func_name.to_string()));
+            }
+
+            // args (empty array — we don't capture actual argument values)
+            entry.set_string("args".to_string(), Value::Array(PhpArray::new()));
+
+            trace.push(Value::Array(entry));
+        }
+
+        Value::Array(trace)
+    }
 
     /// Populate superglobal CVs ($_GET, $_POST, $_COOKIE, $_SERVER, etc.) into a frame.
     /// In PHP, superglobals are accessible inside any function without `global`.
@@ -1352,10 +1505,17 @@ impl Vm {
     }
 
     #[inline(always)]
+    #[inline(always)]
     pub(crate) fn write_output(&mut self, s: &str) {
         if let Some(buf) = self.ob_stack.last_mut() {
             buf.push_str(s);
         } else {
+            if !self.headers_sent && !s.is_empty() {
+                self.headers_sent = true;
+                let (file, line) = self.get_error_context();
+                self.headers_sent_file = file;
+                self.headers_sent_line = line;
+            }
             self.output.push_str(s);
         }
     }
@@ -1398,6 +1558,9 @@ impl Vm {
 
         // Get current file and line from execution context
         let (file, line) = self.get_error_context();
+
+        // Record as last error for error_get_last()
+        self.last_error = Some((level, message.to_string(), file.clone(), line));
 
         // If user error handler is set, invoke it
         if let Some(handler_name) = self.error_handler.clone() {

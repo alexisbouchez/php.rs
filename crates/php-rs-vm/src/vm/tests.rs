@@ -13950,4 +13950,252 @@ foreach ($items as $i => [$name, $val]) {
         );
         assert_eq!(output, "0:x=10 1:y=20 ");
     }
+
+    // =========================================================================
+    // Process & system info functions
+    // =========================================================================
+
+    #[test]
+    fn test_getmypid() {
+        let output = run_php("<?php $pid = getmypid(); echo is_int($pid) ? 'int' : 'other'; echo $pid > 0 ? ' positive' : ' zero';");
+        assert_eq!(output, "int positive");
+    }
+
+    #[test]
+    fn test_getmyuid() {
+        let output = run_php("<?php $uid = getmyuid(); echo is_int($uid) ? 'int' : 'other';");
+        assert_eq!(output, "int");
+    }
+
+    #[test]
+    fn test_getmygid() {
+        let output = run_php("<?php $gid = getmygid(); echo is_int($gid) ? 'int' : 'other';");
+        assert_eq!(output, "int");
+    }
+
+    #[test]
+    fn test_get_current_user() {
+        let output = run_php("<?php $u = get_current_user(); echo is_string($u) ? 'string' : 'other'; echo strlen($u) > 0 ? ' notempty' : ' empty';");
+        assert_eq!(output, "string notempty");
+    }
+
+    #[test]
+    fn test_gethostname() {
+        let output = run_php("<?php $h = gethostname(); echo is_string($h) ? 'string' : 'other'; echo strlen($h) > 0 ? ' notempty' : ' empty';");
+        assert_eq!(output, "string notempty");
+    }
+
+    #[test]
+    fn test_sys_getloadavg() {
+        let output = run_php(r#"<?php
+$load = sys_getloadavg();
+echo is_array($load) ? 'array' : 'other';
+echo count($load) === 3 ? ' three' : ' wrong';
+echo is_float($load[0]) ? ' float' : ' notfloat';
+"#);
+        assert_eq!(output, "array three float");
+    }
+
+    #[test]
+    fn test_getrusage() {
+        let output = run_php(r#"<?php
+$ru = getrusage();
+echo is_array($ru) ? 'array' : 'other';
+echo isset($ru['ru_utime.tv_sec']) ? ' utime' : ' noutime';
+echo isset($ru['ru_stime.tv_sec']) ? ' stime' : ' nostime';
+echo isset($ru['ru_maxrss']) ? ' maxrss' : ' nomaxrss';
+"#);
+        assert_eq!(output, "array utime stime maxrss");
+    }
+
+    #[test]
+    fn test_connection_status_constants() {
+        let output = run_php(r#"<?php
+echo CONNECTION_NORMAL . " ";
+echo CONNECTION_ABORTED . " ";
+echo CONNECTION_TIMEOUT;
+"#);
+        assert_eq!(output, "0 1 2");
+    }
+
+    #[test]
+    fn test_connection_status_returns_normal() {
+        let output = run_php("<?php echo connection_status();");
+        assert_eq!(output, "0");
+    }
+
+    #[test]
+    fn test_ignore_user_abort() {
+        let output = run_php(r#"<?php
+echo ignore_user_abort() . "\n";
+ignore_user_abort(true);
+echo ignore_user_abort() . "\n";
+echo ignore_user_abort(false) . "\n";
+echo ignore_user_abort() . "\n";
+"#);
+        assert_eq!(output, "0\n1\n1\n0\n");
+    }
+
+    #[test]
+    fn test_headers_sent_initially_false() {
+        let output = run_php("<?php echo headers_sent() ? 'yes' : 'no';");
+        // headers_sent() itself produces output, but we check the return value before that
+        // Actually: echo calls write_output which sets headers_sent, but headers_sent() is called
+        // before echo. In PHP, output starts after headers_sent returns.
+        assert_eq!(output, "no");
+    }
+
+    // =========================================================================
+    // compact / extract / settype
+    // =========================================================================
+
+    #[test]
+    fn test_compact_with_array_arg() {
+        let output = run_php(r#"<?php
+$x = 1;
+$y = 2;
+$z = 3;
+$result = compact(["x", "y"], "z");
+echo $result["x"] . " " . $result["y"] . " " . $result["z"];
+"#);
+        assert_eq!(output, "1 2 3");
+    }
+
+    #[test]
+    fn test_extract_overwrite() {
+        let output = run_php(r#"<?php
+$data = ["name" => "Bob", "age" => 25];
+$count = extract($data);
+echo "$name $age $count";
+"#);
+        assert_eq!(output, "Bob 25 2");
+    }
+
+    #[test]
+    fn test_extract_skip() {
+        let output = run_php(r#"<?php
+$name = "Original";
+$data = ["name" => "Bob", "age" => 25];
+$count = extract($data, EXTR_SKIP);
+echo "$name $age $count";
+"#);
+        assert_eq!(output, "Original 25 1");
+    }
+
+    #[test]
+    fn test_settype_int() {
+        let output = run_php(r#"<?php
+$val = "42";
+settype($val, "integer");
+echo gettype($val) . " " . $val;
+"#);
+        assert_eq!(output, "integer 42");
+    }
+
+    #[test]
+    fn test_settype_bool() {
+        let output = run_php(r#"<?php
+$val = "hello";
+settype($val, "boolean");
+echo var_export($val, true);
+"#);
+        assert_eq!(output, "true");
+    }
+
+    #[test]
+    fn test_settype_array() {
+        let output = run_php(r#"<?php
+$val = "test";
+settype($val, "array");
+echo is_array($val) ? "array" : "other";
+echo " " . $val[0];
+"#);
+        assert_eq!(output, "array test");
+    }
+
+    #[test]
+    fn test_settype_null() {
+        let output = run_php(r#"<?php
+$val = 42;
+settype($val, "null");
+echo is_null($val) ? "null" : "other";
+"#);
+        assert_eq!(output, "null");
+    }
+
+    // =========================================================================
+    // error_get_last / error_clear_last
+    // =========================================================================
+
+    #[test]
+    fn test_error_get_last_initially_null() {
+        let output = run_php("<?php echo error_get_last() === null ? 'null' : 'set';");
+        assert_eq!(output, "null");
+    }
+
+    // =========================================================================
+    // forward_static_call
+    // =========================================================================
+
+    #[test]
+    fn test_forward_static_call() {
+        let output = run_php(r#"<?php
+function my_add($a, $b) { return $a + $b; }
+echo forward_static_call("my_add", 3, 4);
+"#);
+        assert_eq!(output, "7");
+    }
+
+    // =========================================================================
+    // memory_get_usage
+    // =========================================================================
+
+    #[test]
+    fn test_memory_get_usage_returns_positive() {
+        let output = run_php("<?php echo memory_get_usage() > 0 ? 'positive' : 'zero';");
+        assert_eq!(output, "positive");
+    }
+
+    // =========================================================================
+    // posix functions
+    // =========================================================================
+
+    #[test]
+    fn test_posix_getuid() {
+        let output = run_php("<?php echo is_int(posix_getuid()) ? 'int' : 'other';");
+        assert_eq!(output, "int");
+    }
+
+    #[test]
+    fn test_posix_getppid() {
+        let output = run_php("<?php $ppid = posix_getppid(); echo $ppid > 0 ? 'positive' : 'zero';");
+        assert_eq!(output, "positive");
+    }
+
+    #[test]
+    fn test_posix_uname() {
+        let output = run_php(r#"<?php
+$u = posix_uname();
+echo isset($u['sysname']) ? 'sysname' : 'no';
+echo isset($u['nodename']) ? ' nodename' : ' no';
+echo isset($u['release']) ? ' release' : ' no';
+echo isset($u['machine']) ? ' machine' : ' no';
+"#);
+        assert_eq!(output, "sysname nodename release machine");
+    }
+
+    // =========================================================================
+    // popen / pclose
+    // =========================================================================
+
+    #[test]
+    fn test_popen_pclose() {
+        let output = run_php(r#"<?php
+$fp = popen("echo hello", "r");
+$line = fgets($fp);
+echo trim($line);
+pclose($fp);
+"#);
+        assert_eq!(output, "hello");
+    }
 }

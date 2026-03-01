@@ -1607,6 +1607,11 @@ fn php_extract(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr = args.first().cloned().unwrap_or(Value::Null);
+    let flags = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+    let prefix = args.get(2).map(|v| v.to_php_string()).unwrap_or_default();
+    // EXTR_OVERWRITE=0, EXTR_SKIP=1, EXTR_PREFIX_SAME=2, EXTR_PREFIX_ALL=3
+    let extract_type = flags & 0xff;
+
     if let Value::Array(ref a) = arr {
         let mut count = 0i64;
         let frame = vm.call_stack.last().unwrap();
@@ -1617,11 +1622,31 @@ fn php_extract(
         let mut new_vars: Vec<(String, Value)> = Vec::new();
         for (key, val) in a.entries() {
             if let ArrayKey::String(name) = key {
-                if let Some(idx) = vars.iter().position(|v| v == name) {
+                let var_name = if extract_type == 3 {
+                    // EXTR_PREFIX_ALL
+                    format!("{}_{}", prefix, name)
+                } else {
+                    name.clone()
+                };
+                if let Some(idx) = vars.iter().position(|v| v == &var_name) {
+                    // Variable exists in scope
+                    let existing = &vm.call_stack.last().unwrap().cvs;
+                    let has_value = idx < existing.len() && !matches!(existing[idx], Value::Null);
+                    match extract_type {
+                        1 if has_value => continue, // EXTR_SKIP
+                        2 if has_value => {
+                            // EXTR_PREFIX_SAME — use prefixed name
+                            let prefixed = format!("{}_{}", prefix, name);
+                            new_vars.push((prefixed, val.clone()));
+                            count += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
                     assignments.push((idx, val.clone()));
                     count += 1;
                 } else {
-                    new_vars.push((name.clone(), val.clone()));
+                    new_vars.push((var_name, val.clone()));
                     count += 1;
                 }
             }

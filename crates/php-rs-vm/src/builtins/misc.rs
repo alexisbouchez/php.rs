@@ -168,7 +168,8 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     r.insert("restore_exception_handler", php_restore_exception_handler);
     r.insert("error_log", php_error_log);
     r.insert("error_clear_last", php_error_clear_last);
-    r.insert("error_get_last", php_error_clear_last);
+    r.insert("error_get_last", php_error_get_last);
+    r.insert("error_clear_last", php_error_clear_last);
     r.insert("get_error_handler", php_get_error_handler);
     r.insert("get_exception_handler", php_get_error_handler);
 
@@ -268,7 +269,7 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     r.insert("get_declared_interfaces", php_get_declared_interfaces);
     r.insert("get_declared_traits", php_get_declared_traits);
     r.insert("trait_exists", php_trait_exists);
-    r.insert("settype", php_settype);
+    // settype is registered in type_check.rs
     r.insert("get_included_files", php_get_included_files);
     r.insert("get_required_files", php_get_included_files);
     r.insert("get_loaded_extensions", php_get_loaded_extensions);
@@ -303,9 +304,9 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     // -- Process --
     r.insert("getmypid", php_getmypid);
     r.insert("getmyuid", php_getmyuid);
-    r.insert("getmygid", php_getmyuid);
-    r.insert("getmyinode", php_getmyuid);
-    r.insert("getlastmod", php_getmyuid);
+    r.insert("getmygid", php_getmygid);
+    r.insert("getmyinode", php_getmyinode);
+    r.insert("getlastmod", php_getlastmod);
     r.insert("get_current_user", php_get_current_user);
     r.insert("gethostname", php_gethostname);
     r.insert("gettimeofday", php_gettimeofday);
@@ -408,9 +409,9 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     r.insert("image_type_to_mime_type", php_image_type_to_mime_type);
     r.insert("image_type_to_extension", php_image_type_to_extension);
     r.insert("getimagesize", php_getimagesize);
-    r.insert("getimagesizefromstring", php_getimagesize);
-    r.insert("iptcparse", php_getimagesize);
-    r.insert("iptcembed", php_getimagesize);
+    r.insert("getimagesizefromstring", php_getimagesizefromstring);
+    r.insert("iptcparse", php_iptc_stub);
+    r.insert("iptcembed", php_iptc_stub);
 
     // -- Windows stubs --
     r.insert("sapi_windows_cp_conv", php_sapi_windows_stub);
@@ -521,7 +522,8 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     // register_simplexml(r);
 
     // -- XMLWriter --
-    register_xmlwriter(r);
+    // XMLWriter functions are implemented in remaining.rs dispatch
+    // register_xmlwriter(r);
 
     // -- Readline --
     register_readline(r);
@@ -649,11 +651,22 @@ fn php_time_nanosleep(
 }
 
 fn php_time_sleep_until(
-    _vm: &mut Vm,
-    _args: &[Value],
+    vm: &mut Vm,
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    let target = args.first().map(|v| v.to_double()).unwrap_or(0.0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    if target <= now {
+        let _ = vm.emit_error(2, "time_sleep_until(): Sleep until to time is less than current time");
+        return Ok(Value::Bool(false));
+    }
+    let diff = target - now;
+    std::thread::sleep(std::time::Duration::from_secs_f64(diff));
     Ok(Value::Bool(true))
 }
 
@@ -667,12 +680,16 @@ fn php_set_time_limit(
 }
 
 fn php_ignore_user_abort(
-    _vm: &mut Vm,
-    _args: &[Value],
+    vm: &mut Vm,
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Long(0))
+    let old = if vm.ignore_user_abort { 1i64 } else { 0i64 };
+    if let Some(val) = args.first() {
+        vm.ignore_user_abort = val.is_truthy();
+    }
+    Ok(Value::Long(old))
 }
 
 // -- Error handling --
@@ -858,22 +875,45 @@ fn php_error_log(
     }
 }
 
-fn php_error_clear_last(
-    _vm: &mut Vm,
+fn php_error_get_last(
+    vm: &mut Vm,
     _args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    match &vm.last_error {
+        Some((level, msg, file, line)) => {
+            let mut arr = PhpArray::new();
+            arr.set_string("type".into(), Value::Long(*level));
+            arr.set_string("message".into(), Value::String(msg.clone()));
+            arr.set_string("file".into(), Value::String(file.clone()));
+            arr.set_string("line".into(), Value::Long(*line as i64));
+            Ok(Value::Array(arr))
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+fn php_error_clear_last(
+    vm: &mut Vm,
+    _args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    vm.last_error = None;
     Ok(Value::Null)
 }
 
 fn php_get_error_handler(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     _args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Null)
+    match &vm.error_handler {
+        Some(handler) => Ok(Value::String(handler.clone())),
+        None => Ok(Value::Null),
+    }
 }
 
 // -- Function handling --
@@ -991,12 +1031,16 @@ fn php_unregister_tick_function(
 }
 
 fn php_forward_static_call(
-    _vm: &mut Vm,
-    _args: &[Value],
+    vm: &mut Vm,
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Bool(false))
+    // forward_static_call($callable, ...$args) - same as call_user_func but preserves LSB
+    let callable = args.first().cloned().unwrap_or(Value::Null);
+    let call_args: Vec<Value> = args.iter().skip(1).cloned().collect();
+    let func_name = callable.to_php_string();
+    vm.invoke_user_callback(&func_name, call_args)
 }
 
 fn php_func_get_args(
@@ -1187,21 +1231,40 @@ fn php_unserialize(
 }
 
 fn php_compact(
-    _vm: &mut Vm,
-    _args: &[Value],
+    vm: &mut Vm,
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Array(PhpArray::new()))
-}
-
-fn php_extract(
-    _vm: &mut Vm,
-    _args: &[Value],
-    _ref_args: &[(usize, OperandType, u32)],
-    _ref_prop_args: &[(usize, Value, String)],
-) -> VmResult<Value> {
-    Ok(Value::Long(0))
+    let mut result = PhpArray::new();
+    if let Some(frame) = vm.call_stack.last() {
+        let oa = &vm.op_arrays[frame.op_array_idx];
+        // Collect names to look up — can be strings or arrays of strings
+        let mut names = Vec::new();
+        for arg in args {
+            match arg {
+                Value::String(s) => names.push(s.clone()),
+                Value::Array(arr) => {
+                    for (_, v) in arr.entries() {
+                        names.push(v.to_php_string());
+                    }
+                }
+                other => names.push(other.to_php_string()),
+            }
+        }
+        for name in names {
+            // Find CV index for this variable name
+            if let Some(cv_idx) = oa.vars.iter().position(|v| v == &name) {
+                if cv_idx < frame.cvs.len() {
+                    let val = frame.cvs[cv_idx].clone();
+                    if !matches!(val, Value::Null) {
+                        result.set_string(name, val);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Value::Array(result))
 }
 
 fn php_isset(
@@ -1808,6 +1871,15 @@ fn php_header(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    if vm.headers_sent {
+        let file = vm.headers_sent_file.clone();
+        let line = vm.headers_sent_line;
+        let _ = vm.emit_error(2, &format!(
+            "Cannot modify header information - headers already sent by (output started at {}:{})",
+            file, line
+        ));
+        return Ok(Value::Null);
+    }
     if let Some(header_str) = args.first() {
         let h = header_str.to_php_string();
         let replace = args.get(1).map(|v| v.is_truthy()).unwrap_or(true);
@@ -1862,12 +1934,19 @@ fn php_header_remove(
 }
 
 fn php_headers_sent(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     _args: &[Value],
-    _ref_args: &[(usize, OperandType, u32)],
-    _ref_prop_args: &[(usize, Value, String)],
+    ref_args: &[(usize, OperandType, u32)],
+    ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Bool(false))
+    if vm.headers_sent {
+        // Write back file and line where headers were sent via ref params
+        let file = vm.headers_sent_file.clone();
+        let line = vm.headers_sent_line as i64;
+        vm.write_back_arg(0, Value::String(file), ref_args, ref_prop_args);
+        vm.write_back_arg(1, Value::Long(line), ref_args, ref_prop_args);
+    }
+    Ok(Value::Bool(vm.headers_sent))
 }
 
 fn php_http_response_code(
@@ -2280,14 +2359,6 @@ fn php_trait_exists(
     Ok(Value::Bool(exists))
 }
 
-fn php_settype(
-    _vm: &mut Vm,
-    _args: &[Value],
-    _ref_args: &[(usize, OperandType, u32)],
-    _ref_prop_args: &[(usize, Value, String)],
-) -> VmResult<Value> {
-    Ok(Value::Bool(true))
-}
 
 fn php_get_included_files(
     vm: &mut Vm,
@@ -2537,6 +2608,19 @@ fn php_memory_get_usage(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    // Use getrusage maxrss as a reasonable approximation
+    #[cfg(unix)]
+    {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        // On macOS, ru_maxrss is in bytes; on Linux, in KB
+        #[cfg(target_os = "macos")]
+        let mem = usage.ru_maxrss;
+        #[cfg(not(target_os = "macos"))]
+        let mem = usage.ru_maxrss * 1024;
+        return Ok(Value::Long(mem as i64));
+    }
+    #[cfg(not(unix))]
     Ok(Value::Long(0))
 }
 
@@ -2561,20 +2645,105 @@ fn php_getmypid(
 }
 
 fn php_getmyuid(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     _args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Long(0))
+    // Return the owner uid of the main script file
+    if let Some(ref filename) = vm.op_arrays.first().and_then(|oa| oa.filename.clone()) {
+        if let Ok(meta) = std::fs::metadata(filename) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return Ok(Value::Long(meta.uid() as i64));
+            }
+        }
+    }
+    Ok(Value::Long(unsafe { libc::getuid() } as i64))
+}
+
+fn php_getmygid(
+    vm: &mut Vm,
+    _args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    // Return the owner gid of the main script file
+    if let Some(ref filename) = vm.op_arrays.first().and_then(|oa| oa.filename.clone()) {
+        if let Ok(meta) = std::fs::metadata(filename) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return Ok(Value::Long(meta.gid() as i64));
+            }
+        }
+    }
+    Ok(Value::Long(unsafe { libc::getgid() } as i64))
+}
+
+fn php_getmyinode(
+    vm: &mut Vm,
+    _args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    // Return the inode of the main script file
+    if let Some(ref filename) = vm.op_arrays.first().and_then(|oa| oa.filename.clone()) {
+        if let Ok(meta) = std::fs::metadata(filename) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return Ok(Value::Long(meta.ino() as i64));
+            }
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn php_getlastmod(
+    vm: &mut Vm,
+    _args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    // Return the last modification time of the main script file
+    if let Some(ref filename) = vm.op_arrays.first().and_then(|oa| oa.filename.clone()) {
+        if let Ok(meta) = std::fs::metadata(filename) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    return Ok(Value::Long(dur.as_secs() as i64));
+                }
+            }
+        }
+    }
+    Ok(Value::Bool(false))
 }
 
 fn php_get_current_user(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     _args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    // Return the owner name of the main script file
+    #[cfg(unix)]
+    {
+        if let Some(ref filename) = vm.op_arrays.first().and_then(|oa| oa.filename.clone()) {
+            if let Ok(meta) = std::fs::metadata(filename) {
+                use std::os::unix::fs::MetadataExt;
+                let uid = meta.uid();
+                let pw = unsafe { libc::getpwuid(uid) };
+                if !pw.is_null() {
+                    let name = unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) };
+                    if let Ok(s) = name.to_str() {
+                        return Ok(Value::String(s.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    let _ = vm;
     Ok(Value::String(
         std::env::var("USER").unwrap_or_else(|_| "nobody".into()),
     ))
@@ -2586,7 +2755,15 @@ fn php_gethostname(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::String("localhost".into()))
+    let mut buf = [0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret == 0 {
+        let hostname = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const libc::c_char) };
+        if let Ok(s) = hostname.to_str() {
+            return Ok(Value::String(s.to_string()));
+        }
+    }
+    Ok(Value::Bool(false))
 }
 
 fn php_gettimeofday(
@@ -2639,24 +2816,62 @@ fn php_sys_getloadavg(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    let mut loadavg = [0.0f64; 3];
+    #[cfg(unix)]
+    {
+        unsafe { libc::getloadavg(loadavg.as_mut_ptr(), 3) };
+    }
     let mut arr = PhpArray::new();
-    arr.push(Value::Double(0.0));
-    arr.push(Value::Double(0.0));
-    arr.push(Value::Double(0.0));
+    arr.push(Value::Double(loadavg[0]));
+    arr.push(Value::Double(loadavg[1]));
+    arr.push(Value::Double(loadavg[2]));
     Ok(Value::Array(arr))
 }
 
 fn php_getrusage(
     _vm: &mut Vm,
-    _args: &[Value],
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    let who = args.first().map(|v| v.to_long()).unwrap_or(0);
+    let who_flag = if who == 1 {
+        libc::RUSAGE_CHILDREN
+    } else {
+        libc::RUSAGE_SELF
+    };
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(who_flag, &mut usage) };
     let mut arr = PhpArray::new();
-    arr.set_string("ru_utime.tv_sec".into(), Value::Long(0));
-    arr.set_string("ru_utime.tv_usec".into(), Value::Long(0));
-    arr.set_string("ru_stime.tv_sec".into(), Value::Long(0));
-    arr.set_string("ru_stime.tv_usec".into(), Value::Long(0));
+    arr.set_string("ru_oublock".into(), Value::Long(usage.ru_oublock as i64));
+    arr.set_string("ru_inblock".into(), Value::Long(usage.ru_inblock as i64));
+    arr.set_string("ru_msgsnd".into(), Value::Long(usage.ru_msgsnd as i64));
+    arr.set_string("ru_msgrcv".into(), Value::Long(usage.ru_msgrcv as i64));
+    arr.set_string("ru_maxrss".into(), Value::Long(usage.ru_maxrss as i64));
+    arr.set_string("ru_ixrss".into(), Value::Long(usage.ru_ixrss as i64));
+    arr.set_string("ru_idrss".into(), Value::Long(usage.ru_idrss as i64));
+    arr.set_string("ru_minflt".into(), Value::Long(usage.ru_minflt as i64));
+    arr.set_string("ru_majflt".into(), Value::Long(usage.ru_majflt as i64));
+    arr.set_string("ru_nsignals".into(), Value::Long(usage.ru_nsignals as i64));
+    arr.set_string("ru_nvcsw".into(), Value::Long(usage.ru_nvcsw as i64));
+    arr.set_string("ru_nivcsw".into(), Value::Long(usage.ru_nivcsw as i64));
+    arr.set_string("ru_nswap".into(), Value::Long(usage.ru_nswap as i64));
+    arr.set_string(
+        "ru_utime.tv_usec".into(),
+        Value::Long(usage.ru_utime.tv_usec as i64),
+    );
+    arr.set_string(
+        "ru_utime.tv_sec".into(),
+        Value::Long(usage.ru_utime.tv_sec as i64),
+    );
+    arr.set_string(
+        "ru_stime.tv_usec".into(),
+        Value::Long(usage.ru_stime.tv_usec as i64),
+    );
+    arr.set_string(
+        "ru_stime.tv_sec".into(),
+        Value::Long(usage.ru_stime.tv_sec as i64),
+    );
     Ok(Value::Array(arr))
 }
 
@@ -3090,21 +3305,72 @@ fn php_escapeshellcmd(
 }
 
 fn php_popen(
-    _vm: &mut Vm,
-    _args: &[Value],
+    vm: &mut Vm,
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Bool(false))
+    let command = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let mode = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "r".into());
+
+    if mode.contains('r') {
+        // Read mode: capture stdout, store as in-memory FileHandle for fgets/fread
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .output();
+        match output {
+            Ok(out) => {
+                let data = out.stdout;
+                let handle = php_rs_ext_standard::file::FileHandle::from_bytes(data);
+                let id = vm.next_resource_id;
+                vm.next_resource_id += 1;
+                vm.file_handles.insert(id, handle);
+                // Store the exit code in proc_handles as a placeholder
+                Ok(Value::Resource(id, "process".into()))
+            }
+            Err(_) => Ok(Value::Bool(false)),
+        }
+    } else {
+        // Write mode: spawn child with piped stdin
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&command)
+            .stdin(std::process::Stdio::piped())
+            .spawn();
+        match child {
+            Ok(child) => {
+                let id = vm.next_resource_id;
+                vm.next_resource_id += 1;
+                vm.proc_handles.insert(id, child);
+                Ok(Value::Resource(id, "process".into()))
+            }
+            Err(_) => Ok(Value::Bool(false)),
+        }
+    }
 }
 
 fn php_pclose(
-    _vm: &mut Vm,
-    _args: &[Value],
+    vm: &mut Vm,
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Long(0))
+    let res_id = match args.first() {
+        Some(Value::Resource(id, _)) => *id,
+        _ => return Ok(Value::Long(-1)),
+    };
+    // Check proc_handles first (write mode), then file_handles (read mode)
+    if let Some(mut child) = vm.proc_handles.remove(&res_id) {
+        match child.wait() {
+            Ok(status) => Ok(Value::Long(status.code().unwrap_or(-1) as i64)),
+            Err(_) => Ok(Value::Long(-1)),
+        }
+    } else {
+        // For read mode, just remove the file handle
+        vm.file_handles.remove(&res_id);
+        Ok(Value::Long(0))
+    }
 }
 
 /// proc_open($command, $descriptorspec, &$pipes, $cwd, $env, $other_options): resource|false
@@ -3355,13 +3621,38 @@ fn php_proc_terminate(
 
 /// proc_nice($increment): bool
 fn php_proc_nice(
-    _vm: &mut Vm,
-    _args: &[Value],
+    vm: &mut Vm,
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    // proc_nice is platform-specific; return true as best-effort
-    Ok(Value::Bool(true))
+    let increment = args.first().map(|v| v.to_long()).unwrap_or(0) as libc::c_int;
+    #[cfg(unix)]
+    {
+        use std::io::Error;
+        // Clear errno, then call nice()
+        unsafe {
+            #[cfg(target_os = "macos")]
+            {
+                *libc::__error() = 0;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                *libc::__errno_location() = 0;
+            }
+        }
+        let result = unsafe { libc::nice(increment) };
+        if result == -1 && Error::last_os_error().raw_os_error() != Some(0) {
+            let _ = vm.emit_error(2, "proc_nice(): Permission denied");
+            return Ok(Value::Bool(false));
+        }
+        return Ok(Value::Bool(true));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (vm, increment);
+        Ok(Value::Bool(false))
+    }
 }
 
 // -- Pack/Unpack --
@@ -4046,12 +4337,152 @@ fn php_http_build_query(
 }
 
 fn php_getopt(
-    _vm: &mut Vm,
-    _args: &[Value],
-    _ref_args: &[(usize, OperandType, u32)],
-    _ref_prop_args: &[(usize, Value, String)],
+    vm: &mut Vm,
+    args: &[Value],
+    ref_args: &[(usize, OperandType, u32)],
+    ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Bool(false))
+    let short_opts = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let long_opts = match args.get(1) {
+        Some(Value::Array(a)) => a.entries().iter().map(|(_, v)| v.to_php_string()).collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+
+    // Get argv from $_SERVER or $argv
+    let argv: Vec<String> = {
+        let mut found = Vec::new();
+        // Try reading from bottom frame's $argv
+        if let Some(frame) = vm.call_stack.first() {
+            let oa = &vm.op_arrays[frame.op_array_idx];
+            if let Some(idx) = oa.vars.iter().position(|v| v == "argv") {
+                if idx < frame.cvs.len() {
+                    if let Value::Array(arr) = &frame.cvs[idx] {
+                        for (_, v) in arr.entries() {
+                            found.push(v.to_php_string());
+                        }
+                    }
+                }
+            }
+        }
+        if found.is_empty() {
+            std::env::args().collect()
+        } else {
+            found
+        }
+    };
+
+    let mut result = PhpArray::new();
+    let mut optind = 1usize; // skip program name
+    let mut rest_index = argv.len() as i64;
+
+    while optind < argv.len() {
+        let arg = &argv[optind];
+        if arg == "--" {
+            rest_index = optind as i64 + 1;
+            break;
+        }
+        if arg.starts_with("--") {
+            // Long option
+            let opt_str = &arg[2..];
+            let (name, value) = if let Some(eq_pos) = opt_str.find('=') {
+                (opt_str[..eq_pos].to_string(), Some(opt_str[eq_pos + 1..].to_string()))
+            } else {
+                (opt_str.to_string(), None)
+            };
+            // Check if this long opt is defined
+            let mut found = false;
+            for lo in &long_opts {
+                let (lo_name, requires) = if lo.ends_with("::") {
+                    (lo.trim_end_matches(':'), 2)
+                } else if lo.ends_with(':') {
+                    (lo.trim_end_matches(':'), 1)
+                } else {
+                    (lo.as_str(), 0)
+                };
+                if lo_name == name {
+                    found = true;
+                    match requires {
+                        0 => { result.set_string(name.clone(), Value::Bool(false)); }
+                        1 => {
+                            let val = value.or_else(|| {
+                                optind += 1;
+                                argv.get(optind).cloned()
+                            });
+                            if let Some(v) = val {
+                                result.set_string(name.clone(), Value::String(v));
+                            }
+                        }
+                        _ => {
+                            // Optional value
+                            if let Some(v) = value {
+                                result.set_string(name.clone(), Value::String(v));
+                            } else {
+                                result.set_string(name.clone(), Value::Bool(false));
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            if !found {
+                rest_index = optind as i64;
+                break;
+            }
+        } else if arg.starts_with('-') && arg.len() > 1 {
+            // Short options
+            let chars: Vec<char> = arg[1..].chars().collect();
+            let mut i = 0;
+            while i < chars.len() {
+                let c = chars[i];
+                let c_pos = short_opts.find(c);
+                if c_pos.is_none() {
+                    i += 1;
+                    continue;
+                }
+                let c_pos = c_pos.unwrap();
+                let colons = short_opts[c_pos + 1..].chars().take_while(|&x| x == ':').count();
+                let key = c.to_string();
+                match colons {
+                    0 => { result.set_string(key, Value::Bool(false)); }
+                    1 => {
+                        // Required value: rest of this arg or next arg
+                        if i + 1 < chars.len() {
+                            let val: String = chars[i + 1..].iter().collect();
+                            result.set_string(key, Value::String(val));
+                            i = chars.len();
+                            continue;
+                        } else {
+                            optind += 1;
+                            if let Some(v) = argv.get(optind) {
+                                result.set_string(key, Value::String(v.clone()));
+                            }
+                        }
+                    }
+                    _ => {
+                        // Optional value: only from rest of this arg
+                        if i + 1 < chars.len() {
+                            let val: String = chars[i + 1..].iter().collect();
+                            result.set_string(key, Value::String(val));
+                            i = chars.len();
+                            continue;
+                        } else {
+                            result.set_string(key, Value::Bool(false));
+                        }
+                    }
+                }
+                i += 1;
+            }
+        } else {
+            rest_index = optind as i64;
+            break;
+        }
+        optind += 1;
+    }
+
+    // Write back optind via ref param (3rd arg)
+    vm.write_back_arg(2, Value::Long(rest_index), ref_args, ref_prop_args);
+
+    Ok(Value::Array(result))
 }
 
 // -- Password hashing --
@@ -4458,7 +4889,61 @@ fn php_image_type_to_extension(
     }
 }
 
+fn imagesize_to_array(info: &php_rs_ext_gd::ImageSize) -> Value {
+    let mut arr = PhpArray::new();
+    arr.push(Value::Long(info.width as i64));
+    arr.push(Value::Long(info.height as i64));
+    arr.push(Value::Long(info.image_type as i64));
+    let attr = format!(
+        "width=\"{}\" height=\"{}\"",
+        info.width, info.height
+    );
+    arr.push(Value::String(attr.into()));
+    arr.set_string("bits".to_string(), Value::Long(info.bits as i64));
+    arr.set_string("channels".to_string(), Value::Long(info.channels as i64));
+    arr.set_string("mime".to_string(), Value::String(info.mime.clone()));
+    Value::Array(arr)
+}
+
 fn php_getimagesize(
+    _vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let filename = args.first().map(|v| v.to_string()).unwrap_or_default();
+    if filename.is_empty() {
+        return Ok(Value::Bool(false));
+    }
+    // Try to read file and parse actual image headers
+    if let Ok(data) = std::fs::read(&filename) {
+        if let Some(info) = php_rs_ext_gd::getimagesizefromstring(&data) {
+            return Ok(imagesize_to_array(&info));
+        }
+    }
+    // Fall back to extension-based detection
+    if let Some(info) = php_rs_ext_gd::getimagesize(&filename) {
+        return Ok(imagesize_to_array(&info));
+    }
+    Ok(Value::Bool(false))
+}
+
+fn php_getimagesizefromstring(
+    _vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let data_str = args.first().map(|v| v.to_string()).unwrap_or_default();
+    let data: Vec<u8> = data_str.chars().map(|c| c as u8).collect();
+    if let Some(info) = php_rs_ext_gd::getimagesizefromstring(&data) {
+        Ok(imagesize_to_array(&info))
+    } else {
+        Ok(Value::Bool(false))
+    }
+}
+
+fn php_iptc_stub(
     _vm: &mut Vm,
     _args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
@@ -4526,7 +5011,12 @@ fn php_posix_getppid(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Long(1))
+    #[cfg(unix)]
+    {
+        Ok(Value::Long(unsafe { libc::getppid() } as i64))
+    }
+    #[cfg(not(unix))]
+    Ok(Value::Long(0))
 }
 fn php_posix_getuid(
     _vm: &mut Vm,
@@ -4534,15 +5024,33 @@ fn php_posix_getuid(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    #[cfg(unix)]
+    {
+        Ok(Value::Long(unsafe { libc::getuid() } as i64))
+    }
+    #[cfg(not(unix))]
     Ok(Value::Long(0))
 }
 fn php_posix_getpgid(
     _vm: &mut Vm,
-    _args: &[Value],
+    args: &[Value],
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    Ok(Value::Long(std::process::id() as i64))
+    let pid = args.first().map(|v| v.to_long()).unwrap_or(0) as libc::pid_t;
+    #[cfg(unix)]
+    {
+        let pgid = unsafe { libc::getpgid(pid) };
+        if pgid < 0 {
+            return Ok(Value::Bool(false));
+        }
+        return Ok(Value::Long(pgid as i64));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(Value::Long(0))
+    }
 }
 fn php_posix_getlogin(
     _vm: &mut Vm,
@@ -4561,18 +5069,29 @@ fn php_posix_uname(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
+    #[cfg(unix)]
+    {
+        let mut utsname: libc::utsname = unsafe { std::mem::zeroed() };
+        if unsafe { libc::uname(&mut utsname) } == 0 {
+            let to_string = |arr: &[libc::c_char]| {
+                let cstr = unsafe { std::ffi::CStr::from_ptr(arr.as_ptr()) };
+                cstr.to_str().unwrap_or("").to_string()
+            };
+            let mut arr = PhpArray::new();
+            arr.set_string("sysname".into(), Value::String(to_string(&utsname.sysname)));
+            arr.set_string("nodename".into(), Value::String(to_string(&utsname.nodename)));
+            arr.set_string("release".into(), Value::String(to_string(&utsname.release)));
+            arr.set_string("version".into(), Value::String(to_string(&utsname.version)));
+            arr.set_string("machine".into(), Value::String(to_string(&utsname.machine)));
+            return Ok(Value::Array(arr));
+        }
+    }
     let mut arr = PhpArray::new();
-    arr.set_string(
-        "sysname".into(),
-        Value::String(std::env::consts::OS.to_string()),
-    );
+    arr.set_string("sysname".into(), Value::String(std::env::consts::OS.to_string()));
     arr.set_string("nodename".into(), Value::String("localhost".into()));
     arr.set_string("release".into(), Value::String("1.0.0".into()));
     arr.set_string("version".into(), Value::String("1".into()));
-    arr.set_string(
-        "machine".into(),
-        Value::String(std::env::consts::ARCH.to_string()),
-    );
+    arr.set_string("machine".into(), Value::String(std::env::consts::ARCH.to_string()));
     Ok(Value::Array(arr))
 }
 

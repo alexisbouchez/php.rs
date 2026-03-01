@@ -336,6 +336,9 @@ pub(crate) fn php_settype(
     // Write back to ref if possible
     if let Some(Value::Reference(rc)) = args.first() {
         *rc.borrow_mut() = converted;
+    } else {
+        // Write back via CV ref_args mechanism
+        _vm.write_back_arg(0, converted, _ref_args, _ref_prop_args);
     }
 
     Ok(Value::Bool(true))

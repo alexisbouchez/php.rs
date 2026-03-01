@@ -170,6 +170,36 @@ pub(crate) fn build_default_constants() -> HashMap<String, Value> {
     c.insert("FILTER_SANITIZE_URL".into(), Value::Long(523));
     c.insert("FILTER_SANITIZE_ADD_SLASHES".into(), Value::Long(524));
     c.insert("FILTER_DEFAULT".into(), Value::Long(516));
+    c.insert("FILTER_FLAG_NONE".into(), Value::Long(0));
+    c.insert("FILTER_FLAG_STRIP_LOW".into(), Value::Long(4));
+    c.insert("FILTER_FLAG_STRIP_HIGH".into(), Value::Long(8));
+    c.insert("FILTER_FLAG_ALLOW_FRACTION".into(), Value::Long(4096));
+    c.insert("FILTER_FLAG_ALLOW_THOUSAND".into(), Value::Long(8192));
+    c.insert("FILTER_FLAG_ALLOW_SCIENTIFIC".into(), Value::Long(16384));
+    c.insert("FILTER_FLAG_NO_ENCODE_QUOTES".into(), Value::Long(128));
+    c.insert("FILTER_FLAG_ENCODE_LOW".into(), Value::Long(16));
+    c.insert("FILTER_FLAG_ENCODE_HIGH".into(), Value::Long(32));
+    c.insert("FILTER_FLAG_ENCODE_AMP".into(), Value::Long(64));
+    c.insert("FILTER_FLAG_IPV4".into(), Value::Long(1048576));
+    c.insert("FILTER_FLAG_IPV6".into(), Value::Long(2097152));
+    c.insert("FILTER_FLAG_NO_RES_RANGE".into(), Value::Long(4194304));
+    c.insert("FILTER_FLAG_NO_PRIV_RANGE".into(), Value::Long(8388608));
+    c.insert("FILTER_FLAG_PATH_REQUIRED".into(), Value::Long(262144));
+    c.insert("FILTER_FLAG_QUERY_REQUIRED".into(), Value::Long(524288));
+    c.insert("FILTER_REQUIRE_SCALAR".into(), Value::Long(33554432));
+    c.insert("FILTER_REQUIRE_ARRAY".into(), Value::Long(16777216));
+    c.insert("FILTER_FORCE_ARRAY".into(), Value::Long(67108864));
+    c.insert("FILTER_NULL_ON_FAILURE".into(), Value::Long(134217728));
+    c.insert("FILTER_CALLBACK".into(), Value::Long(1024));
+
+    // Input type constants for filter_input()
+    c.insert("INPUT_GET".into(), Value::Long(1));
+    c.insert("INPUT_POST".into(), Value::Long(2));
+    c.insert("INPUT_COOKIE".into(), Value::Long(4));
+    c.insert("INPUT_ENV".into(), Value::Long(16));
+    c.insert("INPUT_SERVER".into(), Value::Long(32));
+    c.insert("INPUT_SESSION".into(), Value::Long(64));
+    c.insert("INPUT_REQUEST".into(), Value::Long(99));
 
     // URL component constants
     c.insert("PHP_URL_SCHEME".into(), Value::Long(0));
@@ -184,6 +214,20 @@ pub(crate) fn build_default_constants() -> HashMap<String, Value> {
     // Filesystem constants
     c.insert("FILE_APPEND".into(), Value::Long(8));
     c.insert("LOCK_EX".into(), Value::Long(2));
+
+    // Connection status constants
+    c.insert("CONNECTION_NORMAL".into(), Value::Long(0));
+    c.insert("CONNECTION_ABORTED".into(), Value::Long(1));
+    c.insert("CONNECTION_TIMEOUT".into(), Value::Long(2));
+
+    // Extract constants
+    c.insert("EXTR_OVERWRITE".into(), Value::Long(0));
+    c.insert("EXTR_SKIP".into(), Value::Long(1));
+    c.insert("EXTR_PREFIX_SAME".into(), Value::Long(2));
+    c.insert("EXTR_PREFIX_ALL".into(), Value::Long(3));
+    c.insert("EXTR_PREFIX_INVALID".into(), Value::Long(4));
+    c.insert("EXTR_IF_EXISTS".into(), Value::Long(6));
+    c.insert("EXTR_REFS".into(), Value::Long(256));
 
     // Calendar constants
     c.insert("CAL_GREGORIAN".into(), Value::Long(0));

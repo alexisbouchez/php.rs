@@ -30,6 +30,7 @@ php-rs-ext-iconv = { path = "../php-rs-ext-iconv" }
 php-rs-ext-zip = { path = "../php-rs-ext-zip" }
 php-rs-ext-bz2 = { path = "../php-rs-ext-bz2" }
 php-rs-ext-phar = { path = "../php-rs-ext-phar" }
+php-rs-ext-dom = { path = "../php-rs-ext-dom" }
 php-rs-ext-simplexml = { path = "../php-rs-ext-simplexml" }
 php-rs-ext-xml = { path = "../php-rs-ext-xml" }
 php-rs-ext-xmlreader = { path = "../php-rs-ext-xmlreader" }
@@ -52,6 +53,7 @@ php-rs-ext-curl = { path = "../php-rs-ext-curl", optional = true }
 php-rs-ext-openssl = { path = "../php-rs-ext-openssl", optional = true }
 php-rs-ext-pdo = { path = "../php-rs-ext-pdo", optional = true }
 php-rs-ext-sodium = { path = "../php-rs-ext-sodium", optional = true }
+libc = "0.2"
 regex = "1"
 fancy-regex = "0.14"
 mysql = { version = "25.0", optional = true }
