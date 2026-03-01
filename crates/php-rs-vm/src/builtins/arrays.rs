@@ -520,11 +520,17 @@ fn php_array_unique(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr = args.first().cloned().unwrap_or(Value::Null);
+    let flags = args.get(1).map(|v| v.to_long()).unwrap_or(2); // SORT_STRING is default
     if let Value::Array(ref a) = arr {
         let mut result = PhpArray::new();
         let mut seen: Vec<Value> = Vec::new();
+        let eq_fn: fn(&Value, &Value) -> bool = match flags {
+            1 => |a, b| a.to_double() == b.to_double(), // SORT_NUMERIC
+            2 | 5 => |a, b| a.to_php_string() == b.to_php_string(), // SORT_STRING / SORT_LOCALE_STRING
+            _ => |a, b| a.loose_eq(b), // SORT_REGULAR (0)
+        };
         for (key, val) in a.entries() {
-            if !seen.iter().any(|s| s.loose_eq(val)) {
+            if !seen.iter().any(|s| eq_fn(s, val)) {
                 seen.push(val.clone());
                 match key {
                     ArrayKey::Int(n) => result.set_int(*n, val.clone()),
@@ -903,11 +909,21 @@ fn php_array_intersect(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr1 = args.first().cloned().unwrap_or(Value::Null);
-    let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
-    if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+    if let Value::Array(ref a1) = arr1 {
+        let compare_arrays: Vec<&PhpArray> = args
+            .iter()
+            .skip(1)
+            .filter_map(|v| if let Value::Array(ref a) = v { Some(a) } else { None })
+            .collect();
+        if compare_arrays.is_empty() {
+            return Ok(Value::Array(PhpArray::new()));
+        }
         let mut result = PhpArray::new();
         for (key, val) in a1.entries() {
-            if a2.entries().iter().any(|(_, v)| val.loose_eq(v)) {
+            let in_all = compare_arrays.iter().all(|ca| {
+                ca.entries().iter().any(|(_, v)| val.loose_eq(v))
+            });
+            if in_all {
                 match key {
                     ArrayKey::Int(n) => result.set_int(*n, val.clone()),
                     ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
@@ -931,11 +947,21 @@ fn php_array_intersect_key(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr1 = args.first().cloned().unwrap_or(Value::Null);
-    let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
-    if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+    if let Value::Array(ref a1) = arr1 {
+        let compare_arrays: Vec<&PhpArray> = args
+            .iter()
+            .skip(1)
+            .filter_map(|v| if let Value::Array(ref a) = v { Some(a) } else { None })
+            .collect();
+        if compare_arrays.is_empty() {
+            return Ok(Value::Array(PhpArray::new()));
+        }
         let mut result = PhpArray::new();
         for (key, val) in a1.entries() {
-            if a2.entries().iter().any(|(k, _)| k == key) {
+            let in_all = compare_arrays.iter().all(|ca| {
+                ca.entries().iter().any(|(k, _)| k == key)
+            });
+            if in_all {
                 match key {
                     ArrayKey::Int(n) => result.set_int(*n, val.clone()),
                     ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
@@ -959,15 +985,21 @@ fn php_array_intersect_assoc(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr1 = args.first().cloned().unwrap_or(Value::Null);
-    let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
-    if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+    if let Value::Array(ref a1) = arr1 {
+        let compare_arrays: Vec<&PhpArray> = args
+            .iter()
+            .skip(1)
+            .filter_map(|v| if let Value::Array(ref a) = v { Some(a) } else { None })
+            .collect();
+        if compare_arrays.is_empty() {
+            return Ok(Value::Array(PhpArray::new()));
+        }
         let mut result = PhpArray::new();
         for (key, val) in a1.entries() {
-            let found = a2
-                .entries()
-                .iter()
-                .any(|(k, v)| k == key && val.loose_eq(v));
-            if found {
+            let in_all = compare_arrays.iter().all(|ca| {
+                ca.entries().iter().any(|(k, v)| k == key && val.loose_eq(v))
+            });
+            if in_all {
                 match key {
                     ArrayKey::Int(n) => result.set_int(*n, val.clone()),
                     ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
@@ -991,11 +1023,21 @@ fn php_array_diff(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr1 = args.first().cloned().unwrap_or(Value::Null);
-    let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
-    if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+    if let Value::Array(ref a1) = arr1 {
+        let compare_arrays: Vec<&PhpArray> = args
+            .iter()
+            .skip(1)
+            .filter_map(|v| if let Value::Array(ref a) = v { Some(a) } else { None })
+            .collect();
+        if compare_arrays.is_empty() {
+            return Ok(Value::Array(a1.clone()));
+        }
         let mut result = PhpArray::new();
         for (key, val) in a1.entries() {
-            if !a2.entries().iter().any(|(_, v)| val.loose_eq(v)) {
+            let in_any = compare_arrays.iter().any(|ca| {
+                ca.entries().iter().any(|(_, v)| val.loose_eq(v))
+            });
+            if !in_any {
                 match key {
                     ArrayKey::Int(n) => result.set_int(*n, val.clone()),
                     ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
@@ -1019,11 +1061,21 @@ fn php_array_diff_key(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr1 = args.first().cloned().unwrap_or(Value::Null);
-    let arr2 = args.get(1).cloned().unwrap_or(Value::Null);
-    if let (Value::Array(ref a1), Value::Array(ref a2)) = (&arr1, &arr2) {
+    if let Value::Array(ref a1) = arr1 {
+        let compare_arrays: Vec<&PhpArray> = args
+            .iter()
+            .skip(1)
+            .filter_map(|v| if let Value::Array(ref a) = v { Some(a) } else { None })
+            .collect();
+        if compare_arrays.is_empty() {
+            return Ok(Value::Array(a1.clone()));
+        }
         let mut result = PhpArray::new();
         for (key, val) in a1.entries() {
-            if !a2.entries().iter().any(|(k, _)| k == key) {
+            let in_any = compare_arrays.iter().any(|ca| {
+                ca.entries().iter().any(|(k, _)| k == key)
+            });
+            if !in_any {
                 match key {
                     ArrayKey::Int(n) => result.set_int(*n, val.clone()),
                     ArrayKey::String(s) => result.set_string(s.clone(), val.clone()),
@@ -1739,7 +1791,7 @@ fn php_compact(
             Value::String(name) => {
                 // Find the variable by name in the caller's frame
                 if let Some(idx) = vars.iter().position(|v| v == name) {
-                    if idx < cvs.len() && !cvs[idx].is_null() {
+                    if idx < cvs.len() {
                         result.set_string(name.clone(), cvs[idx].clone());
                     }
                 }
@@ -1749,7 +1801,7 @@ fn php_compact(
                 for (_, val) in arr.entries() {
                     if let Value::String(name) = val {
                         if let Some(idx) = vars.iter().position(|v| v == name) {
-                            if idx < cvs.len() && !cvs[idx].is_null() {
+                            if idx < cvs.len() {
                                 result.set_string(name.clone(), cvs[idx].clone());
                             }
                         }

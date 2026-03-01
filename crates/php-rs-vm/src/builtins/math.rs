@@ -113,6 +113,8 @@ pub(crate) fn dispatch(
             let b = args.get(1).cloned().unwrap_or(Value::Long(1)).to_long();
             if b == 0 {
                 Err(VmError::FatalError("Division by zero".to_string()))
+            } else if a == i64::MIN && b == -1 {
+                Err(VmError::FatalError("Division of PHP_INT_MIN by -1 is not an integer".to_string()))
             } else {
                 Ok(Some(Value::Long(a / b)))
             }

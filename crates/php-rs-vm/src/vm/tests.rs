@@ -14704,4 +14704,109 @@ echo ($a === Suit::Diamonds ? "equal" : "not equal");
 "#);
         assert_eq!(output, "equal\nnot equal");
     }
+
+    #[test]
+    fn test_enum_from() {
+        let output = run_php(r#"<?php
+enum Status: string {
+    case Active = "active";
+    case Inactive = "inactive";
+}
+$s = Status::from("active");
+echo $s->name . "\n";
+echo $s->value;
+"#);
+        assert_eq!(output, "Active\nactive");
+    }
+
+    #[test]
+    fn test_enum_try_from() {
+        let output = run_php(r#"<?php
+enum Color: int {
+    case Red = 1;
+    case Green = 2;
+    case Blue = 3;
+}
+$c = Color::tryFrom(2);
+echo $c->name . "\n";
+$n = Color::tryFrom(99);
+echo ($n === null ? "null" : "not null");
+"#);
+        assert_eq!(output, "Green\nnull");
+    }
+
+    #[test]
+    fn test_enum_cases() {
+        let output = run_php(r#"<?php
+enum Suit: string {
+    case Hearts = "H";
+    case Diamonds = "D";
+}
+$cases = Suit::cases();
+echo count($cases) . "\n";
+foreach ($cases as $c) {
+    echo $c->name . "\n";
+}
+"#);
+        assert!(output.contains("2\n"));
+        assert!(output.contains("Hearts\n"));
+        assert!(output.contains("Diamonds"));
+    }
+
+    #[test]
+    fn test_intdiv_overflow() {
+        let result = run_php_result(r#"<?php
+echo intdiv(PHP_INT_MIN, -1);
+"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_array_diff_variadic() {
+        let output = run_php(r#"<?php
+$a = [1, 2, 3, 4, 5];
+$b = [2, 4];
+$c = [5];
+$result = array_diff($a, $b, $c);
+echo implode(",", $result);
+"#);
+        assert_eq!(output, "1,3");
+    }
+
+    #[test]
+    fn test_array_intersect_variadic() {
+        let output = run_php(r#"<?php
+$a = [1, 2, 3, 4, 5];
+$b = [2, 3, 4, 6];
+$c = [3, 4, 7];
+$result = array_intersect($a, $b, $c);
+echo implode(",", $result);
+"#);
+        assert_eq!(output, "3,4");
+    }
+
+    #[test]
+    fn test_array_unique_sort_string() {
+        let output = run_php(r#"<?php
+$a = [0, "a", 1, "b", "0"];
+$result = array_unique($a, SORT_STRING);
+echo count($result);
+"#);
+        // With SORT_STRING, "0" and 0 are same as strings, so one is removed
+        // 0, "a", 1, "b" remain (4 unique string representations: "0", "a", "1", "b")
+        assert_eq!(output, "4");
+    }
+
+    #[test]
+    fn test_compact_includes_null() {
+        let output = run_php(r#"<?php
+$a = 1;
+$b = null;
+$c = "hello";
+$result = compact("a", "b", "c");
+echo count($result) . "\n";
+echo ($result["b"] === null ? "null" : "other");
+"#);
+        assert_eq!(output, "3\nnull");
+    }
 }

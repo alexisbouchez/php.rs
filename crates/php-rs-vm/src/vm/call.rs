@@ -1189,6 +1189,85 @@ impl Vm {
             return Ok(DispatchSignal::Next);
         }
 
+        // Handle Enum::from() and Enum::tryFrom() for backed enums
+        if func_name.ends_with("::from") || func_name.ends_with("::tryFrom") {
+            let sep = func_name.rfind("::").unwrap();
+            let enum_name = &func_name[..sep];
+            let method = &func_name[sep + 2..];
+            if let Some(class_def) = self.classes.get(enum_name) {
+                if class_def.is_enum {
+                    let search_val = args.first().cloned().unwrap_or(Value::Null);
+                    let mut found = None;
+                    for (case_name, case_val) in &class_def.class_constants {
+                        if case_name == "class" {
+                            continue;
+                        }
+                        if case_val.loose_eq(&search_val) {
+                            let mut obj =
+                                crate::value::PhpObject::new(enum_name.to_string());
+                            obj.set_property(
+                                "name".to_string(),
+                                Value::String(case_name.clone()),
+                            );
+                            obj.set_property("value".to_string(), case_val.clone());
+                            found = Some(Value::Object(obj));
+                            break;
+                        }
+                    }
+                    let result = match method {
+                        "from" => match found {
+                            Some(v) => v,
+                            None => {
+                                let mut ex_obj = crate::value::PhpObject::new("ValueError".to_string());
+                                ex_obj.set_property(
+                                    "message".to_string(),
+                                    Value::String(format!(
+                                        "{} is not a valid backing value for enum \"{}\"",
+                                        search_val.to_php_string(),
+                                        enum_name
+                                    )),
+                                );
+                                return Err(crate::VmError::Thrown(Value::Object(ex_obj)));
+                            }
+                        },
+                        _ => found.unwrap_or(Value::Null), // tryFrom returns null
+                    };
+                    if op.result_type != OperandType::Unused {
+                        self.write_result(op, caller_oa_idx, result)?;
+                    }
+                    return Ok(DispatchSignal::Next);
+                }
+            }
+        }
+
+        // Handle Enum::cases() for enums
+        if func_name.ends_with("::cases") {
+            let sep = func_name.rfind("::").unwrap();
+            let enum_name = &func_name[..sep];
+            if let Some(class_def) = self.classes.get(enum_name) {
+                if class_def.is_enum {
+                    let mut arr = crate::value::PhpArray::new();
+                    for (case_name, case_val) in &class_def.class_constants {
+                        if case_name == "class" {
+                            continue;
+                        }
+                        let mut obj =
+                            crate::value::PhpObject::new(enum_name.to_string());
+                        obj.set_property(
+                            "name".to_string(),
+                            Value::String(case_name.clone()),
+                        );
+                        obj.set_property("value".to_string(), case_val.clone());
+                        arr.push(Value::Object(obj));
+                    }
+                    if op.result_type != OperandType::Unused {
+                        self.write_result(op, caller_oa_idx, Value::Array(arr))?;
+                    }
+                    return Ok(DispatchSignal::Next);
+                }
+            }
+        }
+
         // Check if this is a Generator method call
         if let Some(gen_result) = self.try_generator_method(&func_name, &args)? {
             if op.result_type != OperandType::Unused {
