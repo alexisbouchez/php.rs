@@ -241,9 +241,22 @@ fn php_array_keys(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr = args.first().cloned().unwrap_or(Value::Null);
+    let search_value = args.get(1).cloned();
+    let strict = args.get(2).map(|v| v.to_bool()).unwrap_or(false);
     let mut result = PhpArray::new();
     if let Value::Array(ref a) = arr {
-        for (key, _) in a.entries() {
+        for (key, val) in a.entries() {
+            // If search_value given, only include keys whose value matches
+            if let Some(ref search) = search_value {
+                let matches = if strict {
+                    val.strict_eq(search)
+                } else {
+                    val.loose_eq(search)
+                };
+                if !matches {
+                    continue;
+                }
+            }
             match key {
                 ArrayKey::Int(n) => result.push(Value::Long(*n)),
                 ArrayKey::String(s) => result.push(Value::String(s.clone())),
@@ -375,12 +388,19 @@ fn php_array_reverse(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let arr = args.first().cloned().unwrap_or(Value::Null);
+    let preserve_keys = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
     let mut result = PhpArray::new();
     if let Value::Array(ref a) = arr {
         let entries: Vec<_> = a.entries().iter().rev().collect();
         for (key, val) in entries {
             match key {
-                ArrayKey::Int(_) => result.push(val.clone()),
+                ArrayKey::Int(n) => {
+                    if preserve_keys {
+                        result.set_int(*n, val.clone());
+                    } else {
+                        result.push(val.clone());
+                    }
+                }
                 ArrayKey::String(s) => {
                     result.set_string(s.clone(), val.clone());
                 }

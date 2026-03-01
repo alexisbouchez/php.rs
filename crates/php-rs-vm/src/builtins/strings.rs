@@ -5,6 +5,46 @@ use crate::vm::{Vm, VmResult};
 use php_rs_compiler::op::OperandType;
 use php_rs_ext_json::{self, JsonValue};
 
+/// Perform str_replace with support for array search/replace.
+fn str_replace_impl(search: &Value, replace: &Value, subject: &str) -> String {
+    match search {
+        Value::Array(ref search_arr) => {
+            // Array search: iterate through search values with corresponding replacements
+            let mut result = subject.to_string();
+            let replace_entries: Vec<String> = match replace {
+                Value::Array(ref rep_arr) => rep_arr
+                    .entries()
+                    .iter()
+                    .map(|(_, v)| v.to_php_string())
+                    .collect(),
+                _ => vec![replace.to_php_string()],
+            };
+            for (i, (_, s)) in search_arr.entries().iter().enumerate() {
+                let s_str = s.to_php_string();
+                if s_str.is_empty() {
+                    continue;
+                }
+                let r_str = if replace_entries.len() > 1 {
+                    replace_entries.get(i).cloned().unwrap_or_default()
+                } else {
+                    replace_entries.first().cloned().unwrap_or_default()
+                };
+                result = result.replace(&s_str, &r_str);
+            }
+            result
+        }
+        _ => {
+            // Scalar search/replace
+            let s = search.to_php_string();
+            let r = replace.to_php_string();
+            if s.is_empty() {
+                return subject.to_string();
+            }
+            subject.replace(&s, &r)
+        }
+    }
+}
+
 /// Dispatch a built-in strings function call.
 /// Returns `Ok(Some(value))` if handled, `Ok(None)` if not recognized.
 pub(crate) fn dispatch(
@@ -170,10 +210,27 @@ pub(crate) fn dispatch(
             }
         }
         "str_replace" => {
-            let search = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            let replace = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
-            let subject = args.get(2).cloned().unwrap_or(Value::Null).to_php_string();
-            Ok(Some(Value::String(subject.replace(&search, &replace))))
+            let search_val = args.first().cloned().unwrap_or(Value::Null);
+            let replace_val = args.get(1).cloned().unwrap_or(Value::Null);
+            let subject_val = args.get(2).cloned().unwrap_or(Value::Null);
+
+            // Handle array subject: apply replacement to each element
+            if let Value::Array(ref subj_arr) = subject_val {
+                let mut result_arr = PhpArray::new();
+                for (key, val) in subj_arr.entries() {
+                    let s = val.to_php_string();
+                    let replaced = str_replace_impl(&search_val, &replace_val, &s);
+                    match key {
+                        ArrayKey::Int(n) => result_arr.set_int(*n, Value::String(replaced)),
+                        ArrayKey::String(k) => result_arr.set_string(k.clone(), Value::String(replaced)),
+                    }
+                }
+                return Ok(Some(Value::Array(result_arr)));
+            }
+
+            let subject = subject_val.to_php_string();
+            let result = str_replace_impl(&search_val, &replace_val, &subject);
+            Ok(Some(Value::String(result)))
         }
         "sprintf" => {
             let fmt = args.first().cloned().unwrap_or(Value::Null).to_php_string();

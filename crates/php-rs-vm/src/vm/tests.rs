@@ -14538,4 +14538,74 @@ echo implode(",", $arr);
 "#);
         assert_eq!(output, "img1,img2,img10,img12");
     }
+
+    #[test]
+    fn test_array_reverse_preserve_keys() {
+        let output = run_php(r#"<?php
+$arr = [10 => 'a', 20 => 'b', 30 => 'c'];
+$r = array_reverse($arr, true);
+$keys = array_keys($r);
+echo implode(",", $keys) . "\n";
+echo implode(",", $r);
+"#);
+        assert_eq!(output, "30,20,10\nc,b,a");
+    }
+
+    #[test]
+    fn test_array_reverse_no_preserve() {
+        let output = run_php(r#"<?php
+$arr = [10 => 'a', 20 => 'b', 30 => 'c'];
+$r = array_reverse($arr);
+$keys = array_keys($r);
+echo implode(",", $keys) . "\n";
+echo implode(",", $r);
+"#);
+        assert_eq!(output, "0,1,2\nc,b,a");
+    }
+
+    #[test]
+    fn test_array_keys_search_value() {
+        let output = run_php(r#"<?php
+$arr = ['a' => 'x', 'b' => 'y', 'c' => 'x', 'd' => 'z'];
+$keys = array_keys($arr, 'x');
+echo implode(",", $keys);
+"#);
+        assert_eq!(output, "a,c");
+    }
+
+    #[test]
+    fn test_array_keys_strict() {
+        let output = run_php(r#"<?php
+$arr = [0 => '0', 1 => 0, 2 => false, 3 => null];
+$keys = array_keys($arr, 0, true);
+echo implode(",", $keys);
+"#);
+        assert_eq!(output, "1");
+    }
+
+    #[test]
+    fn test_str_replace_array_search() {
+        let output = run_php(r#"<?php
+echo str_replace(['a', 'e', 'i', 'o', 'u'], '*', 'Hello World');
+"#);
+        assert_eq!(output, "H*ll* W*rld");
+    }
+
+    #[test]
+    fn test_str_replace_array_search_replace() {
+        let output = run_php(r#"<?php
+echo str_replace(['apple', 'banana'], ['orange', 'grape'], 'I like apple and banana');
+"#);
+        assert_eq!(output, "I like orange and grape");
+    }
+
+    #[test]
+    fn test_array_unshift_order() {
+        let output = run_php(r#"<?php
+$arr = ['c'];
+array_unshift($arr, 'a', 'b');
+echo implode(",", $arr);
+"#);
+        assert_eq!(output, "a,b,c");
+    }
 }
