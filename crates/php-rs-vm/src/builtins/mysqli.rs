@@ -670,6 +670,7 @@ fn php_mysqli_query(
         _ => return Ok(Value::Bool(false)),
     };
     let sql = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+    vm.record_event("sql", sql.clone());
 
     let conn = match vm.mysqli_connections.get_mut(&conn_id) {
         Some(c) => c,

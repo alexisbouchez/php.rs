@@ -27,6 +27,7 @@ impl Vm {
             "prepare" => {
                 // $pdo->prepare($sql)
                 let sql = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                self.record_event("sql", format!("PREPARE {}", sql));
 
                 if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
                     match conn.prepare(&sql) {
@@ -54,6 +55,7 @@ impl Vm {
             "query" => {
                 // $pdo->query($sql)
                 let sql = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                self.record_event("sql", sql.clone());
 
                 if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
                     match conn.query(&sql) {
@@ -81,6 +83,7 @@ impl Vm {
             "exec" => {
                 // $pdo->exec($sql)
                 let sql = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                self.record_event("sql", sql.clone());
 
                 if let Some(conn) = self.pdo_connections.get_mut(&obj_id) {
                     match conn.exec(&sql) {
@@ -223,6 +226,7 @@ impl Vm {
         match method {
             "execute" => {
                 // $stmt->execute([$params])
+                self.record_event("sql", "EXECUTE prepared".into());
                 let params_val = args.get(1).cloned().unwrap_or(Value::Null);
                 let params = if let Value::Array(ref a) = params_val {
                     Some(
@@ -657,6 +661,8 @@ impl Vm {
         positional: &[(usize, crate::sqlite3::Sqlite3ParamValue)],
     ) -> VmResult<Option<Value>> {
         use crate::sqlite3::Sqlite3ResultSet;
+
+        self.record_event("sql", sql.to_string());
 
         // Execute query inside a scope so the immutable borrow on sqlite3_connections
         // ends before we insert into sqlite3_results (which needs &mut self).

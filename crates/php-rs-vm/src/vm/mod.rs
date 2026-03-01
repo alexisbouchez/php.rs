@@ -22,6 +22,7 @@ use crate::value::{ArrayKey, PhpArray, PhpObject, Value};
 
 mod call;
 mod database;
+mod defaults;
 mod generators;
 mod helpers;
 mod oop;
@@ -52,6 +53,15 @@ fn now_millis() -> u64 {
 
 /// Global flag set by signal handlers (SIGINT/SIGTERM) for graceful shutdown.
 pub static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// A recorded VM event (SQL query, file include, error/warning/notice).
+/// Used by the dashboard to show what happened inside each request.
+#[derive(Clone)]
+pub struct VmEvent {
+    pub kind: &'static str,
+    pub detail: String,
+    pub elapsed_us: u128,
+}
 
 /// VM execution error -- all possible runtime error conditions.
 ///
@@ -645,6 +655,11 @@ pub struct Vm {
     /// Stored on the VM so they can be populated into every new function frame.
     /// PHP superglobals are accessible inside functions without `global` declaration.
     pub(crate) superglobals: HashMap<String, Value>,
+    /// Recorded VM events for dashboard introspection.
+    pub(crate) events: Vec<VmEvent>,
+    /// Request start time for event elapsed_us calculation.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) request_start: Instant,
 }
 
 /// Signal from an opcode handler to the dispatch loop.
@@ -738,799 +753,9 @@ impl Vm {
             functions: HashMap::new(),
             op_arrays: Vec::new(),
             call_stack: Vec::new(),
-            constants: {
-                let mut c = HashMap::new();
-                c.insert(
-                    "DIRECTORY_SEPARATOR".to_string(),
-                    Value::String("/".to_string()),
-                );
-                c.insert("PATH_SEPARATOR".to_string(), Value::String(":".to_string()));
-                c.insert("PHP_EOL".to_string(), Value::String("\n".to_string()));
-                c.insert("PHP_INT_MAX".to_string(), Value::Long(i64::MAX));
-                c.insert("PHP_INT_MIN".to_string(), Value::Long(i64::MIN));
-                c.insert("PHP_INT_SIZE".to_string(), Value::Long(8));
-                c.insert("PHP_FLOAT_MAX".to_string(), Value::Double(f64::MAX));
-                c.insert(
-                    "PHP_FLOAT_MIN".to_string(),
-                    Value::Double(f64::MIN_POSITIVE),
-                );
-                c.insert("PHP_FLOAT_EPSILON".to_string(), Value::Double(f64::EPSILON));
-                c.insert("INF".to_string(), Value::Double(f64::INFINITY));
-                c.insert("NAN".to_string(), Value::Double(f64::NAN));
-                c.insert("PHP_FLOAT_INF".to_string(), Value::Double(f64::INFINITY));
-                c.insert("PHP_FLOAT_NAN".to_string(), Value::Double(f64::NAN));
-                c.insert("PHP_MAJOR_VERSION".to_string(), Value::Long(8));
-                c.insert("PHP_MINOR_VERSION".to_string(), Value::Long(6));
-                c.insert("PHP_RELEASE_VERSION".to_string(), Value::Long(0));
-                c.insert(
-                    "PHP_VERSION".to_string(),
-                    Value::String("8.6.0".to_string()),
-                );
-                c.insert("PHP_VERSION_ID".to_string(), Value::Long(80600));
-                c.insert("PHP_MAXPATHLEN".to_string(), Value::Long(1024));
-                c.insert(
-                    "PHP_OS".to_string(),
-                    Value::String(
-                        if cfg!(target_arch = "wasm32") {
-                            "WASM"
-                        } else if cfg!(target_os = "macos") {
-                            "Darwin"
-                        } else if cfg!(target_os = "windows") {
-                            "WINNT"
-                        } else {
-                            "Linux"
-                        }
-                        .to_string(),
-                    ),
-                );
-                c.insert(
-                    "PHP_OS_FAMILY".to_string(),
-                    Value::String(
-                        if cfg!(target_arch = "wasm32") {
-                            "WASM"
-                        } else if cfg!(target_os = "windows") {
-                            "Windows"
-                        } else {
-                            "Unix"
-                        }
-                        .to_string(),
-                    ),
-                );
-                c.insert(
-                    "PHP_SAPI".to_string(),
-                    Value::String(
-                        if cfg!(target_arch = "wasm32") {
-                            "wasm"
-                        } else {
-                            "cli"
-                        }
-                        .to_string(),
-                    ),
-                );
-                c.insert("PHP_PREFIX".to_string(), Value::String("/usr".to_string()));
-                c.insert(
-                    "PHP_BINDIR".to_string(),
-                    Value::String("/usr/bin".to_string()),
-                );
-                c.insert("TRUE".to_string(), Value::Bool(true));
-                c.insert("FALSE".to_string(), Value::Bool(false));
-                c.insert("NULL".to_string(), Value::Null);
-                c.insert(
-                    "STDIN".to_string(),
-                    Value::Resource(0, "stream".to_string()),
-                );
-                c.insert(
-                    "STDOUT".to_string(),
-                    Value::Resource(1, "stream".to_string()),
-                );
-                c.insert(
-                    "STDERR".to_string(),
-                    Value::Resource(2, "stream".to_string()),
-                );
-                c.insert("E_ERROR".to_string(), Value::Long(1));
-                c.insert("E_WARNING".to_string(), Value::Long(2));
-                c.insert("E_PARSE".to_string(), Value::Long(4));
-                c.insert("E_NOTICE".to_string(), Value::Long(8));
-                c.insert("E_CORE_ERROR".to_string(), Value::Long(16));
-                c.insert("E_CORE_WARNING".to_string(), Value::Long(32));
-                c.insert("E_COMPILE_ERROR".to_string(), Value::Long(64));
-                c.insert("E_COMPILE_WARNING".to_string(), Value::Long(128));
-                c.insert("E_USER_ERROR".to_string(), Value::Long(256));
-                c.insert("E_USER_WARNING".to_string(), Value::Long(512));
-                c.insert("E_USER_NOTICE".to_string(), Value::Long(1024));
-                c.insert("E_STRICT".to_string(), Value::Long(2048));
-                c.insert("E_RECOVERABLE_ERROR".to_string(), Value::Long(4096));
-                c.insert("E_DEPRECATED".to_string(), Value::Long(8192));
-                c.insert("E_USER_DEPRECATED".to_string(), Value::Long(16384));
-                c.insert("E_ALL".to_string(), Value::Long(32767));
-                c.insert("STR_PAD_RIGHT".to_string(), Value::Long(1));
-                c.insert("STR_PAD_LEFT".to_string(), Value::Long(0));
-                c.insert("STR_PAD_BOTH".to_string(), Value::Long(2));
-                c.insert("SORT_REGULAR".to_string(), Value::Long(0));
-                c.insert("SORT_NUMERIC".to_string(), Value::Long(1));
-                c.insert("SORT_STRING".to_string(), Value::Long(2));
-                c.insert("SORT_ASC".to_string(), Value::Long(4));
-                c.insert("SORT_DESC".to_string(), Value::Long(3));
-                c.insert("SORT_NATURAL".to_string(), Value::Long(6));
-                c.insert("SORT_FLAG_CASE".to_string(), Value::Long(8));
-                c.insert("ARRAY_FILTER_USE_BOTH".to_string(), Value::Long(1));
-                c.insert("ARRAY_FILTER_USE_KEY".to_string(), Value::Long(2));
-                c.insert("ARRAY_FILTER_USE_VALUE".to_string(), Value::Long(0));
-                c.insert("PREG_SPLIT_NO_EMPTY".to_string(), Value::Long(1));
-                c.insert("PREG_SPLIT_DELIM_CAPTURE".to_string(), Value::Long(2));
-                c.insert("PREG_SPLIT_OFFSET_CAPTURE".to_string(), Value::Long(4));
-                c.insert("PREG_GREP_INVERT".to_string(), Value::Long(1));
-                c.insert("PREG_NO_ERROR".to_string(), Value::Long(0));
-                c.insert("PREG_INTERNAL_ERROR".to_string(), Value::Long(1));
-                c.insert("PREG_BACKTRACK_LIMIT_ERROR".to_string(), Value::Long(2));
-                c.insert("PREG_RECURSION_LIMIT_ERROR".to_string(), Value::Long(3));
-                c.insert("PREG_BAD_UTF8_ERROR".to_string(), Value::Long(4));
-                c.insert("PREG_BAD_UTF8_OFFSET_ERROR".to_string(), Value::Long(5));
-                c.insert("PREG_JIT_STACKLIMIT_ERROR".to_string(), Value::Long(6));
-                c.insert("PREG_OFFSET_CAPTURE".to_string(), Value::Long(256));
-                c.insert("PREG_UNMATCHED_AS_NULL".to_string(), Value::Long(512));
-                c.insert("PREG_SET_ORDER".to_string(), Value::Long(2));
-                c.insert("PREG_PATTERN_ORDER".to_string(), Value::Long(1));
-                c.insert("JSON_PRETTY_PRINT".to_string(), Value::Long(128));
-                c.insert("JSON_UNESCAPED_SLASHES".to_string(), Value::Long(64));
-                c.insert("JSON_UNESCAPED_UNICODE".to_string(), Value::Long(256));
-                c.insert("JSON_THROW_ON_ERROR".to_string(), Value::Long(4194304));
-                c.insert("JSON_FORCE_OBJECT".to_string(), Value::Long(16));
-                c.insert("JSON_HEX_TAG".to_string(), Value::Long(1));
-                c.insert("JSON_HEX_AMP".to_string(), Value::Long(2));
-                c.insert("JSON_HEX_APOS".to_string(), Value::Long(4));
-                c.insert("JSON_HEX_QUOT".to_string(), Value::Long(8));
-                c.insert("JSON_NUMERIC_CHECK".to_string(), Value::Long(32));
-                c.insert("FILTER_VALIDATE_INT".to_string(), Value::Long(257));
-                c.insert("FILTER_VALIDATE_FLOAT".to_string(), Value::Long(259));
-                c.insert("FILTER_VALIDATE_EMAIL".to_string(), Value::Long(274));
-                c.insert("FILTER_VALIDATE_URL".to_string(), Value::Long(273));
-                c.insert("FILTER_VALIDATE_IP".to_string(), Value::Long(275));
-                c.insert("FILTER_VALIDATE_BOOLEAN".to_string(), Value::Long(258));
-                c.insert("FILTER_VALIDATE_DOMAIN".to_string(), Value::Long(276));
-                c.insert("FILTER_VALIDATE_MAC".to_string(), Value::Long(279));
-                c.insert("FILTER_SANITIZE_STRING".to_string(), Value::Long(513));
-                c.insert("FILTER_SANITIZE_ENCODED".to_string(), Value::Long(514));
-                c.insert(
-                    "FILTER_SANITIZE_SPECIAL_CHARS".to_string(),
-                    Value::Long(515),
-                );
-                c.insert("FILTER_SANITIZE_NUMBER_INT".to_string(), Value::Long(517));
-                c.insert("FILTER_SANITIZE_NUMBER_FLOAT".to_string(), Value::Long(520));
-                c.insert("FILTER_SANITIZE_EMAIL".to_string(), Value::Long(522));
-                c.insert("FILTER_SANITIZE_URL".to_string(), Value::Long(523));
-                c.insert("FILTER_SANITIZE_ADD_SLASHES".to_string(), Value::Long(524));
-                c.insert("FILTER_DEFAULT".to_string(), Value::Long(516));
-                // PHP_URL_* constants (for parse_url component parameter)
-                c.insert("PHP_URL_SCHEME".to_string(), Value::Long(0));
-                c.insert("PHP_URL_HOST".to_string(), Value::Long(1));
-                c.insert("PHP_URL_PORT".to_string(), Value::Long(2));
-                c.insert("PHP_URL_USER".to_string(), Value::Long(3));
-                c.insert("PHP_URL_PASS".to_string(), Value::Long(4));
-                c.insert("PHP_URL_PATH".to_string(), Value::Long(5));
-                c.insert("PHP_URL_QUERY".to_string(), Value::Long(6));
-                c.insert("PHP_URL_FRAGMENT".to_string(), Value::Long(7));
-                // Filesystem constants
-                c.insert("FILE_APPEND".to_string(), Value::Long(8));
-                c.insert("LOCK_EX".to_string(), Value::Long(2));
-                // Calendar constants
-                c.insert("CAL_GREGORIAN".to_string(), Value::Long(0));
-                c.insert("CAL_JULIAN".to_string(), Value::Long(1));
-                c.insert("CAL_JEWISH".to_string(), Value::Long(2));
-                c.insert("CAL_FRENCH".to_string(), Value::Long(3));
-                // SQLite3 fetch mode constants
-                c.insert("SQLITE3_ASSOC".to_string(), Value::Long(1));
-                c.insert("SQLITE3_NUM".to_string(), Value::Long(2));
-                c.insert("SQLITE3_BOTH".to_string(), Value::Long(3));
-                // SQLite3 column type constants
-                c.insert("SQLITE3_INTEGER".to_string(), Value::Long(1));
-                c.insert("SQLITE3_FLOAT".to_string(), Value::Long(2));
-                c.insert("SQLITE3_TEXT".to_string(), Value::Long(3));
-                c.insert("SQLITE3_BLOB".to_string(), Value::Long(4));
-                c.insert("SQLITE3_NULL".to_string(), Value::Long(5));
-                // SQLite3 open flag constants
-                c.insert("SQLITE3_OPEN_READONLY".to_string(), Value::Long(1));
-                // password_hash algorithm constants
-                c.insert("PASSWORD_DEFAULT".to_string(), Value::Long(1));
-                c.insert("PASSWORD_BCRYPT".to_string(), Value::Long(1));
-                c.insert("PASSWORD_ARGON2I".to_string(), Value::Long(2));
-                c.insert("PASSWORD_ARGON2ID".to_string(), Value::Long(3));
-                c.insert("PASSWORD_BCRYPT_DEFAULT_COST".to_string(), Value::Long(10));
-                c.insert("SQLITE3_OPEN_READWRITE".to_string(), Value::Long(2));
-                c.insert("SQLITE3_OPEN_CREATE".to_string(), Value::Long(4));
-                // Stream notification constants
-                c.insert("STREAM_NOTIFY_RESOLVE".to_string(), Value::Long(1));
-                c.insert("STREAM_NOTIFY_CONNECT".to_string(), Value::Long(2));
-                c.insert("STREAM_NOTIFY_AUTH_REQUIRED".to_string(), Value::Long(3));
-                c.insert("STREAM_NOTIFY_MIME_TYPE_IS".to_string(), Value::Long(4));
-                c.insert("STREAM_NOTIFY_FILE_SIZE_IS".to_string(), Value::Long(5));
-                c.insert("STREAM_NOTIFY_REDIRECTED".to_string(), Value::Long(6));
-                c.insert("STREAM_NOTIFY_PROGRESS".to_string(), Value::Long(7));
-                c.insert("STREAM_NOTIFY_COMPLETED".to_string(), Value::Long(8));
-                c.insert("STREAM_NOTIFY_FAILURE".to_string(), Value::Long(9));
-                c.insert("STREAM_NOTIFY_AUTH_RESULT".to_string(), Value::Long(10));
-                c.insert("STREAM_NOTIFY_SEVERITY_INFO".to_string(), Value::Long(0));
-                c.insert("STREAM_NOTIFY_SEVERITY_WARN".to_string(), Value::Long(1));
-                c.insert("STREAM_NOTIFY_SEVERITY_ERR".to_string(), Value::Long(2));
-                c.insert("STREAM_FILTER_READ".to_string(), Value::Long(1));
-                c.insert("STREAM_FILTER_WRITE".to_string(), Value::Long(2));
-                c.insert("STREAM_FILTER_ALL".to_string(), Value::Long(3));
-                // cURL option constants
-                #[cfg(feature = "native-io")]
-                {
-                    use php_rs_ext_curl::constants;
-                    c.insert(
-                        "CURLOPT_URL".to_string(),
-                        Value::Long(constants::CURLOPT_URL as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_RETURNTRANSFER".to_string(),
-                        Value::Long(constants::CURLOPT_RETURNTRANSFER as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_POST".to_string(),
-                        Value::Long(constants::CURLOPT_POST as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_POSTFIELDS".to_string(),
-                        Value::Long(constants::CURLOPT_POSTFIELDS as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_HTTPHEADER".to_string(),
-                        Value::Long(constants::CURLOPT_HTTPHEADER as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_TIMEOUT".to_string(),
-                        Value::Long(constants::CURLOPT_TIMEOUT as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_FOLLOWLOCATION".to_string(),
-                        Value::Long(constants::CURLOPT_FOLLOWLOCATION as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_SSL_VERIFYPEER".to_string(),
-                        Value::Long(constants::CURLOPT_SSL_VERIFYPEER as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_USERAGENT".to_string(),
-                        Value::Long(constants::CURLOPT_USERAGENT as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_CUSTOMREQUEST".to_string(),
-                        Value::Long(constants::CURLOPT_CUSTOMREQUEST as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_CONNECTTIMEOUT".to_string(),
-                        Value::Long(constants::CURLOPT_CONNECTTIMEOUT as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_HEADER".to_string(),
-                        Value::Long(constants::CURLOPT_HEADER as i64),
-                    );
-                    c.insert(
-                        "CURLOPT_NOBODY".to_string(),
-                        Value::Long(constants::CURLOPT_NOBODY as i64),
-                    );
-                    // Extra commonly-used CURLOPT constants (PHP canonical values)
-                    c.insert("CURLOPT_VERBOSE".to_string(), Value::Long(41));
-                    c.insert("CURLOPT_REFERER".to_string(), Value::Long(10016));
-                    c.insert("CURLOPT_COOKIE".to_string(), Value::Long(10022));
-                    c.insert("CURLOPT_COOKIEFILE".to_string(), Value::Long(10031));
-                    c.insert("CURLOPT_COOKIEJAR".to_string(), Value::Long(10082));
-                    c.insert("CURLOPT_USERNAME".to_string(), Value::Long(10173));
-                    c.insert("CURLOPT_PASSWORD".to_string(), Value::Long(10174));
-                    c.insert("CURLOPT_USERPWD".to_string(), Value::Long(10005));
-                    c.insert("CURLOPT_MAXREDIRS".to_string(), Value::Long(68));
-                    c.insert("CURLOPT_SSL_VERIFYHOST".to_string(), Value::Long(81));
-                    c.insert("CURLOPT_CAINFO".to_string(), Value::Long(10065));
-                    c.insert("CURLOPT_SSLCERT".to_string(), Value::Long(10025));
-                    c.insert("CURLOPT_SSLKEY".to_string(), Value::Long(10087));
-                    c.insert("CURLOPT_ENCODING".to_string(), Value::Long(10102));
-                    c.insert("CURLOPT_HTTP_VERSION".to_string(), Value::Long(84));
-                    c.insert("CURLOPT_HTTPGET".to_string(), Value::Long(80));
-                    c.insert("CURLOPT_PUT".to_string(), Value::Long(54));
-                    c.insert("CURLOPT_INFILE".to_string(), Value::Long(10009));
-                    c.insert("CURLOPT_INFILESIZE".to_string(), Value::Long(14));
-                    c.insert("CURLOPT_WRITEHEADER".to_string(), Value::Long(10029));
-                    c.insert("CURLOPT_FILE".to_string(), Value::Long(10001));
-                    c.insert("CURLOPT_RANGE".to_string(), Value::Long(10007));
-                    c.insert("CURLOPT_RESUME_FROM".to_string(), Value::Long(21));
-                    c.insert("CURLOPT_AUTOREFERER".to_string(), Value::Long(58));
-                    c.insert("CURLOPT_PORT".to_string(), Value::Long(3));
-                    c.insert("CURLOPT_MAXFILESIZE".to_string(), Value::Long(114));
-                    c.insert("CURLOPT_PROTOCOLS".to_string(), Value::Long(181));
-                    c.insert("CURLOPT_REDIR_PROTOCOLS".to_string(), Value::Long(182));
-                    c.insert("CURLOPT_FRESH_CONNECT".to_string(), Value::Long(74));
-                    c.insert("CURLOPT_FORBID_REUSE".to_string(), Value::Long(75));
-                    c.insert("CURLOPT_INTERFACE".to_string(), Value::Long(10062));
-                    c.insert("CURLOPT_PROXY".to_string(), Value::Long(10004));
-                    c.insert("CURLOPT_PROXYPORT".to_string(), Value::Long(59));
-                    c.insert("CURLOPT_PROXYTYPE".to_string(), Value::Long(101));
-                    c.insert("CURLOPT_PROXYUSERPWD".to_string(), Value::Long(10006));
-                    c.insert("CURLOPT_IPRESOLVE".to_string(), Value::Long(113));
-                    c.insert("CURLOPT_TIMEOUT_MS".to_string(), Value::Long(155));
-                    c.insert("CURLOPT_CONNECTTIMEOUT_MS".to_string(), Value::Long(156));
-                    c.insert("CURLOPT_LOW_SPEED_LIMIT".to_string(), Value::Long(19));
-                    c.insert("CURLOPT_LOW_SPEED_TIME".to_string(), Value::Long(20));
-                    c.insert("CURLOPT_DNS_CACHE_TIMEOUT".to_string(), Value::Long(92));
-                    c.insert("CURLOPT_BUFFERSIZE".to_string(), Value::Long(98));
-                    c.insert("CURLOPT_TCP_NODELAY".to_string(), Value::Long(121));
-                    c.insert("CURLOPT_SAFE_UPLOAD".to_string(), Value::Long(-1)); // PHP internal
-                                                                                  // CURLINFO constants
-                    c.insert(
-                        "CURLINFO_HTTP_CODE".to_string(),
-                        Value::Long(constants::CURLINFO_HTTP_CODE as i64),
-                    );
-                    c.insert(
-                        "CURLINFO_TOTAL_TIME".to_string(),
-                        Value::Long(constants::CURLINFO_TOTAL_TIME as i64),
-                    );
-                    c.insert(
-                        "CURLINFO_CONTENT_TYPE".to_string(),
-                        Value::Long(constants::CURLINFO_CONTENT_TYPE as i64),
-                    );
-                    c.insert(
-                        "CURLINFO_EFFECTIVE_URL".to_string(),
-                        Value::Long(constants::CURLINFO_EFFECTIVE_URL as i64),
-                    );
-                    c.insert(
-                        "CURLINFO_HEADER_SIZE".to_string(),
-                        Value::Long(constants::CURLINFO_HEADER_SIZE as i64),
-                    );
-                    c.insert("CURLINFO_RESPONSE_CODE".to_string(), Value::Long(2097154)); // alias for HTTP_CODE
-                    c.insert("CURLINFO_NAMELOOKUP_TIME".to_string(), Value::Long(3145732));
-                    c.insert("CURLINFO_CONNECT_TIME".to_string(), Value::Long(3145733));
-                    c.insert(
-                        "CURLINFO_PRETRANSFER_TIME".to_string(),
-                        Value::Long(3145734),
-                    );
-                    c.insert(
-                        "CURLINFO_STARTTRANSFER_TIME".to_string(),
-                        Value::Long(3145736),
-                    );
-                    c.insert("CURLINFO_REDIRECT_COUNT".to_string(), Value::Long(2097172));
-                    c.insert("CURLINFO_REDIRECT_TIME".to_string(), Value::Long(3145737));
-                    c.insert("CURLINFO_REDIRECT_URL".to_string(), Value::Long(1048607));
-                    c.insert("CURLINFO_SIZE_DOWNLOAD".to_string(), Value::Long(3145738));
-                    c.insert("CURLINFO_SIZE_UPLOAD".to_string(), Value::Long(3145735));
-                    c.insert("CURLINFO_SPEED_DOWNLOAD".to_string(), Value::Long(3145733));
-                    c.insert("CURLINFO_SPEED_UPLOAD".to_string(), Value::Long(3145734));
-                    c.insert("CURLINFO_REQUEST_SIZE".to_string(), Value::Long(2097164));
-                    c.insert(
-                        "CURLINFO_SSL_VERIFYRESULT".to_string(),
-                        Value::Long(2097165),
-                    );
-                    c.insert(
-                        "CURLINFO_CONTENT_LENGTH_DOWNLOAD".to_string(),
-                        Value::Long(3145743),
-                    );
-                    c.insert(
-                        "CURLINFO_CONTENT_LENGTH_UPLOAD".to_string(),
-                        Value::Long(3145744),
-                    );
-                    c.insert("CURLINFO_PRIVATE".to_string(), Value::Long(1048597));
-                    c.insert("CURLINFO_HTTPAUTH_AVAIL".to_string(), Value::Long(2097175));
-                    c.insert("CURLINFO_PROXYAUTH_AVAIL".to_string(), Value::Long(2097176));
-                    // CURLE error constants
-                    c.insert(
-                        "CURLE_OK".to_string(),
-                        Value::Long(constants::CURLE_OK as i64),
-                    );
-                    c.insert(
-                        "CURLE_UNSUPPORTED_PROTOCOL".to_string(),
-                        Value::Long(constants::CURLE_UNSUPPORTED_PROTOCOL as i64),
-                    );
-                    c.insert(
-                        "CURLE_URL_MALFORMAT".to_string(),
-                        Value::Long(constants::CURLE_URL_MALFORMAT as i64),
-                    );
-                    c.insert(
-                        "CURLE_COULDNT_RESOLVE_HOST".to_string(),
-                        Value::Long(constants::CURLE_COULDNT_RESOLVE_HOST as i64),
-                    );
-                    c.insert(
-                        "CURLE_COULDNT_CONNECT".to_string(),
-                        Value::Long(constants::CURLE_COULDNT_CONNECT as i64),
-                    );
-                    c.insert(
-                        "CURLE_OPERATION_TIMEDOUT".to_string(),
-                        Value::Long(constants::CURLE_OPERATION_TIMEDOUT as i64),
-                    );
-                    c.insert(
-                        "CURLE_SSL_CONNECT_ERROR".to_string(),
-                        Value::Long(constants::CURLE_SSL_CONNECT_ERROR as i64),
-                    );
-                    c.insert("CURLE_FAILED_INIT".to_string(), Value::Long(2));
-                    c.insert("CURLE_NOT_BUILT_IN".to_string(), Value::Long(4));
-                    c.insert("CURLE_COULDNT_RESOLVE_PROXY".to_string(), Value::Long(5));
-                    c.insert("CURLE_PARTIAL_FILE".to_string(), Value::Long(18));
-                    c.insert("CURLE_HTTP_RETURNED_ERROR".to_string(), Value::Long(22));
-                    c.insert("CURLE_WRITE_ERROR".to_string(), Value::Long(23));
-                    c.insert("CURLE_READ_ERROR".to_string(), Value::Long(26));
-                    c.insert("CURLE_OUT_OF_MEMORY".to_string(), Value::Long(27));
-                    c.insert("CURLE_SEND_ERROR".to_string(), Value::Long(55));
-                    c.insert("CURLE_RECV_ERROR".to_string(), Value::Long(56));
-                    c.insert("CURLE_SSL_CERTPROBLEM".to_string(), Value::Long(58));
-                    c.insert("CURLE_SSL_CIPHER".to_string(), Value::Long(59));
-                    c.insert("CURLE_SSL_CACERT".to_string(), Value::Long(60));
-                    c.insert("CURLE_BAD_CONTENT_ENCODING".to_string(), Value::Long(61));
-                    c.insert("CURLE_TOO_MANY_REDIRECTS".to_string(), Value::Long(47));
-                    // CURLVERSION
-                    c.insert("CURLVERSION_NOW".to_string(), Value::Long(9));
-                    // HTTP version constants
-                    c.insert("CURL_HTTP_VERSION_NONE".to_string(), Value::Long(0));
-                    c.insert("CURL_HTTP_VERSION_1_0".to_string(), Value::Long(1));
-                    c.insert("CURL_HTTP_VERSION_1_1".to_string(), Value::Long(2));
-                    c.insert("CURL_HTTP_VERSION_2_0".to_string(), Value::Long(3));
-                    c.insert("CURL_HTTP_VERSION_2".to_string(), Value::Long(3));
-                    // cURL multi constants
-                    c.insert("CURLM_OK".to_string(), Value::Long(0));
-                    c.insert("CURLM_BAD_HANDLE".to_string(), Value::Long(1));
-                    c.insert("CURLM_BAD_EASY_HANDLE".to_string(), Value::Long(2));
-                    c.insert("CURLM_OUT_OF_MEMORY".to_string(), Value::Long(3));
-                    c.insert("CURLM_INTERNAL_ERROR".to_string(), Value::Long(4));
-                    // CURLPROTO constants
-                    c.insert("CURLPROTO_HTTP".to_string(), Value::Long(1));
-                    c.insert("CURLPROTO_HTTPS".to_string(), Value::Long(2));
-                    c.insert("CURLPROTO_FTP".to_string(), Value::Long(4));
-                    c.insert("CURLPROTO_ALL".to_string(), Value::Long(-1));
-                }
-                // INI permission level constants
-                c.insert("INI_USER".to_string(), Value::Long(4));
-                c.insert("INI_PERDIR".to_string(), Value::Long(2));
-                c.insert("INI_SYSTEM".to_string(), Value::Long(1));
-                c.insert("INI_ALL".to_string(), Value::Long(7));
-                c.insert("PHP_INI_USER".to_string(), Value::Long(4));
-                c.insert("PHP_INI_PERDIR".to_string(), Value::Long(2));
-                c.insert("PHP_INI_SYSTEM".to_string(), Value::Long(1));
-                c.insert("PHP_INI_ALL".to_string(), Value::Long(7));
-                // Session status constants
-                c.insert("PHP_SESSION_DISABLED".to_string(), Value::Long(0));
-                c.insert("PHP_SESSION_NONE".to_string(), Value::Long(1));
-                c.insert("PHP_SESSION_ACTIVE".to_string(), Value::Long(2));
-                // Stream filter constants
-                c.insert("STREAM_FILTER_READ".to_string(), Value::Long(1));
-                c.insert("STREAM_FILTER_WRITE".to_string(), Value::Long(2));
-                c.insert("STREAM_FILTER_ALL".to_string(), Value::Long(3));
-                c
-            },
+            constants: defaults::build_default_constants(),
             constant_attributes: HashMap::new(),
-            classes: {
-                let mut cls = HashMap::new();
-                // Register built-in SPL classes with their constants
-                let make_class =
-                    |name: &str, parent: Option<&str>, constants: Vec<(&str, i64)>| -> ClassDef {
-                        let mut cc = HashMap::new();
-                        for (k, v) in constants {
-                            cc.insert(k.to_string(), Value::Long(v));
-                        }
-                        ClassDef {
-                            _name: name.to_string(),
-                            parent: parent.map(|s| s.to_string()),
-                            interfaces: Vec::new(),
-                            traits: Vec::new(),
-                            is_abstract: false,
-                            is_final: false,
-                            is_interface: false,
-                            is_enum: false,
-                            is_readonly: false,
-                            methods: HashMap::new(),
-                            method_flags: HashMap::new(),
-                            property_flags: HashMap::new(),
-                            default_properties: HashMap::new(),
-                            class_constants: cc,
-                            class_constant_flags: HashMap::new(),
-                            static_properties: HashMap::new(),
-                            property_types: HashMap::new(),
-                            attributes: Vec::new(),
-                            property_get_hooks: HashMap::new(),
-                            property_set_hooks: HashMap::new(),
-                        }
-                    };
-                cls.insert(
-                    "SplFileInfo".to_string(),
-                    make_class("SplFileInfo", None, vec![]),
-                );
-                cls.insert(
-                    "DirectoryIterator".to_string(),
-                    make_class("DirectoryIterator", Some("SplFileInfo"), vec![]),
-                );
-                cls.insert(
-                    "FilesystemIterator".to_string(),
-                    make_class(
-                        "FilesystemIterator",
-                        Some("DirectoryIterator"),
-                        vec![
-                            ("CURRENT_AS_PATHNAME", 32),
-                            ("CURRENT_AS_FILEINFO", 0),
-                            ("CURRENT_AS_SELF", 16),
-                            ("KEY_AS_PATHNAME", 0),
-                            ("KEY_AS_FILENAME", 256),
-                            ("FOLLOW_SYMLINKS", 512),
-                            ("NEW_CURRENT_AND_KEY", 256),
-                            ("SKIP_DOTS", 4096),
-                            ("UNIX_PATHS", 8192),
-                            ("OTHER_MODE_MASK", 0xF000),
-                        ],
-                    ),
-                );
-                cls.insert(
-                    "RecursiveDirectoryIterator".to_string(),
-                    make_class(
-                        "RecursiveDirectoryIterator",
-                        Some("FilesystemIterator"),
-                        vec![],
-                    ),
-                );
-                cls.insert(
-                    "RecursiveIteratorIterator".to_string(),
-                    make_class(
-                        "RecursiveIteratorIterator",
-                        None,
-                        vec![
-                            ("LEAVES_ONLY", 0),
-                            ("SELF_FIRST", 1),
-                            ("CHILD_FIRST", 2),
-                            ("CATCH_GET_CHILD", 16),
-                        ],
-                    ),
-                );
-                cls.insert(
-                    "FilterIterator".to_string(),
-                    make_class("FilterIterator", None, vec![]),
-                );
-                cls.insert(
-                    "RecursiveFilterIterator".to_string(),
-                    make_class("RecursiveFilterIterator", Some("FilterIterator"), vec![]),
-                );
-                cls.insert(
-                    "IteratorIterator".to_string(),
-                    make_class("IteratorIterator", None, vec![]),
-                );
-                cls.insert(
-                    "AppendIterator".to_string(),
-                    make_class("AppendIterator", None, vec![]),
-                );
-                cls.insert(
-                    "RegexIterator".to_string(),
-                    make_class(
-                        "RegexIterator",
-                        Some("FilterIterator"),
-                        vec![
-                            ("MATCH", 0),
-                            ("GET_MATCH", 1),
-                            ("ALL_MATCHES", 2),
-                            ("SPLIT", 3),
-                            ("REPLACE", 4),
-                            ("USE_KEY", 1),
-                        ],
-                    ),
-                );
-                cls.insert(
-                    "RecursiveRegexIterator".to_string(),
-                    make_class("RecursiveRegexIterator", Some("RegexIterator"), vec![]),
-                );
-                // SQLite3 built-in classes
-                cls.insert(
-                    "SQLite3".to_string(),
-                    make_class(
-                        "SQLite3",
-                        None,
-                        vec![
-                            ("SQLITE3_ASSOC", 1),
-                            ("SQLITE3_NUM", 2),
-                            ("SQLITE3_BOTH", 3),
-                            ("SQLITE3_INTEGER", 1),
-                            ("SQLITE3_FLOAT", 2),
-                            ("SQLITE3_TEXT", 3),
-                            ("SQLITE3_BLOB", 4),
-                            ("SQLITE3_NULL", 5),
-                            ("SQLITE3_OPEN_READONLY", 1),
-                            ("SQLITE3_OPEN_READWRITE", 2),
-                            ("SQLITE3_OPEN_CREATE", 4),
-                        ],
-                    ),
-                );
-                cls.insert(
-                    "SQLite3Result".to_string(),
-                    make_class("SQLite3Result", None, vec![]),
-                );
-                cls.insert(
-                    "SQLite3Stmt".to_string(),
-                    make_class("SQLite3Stmt", None, vec![]),
-                );
-                // DateTime/DateTimeImmutable/DateTimeZone/DateInterval/DatePeriod classes
-                cls.insert(
-                    "DateTime".to_string(),
-                    make_class(
-                        "DateTime",
-                        None,
-                        vec![
-                            ("ATOM", 0),
-                            ("COOKIE", 0),
-                            ("ISO8601", 0),
-                            ("RFC822", 0),
-                            ("RFC850", 0),
-                            ("RFC1036", 0),
-                            ("RFC1123", 0),
-                            ("RFC7231", 0),
-                            ("RFC2822", 0),
-                            ("RFC3339", 0),
-                            ("RFC3339_EXTENDED", 0),
-                            ("RSS", 0),
-                            ("W3C", 0),
-                        ],
-                    ),
-                );
-                cls.insert(
-                    "DateTimeImmutable".to_string(),
-                    make_class(
-                        "DateTimeImmutable",
-                        None,
-                        vec![
-                            ("ATOM", 0),
-                            ("COOKIE", 0),
-                            ("ISO8601", 0),
-                            ("RFC822", 0),
-                            ("RFC850", 0),
-                            ("RFC1036", 0),
-                            ("RFC1123", 0),
-                            ("RFC7231", 0),
-                            ("RFC2822", 0),
-                            ("RFC3339", 0),
-                            ("RFC3339_EXTENDED", 0),
-                            ("RSS", 0),
-                            ("W3C", 0),
-                        ],
-                    ),
-                );
-                cls.insert(
-                    "DateTimeZone".to_string(),
-                    make_class(
-                        "DateTimeZone",
-                        None,
-                        vec![
-                            ("AFRICA", 1),
-                            ("AMERICA", 2),
-                            ("ANTARCTICA", 4),
-                            ("ARCTIC", 8),
-                            ("ASIA", 16),
-                            ("ATLANTIC", 32),
-                            ("AUSTRALIA", 64),
-                            ("EUROPE", 128),
-                            ("INDIAN", 256),
-                            ("PACIFIC", 512),
-                            ("UTC", 1024),
-                            ("ALL", 2047),
-                            ("ALL_WITH_BC", 4095),
-                            ("PER_COUNTRY", 4096),
-                        ],
-                    ),
-                );
-                cls.insert(
-                    "DateInterval".to_string(),
-                    make_class("DateInterval", None, vec![]),
-                );
-                cls.insert(
-                    "DatePeriod".to_string(),
-                    make_class(
-                        "DatePeriod",
-                        None,
-                        vec![("EXCLUDE_START_DATE", 1), ("INCLUDE_END_DATE", 2)],
-                    ),
-                );
-                // SPL data structure classes
-                cls.insert(
-                    "SplFixedArray".to_string(),
-                    make_class("SplFixedArray", None, vec![]),
-                );
-                cls.insert(
-                    "SplDoublyLinkedList".to_string(),
-                    make_class(
-                        "SplDoublyLinkedList",
-                        None,
-                        vec![
-                            ("IT_MODE_LIFO", 2),
-                            ("IT_MODE_FIFO", 0),
-                            ("IT_MODE_DELETE", 1),
-                            ("IT_MODE_KEEP", 0),
-                        ],
-                    ),
-                );
-                cls.insert(
-                    "SplStack".to_string(),
-                    make_class("SplStack", Some("SplDoublyLinkedList"), vec![]),
-                );
-                cls.insert(
-                    "SplQueue".to_string(),
-                    make_class("SplQueue", Some("SplDoublyLinkedList"), vec![]),
-                );
-                cls.insert("SplHeap".to_string(), make_class("SplHeap", None, vec![]));
-                cls.insert(
-                    "SplMinHeap".to_string(),
-                    make_class("SplMinHeap", Some("SplHeap"), vec![]),
-                );
-                cls.insert(
-                    "SplMaxHeap".to_string(),
-                    make_class("SplMaxHeap", Some("SplHeap"), vec![]),
-                );
-                cls.insert(
-                    "SplPriorityQueue".to_string(),
-                    make_class(
-                        "SplPriorityQueue",
-                        None,
-                        vec![("EXTR_BOTH", 3), ("EXTR_PRIORITY", 1), ("EXTR_DATA", 2)],
-                    ),
-                );
-                cls.insert(
-                    "SplObjectStorage".to_string(),
-                    make_class("SplObjectStorage", None, vec![]),
-                );
-
-                // Register built-in interfaces
-                let make_interface = |name: &str| -> ClassDef {
-                    ClassDef {
-                        _name: name.to_string(),
-                        parent: None,
-                        interfaces: Vec::new(),
-                        traits: Vec::new(),
-                        is_abstract: true,
-                        is_final: false,
-                        is_interface: true,
-                        is_enum: false,
-                        is_readonly: false,
-                        methods: HashMap::new(),
-                        method_flags: HashMap::new(),
-                        property_flags: HashMap::new(),
-                        default_properties: HashMap::new(),
-                        class_constants: HashMap::new(),
-                        class_constant_flags: HashMap::new(),
-                        static_properties: HashMap::new(),
-                        property_types: HashMap::new(),
-                        attributes: Vec::new(),
-                        property_get_hooks: HashMap::new(),
-                        property_set_hooks: HashMap::new(),
-                    }
-                };
-                cls.insert(
-                    "SessionHandlerInterface".to_string(),
-                    make_interface("SessionHandlerInterface"),
-                );
-                cls.insert(
-                    "SessionIdInterface".to_string(),
-                    make_interface("SessionIdInterface"),
-                );
-                cls.insert(
-                    "SessionUpdateTimestampHandlerInterface".to_string(),
-                    make_interface("SessionUpdateTimestampHandlerInterface"),
-                );
-
-                // Add __construct sentinel for built-in classes with constructors
-                // so handle_new pushes a PendingCall that dispatches to call.rs
-                for name in &[
-                    "DateTime",
-                    "DateTimeImmutable",
-                    "DateTimeZone",
-                    "DateInterval",
-                    "DatePeriod",
-                    "SplFixedArray",
-                    "SplDoublyLinkedList",
-                    "SplStack",
-                    "SplQueue",
-                    "SplHeap",
-                    "SplMinHeap",
-                    "SplMaxHeap",
-                    "SplPriorityQueue",
-                    "SplObjectStorage",
-                ] {
-                    if let Some(class_def) = cls.get_mut(*name) {
-                        class_def
-                            .methods
-                            .insert("__construct".to_string(), usize::MAX);
-                    }
-                }
-                cls
-            },
+            classes: defaults::build_default_classes(),
             next_object_id: 1,
             current_exception: None,
             included_files: HashSet::new(),
@@ -1634,6 +859,9 @@ impl Vm {
             string_pool: php_rs_gc::StringPool::new(),
             opcode_cache: HashMap::new(),
             superglobals: HashMap::new(),
+            events: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            request_start: Instant::now(),
         }
     }
 
@@ -1703,6 +931,22 @@ impl Vm {
             out.push_str(buf);
         }
         out
+    }
+
+    /// Record an internal VM event (SQL query, include, error, etc.).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn record_event(&mut self, kind: &'static str, detail: String) {
+        let elapsed_us = self.request_start.elapsed().as_micros();
+        self.events.push(VmEvent { kind, detail, elapsed_us });
+    }
+
+    /// No-op on WASM (no Instant available).
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn record_event(&mut self, _kind: &'static str, _detail: String) {}
+
+    /// Take all recorded events, leaving the internal list empty.
+    pub fn take_events(&mut self) -> Vec<VmEvent> {
+        std::mem::take(&mut self.events)
     }
 
     /// Check if a file path is allowed by open_basedir restriction.
@@ -1885,7 +1129,7 @@ impl Vm {
     }
 
     /// Compile a file with opcode caching. Returns cached version if file hasn't changed.
-    fn compile_cached(&mut self, file_path: &str) -> VmResult<ZOpArray> {
+    pub fn compile_cached(&mut self, file_path: &str) -> VmResult<ZOpArray> {
         // Check file modification time
         #[cfg(not(target_arch = "wasm32"))]
         let mtime = std::fs::metadata(file_path)
@@ -1907,9 +1151,10 @@ impl Vm {
         // Cache miss — compile from source
         let source = std::fs::read_to_string(file_path)
             .map_err(|e| VmError::FatalError(format!("Failed to read {}: {}", file_path, e)))?;
-        let op_array = php_rs_compiler::compile(&source).map_err(|e| {
+        let mut op_array = php_rs_compiler::compile(&source).map_err(|e| {
             VmError::FatalError(format!("Compilation error in {}: {}", file_path, e))
         })?;
+        op_array.filename = Some(file_path.to_string());
 
         // Store in cache
         self.opcode_cache
@@ -1931,6 +1176,29 @@ impl Vm {
     /// Get opcode cache statistics.
     pub fn opcode_cache_size(&self) -> usize {
         self.opcode_cache.len()
+    }
+
+    /// Load a pre-compiled opcache file into the VM's opcode cache.
+    /// Entries are loaded with their stored mtimes, so the normal mtime
+    /// check in `compile_cached()` will validate freshness automatically.
+    pub fn load_opcache(&mut self, path: &std::path::Path) -> Result<usize, String> {
+        let cache = php_rs_compiler::OpcacheFile::load(path)?;
+        let count = cache.entries.len();
+        for (file_path, entry) in cache.entries {
+            self.opcode_cache
+                .insert(file_path, (entry.mtime, entry.op_array));
+        }
+        Ok(count)
+    }
+
+    /// Save the VM's current opcode cache to disk.
+    pub fn save_opcache(&self, path: &std::path::Path) -> Result<usize, String> {
+        let mut cache = php_rs_compiler::OpcacheFile::new();
+        for (file_path, (mtime, op_array)) in &self.opcode_cache {
+            cache.add(file_path.clone(), *mtime, op_array.clone());
+        }
+        cache.save(path)?;
+        Ok(cache.len())
     }
 
     /// Set the raw POST/PUT body for php://input stream reads.
@@ -2123,6 +1391,10 @@ impl Vm {
         if self.error_reporting_level & level == 0 {
             return Ok(true); // Suppressed
         }
+
+        // Record event for dashboard tracing
+        let event_kind = match level { 8 | 1024 => "notice", 2 | 512 => "warning", _ => "error" };
+        self.record_event(event_kind, message.to_string());
 
         // Get current file and line from execution context
         let (file, line) = self.get_error_context();

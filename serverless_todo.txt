@@ -1,0 +1,702 @@
+================================================================================
+                        php.rs PaaS — MASTER PLAN
+================================================================================
+
+Goal: Turn php.rs into a managed PHP hosting platform (PaaS) — a Heroku /
+Platform.sh / Laravel Cloud competitor built on a Rust-native PHP runtime.
+
+The killer advantage: no PHP-FPM, no C extensions, no .so dependencies.
+Each tenant app is a single-process Rust binary that boots in <10ms, handles
+HTTP directly, and uses ~5 MB RSS idle. One bare-metal box can host thousands
+of PHP apps with full isolation.
+
+================================================================================
+ ARCHITECTURE OVERVIEW
+================================================================================
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                        CONTROL PLANE                            │
+  │  API server · Dashboard · CLI · Git receiver · Build pipeline   │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                          ROUTER                                 │
+  │  L7 reverse proxy (TLS termination, domain→app routing, LB)     │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                        DATA PLANE                               │
+  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐           │
+  │  │ App VM  │  │ App VM  │  │ App VM  │  │ App VM  │  ...       │
+  │  │(tenant) │  │(tenant) │  │(tenant) │  │(tenant) │           │
+  │  └─────────┘  └─────────┘  └─────────┘  └─────────┘           │
+  │  Orchestrator (scheduling, scaling, health checks)              │
+  ├─────────────────────────────────────────────────────────────────┤
+  │                      BACKING SERVICES                           │
+  │  MySQL/PgSQL · Redis · Object Storage · DNS · Cert Manager      │
+  └─────────────────────────────────────────────────────────────────┘
+
+Each "App VM" is a php.rs process running a tenant's PHP app. NOT a
+virtual machine — a lightweight Rust process with the PHP interpreter
+embedded. Think containers, but without Docker overhead.
+
+================================================================================
+ PHASE 1: App Runtime (`crates/php-rs-sapi-paas/`)
+================================================================================
+
+The core process that runs a single tenant's PHP application.
+This is the equivalent of what PHP-FPM does, but as a single binary.
+
+[x] 1.1  Create crate `php-rs-sapi-paas`
+         - Binary target: `php-rs-app` (the per-tenant process)
+         - Dependencies: php-rs-compiler, php-rs-vm, php-rs-runtime
+         - Sync thread pool (no tokio/hyper — matches existing CLI server patterns)
+
+[x] 1.2  HTTP server with VM worker pool
+         - Sync HTTP listener with thread pool accepts connections
+         - Worker pool of N threads, each with its own warm Vm instance
+         - Requests dispatched to workers via channel (like current server.rs)
+         - Each worker: receive request → build superglobals → execute PHP →
+           send response → VM auto-resets for next request
+         - Vm instances persist across requests (opcode cache stays warm)
+         - Configurable worker count (default: CPU cores)
+
+[x] 1.3  Application configuration via environment
+         - APP_ROOT=/app (document root)
+         - APP_ENTRY=public/index.php (entry script for all routes)
+         - APP_WORKERS=4 (worker thread count)
+         - APP_PORT=8080 (listen port, assigned by orchestrator)
+         - APP_MEMORY_LIMIT=128M (per-request PHP memory limit)
+         - APP_MAX_EXECUTION_TIME=30 (seconds)
+         - APP_ENV=production (passed to $_SERVER)
+         - APP_KEY, DATABASE_URL, REDIS_URL, etc. (user env vars)
+         - APP_PRELOAD=preload.php (optional preload script)
+         - APP_INI_* prefix for arbitrary php.ini overrides
+           e.g. APP_INI_display_errors=Off
+
+[x] 1.4  Request routing
+         - All requests → APP_ENTRY (framework router handles dispatch)
+         - Static file serving for known extensions (css, js, images, fonts)
+           served directly from APP_ROOT without PHP execution
+         - PATH_INFO / SCRIPT_NAME set correctly for frameworks
+         - .htaccess NOT supported (Nginx/Apache rewrite rules irrelevant)
+
+[x] 1.5  Health check and readiness endpoints
+         - GET /_health → 200 OK (for orchestrator liveness probes)
+         - GET /_ready → 200 OK only after app has booted successfully
+         - These bypass PHP entirely (handled in Rust)
+         - Configurable paths via APP_HEALTH_PATH, APP_READY_PATH
+
+[x] 1.6  Graceful shutdown
+         - SIGTERM/SIGINT → stop accepting new connections
+         - Drain in-flight requests (drop worker pool waits for completion)
+         - Exit cleanly with status 0
+
+[x] 1.7  Structured logging
+         - JSON lines to stdout (12-factor app style)
+         - Per-request log: method, path, status, duration_ms, bytes, request_id
+         - Log levels: info, warn, error
+         - Request ID generation (timestamp + counter)
+         - Include app_name in all log lines
+
+[x] 1.8  Metrics endpoint
+         - GET /_metrics (Prometheus text exposition format)
+         - Counters: requests_total, requests_ok, requests_4xx, requests_5xx,
+           php_errors_total, static_files_total
+         - Gauges: request_duration_avg_ms
+         - Cumulative: request_duration_seconds_total
+
+[x] 1.9  Tests for app runtime
+         - Boot app, send HTTP request, verify response
+         - Concurrent requests across worker pool
+         - Static file serving
+         - Graceful shutdown under load
+         - Environment variable injection
+         - Health check responses
+
+================================================================================
+ PHASE 2: Build System
+================================================================================
+
+Transforms a user's PHP project into a deployable unit. The build output
+is a directory containing the PHP source + a manifest. The php-rs-app
+binary is shared (not rebuilt per tenant).
+
+[x] 2.1  Build pipeline design
+         - Input: git repo (or tarball) with PHP project
+         - Detection: identify framework (Laravel, Symfony, WordPress,
+           vanilla PHP) from composer.json, artisan, etc.
+         - Steps:
+           1. Clone/extract source
+           2. Run `composer install --no-dev --optimize-autoloader`
+              (using system PHP or our own composer runner)
+           3. Generate optimized autoloader classmap
+           4. Pre-compile all PHP files to opcode cache (optional)
+           5. Detect entry point (public/index.php, index.php, etc.)
+           6. Generate app manifest (Appfile.toml)
+           7. Package as deployable slug (tarball)
+         - Output: slug.tar.gz + Appfile.toml
+
+[x] 2.2  Appfile.toml (application manifest)
+         - Auto-generated during build, user can also provide one
+         - Fields:
+           ```toml
+           [app]
+           name = "my-laravel-app"
+           framework = "laravel"    # auto-detected
+           entry = "public/index.php"
+           root = "public"
+
+           [php]
+           version = "8.6"
+           memory_limit = "256M"
+           max_execution_time = 60
+           preload = "preload.php"
+           extensions = ["pdo_mysql", "redis", "gd"]
+
+           [resources]
+           workers = 4
+           memory = "512M"          # process memory limit
+
+           [env]
+           APP_ENV = "production"
+           # secrets injected at runtime, not stored here
+
+           [services]
+           mysql = true
+           redis = true
+
+           [scaling]
+           min_instances = 1
+           max_instances = 10
+           target_concurrency = 50  # requests per instance
+           ```
+
+[x] 2.3  Composer integration
+         - Use the existing `php-rs-composer` crate for autoloader parsing
+         - Run `composer install` via subprocess (system PHP or bundled)
+         - Alternatively: pure-Rust composer dependency resolution (long-term)
+         - Generate optimized classmap for fast autoloading
+         - Vendor directory included in slug
+
+[x] 2.4  Opcode pre-compilation during build
+         - Walk all .php files in the project
+         - Compile each to ZOpArray using php-rs-compiler
+         - Serialize opcode cache to binary file (opcache.bin)
+         - App runtime loads opcache.bin on startup → zero parse overhead
+         - Requires: add Serialize/Deserialize to ZOpArray and all nested types
+         - Use bincode for compact + fast serialization
+
+[x] 2.5  Framework-specific build steps
+         - Laravel:
+           · Run `php artisan config:cache` equivalent
+           · Run `php artisan route:cache` equivalent
+           · Run `php artisan view:cache` equivalent
+           · Detect required extensions from config/database.php
+         - Symfony:
+           · Warm the DI container cache
+           · Compile routes
+           · Detect required extensions from bundles
+         - WordPress:
+           · Detect wp-config.php, set entry to index.php
+           · Handle wp-content/uploads as writable path
+         - Vanilla:
+           · Detect index.php or specified entry point
+
+[x] 2.6  Build caching
+         - Cache composer vendor directory between builds (hash composer.lock)
+         - Cache opcode compilation output (hash source files)
+         - Incremental builds: only recompile changed files
+         - Layer-based caching (like Docker layers):
+           Layer 1: php-rs-app binary (shared, rarely changes)
+           Layer 2: vendor/ (changes on composer.lock update)
+           Layer 3: app source (changes on every deploy)
+
+================================================================================
+ PHASE 3: Orchestrator
+================================================================================
+
+Manages app lifecycle across one or more compute nodes. Starts simple
+(single-node), grows to multi-node.
+
+[x] 3.1  Process manager (single-node, MVP)
+         - Manages N app processes on a single machine
+         - Each app = one `php-rs-app` process with its own port
+         - Responsibilities:
+           · Start app process with correct env vars
+           · Monitor health (poll /_health)
+           · Restart on crash (with backoff)
+           · Stop gracefully on undeploy (SIGTERM → wait → SIGKILL)
+           · Route port assignments
+         - State stored in JSON file (~/.php-rs/state.json)
+         - CLI: `php-rs-ctl app create/start/stop/restart/status/list/destroy/config`
+
+[x] 3.2  Application deployment flow
+         1. Receive slug (tarball) via API or CLI
+         2. Extract to /apps/{app_id}/releases/{version}/
+         3. Symlink /apps/{app_id}/current → new release
+         4. Start new app process pointing to new release
+         5. Wait for /_ready
+         6. Update router to point to new process
+         7. Send SIGTERM to old process
+         8. Clean up old releases (keep last N)
+         - Zero-downtime deployment (old serves until new is ready)
+         - Also: `deploy --dir <path>` for local source deployments
+
+[x] 3.3  Environment variable management
+         - Per-app env vars stored encrypted at rest
+         - Injected into app process environment on start
+         - `php-rs-ctl config set DATABASE_URL=postgres://...`
+         - `php-rs-ctl config get`
+         - Config changes trigger app restart
+         - Secrets never written to disk in plaintext
+         - Support for .env file import
+
+[x] 3.4  Log aggregation
+         - Capture stdout/stderr from each app process
+         - Tag with app_id, timestamp, stream (stdout/stderr)
+         - Store in ring buffer (last N lines per app, default 10K)
+         - `php-rs-ctl logs -f` (tail with follow)
+         - `php-rs-ctl logs --app myapp --since 1h`
+         - Forward to external log drains (syslog, Datadog, etc.)
+
+[x] 3.5  Process resource limits
+         - Memory limit per app process (cgroups on Linux, or ulimit)
+         - CPU limit per app (cgroups cpu.shares / cpu.max)
+         - Disk quota per app (/apps/{app_id}/ size limit)
+         - OOM handling: restart process, log event, alert
+         - Network: no inter-app communication (isolated)
+
+[x] 3.6  Auto-scaling (single-node)
+         - Monitor request queue depth and response latency
+         - Scale app instances 1→N within configured min/max
+         - Scale-up trigger: avg response time > threshold
+         - Scale-down trigger: idle for > cooldown period
+         - Load balance across instances (round-robin or least-connections)
+
+[x] 3.7  Cron / scheduled tasks
+         - `php-rs-ctl cron add "*/5 * * * * php artisan schedule:run"`
+         - Run PHP scripts on schedule via one-off process
+         - Capture output, log results
+         - Prevent overlapping runs (file lock or tracking)
+         - Laravel: auto-detect `schedule:run` from Appfile
+
+[x] 3.8  Worker processes (queues)
+         - Long-running PHP worker processes (Laravel queues, etc.)
+         - `php-rs-ctl worker add "php artisan queue:work"`
+         - Monitored and restarted like app processes
+         - Separate from HTTP workers
+         - Configurable count per app
+
+================================================================================
+ PHASE 4: Router / Reverse Proxy
+================================================================================
+
+Routes incoming HTTP(S) requests to the correct app process.
+
+[x] 4.1  L7 reverse proxy
+         - Accept connections on ports 80/443
+         - TLS termination (via rustls or OpenSSL)
+         - Route by Host header → app process (by port)
+         - Connection pooling to backend app processes
+         - WebSocket proxying (for Laravel Echo, Ratchet, etc.)
+         - HTTP/2 support (frontend), HTTP/1.1 to backends
+         - Built on hyper + tokio
+
+[x] 4.2  Domain → app routing table
+         - Map custom domains and subdomains to app instances
+         - Default: {app-name}.{platform-domain} (e.g. myapp.phprs.dev)
+         - Custom domains: myapp.com → app process
+         - Wildcard subdomains: *.myapp.com → app process
+         - Route table stored in shared state (SQLite or in-memory)
+         - Hot-reload routing table without restart
+
+[x] 4.3  TLS certificate management
+         - Auto-provision Let's Encrypt certificates for custom domains
+         - ACME HTTP-01 challenge handling (built into router)
+         - Certificate storage (filesystem or database)
+         - Auto-renewal (certificates valid 90 days, renew at 60)
+         - Fallback: self-signed cert for platform subdomains in dev mode
+         - SNI-based certificate selection for multiple domains
+
+[x] 4.4  Load balancing across app instances
+         - Round-robin across healthy instances of same app
+         - Health-check aware: remove unhealthy backends automatically
+         - Sticky sessions option (cookie-based, for $_SESSION compat)
+         - Connection draining on instance shutdown
+
+[x] 4.5  Rate limiting and DDoS protection
+         - Per-app rate limits (configurable requests/minute)
+         - Per-IP rate limits
+         - Request size limits (body, headers)
+         - Slowloris protection (connection timeouts)
+         - Optional: IP allowlist/blocklist per app
+
+[x] 4.6  Request/response middleware
+         - Add X-Request-Id header (for tracing)
+         - Add X-Powered-By: php.rs
+         - CORS handling (configurable per app)
+         - Gzip/Brotli compression for responses
+         - Security headers (HSTS, X-Frame-Options, etc.) as defaults
+         - Access logging (combined log format)
+
+================================================================================
+ PHASE 5: Tenant Isolation & Security
+================================================================================
+
+Multi-tenant hosting of untrusted PHP code requires strong isolation.
+
+[x] 5.1  Filesystem isolation
+         - Each app confined to /apps/{app_id}/ via open_basedir
+         - Writable paths: /apps/{app_id}/storage/, /tmp/{app_id}/
+         - App cannot read other apps' files
+         - Symlink attacks prevented (canonicalize paths)
+         - /tmp is per-app (namespaced or private mount)
+
+[x] 5.2  Process isolation
+         - Each app runs as its own OS user (uid/gid per tenant)
+         - Linux namespaces (PID, mount, network) for stronger isolation
+         - seccomp-bpf: restrict syscalls to a safe allowlist
+         - No network access between app processes
+         - App can only connect to its own backing services
+         - Consider: landlock LSM for filesystem restrictions
+
+[x] 5.3  PHP-level sandboxing
+         - disable_functions per tenant (default blocklist):
+           exec, shell_exec, system, passthru, popen, proc_open,
+           pcntl_*, posix_*, dl, putenv, apache_*
+         - disable_classes: SplFileObject (if needed)
+         - open_basedir enforcement (already implemented in VM)
+         - Disable URL includes: allow_url_include=Off
+         - Disable dynamic extension loading: enable_dl=Off
+         - Read-only INI: tenants cannot override security settings
+
+[x] 5.4  Resource limits per tenant
+         - Memory per process: cgroups memory.max
+         - CPU: cgroups cpu.max (e.g. 100ms per 100ms = 1 core)
+         - Disk: filesystem quota or dir size monitoring
+         - Network bandwidth: tc (traffic control) or cgroups net_cls
+         - Max concurrent requests: configurable per plan
+         - Max request body size: configurable
+         - Enforce at both OS and PHP level
+
+[x] 5.5  Network isolation
+         - Apps cannot bind arbitrary ports
+         - Apps cannot connect to other apps' ports
+         - Outbound HTTP(S) allowed (for APIs, webhooks)
+         - Outbound to backing services allowed (DB, Redis)
+         - All other outbound blocked by default
+         - Optional: outbound proxy for auditing
+
+[x] 5.6  Secrets management
+         - Environment variables encrypted at rest (AES-256-GCM)
+         - Decrypted only in app process memory
+         - Never logged or exposed in error messages
+         - Rotation support: update secret → restart app
+         - Integration with external vaults (HashiCorp Vault, AWS Secrets
+           Manager) as future enhancement
+
+================================================================================
+ PHASE 6: Backing Services
+================================================================================
+
+Managed databases, caches, and storage that tenants can provision.
+
+[x] 6.1  MySQL provisioning
+         - Per-app MySQL database (shared server, isolated DB + user)
+         - `php-rs-ctl db create mysql` → provisions DB, creates user,
+           injects DATABASE_URL into app env
+         - Connection pooling at the platform level (PgBouncer-style)
+         - Automated backups (daily snapshots)
+         - Expose phpMyAdmin or Adminer for web-based management
+
+[x] 6.2  PostgreSQL provisioning
+         - Same model as MySQL but for PostgreSQL
+         - Per-app database + role with connection limits
+         - `php-rs-ctl db create postgres`
+         - Extension management (enable postgis, uuid-ossp, etc.)
+
+[x] 6.3  Redis provisioning
+         - Per-app Redis instance (or shared with key prefix isolation)
+         - `php-rs-ctl redis create`
+         - Inject REDIS_URL into app env
+         - Memory limit per tenant
+         - Used for: sessions, cache, queues
+
+[x] 6.4  Object storage
+         - S3-compatible API (MinIO or similar)
+         - Per-app bucket with access credentials
+         - `php-rs-ctl storage create`
+         - Inject S3 endpoint, key, secret into app env
+         - Used for: file uploads, media, backups
+
+[x] 6.5  Service discovery
+         - Apps discover backing services via environment variables
+         - Standard names: DATABASE_URL, REDIS_URL, S3_ENDPOINT, etc.
+         - No hardcoded IPs or ports
+         - Service credentials rotated without app code changes
+
+================================================================================
+ PHASE 7: Control Plane API & CLI
+================================================================================
+
+The user-facing interface for managing apps and services.
+
+[x] 7.1  REST API server
+         - Built in Rust (axum or actix-web)
+         - Endpoints:
+           · POST   /apps                      — create app
+           · GET    /apps                      — list apps
+           · GET    /apps/{id}                 — app details
+           · DELETE /apps/{id}                 — destroy app
+           · POST   /apps/{id}/deploy          — deploy from slug
+           · POST   /apps/{id}/restart         — restart app
+           · GET    /apps/{id}/logs            — retrieve logs
+           · GET    /apps/{id}/logs/stream     — SSE log stream
+           · GET    /apps/{id}/metrics         — Prometheus metrics
+           · PUT    /apps/{id}/config          — set env vars
+           · GET    /apps/{id}/config          — get env vars
+           · POST   /apps/{id}/domains         — add custom domain
+           · DELETE /apps/{id}/domains/{domain} — remove domain
+           · POST   /apps/{id}/scale           — set instance count
+           · POST   /apps/{id}/db              — provision database
+           · GET    /apps/{id}/db              — database info
+         - Auth: API token (Bearer) or session cookie
+
+[x] 7.2  CLI tool: `php-rs-ctl`
+         - Direct process management (no REST API wrapper yet)
+         - Implemented commands:
+           · `php-rs-ctl app create <name> [--root --entry --docroot --workers]`
+           · `php-rs-ctl app list` / `app status [name]`
+           · `php-rs-ctl app start/stop/restart/destroy <name>`
+           · `php-rs-ctl app config <name> set/get`
+           · `php-rs-ctl app domains <name> add/remove/list`
+           · `php-rs-ctl deploy <name> --tar/--dir`
+           · `php-rs-ctl monitor` (health check daemon)
+           · `php-rs-ctl router` (L7 reverse proxy)
+           · `php-rs-ctl routes` (show routing table)
+         - State stored in ~/.php-rs/state.json
+         - TODO (future): logs -f, scale, run, ssh, db commands
+
+[x] 7.3  Git push deployment
+         - Built-in git server (gitoxide or libgit2 bindings)
+         - `git remote add phprs https://git.phprs.dev/myapp.git`
+         - `git push phprs main` → triggers build + deploy
+         - Pre-receive hook: validate, build slug, deploy
+         - Show build output in git push terminal (like Heroku)
+         - Support for deploy branches (deploy from non-main)
+
+[x] 7.4  Web dashboard
+         - SPA frontend (React/Vue/Svelte, or server-rendered)
+         - App list, create, deploy, configure
+         - Real-time log viewer (SSE)
+         - Metrics graphs (request rate, latency, errors, memory)
+         - Domain management with DNS instructions
+         - Database management (connection info, reset, backups)
+         - Environment variable editor
+         - Deploy history with rollback
+         - Team management (future)
+
+[x] 7.5  Authentication & authorization
+         - User registration + login (email/password)
+         - API token generation
+         - OAuth2 (GitHub, GitLab) for login + git integration
+         - Per-app ownership (who can deploy, configure, destroy)
+         - Team support: org → members → apps (future)
+
+================================================================================
+ PHASE 8: Performance & Cold Start
+================================================================================
+
+[x] 8.1  VM warm pool
+         - Pre-spawn N idle Vm instances with opcode cache loaded
+         - When request arrives, grab warm VM from pool instead of creating
+         - Return to pool after request (with per-request state cleared)
+         - Pool size = configured worker count per app
+         - Warm VMs survive across requests (opcode cache, class table intact)
+
+[x] 8.2  Opcode cache serialization
+         - Serialize compiled ZOpArrays to disk during build phase
+         - Load serialized opcache on app startup (skip parse + compile)
+         - Add Serialize/Deserialize to: ZOpArray, ZOp, Literal, ArgInfo,
+           TryCatchElement, ClassMetadata, LiveRange
+         - Use bincode for speed, rkyv for zero-copy (benchmark both)
+         - Cache invalidation: rebuild on deploy (immutable releases)
+
+[x] 8.3  Lazy constant and builtin registration
+         - Currently: ~200 constants + ~500 builtins registered on Vm::new()
+         - Move to lazy initialization: register on first access
+         - Group by extension for batch registration
+         - Measure savings: time Vm::new() before and after
+
+[x] 8.4  Framework preloading
+         - OPcache preload equivalent: compile + cache framework core files
+         - Laravel: Illuminate\*, config, routes, service providers
+         - Symfony: Symfony\*, DI container, routing
+         - Preloaded code stays in opcode cache across requests
+         - Triggered by APP_PRELOAD= config or auto-detected per framework
+
+[x] 8.5  Benchmarks
+         - Cold start: time from process start to first response served
+         - Warm request: time to handle request on warm VM
+         - Throughput: requests/second at various concurrency levels
+         - Memory: RSS per app process at idle and under load
+         - Compare against: PHP-FPM, FrankenPHP, Laravel Octane, Swoole
+         - Targets:
+           · Cold start: <20ms (beat PHP-FPM's ~100ms)
+           · Hello world: >50K req/s per core
+           · Laravel route: >5K req/s per core
+           · Memory idle: <10 MB per app
+
+================================================================================
+ PHASE 9: Developer Experience
+================================================================================
+
+[x] 9.1  `php-rs paas init` command
+         - Interactive project setup in current directory
+         - Detect framework, generate Appfile.toml
+         - Generate .php-rs-ignore (like .dockerignore)
+         - Suggest services (MySQL if doctrine/eloquent detected, etc.)
+
+[x] 9.2  Local development mode
+         - `php-rs paas dev` — run app locally mimicking PaaS environment
+         - Read Appfile.toml for configuration
+         - Inject env vars from .env file
+         - Simulate health checks, structured logging
+         - Hot reload on file changes (watch mode)
+         - Match production behavior as closely as possible
+
+[x] 9.3  One-off commands
+         - `php-rs-ctl run "php artisan migrate"` — run in app context
+         - Same env vars, same filesystem, same DB access
+         - Runs in isolated one-off process (not in HTTP worker)
+         - Stdout/stderr streamed back to CLI
+         - Timeout protection
+
+[x] 9.4  SSH / exec into app
+         - `php-rs-ctl ssh` — get a shell in the app's filesystem context
+         - For debugging: inspect files, run artisan tinker, check logs
+         - Sandboxed: same restrictions as the app process
+         - Optional: disable in production for security
+
+[x] 9.5  Deploy previews
+         - Every PR gets a preview deployment at {pr-id}.preview.phprs.dev
+         - Shares backing services with staging (or isolated, configurable)
+         - Auto-destroyed when PR is merged/closed
+         - Webhook integration: post deployment URL as PR comment
+
+================================================================================
+ PHASE 10: Multi-Node / Clustering (Future)
+================================================================================
+
+Scale beyond a single machine. This is the long-term vision — Phase 1-9
+work on a single node first.
+
+[x] 10.1 Node registration and discovery
+         - Orchestrator nodes register with control plane
+         - Health monitoring of compute nodes
+         - Capacity tracking (CPU, memory, disk per node)
+
+[x] 10.2 App placement / scheduling
+         - Place apps on nodes with available capacity
+         - Affinity rules (co-locate app + database, or spread for HA)
+         - Bin-packing for efficiency vs spread for reliability
+         - Migration: move app between nodes (drain + restart)
+
+[x] 10.3 Distributed routing
+         - Router runs on every node (or dedicated edge nodes)
+         - Consistent routing table (etcd, Consul, or Raft-based)
+         - Inter-node request forwarding when app is on different node
+         - Anycast or GeoDNS for global distribution
+
+[x] 10.4 Shared storage
+         - App slugs stored in object storage (S3/MinIO)
+         - Pulled to node on app placement
+         - Log aggregation across nodes
+         - Metrics aggregation (Prometheus federation)
+
+[x] 10.5 High availability
+         - App replicas across multiple nodes
+         - Database replication (primary + read replicas)
+         - Router failover
+         - Control plane redundancy
+         - Zero-downtime node maintenance
+
+================================================================================
+ IMPLEMENTATION PRIORITY (MVP → Production)
+================================================================================
+
+ MVP (single node, one developer can use it):
+ ─────────────────────────────────────────────
+  1. Phase 1.1-1.6   App runtime (HTTP server + VM pool)
+  2. Phase 1.7-1.8   Logging + metrics
+  3. Phase 3.1-3.2   Process manager + deployment flow
+  4. Phase 4.1-4.2   Router + domain mapping
+  5. Phase 5.1, 5.3  Filesystem + PHP sandboxing
+  6. Phase 7.2       CLI tool (basic commands)
+  7. Phase 2.1-2.2   Build pipeline + manifest
+
+ Beta (host other people's apps):
+ ─────────────────────────────────
+  8. Phase 5.2, 5.4  Process isolation + resource limits
+  9. Phase 4.3       TLS / Let's Encrypt
+  10. Phase 6.1-6.3  MySQL, PostgreSQL, Redis
+  11. Phase 7.1      REST API
+  12. Phase 7.3      Git push deploy
+  13. Phase 3.3-3.4  Env var management + log aggregation
+  14. Phase 8.1-8.3  Performance (warm pool, opcache, lazy init)
+
+ Production:
+ ───────────
+  15. Phase 5.5-5.6  Network isolation + secrets
+  16. Phase 4.4-4.6  Load balancing, rate limiting, middleware
+  17. Phase 3.5-3.8  Resource limits, auto-scaling, cron, workers
+  18. Phase 7.4-7.5  Dashboard + auth
+  19. Phase 8.4-8.5  Framework preloading + benchmarks
+  20. Phase 9        Developer experience polish
+  21. Phase 2.3-2.6  Build caching + framework-specific builds
+  22. Phase 6.4-6.5  Object storage + service discovery
+
+ Scale:
+ ──────
+  23. Phase 10       Multi-node clustering
+
+================================================================================
+ COMPETITIVE POSITIONING
+================================================================================
+
+ vs Heroku:
+   - Heroku PHP uses Apache/Nginx + PHP-FPM — 3 processes per dyno
+   - php.rs PaaS: single process, no web server / FPM overhead
+   - Heroku cold start (dyno spinup): ~5-10 seconds
+   - php.rs cold start: <20ms (process start → serving)
+   - Memory: Heroku PHP dyno ~100 MB idle, php.rs ~5-10 MB idle
+   - 10x more apps per dollar on same hardware
+
+ vs Platform.sh:
+   - Platform.sh: full container per app, heavy infrastructure
+   - php.rs: process-level isolation, lighter weight
+   - Platform.sh: supports many languages — we focus on PHP only
+   - php.rs advantage: deep PHP-specific optimizations
+
+ vs Laravel Forge / Ploi:
+   - Forge/Ploi: provision cloud VMs, install Nginx+PHP-FPM+MySQL
+   - They manage YOUR servers — still traditional infrastructure
+   - php.rs PaaS: fully managed, no VM provisioning needed
+   - Closer to Laravel Cloud / Laravel Vapor in model
+
+ vs Laravel Cloud:
+   - Both are managed PHP hosting
+   - php.rs: not Laravel-exclusive, works with any PHP framework
+   - php.rs: Rust-native runtime, fundamentally faster
+   - Laravel Cloud: deeper Laravel integration (Pulse, Horizon, etc.)
+
+ vs FrankenPHP / Swoole / RoadRunner:
+   - These replace PHP-FPM with a better app server
+   - Still require deploying infrastructure manually
+   - php.rs PaaS: includes the app server AND the platform
+   - php.rs: no PHP C runtime at all — pure Rust
+
+ Key differentiator: Because the PHP interpreter IS the app server
+ (no PHP-FPM, no Nginx, no .so extensions, no C runtime), we can
+ achieve process density and cold-start times impossible with any
+ C-based PHP runtime. A $20/month bare-metal box can host hundreds
+ of low-traffic PHP apps.
+
+================================================================================

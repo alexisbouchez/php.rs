@@ -8,13 +8,14 @@
 //! Mirrors `struct _zend_op_array` from `php-src/Zend/zend_compile.h`.
 
 use crate::op::ZOp;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
 /// A try/catch/finally element — marks the opcode ranges for exception handling.
 ///
 /// Mirrors `zend_try_catch_element` from zend_compile.h.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TryCatchElement {
     /// Opline index where the try block starts.
     pub try_op: u32,
@@ -32,7 +33,7 @@ pub struct TryCatchElement {
 ///
 /// Mirrors ZEND_LIVE_TMPVAR, ZEND_LIVE_LOOP, etc.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LiveRangeKind {
     TmpVar = 0,
     Loop = 1,
@@ -44,7 +45,7 @@ pub enum LiveRangeKind {
 /// A live range for a temporary variable — used for cleanup on exception.
 ///
 /// Mirrors `zend_live_range` from zend_compile.h.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveRange {
     /// The variable slot (low bits encode the kind).
     pub var: u32,
@@ -82,7 +83,7 @@ impl LiveRange {
 /// Argument info for a function parameter.
 ///
 /// Corresponds to `zend_arg_info` in php-src.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ArgInfo {
     /// Parameter name.
     pub name: String,
@@ -99,7 +100,7 @@ pub struct ArgInfo {
 }
 
 /// Info about a class property (for compile-time metadata).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClassPropertyInfo {
     pub name: String,
     pub default: Option<Literal>,
@@ -115,7 +116,7 @@ pub struct ClassPropertyInfo {
 }
 
 /// Compile-time class metadata (properties, constants, traits).
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ClassMetadata {
     pub properties: Vec<ClassPropertyInfo>,
     pub constants: Vec<(String, Literal)>,
@@ -127,7 +128,7 @@ pub struct ClassMetadata {
 }
 
 /// Compiled trait adaptation info.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TraitAdaptationInfo {
     /// `TraitName::method insteadof OtherTrait, ...`
     Precedence {
@@ -152,7 +153,7 @@ pub enum TraitAdaptationInfo {
 /// In PHP, every compiled file gets a top-level op_array. Each function and
 /// method definition within that file also gets its own op_array. They share
 /// a reference to the file's literal pool but have separate opcode sequences.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ZOpArray {
     /// Function name (empty for top-level script).
     pub function_name: Option<String>,
@@ -225,7 +226,7 @@ pub struct ZOpArray {
 ///
 /// During compilation, constant expressions are evaluated and stored here.
 /// Const operands reference these by index.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Literal {
     Null,
     Bool(bool),

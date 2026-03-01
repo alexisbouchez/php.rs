@@ -8,11 +8,12 @@
 //! - Concurrent request handling via thread pool (10C.03)
 //! - Access logging with timestamps, status codes, response times (10C.04)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read as _, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use php_rs_runtime::superglobals::Superglobals;
@@ -28,6 +29,100 @@ pub struct ServerConfig {
     pub docroot: PathBuf,
     /// Optional router script.
     pub router: Option<PathBuf>,
+}
+
+// ── Dashboard State ─────────────────────────────────────────────────────────
+
+const DASHBOARD_RING_SIZE: usize = 1000;
+
+struct RequestRecord {
+    id: u64,
+    timestamp: String,
+    method: String,
+    uri: String,
+    status: u16,
+    elapsed_ms: u128,
+    content_length: usize,
+    remote_addr: String,
+    content_type: String,
+    events: Vec<(String, String, u128)>, // (kind, detail, elapsed_us)
+}
+
+impl RequestRecord {
+    fn to_json(&self) -> String {
+        let mut ev_json = String::from("[");
+        for (i, (kind, detail, us)) in self.events.iter().enumerate() {
+            if i > 0 { ev_json.push(','); }
+            let d = detail.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+            ev_json.push_str(&format!(r#"{{"k":"{}","d":"{}","us":{}}}"#, kind, d, us));
+        }
+        ev_json.push(']');
+        format!(
+            r#"{{"id":{},"ts":"{}","method":"{}","uri":"{}","status":{},"ms":{},"len":{},"addr":"{}","ct":"{}","ev":{}}}"#,
+            self.id,
+            self.timestamp.replace('\\', "\\\\").replace('"', "\\\""),
+            self.method.replace('\\', "\\\\").replace('"', "\\\""),
+            self.uri.replace('\\', "\\\\").replace('"', "\\\""),
+            self.status,
+            self.elapsed_ms,
+            self.content_length,
+            self.remote_addr.replace('\\', "\\\\").replace('"', "\\\""),
+            self.content_type.replace('\\', "\\\\").replace('"', "\\\""),
+            ev_json,
+        )
+    }
+}
+
+struct DashboardState {
+    next_id: AtomicU64,
+    entries: Mutex<VecDeque<RequestRecord>>,
+    total_requests: AtomicU64,
+    total_errors: AtomicU64,
+}
+
+impl DashboardState {
+    fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            entries: Mutex::new(VecDeque::with_capacity(DASHBOARD_RING_SIZE)),
+            total_requests: AtomicU64::new(0),
+            total_errors: AtomicU64::new(0),
+        }
+    }
+
+    fn push(&self, method: String, uri: String, status: u16, elapsed_ms: u128, content_length: usize, remote_addr: String, content_type: String, events: Vec<(String, String, u128)>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.total_requests.fetch_add(1, Ordering::Relaxed);
+        if status >= 400 {
+            self.total_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        let record = RequestRecord {
+            id,
+            timestamp: format_timestamp(),
+            method,
+            uri,
+            status,
+            elapsed_ms,
+            content_length,
+            remote_addr,
+            content_type,
+            events,
+        };
+        let mut entries = self.entries.lock().unwrap();
+        if entries.len() >= DASHBOARD_RING_SIZE {
+            entries.pop_front();
+        }
+        entries.push_back(record);
+    }
+
+    fn entries_since(&self, last_id: u64) -> Vec<String> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .iter()
+            .filter(|r| r.id > last_id)
+            .map(|r| format!("id: {}\ndata: {}\n", r.id, r.to_json()))
+            .collect()
+    }
 }
 
 // ── HTTP Request ────────────────────────────────────────────────────────────
@@ -331,8 +426,8 @@ fn send_500(stream: &mut std::net::TcpStream, message: &str) {
 /// Result of a PHP router script execution.
 enum RouterResult {
     /// Router handled the request — send this response.
-    /// Fields: status, content_type, extra_headers, body
-    Handled(u16, String, Vec<String>, Vec<u8>),
+    /// Fields: status, content_type, extra_headers, body, events
+    Handled(u16, String, Vec<String>, Vec<u8>, Vec<(String, String, u128)>),
     /// Router returned false — fall through to static file serving.
     Fallthrough,
     /// Router script error.
@@ -382,16 +477,18 @@ fn execute_router_script(
             let content_type = extract_content_type(&vm);
             let body = php_output_to_bytes(&output, &content_type);
             let extra_headers = vm.response_headers().to_vec();
-            RouterResult::Handled(status, content_type, extra_headers, body)
+            let events = take_vm_events(&mut vm);
+            RouterResult::Handled(status, content_type, extra_headers, body, events)
         }
-        Err(php_rs_vm::VmError::Exit(code)) => {
+        Err(php_rs_vm::VmError::Exit(_)) => {
             // exit() means the script handled the request — never fallthrough.
             let output = vm.output_so_far();
             let status = vm.response_code().unwrap_or(200);
             let content_type = extract_content_type(&vm);
             let body = php_output_to_bytes(&output, &content_type);
             let extra_headers = vm.response_headers().to_vec();
-            RouterResult::Handled(status, content_type, extra_headers, body)
+            let events = take_vm_events(&mut vm);
+            RouterResult::Handled(status, content_type, extra_headers, body, events)
         }
         Err(e) => RouterResult::Error(format!("{:?}", e)),
     }
@@ -437,12 +534,12 @@ fn extract_content_type(vm: &php_rs_vm::Vm) -> String {
 }
 
 /// Execute a PHP script for an HTTP request.
-/// Returns (status, content_type, extra_headers, body).
+/// Returns (status, content_type, extra_headers, body, events).
 fn execute_php_request(
     script_path: &Path,
     req: &HttpRequest,
     config: &ServerConfig,
-) -> Result<(u16, String, Vec<String>, Vec<u8>), String> {
+) -> Result<(u16, String, Vec<String>, Vec<u8>, Vec<(String, String, u128)>), String> {
     let source = std::fs::read_to_string(script_path)
         .map_err(|e| format!("Failed to read {}: {}", script_path.display(), e))?;
 
@@ -465,7 +562,8 @@ fn execute_php_request(
             let content_type = extract_content_type(&vm);
             let body = php_output_to_bytes(&output, &content_type);
             let extra_headers = vm.response_headers().to_vec();
-            Ok((status, content_type, extra_headers, body))
+            let events = take_vm_events(&mut vm);
+            Ok((status, content_type, extra_headers, body, events))
         }
         Err(php_rs_vm::VmError::Exit(_)) => {
             let status = vm.response_code().unwrap_or(200);
@@ -473,10 +571,16 @@ fn execute_php_request(
             let content_type = extract_content_type(&vm);
             let body = php_output_to_bytes(&output, &content_type);
             let extra_headers = vm.response_headers().to_vec();
-            Ok((status, content_type, extra_headers, body))
+            let events = take_vm_events(&mut vm);
+            Ok((status, content_type, extra_headers, body, events))
         }
         Err(e) => Err(format!("{:?}", e)),
     }
+}
+
+/// Extract VM events as (kind, detail, elapsed_us) tuples.
+fn take_vm_events(vm: &mut php_rs_vm::Vm) -> Vec<(String, String, u128)> {
+    vm.take_events().into_iter().map(|e| (e.kind.to_string(), e.detail, e.elapsed_us)).collect()
 }
 
 /// Build all superglobals for a request.
@@ -732,6 +836,180 @@ fn log_access(
     );
 }
 
+// ── Dashboard SSE & HTML ────────────────────────────────────────────────────
+
+/// Handle an SSE stream on a dedicated thread (frees pool worker).
+fn handle_sse_stream(mut stream: std::net::TcpStream, state: Arc<DashboardState>, mut last_id: u64) {
+    // Set write timeout so dead connections don't hang threads
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+
+    let header = "HTTP/1.1 200 OK\r\n\
+                  Content-Type: text/event-stream\r\n\
+                  Cache-Control: no-cache\r\n\
+                  Connection: keep-alive\r\n\
+                  X-Accel-Buffering: no\r\n\
+                  \r\n";
+    if stream.write_all(header.as_bytes()).is_err() {
+        return;
+    }
+    let _ = stream.flush();
+
+    let mut idle_ticks: u32 = 0;
+    loop {
+        let events = state.entries_since(last_id);
+        if events.is_empty() {
+            idle_ticks += 1;
+            // Send keepalive comment every ~3s (30 * 100ms)
+            if idle_ticks >= 30 {
+                if stream.write_all(b": keepalive\n\n").is_err() {
+                    break;
+                }
+                let _ = stream.flush();
+                idle_ticks = 0;
+            }
+        } else {
+            idle_ticks = 0;
+            for event in &events {
+                if stream.write_all(event.as_bytes()).is_err() {
+                    return;
+                }
+                if stream.write_all(b"\n").is_err() {
+                    return;
+                }
+            }
+            let _ = stream.flush();
+            // Update last_id from the last event we sent
+            // The event format is "id: N\ndata: ...\n"
+            if let Some(last_event) = events.last() {
+                if let Some(id_line) = last_event.lines().next() {
+                    if let Some(id_str) = id_line.strip_prefix("id: ") {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            last_id = id;
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Generate the self-contained dashboard HTML page.
+fn dashboard_html(listen: &str) -> String {
+    format!(r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>php.rs dashboard</title>
+<link rel="preconnect" href="https://fonts.bunny.net">
+<link href="https://fonts.bunny.net/css?family=iosevka:400,700" rel="stylesheet">
+<style>
+*,*::before,*::after{{box-sizing:border-box;margin:0;padding:0}}
+:root{{color-scheme:light;--bg:oklch(.98 .005 260);--surface:oklch(.95 .005 260);--border:oklch(.88 .01 260);--fg:oklch(.2 .02 260);--fg2:oklch(.5 .02 260);--ok:oklch(.45 .2 145);--warn:oklch(.5 .17 80);--err:oklch(.5 .22 25);--accent:oklch(.5 .15 250)}}
+html{{block-size:100dvh}}
+body{{font:400 14px/1.5 Iosevka,ui-monospace,monospace;background:var(--bg);color:var(--fg);display:grid;grid-template-rows:auto 1fr;block-size:100dvh}}
+header{{position:sticky;inset-block-start:0;z-index:1;background:var(--surface);border-block-end:1px solid var(--border);padding-block:.75rem;padding-inline:1.25rem;display:flex;align-items:center;gap:1rem;flex-wrap:wrap}}
+header h1{{font-size:1rem;font-weight:700;letter-spacing:.04em}}
+.dot{{inline-size:8px;block-size:8px;border-radius:50%;background:var(--ok);animation:pulse 2s ease-in-out infinite}}
+@keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
+.dot.dead{{background:var(--err);animation:none}}
+.stats{{margin-inline-start:auto;display:flex;gap:1.5rem;color:var(--fg2);font-size:.85rem}}
+.stats b{{color:var(--fg)}}
+.wrap{{overflow-y:auto;overflow-anchor:auto}}
+table{{inline-size:100%;border-collapse:collapse}}
+thead{{position:sticky;inset-block-start:0;background:var(--surface)}}
+th{{text-align:start;padding:.5rem 1rem;color:var(--fg2);font-weight:400;font-size:.8rem;text-transform:uppercase;letter-spacing:.08em;border-block-end:1px solid var(--border)}}
+td{{padding:.35rem 1rem;border-block-end:1px solid var(--border);white-space:nowrap}}
+tr.req{{cursor:pointer}}
+tr.req:hover td{{background:oklch(.92 .005 260)}}
+tr.detail{{display:none}}
+tr.detail.open{{display:table-row}}
+tr.detail td{{padding:.5rem 1rem;background:var(--surface);color:var(--fg2);white-space:pre-wrap;font-size:.85rem}}
+tr.detail dl{{display:grid;grid-template-columns:max-content 1fr;gap:.15rem 1rem}}
+tr.detail dt{{color:var(--fg2);text-transform:uppercase;font-size:.75rem;letter-spacing:.06em}}
+tr.detail dd{{color:var(--fg)}}
+.s2{{color:var(--ok)}}.s3{{color:var(--accent)}}.s4{{color:var(--warn)}}.s5{{color:var(--err)}}
+.ms{{color:var(--fg2)}}
+.anchor{{overflow-anchor:auto;block-size:1px}}
+.empty{{padding:3rem;text-align:center;color:var(--fg2)}}
+.ev-table{{inline-size:100%;border-collapse:collapse;margin-block-start:.5rem}}
+.ev-table th{{text-align:start;padding:.25rem .5rem;color:var(--fg2);font-weight:400;font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;border-block-end:1px solid var(--border)}}
+.ev-table td{{padding:.2rem .5rem;border-block-end:1px solid var(--border);font-size:.8rem;white-space:nowrap}}
+.ev-table td.ev-detail{{white-space:pre-wrap;word-break:break-all;max-inline-size:60ch;overflow:hidden;text-overflow:ellipsis}}
+.badge{{display:inline-block;padding:.1rem .4rem;border-radius:3px;font-size:.7rem;font-weight:700;letter-spacing:.04em;text-transform:uppercase}}
+.badge-sql{{background:oklch(.92 .08 250);color:oklch(.35 .15 250)}}
+.badge-include{{background:oklch(.92 .02 260);color:oklch(.35 .02 260)}}
+.badge-error{{background:oklch(.92 .1 25);color:oklch(.4 .2 25)}}
+.badge-warning{{background:oklch(.92 .1 80);color:oklch(.4 .17 80)}}
+.badge-notice{{background:oklch(.92 .1 90);color:oklch(.45 .15 90)}}
+.no-events{{color:var(--fg2);font-size:.8rem;font-style:italic}}
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>php.rs &mdash; {listen}</h1>
+  <div class="stats">
+    <span>reqs <b id="cnt">0</b></span>
+    <span>errs <b id="ecnt">0</b></span>
+  </div>
+</header>
+<div class="wrap">
+  <table>
+    <thead><tr><th>time</th><th>method</th><th>uri</th><th>status</th><th>ms</th><th>size</th></tr></thead>
+    <tbody id="tb"></tbody>
+  </table>
+  <div class="anchor"></div>
+  <div class="empty" id="empty">Waiting for requests&hellip;</div>
+</div>
+<script>
+(function(){{
+  const tb=document.getElementById("tb"),dot=document.getElementById("dot");
+  const cnt=document.getElementById("cnt"),ecnt=document.getElementById("ecnt");
+  const empty=document.getElementById("empty");
+  let reqs=0,errs=0;
+  const es=new EventSource("/_php-rs/events");
+  function fmt(n){{if(n<1024)return n+"B";if(n<1048576)return(n/1024).toFixed(1)+"K";return(n/1048576).toFixed(1)+"M"}}
+  function esc(s){{const d=document.createElement("span");d.textContent=s;return d.innerHTML}}
+  function badgeClass(k){{if(k==="sql")return"badge-sql";if(k==="include")return"badge-include";if(k==="error")return"badge-error";if(k==="warning")return"badge-warning";if(k==="notice")return"badge-notice";return"badge-include"}}
+  function evRows(ev){{
+    if(!ev||!ev.length)return"<span class=\"no-events\">no internal events</span>";
+    let h="<table class=\"ev-table\"><thead><tr><th>type</th><th>detail</th><th>at</th></tr></thead><tbody>";
+    for(let i=0;i<ev.length;i++){{
+      const e=ev[i];
+      const ms=(e.us/1000).toFixed(1);
+      const detail=e.d.length>120?esc(e.d.slice(0,120))+"&hellip;":esc(e.d);
+      h+="<tr><td><span class=\"badge "+badgeClass(e.k)+"\">"+esc(e.k)+"</span></td><td class=\"ev-detail\">"+detail+"</td><td class=\"ms\">"+ms+" ms</td></tr>";
+    }}
+    h+="</tbody></table>";
+    return h;
+  }}
+  es.onmessage=function(e){{
+    const d=JSON.parse(e.data);
+    const tr=document.createElement("tr");
+    tr.className="req";
+    const sc=d.status<300?"s2":d.status<400?"s3":d.status<500?"s4":"s5";
+    const evCount=d.ev&&d.ev.length?d.ev.length:0;
+    tr.innerHTML="<td class=\"ms\">"+d.ts.slice(11)+"</td><td>"+esc(d.method)+"</td><td>"+esc(d.uri)+"</td><td class=\""+sc+"\">"+d.status+"</td><td class=\"ms\">"+d.ms+"</td><td class=\"ms\">"+fmt(d.len)+"</td>";
+    const dr=document.createElement("tr");
+    dr.className="detail";
+    dr.innerHTML="<td colspan=\"6\"><dl><dt>id</dt><dd>"+d.id+"</dd><dt>timestamp</dt><dd>"+esc(d.ts)+"</dd><dt>method</dt><dd>"+esc(d.method)+"</dd><dt>uri</dt><dd>"+esc(d.uri)+"</dd><dt>status</dt><dd class=\""+sc+"\">"+d.status+"</dd><dt>elapsed</dt><dd>"+d.ms+" ms</dd><dt>size</dt><dd>"+fmt(d.len)+"</dd><dt>client</dt><dd>"+esc(d.addr)+"</dd><dt>content-type</dt><dd>"+esc(d.ct)+"</dd><dt>events ("+evCount+")</dt><dd>"+evRows(d.ev)+"</dd></dl></td>";
+    tr.addEventListener("click",function(){{dr.classList.toggle("open")}});
+    tb.appendChild(tr);
+    tb.appendChild(dr);
+    reqs++;if(d.status>=400)errs++;
+    cnt.textContent=reqs;ecnt.textContent=errs;
+    if(empty)empty.style.display="none";
+  }};
+  es.onerror=function(){{dot.classList.add("dead")}};
+  es.onopen=function(){{dot.classList.remove("dead")}};
+}})();
+</script>
+</body>
+</html>"##, listen = listen)
+}
+
 // ── Connection Handling ─────────────────────────────────────────────────────
 
 /// Handle a single HTTP connection.
@@ -740,6 +1018,7 @@ fn handle_connection(
     stream: &mut std::net::TcpStream,
     config: &ServerConfig,
     remote_addr: &str,
+    dashboard: &Arc<DashboardState>,
 ) -> Option<(u16, String, String)> {
     let start = Instant::now();
 
@@ -753,23 +1032,56 @@ fn handle_connection(
     let uri = req.uri.clone();
     let stream = reader.into_inner();
 
+    // Dashboard routes — intercept before router script (not logged)
+    let path_trimmed = req.path.trim_end_matches('/');
+    if path_trimmed == "/_php-rs" {
+        let html = dashboard_html(&config.listen);
+        send_response(
+            stream,
+            200,
+            "OK",
+            "text/html; charset=UTF-8",
+            &["Cache-Control: no-store".into()],
+            html.as_bytes(),
+        );
+        return None; // don't log dashboard requests
+    }
+    if req.path == "/_php-rs/events" {
+        let last_id = req
+            .headers
+            .get("last-event-id")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if let Ok(cloned) = stream.try_clone() {
+            let dash = Arc::clone(dashboard);
+            std::thread::spawn(move || {
+                handle_sse_stream(cloned, dash, last_id);
+            });
+        }
+        return None; // SSE handled on dedicated thread, don't log
+    }
+
     // 10C.01: Router script with false-return fallthrough
     if let Some(ref router) = config.router {
         if router.exists() {
             match execute_router_script(router, &req, config) {
-                RouterResult::Handled(status, content_type, extra_headers, body) => {
+                RouterResult::Handled(status, content_type, extra_headers, body, events) => {
+                    let len = body.len();
                     send_response(stream, status, status_text(status), &content_type, &extra_headers, &body);
                     let elapsed = start.elapsed().as_millis();
                     log_access(remote_addr, &config.listen, status, &method, &uri, elapsed);
+                    dashboard.push(method.clone(), uri.clone(), status, elapsed, len, remote_addr.to_string(), content_type, events);
                     return Some((status, method, uri));
                 }
                 RouterResult::Fallthrough => {
                     // Fall through to normal file serving below
                 }
                 RouterResult::Error(msg) => {
+                    let len = msg.len();
                     send_500(stream, &msg);
                     let elapsed = start.elapsed().as_millis();
                     log_access(remote_addr, &config.listen, 500, &method, &uri, elapsed);
+                    dashboard.push(method.clone(), uri.clone(), 500, elapsed, len, remote_addr.to_string(), "text/html".into(), vec![]);
                     return Some((500, method, uri));
                 }
             }
@@ -795,6 +1107,7 @@ fn handle_connection(
             send_404(stream, &req.path);
             let elapsed = start.elapsed().as_millis();
             log_access(remote_addr, &config.listen, 404, &method, &uri, elapsed);
+            dashboard.push(method.clone(), uri.clone(), 404, elapsed, 0, remote_addr.to_string(), "text/html".into(), vec![]);
             return Some((404, method, uri));
         }
     }
@@ -803,40 +1116,45 @@ fn handle_connection(
         send_404(stream, &req.path);
         let elapsed = start.elapsed().as_millis();
         log_access(remote_addr, &config.listen, 404, &method, &uri, elapsed);
+        dashboard.push(method.clone(), uri.clone(), 404, elapsed, 0, remote_addr.to_string(), "text/html".into(), vec![]);
         return Some((404, method, uri));
     }
 
     // Check if it's a PHP file
     let ext = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    let status = if ext == "php" {
+    let (status, content_len, ct_str, php_events) = if ext == "php" {
         match execute_php_request(&file_path, &req, config) {
-            Ok((status, content_type, extra_headers, body)) => {
+            Ok((status, content_type, extra_headers, body, events)) => {
+                let len = body.len();
                 send_response(stream, status, status_text(status), &content_type, &extra_headers, &body);
-                status
+                (status, len, content_type, events)
             }
             Err(msg) => {
+                let len = msg.len();
                 send_500(stream, &msg);
-                500
+                (500, len, "text/html".to_string(), vec![])
             }
         }
     } else {
         // Serve static file
         match std::fs::read(&file_path) {
             Ok(contents) => {
+                let len = contents.len();
                 let ct = mime_type(file_path.to_str().unwrap_or(""));
                 send_response(stream, 200, "OK", ct, &[], &contents);
-                200
+                (200, len, ct.to_string(), vec![])
             }
             Err(_) => {
                 send_404(stream, &req.path);
-                404
+                (404, 0, "text/html".to_string(), vec![])
             }
         }
     };
 
     let elapsed = start.elapsed().as_millis();
     log_access(remote_addr, &config.listen, status, &method, &uri, elapsed);
+    dashboard.push(method.clone(), uri.clone(), status, elapsed, content_len, remote_addr.to_string(), ct_str, php_events);
     Some((status, method, uri))
 }
 
@@ -911,6 +1229,10 @@ pub fn run_server(config: ServerConfig) -> i32 {
     if let Some(ref router) = config.router {
         eprintln!("Router script is {}", router.display());
     }
+    eprintln!(
+        "Dashboard at http://{}/_php-rs",
+        config.listen
+    );
     eprintln!("Press Ctrl+C to quit.");
 
     let listener = match TcpListener::bind(&config.listen) {
@@ -924,17 +1246,19 @@ pub fn run_server(config: ServerConfig) -> i32 {
     // 10C.03: Use thread pool for concurrent handling
     let pool = ThreadPool::new(DEFAULT_THREAD_POOL_SIZE);
     let config = Arc::new(config);
+    let dashboard = Arc::new(DashboardState::new());
 
     for stream in listener.incoming() {
         match stream {
             Ok(mut stream) => {
                 let config = Arc::clone(&config);
+                let dashboard = Arc::clone(&dashboard);
                 let remote_addr = stream
                     .peer_addr()
                     .map(|a| a.to_string())
                     .unwrap_or_else(|_| "unknown".into());
                 pool.execute(move || {
-                    handle_connection(&mut stream, &config, &remote_addr);
+                    handle_connection(&mut stream, &config, &remote_addr, &dashboard);
                 });
             }
             Err(e) => {
@@ -1084,7 +1408,7 @@ mod tests {
             docroot: dir.clone(),
             router: None,
         };
-        let (status, _ct, _hdrs, body) = execute_php_request(&php_file, &req, &config).unwrap();
+        let (status, _ct, _hdrs, body, _) = execute_php_request(&php_file, &req, &config).unwrap();
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body), "Hello from server!");
 
@@ -1139,7 +1463,7 @@ mod tests {
             docroot: dir.clone(),
             router: None,
         };
-        let (status, _, _, body) = execute_php_request(&index_php, &req, &config).unwrap();
+        let (status, _, _, body, _) = execute_php_request(&index_php, &req, &config).unwrap();
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body), "Index!");
 
@@ -1195,7 +1519,7 @@ mod tests {
             docroot: dir.clone(),
             router: None,
         };
-        let (status, _, _, body) = execute_php_request(&php_file, &req, &config).unwrap();
+        let (status, _, _, body, _) = execute_php_request(&php_file, &req, &config).unwrap();
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body), "GET world name=world");
 
@@ -1239,7 +1563,7 @@ mod tests {
             docroot: dir.clone(),
             router: None,
         };
-        let (status, _, _, body) = execute_php_request(&php_file, &req, &config).unwrap();
+        let (status, _, _, body, _) = execute_php_request(&php_file, &req, &config).unwrap();
         assert_eq!(status, 200);
         assert_eq!(String::from_utf8_lossy(&body), "admin:s3cr3t");
 
@@ -1275,7 +1599,7 @@ mod tests {
         };
 
         match execute_router_script(&router, &req, &config) {
-            RouterResult::Handled(status, _, _, body) => {
+            RouterResult::Handled(status, _, _, body, _) => {
                 assert_eq!(status, 200);
                 assert_eq!(String::from_utf8_lossy(&body), "Routed!");
             }
@@ -1314,7 +1638,7 @@ mod tests {
 
         match execute_router_script(&router, &req, &config) {
             RouterResult::Fallthrough => {} // Expected
-            RouterResult::Handled(_, _, _, body) => {
+            RouterResult::Handled(_, _, _, body, _) => {
                 panic!(
                     "Expected Fallthrough, got Handled with body: {}",
                     String::from_utf8_lossy(&body)
@@ -1354,7 +1678,7 @@ mod tests {
         };
 
         match execute_router_script(&router, &req, &config) {
-            RouterResult::Handled(_, _, _, body) => {
+            RouterResult::Handled(_, _, _, body, _) => {
                 assert_eq!(String::from_utf8_lossy(&body), "handled");
             }
             _ => panic!("Expected Handled (output present)"),
@@ -1479,17 +1803,19 @@ mod tests {
         let server_config = Arc::clone(&config);
         let server_thread = std::thread::spawn(move || {
             let pool = ThreadPool::new(2);
+            let dashboard = Arc::new(DashboardState::new());
             // Accept 3 connections then stop
             for _ in 0..3 {
                 if let Ok(mut stream) = listener.accept() {
                     let sc = Arc::clone(&server_config);
+                    let dash = Arc::clone(&dashboard);
                     let remote = stream
                         .0
                         .peer_addr()
                         .map(|a| a.to_string())
                         .unwrap_or_default();
                     pool.execute(move || {
-                        handle_connection(&mut stream.0, &sc, &remote);
+                        handle_connection(&mut stream.0, &sc, &remote, &dash);
                     });
                 }
             }

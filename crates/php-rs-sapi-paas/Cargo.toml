@@ -1,0 +1,21 @@
+[package]
+name = "php-rs-sapi-paas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PaaS SAPI for php.rs — managed PHP application hosting"
+
+[[bin]]
+name = "php-rs-app"
+path = "src/main.rs"
+
+[dependencies]
+php-rs-compiler = { path = "../php-rs-compiler" }
+php-rs-vm = { path = "../php-rs-vm" }
+php-rs-runtime = { path = "../php-rs-runtime" }
+php-rs-composer = { path = "../php-rs-composer" }
+libc = "0.2"
+
+[dev-dependencies]

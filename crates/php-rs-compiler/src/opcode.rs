@@ -7,6 +7,8 @@
 //! assignment, control flow (jumps, calls, returns), array manipulation, object
 //! operations, type casting, exception handling, generator support, and more.
 
+use serde::{Deserialize, Serialize};
+
 /// All 212 Zend VM opcodes -- the instruction set for the PHP virtual machine.
 ///
 /// Numbering matches `php-src/Zend/zend_vm_opcodes.h` exactly.
@@ -14,7 +16,7 @@
 ///
 /// Opcode 45 and 79 are reserved/skipped in the reference implementation.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ZOpcode {
     Nop = 0,
     Add = 1,

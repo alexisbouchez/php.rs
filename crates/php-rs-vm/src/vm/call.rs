@@ -55,6 +55,8 @@ impl Vm {
                         let contents = String::from_utf8(bytes)
                             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                         self.included_files.insert(path.clone());
+                        let kind_label = match mode { 1 => "include", 2 => "include_once", 3 => "require", _ => "require_once" };
+                        self.record_event("include", format!("{} {}", kind_label, path));
                         (contents, Some(path))
                     }
                     Err(_) => {

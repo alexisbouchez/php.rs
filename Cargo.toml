@@ -80,6 +80,8 @@ members = [
     "crates/php-rs-sapi-fpm",
     "crates/php-rs-sapi-embed",
     "crates/php-rs-sapi-wasm",
+    "crates/php-rs-sapi-paas",
+    "crates/php-rs-orchestrator",
     "crates/php-rs-composer",
 ]
 

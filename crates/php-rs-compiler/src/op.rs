@@ -6,6 +6,7 @@
 //! `php-src/Zend/zend_compile.h`.
 
 use crate::opcode::ZOpcode;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Operand type discriminant -- how to interpret an [`Operand`] value.
@@ -14,7 +15,7 @@ use std::fmt;
 /// constants from `zend_compile.h`. The numeric values use the same bit-flag
 /// encoding as the reference implementation.
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OperandType {
     /// Operand slot is not used for this instruction.
     Unused = 0,
@@ -37,7 +38,7 @@ pub enum OperandType {
 /// - [`OperandType::Unused`]: may hold a jump target (opline index) or be truly unused
 ///
 /// This mirrors `znode_op` from `php-src/Zend/zend_compile.h`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Operand {
     /// The raw `u32` value. Interpretation depends on the associated [`OperandType`].
     pub val: u32,
@@ -109,7 +110,7 @@ impl fmt::Display for Operand {
 /// ```
 ///
 /// The `handler` pointer is omitted -- the VM resolves handlers at dispatch time.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZOp {
     /// The opcode for this instruction.
     pub opcode: ZOpcode,
