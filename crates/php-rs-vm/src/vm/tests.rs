@@ -14947,4 +14947,38 @@ echo date("T");
 "#);
         assert_eq!(output, "UTC");
     }
+
+    #[test]
+    fn test_short_array_destructure_holes() {
+        let output = run_php(r#"<?php
+[$a, , $b] = [1, 2, 3];
+echo "$a $b\n";
+[, $x, , $y] = [10, 20, 30, 40];
+echo "$x $y";
+"#);
+        assert_eq!(output, "1 3\n20 40");
+    }
+
+    #[test]
+    fn test_array_count_values_int_keys() {
+        let output = run_php(r#"<?php
+$r = array_count_values([1, 1, "a", "a", 2]);
+echo $r[1] . "\n";
+echo $r["a"] . "\n";
+echo $r[2];
+"#);
+        assert_eq!(output, "2\n2\n1");
+    }
+
+    #[test]
+    fn test_unset_reference_array() {
+        let output = run_php(r#"<?php
+$a = ["x" => 1, "y" => 2, "z" => 3];
+$b = &$a;
+unset($b["y"]);
+echo count($a) . "\n";
+echo isset($a["y"]) ? "yes" : "no";
+"#);
+        assert_eq!(output, "2\nno");
+    }
 }

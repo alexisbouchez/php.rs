@@ -3040,8 +3040,17 @@ impl Vm {
                 match op.op1_type {
                     OperandType::Cv => {
                         if slot < frame.cvs.len() {
-                            if let Value::Array(ref mut arr) = frame.cvs[slot] {
-                                arr.unset(&key);
+                            match &mut frame.cvs[slot] {
+                                Value::Array(ref mut arr) => {
+                                    arr.unset(&key);
+                                }
+                                Value::Reference(rc) => {
+                                    let mut inner = rc.borrow_mut();
+                                    if let Value::Array(ref mut arr) = *inner {
+                                        arr.unset(&key);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }

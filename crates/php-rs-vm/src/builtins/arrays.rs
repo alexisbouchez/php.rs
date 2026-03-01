@@ -655,12 +655,19 @@ fn php_array_count_values(
     if let Value::Array(ref a) = arr {
         let mut result = PhpArray::new();
         for (_, val) in a.entries() {
-            let key_str = val.to_php_string();
-            let current = result
-                .get_string(&key_str)
-                .cloned()
-                .unwrap_or(Value::Long(0));
-            result.set_string(key_str, current.add(&Value::Long(1)));
+            match val {
+                Value::Long(n) => {
+                    let current = result.get_int(*n).cloned().unwrap_or(Value::Long(0));
+                    result.set_int(*n, current.add(&Value::Long(1)));
+                }
+                Value::String(ref s) => {
+                    let current = result.get_string(s).cloned().unwrap_or(Value::Long(0));
+                    result.set_string(s.clone(), current.add(&Value::Long(1)));
+                }
+                _ => {
+                    // PHP warns about non-int/non-string values, skip
+                }
+            }
         }
         Ok(Value::Array(result))
     } else {

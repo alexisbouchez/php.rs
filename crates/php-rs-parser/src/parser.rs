@@ -2647,8 +2647,15 @@ impl<'a> Parser<'a> {
     fn parse_array_elements(&mut self, end_token: Token) -> Result<Vec<ArrayElement>, ParseError> {
         let mut elements = Vec::new();
         while self.current_token != end_token && self.current_token != Token::End {
-            // Handle trailing comma
+            // Handle skipped slots (e.g., [$a, , $b]) by inserting Null placeholder
             if self.current_token == Token::Comma {
+                let span = self.current_span.clone();
+                elements.push(ArrayElement {
+                    key: None,
+                    value: Expression::Null { span },
+                    by_ref: false,
+                    unpack: false,
+                });
                 self.advance();
                 continue;
             }

@@ -1922,6 +1922,10 @@ impl Compiler {
             Expression::ArrayLiteral { elements, .. } => {
                 // Treat like list() destructuring
                 for (i, elem) in elements.iter().enumerate() {
+                    // Skip holes (Null placeholders from parser)
+                    if matches!(elem.value, Expression::Null { .. }) {
+                        continue;
+                    }
                     // Determine the key for this element
                     let key_expr = if let Some(ref k) = elem.key {
                         // Keyed destructuring: [$key => $var]
