@@ -14198,4 +14198,256 @@ pclose($fp);
 "#);
         assert_eq!(output, "hello");
     }
+
+    #[test]
+    fn test_strtok_basic() {
+        let output = run_php(r#"<?php
+$token = strtok("Hello World PHP", " ");
+while ($token !== false) {
+    echo $token . "\n";
+    $token = strtok(" ");
+}
+"#);
+        assert_eq!(output, "Hello\nWorld\nPHP\n");
+    }
+
+    #[test]
+    fn test_strtok_multiple_delimiters() {
+        let output = run_php(r#"<?php
+$token = strtok("one,two;three", ",;");
+$result = [];
+while ($token !== false) {
+    $result[] = $token;
+    $token = strtok(",;");
+}
+echo implode("|", $result);
+"#);
+        assert_eq!(output, "one|two|three");
+    }
+
+    #[test]
+    fn test_hash_init_update_final() {
+        let output = run_php(r#"<?php
+$ctx = hash_init("md5");
+hash_update($ctx, "Hello ");
+hash_update($ctx, "World");
+echo hash_final($ctx);
+"#);
+        assert_eq!(output, "b10a8db164e0754105b7a99be72e3fe5");
+    }
+
+    #[test]
+    fn test_hash_init_sha256() {
+        let output = run_php(r#"<?php
+$ctx = hash_init("sha256");
+hash_update($ctx, "test");
+echo hash_final($ctx);
+"#);
+        assert_eq!(output, "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08");
+    }
+
+    #[test]
+    fn test_hash_copy() {
+        let output = run_php(r#"<?php
+$ctx = hash_init("md5");
+hash_update($ctx, "Hello ");
+$ctx2 = hash_copy($ctx);
+hash_update($ctx, "World");
+hash_update($ctx2, "PHP");
+echo hash_final($ctx) . "\n";
+echo hash_final($ctx2) . "\n";
+"#);
+        let lines: Vec<&str> = output.trim().split('\n').collect();
+        assert_eq!(lines[0], "b10a8db164e0754105b7a99be72e3fe5"); // md5("Hello World")
+        assert_eq!(lines[1], "c540ce201d398a7d275c6e0c669097f3"); // md5("Hello PHP")
+    }
+
+    #[test]
+    fn test_apcu_store_fetch() {
+        let output = run_php(r#"<?php
+apcu_store("key1", "value1");
+apcu_store("key2", 42);
+echo apcu_fetch("key1") . "\n";
+echo apcu_fetch("key2") . "\n";
+var_dump(apcu_fetch("nonexistent"));
+"#);
+        assert_eq!(output, "value1\n42\nbool(false)\n");
+    }
+
+    #[test]
+    fn test_apcu_add_exists_delete() {
+        let output = run_php(r#"<?php
+var_dump(apcu_add("k", "first"));
+var_dump(apcu_add("k", "second"));
+echo apcu_fetch("k") . "\n";
+var_dump(apcu_exists("k"));
+apcu_delete("k");
+var_dump(apcu_exists("k"));
+"#);
+        assert_eq!(output, "bool(true)\nbool(false)\nfirst\nbool(true)\nbool(false)\n");
+    }
+
+    #[test]
+    fn test_apcu_inc_dec() {
+        let output = run_php(r#"<?php
+apcu_store("counter", 10);
+echo apcu_inc("counter") . "\n";
+echo apcu_inc("counter", 5) . "\n";
+echo apcu_dec("counter", 3) . "\n";
+echo apcu_fetch("counter") . "\n";
+"#);
+        assert_eq!(output, "11\n16\n13\n13\n");
+    }
+
+    #[test]
+    fn test_apcu_clear_cache() {
+        let output = run_php(r#"<?php
+apcu_store("a", 1);
+apcu_store("b", 2);
+var_dump(apcu_exists("a"));
+apcu_clear_cache();
+var_dump(apcu_exists("a"));
+"#);
+        assert_eq!(output, "bool(true)\nbool(false)\n");
+    }
+
+    #[test]
+    fn test_array_column_with_objects() {
+        let output = run_php(r#"<?php
+$records = [];
+$obj1 = new stdClass;
+$obj1->name = "Alice";
+$obj1->age = 30;
+$records[] = $obj1;
+$obj2 = new stdClass;
+$obj2->name = "Bob";
+$obj2->age = 25;
+$records[] = $obj2;
+$names = array_column($records, "name");
+echo implode(", ", $names);
+"#);
+        assert_eq!(output, "Alice, Bob");
+    }
+
+    #[test]
+    fn test_array_map_multi_array() {
+        let output = run_php(r#"<?php
+$a = [1, 2, 3];
+$b = [10, 20, 30];
+$result = array_map(function($x, $y) { return $x + $y; }, $a, $b);
+echo implode(", ", $result);
+"#);
+        assert_eq!(output, "11, 22, 33");
+    }
+
+    #[test]
+    fn test_array_map_multi_null_callback() {
+        let output = run_php(r#"<?php
+$a = [1, 2, 3];
+$b = ['a', 'b', 'c'];
+$result = array_map(null, $a, $b);
+echo count($result) . "\n";
+echo $result[0][0] . "," . $result[0][1] . "\n";
+echo $result[1][0] . "," . $result[1][1] . "\n";
+"#);
+        assert_eq!(output, "3\n1,a\n2,b\n");
+    }
+
+    #[test]
+    fn test_array_map_multi_uneven() {
+        let output = run_php(r#"<?php
+$a = [1, 2, 3, 4];
+$b = [10, 20];
+$result = array_map(function($x, $y) { return ($x ?? 0) + ($y ?? 0); }, $a, $b);
+echo implode(", ", $result);
+"#);
+        assert_eq!(output, "11, 22, 3, 4");
+    }
+
+    #[test]
+    fn test_file_put_contents_append() {
+        let output = run_php(r#"<?php
+$tmp = tempnam(sys_get_temp_dir(), 'phprs');
+file_put_contents($tmp, "Hello");
+file_put_contents($tmp, " World", FILE_APPEND);
+echo file_get_contents($tmp);
+unlink($tmp);
+"#);
+        assert_eq!(output, "Hello World");
+    }
+
+    #[test]
+    fn test_file_put_contents_lock_ex() {
+        let output = run_php(r#"<?php
+$tmp = tempnam(sys_get_temp_dir(), 'phprs');
+file_put_contents($tmp, "locked data", LOCK_EX);
+echo file_get_contents($tmp);
+unlink($tmp);
+"#);
+        assert_eq!(output, "locked data");
+    }
+
+    #[test]
+    fn test_dirname_levels() {
+        let output = run_php(r#"<?php
+echo dirname("/a/b/c/d") . "\n";
+echo dirname("/a/b/c/d", 2) . "\n";
+echo dirname("/a/b/c/d", 3) . "\n";
+"#);
+        assert_eq!(output, "/a/b/c\n/a/b\n/a\n");
+    }
+
+    #[test]
+    fn test_first_class_callable() {
+        let output = run_php(r#"<?php
+function double($x) { return $x * 2; }
+$fn = strlen(...);
+echo $fn("hello") . "\n";
+$fn2 = double(...);
+echo $fn2(21);
+"#);
+        assert_eq!(output, "5\n42");
+    }
+
+    #[test]
+    fn test_str_pad_both() {
+        let output = run_php(r#"<?php
+echo str_pad("hi", 10, "-", STR_PAD_BOTH);
+"#);
+        assert_eq!(output, "----hi----");
+    }
+
+    #[test]
+    fn test_str_pad_left() {
+        let output = run_php(r#"<?php
+echo str_pad("42", 5, "0", STR_PAD_LEFT);
+"#);
+        assert_eq!(output, "00042");
+    }
+
+    #[test]
+    fn test_fgetcsv_quoted() {
+        let output = run_php(r#"<?php
+$tmp = tempnam(sys_get_temp_dir(), 'csv');
+file_put_contents($tmp, '"hello, world",42,"say ""hi"""' . "\n");
+$fp = fopen($tmp, 'r');
+$row = fgetcsv($fp);
+fclose($fp);
+echo $row[0] . "\n";
+echo $row[1] . "\n";
+echo $row[2] . "\n";
+unlink($tmp);
+"#);
+        assert_eq!(output, "hello, world\n42\nsay \"hi\"\n");
+    }
+
+    #[test]
+    fn test_array_map_with_keys() {
+        let output = run_php(r#"<?php
+$arr = ['a' => 1, 'b' => 2, 'c' => 3];
+$result = array_map(function($v) { return $v * 10; }, $arr);
+echo $result['a'] . ',' . $result['b'] . ',' . $result['c'];
+"#);
+        assert_eq!(output, "10,20,30");
+    }
 }

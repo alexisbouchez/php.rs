@@ -513,6 +513,29 @@ impl Vm {
                         o.set_property("code".to_string(), code);
                         o.set_property("previous".to_string(), previous);
                     }
+
+                    // Capture stack trace at exception creation
+                    let trace = self.capture_stack_trace();
+                    o.set_property("__trace".to_string(), trace);
+
+                    // Set file/line from the call site (current frame)
+                    let needs_file = match o.get_property("file") {
+                        Some(Value::String(ref s)) if !s.is_empty() => false,
+                        None | Some(Value::Null) | Some(Value::String(_)) => true,
+                        _ => true,
+                    };
+                    if needs_file {
+                        if let Some(frame) = self.call_stack.last() {
+                            let oa = &self.op_arrays[frame.op_array_idx];
+                            if let Some(ref filename) = oa.filename {
+                                o.set_property("file".to_string(), Value::String(filename.clone()));
+                            }
+                            let ip = if frame.ip > 0 { frame.ip - 1 } else { 0 };
+                            if ip < oa.opcodes.len() {
+                                o.set_property("line".to_string(), Value::Long(oa.opcodes[ip].lineno as i64));
+                            }
+                        }
+                    }
                 }
             }
             return Ok(DispatchSignal::Next);
@@ -1020,6 +1043,37 @@ impl Vm {
                                 "__sfo_lines".to_string(),
                                 Value::Array(PhpArray::new()),
                             );
+                        }
+                    }
+                }
+                return Ok(DispatchSignal::Next);
+            }
+
+            // DOMDocument constructor
+            if base_class == "DOMDocument" {
+                if let Some(Value::Object(ref obj)) = args.first() {
+                    let version = args.get(1).map(|v| v.to_php_string()).unwrap_or_else(|| "1.0".to_string());
+                    let encoding = args.get(2).map(|v| v.to_php_string()).unwrap_or_else(|| "".to_string());
+                    obj.set_property("version".to_string(), Value::String(version));
+                    obj.set_property("encoding".to_string(), Value::String(encoding));
+                    obj.set_property("nodeType".to_string(), Value::Long(9));
+                    obj.set_property("nodeName".to_string(), Value::String("#document".to_string()));
+                    // Create and store an empty DomDocument
+                    let doc = php_rs_ext_dom::DomDocument::new();
+                    let doc_id = self.next_dom_id;
+                    self.next_dom_id += 1;
+                    self.dom_documents.insert(doc_id, doc);
+                    obj.set_property("__dom_doc_id".to_string(), Value::Long(doc_id));
+                }
+                return Ok(DispatchSignal::Next);
+            }
+
+            // DOMXPath constructor — takes a DOMDocument as argument
+            if base_class == "DOMXPath" {
+                if let Some(Value::Object(ref obj)) = args.first() {
+                    if let Some(Value::Object(ref doc_obj)) = args.get(1) {
+                        if let Some(doc_id) = doc_obj.get_property("__dom_doc_id") {
+                            obj.set_property("__dom_doc_id".to_string(), doc_id);
                         }
                     }
                 }

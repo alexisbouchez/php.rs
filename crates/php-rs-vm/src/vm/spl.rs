@@ -10,6 +10,53 @@ use super::helpers::*;
 use super::{ClassDef, Vm, VmError, VmResult};
 use crate::value::{ArrayKey, PhpArray, PhpObject, Value};
 
+/// Format a PHP trace array into the string format used by getTraceAsString().
+fn format_trace_as_string(trace: &Value) -> String {
+    let mut result = String::new();
+    if let Value::Array(ref arr) = trace {
+        for (i, (_, entry)) in arr.entries().iter().enumerate() {
+            if let Value::Array(ref frame) = entry {
+                let file = frame.get(&Value::String("file".to_string()))
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_else(|| "[internal function]".to_string());
+                let line = frame.get(&Value::String("line".to_string()))
+                    .map(|v| v.to_long())
+                    .unwrap_or(0);
+                let class = frame.get(&Value::String("class".to_string()))
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
+                let function = frame.get(&Value::String("function".to_string()))
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
+                let type_str = frame.get(&Value::String("type".to_string()))
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
+
+                if !result.is_empty() {
+                    result.push('\n');
+                }
+
+                if file == "[internal function]" {
+                    result.push_str(&format!("#{} {}: ", i, file));
+                } else {
+                    result.push_str(&format!("#{} {}({}): ", i, file, line));
+                }
+
+                if !class.is_empty() {
+                    result.push_str(&format!("{}{}{}", class, type_str, function));
+                } else {
+                    result.push_str(&function);
+                }
+                result.push_str("()");
+            }
+        }
+        if !result.is_empty() {
+            result.push_str(&format!("\n#{} {{main}}", arr.len()));
+        }
+    }
+    result
+}
+
 impl Vm {
     /// Handle built-in class method calls (DateTime, DateTimeZone, etc.)
     /// Handle Exception/Error base class methods (getMessage, getCode, etc.)
@@ -38,14 +85,36 @@ impl Vm {
                     .unwrap_or(Value::String(String::new())),
             ),
             "getLine" => Some(obj.get_property("line").unwrap_or(Value::Long(0))),
-            "getTrace" => Some(Value::Array(PhpArray::new())),
-            "getTraceAsString" => Some(Value::String(String::new())),
+            "getTrace" => {
+                let trace = obj.get_property("__trace")
+                    .unwrap_or(Value::Array(PhpArray::new()));
+                Some(trace)
+            }
+            "getTraceAsString" => {
+                let trace = obj.get_property("__trace")
+                    .unwrap_or(Value::Array(PhpArray::new()));
+                let s = format_trace_as_string(&trace);
+                Some(Value::String(s))
+            }
             "__toString" => {
+                let class = obj.class_name();
                 let msg = obj
                     .get_property("message")
                     .unwrap_or(Value::String(String::new()))
                     .to_php_string();
-                Some(Value::String(msg))
+                let file = obj
+                    .get_property("file")
+                    .unwrap_or(Value::String(String::new()))
+                    .to_php_string();
+                let line = obj
+                    .get_property("line")
+                    .unwrap_or(Value::Long(0))
+                    .to_long();
+                let trace = obj.get_property("__trace")
+                    .unwrap_or(Value::Array(PhpArray::new()));
+                let trace_str = format_trace_as_string(&trace);
+                let result = format!("{}: {} in {}:{}\nStack trace:\n{}", class, msg, file, line, trace_str);
+                Some(Value::String(result))
             }
             _ => None,
         }
@@ -1194,6 +1263,19 @@ impl Vm {
         // SplTempFileObject methods
         if base_class == "SplTempFileObject" {
             if let Some(result) = self.call_spl_file_object_method(method, args)? {
+                return Ok(Some(result));
+            }
+        }
+
+        // DOM classes
+        if matches!(
+            base_class,
+            "DOMDocument" | "DOMElement" | "DOMNode" | "DOMNodeList"
+                | "DOMText" | "DOMComment" | "DOMAttr" | "DOMXPath"
+                | "DOMDocumentFragment" | "DOMCdataSection"
+                | "DOMProcessingInstruction" | "DOMNamedNodeMap"
+        ) {
+            if let Some(result) = self.call_dom_method(base_class, method, args)? {
                 return Ok(Some(result));
             }
         }
@@ -4066,6 +4148,579 @@ impl Vm {
             "getChildren" => Ok(Some(Value::Null)),
             "hasChildren" => Ok(Some(Value::Bool(false))),
             _ => Ok(None),
+        }
+    }
+
+    // ── DOM class method dispatch ──────────────────────────────────────────
+
+    fn call_dom_method(
+        &mut self,
+        class: &str,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        match class {
+            "DOMDocument" => self.call_dom_document_method(method, args),
+            "DOMElement" => self.call_dom_element_method(method, args),
+            "DOMNodeList" => self.call_dom_node_list_method(method, args),
+            "DOMNode" | "DOMText" | "DOMComment" | "DOMAttr"
+            | "DOMCdataSection" | "DOMProcessingInstruction" => {
+                self.call_dom_node_method(method, args)
+            }
+            "DOMXPath" => self.call_dom_xpath_method(method, args),
+            "DOMNamedNodeMap" => self.call_dom_named_node_map_method(method, args),
+            _ => Ok(None),
+        }
+    }
+
+    fn call_dom_document_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(o)) => o.clone(),
+            _ => return Ok(None),
+        };
+
+        match method {
+            "loadHTML" | "loadXML" => {
+                let source = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let result = if method == "loadHTML" {
+                    php_rs_ext_dom::dom_html5_parse(&source)
+                } else {
+                    php_rs_ext_dom::load_xml(&source)
+                };
+                match result {
+                    Ok(doc) => {
+                        let doc_id = self.next_dom_id;
+                        self.next_dom_id += 1;
+                        self.dom_documents.insert(doc_id, doc);
+                        obj.set_property("__dom_doc_id".to_string(), Value::Long(doc_id));
+                        Ok(Some(Value::Bool(true)))
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "loadHTMLFile" | "load" => {
+                let filename = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                match std::fs::read_to_string(&filename) {
+                    Ok(content) => {
+                        let result = if method == "loadHTMLFile" {
+                            php_rs_ext_dom::dom_html5_parse(&content)
+                        } else {
+                            php_rs_ext_dom::load_xml(&content)
+                        };
+                        match result {
+                            Ok(doc) => {
+                                let doc_id = self.next_dom_id;
+                                self.next_dom_id += 1;
+                                self.dom_documents.insert(doc_id, doc);
+                                obj.set_property("__dom_doc_id".to_string(), Value::Long(doc_id));
+                                Ok(Some(Value::Bool(true)))
+                            }
+                            Err(_) => Ok(Some(Value::Bool(false))),
+                        }
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+            "saveHTML" => {
+                let doc_id = obj.get_property("__dom_doc_id").map(|v| v.to_long()).unwrap_or(0);
+                if let Some(doc) = self.dom_documents.get(&doc_id) {
+                    let html = doc.save_xml();
+                    Ok(Some(Value::String(html)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "saveXML" => {
+                let doc_id = obj.get_property("__dom_doc_id").map(|v| v.to_long()).unwrap_or(0);
+                if let Some(doc) = self.dom_documents.get(&doc_id) {
+                    let xml = doc.save_xml();
+                    Ok(Some(Value::String(xml)))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "createElement" => {
+                let tag = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let text = args.get(2).map(|v| v.to_php_string());
+                let mut elem_obj = PhpObject::new("DOMElement".to_string());
+                elem_obj.set_property("nodeName".to_string(), Value::String(tag.clone()));
+                elem_obj.set_property("tagName".to_string(), Value::String(tag.clone()));
+                elem_obj.set_property("nodeType".to_string(), Value::Long(1));
+                if let Some(ref txt) = text {
+                    elem_obj.set_property("textContent".to_string(), Value::String(txt.clone()));
+                    elem_obj.set_property("nodeValue".to_string(), Value::String(txt.clone()));
+                }
+                // Store children and attributes as arrays
+                elem_obj.set_property("__children".to_string(), Value::Array(PhpArray::new()));
+                elem_obj.set_property("__attributes".to_string(), Value::Array(PhpArray::new()));
+                // Copy doc_id for reference
+                if let Some(doc_id) = obj.get_property("__dom_doc_id") {
+                    elem_obj.set_property("__dom_doc_id".to_string(), doc_id);
+                }
+                Ok(Some(Value::Object(elem_obj)))
+            }
+            "createTextNode" => {
+                let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let mut text_obj = PhpObject::new("DOMText".to_string());
+                text_obj.set_property("nodeName".to_string(), Value::String("#text".to_string()));
+                text_obj.set_property("nodeType".to_string(), Value::Long(3));
+                text_obj.set_property("nodeValue".to_string(), Value::String(data.clone()));
+                text_obj.set_property("textContent".to_string(), Value::String(data.clone()));
+                text_obj.set_property("wholeText".to_string(), Value::String(data));
+                Ok(Some(Value::Object(text_obj)))
+            }
+            "createComment" => {
+                let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let mut comment_obj = PhpObject::new("DOMComment".to_string());
+                comment_obj.set_property("nodeName".to_string(), Value::String("#comment".to_string()));
+                comment_obj.set_property("nodeType".to_string(), Value::Long(8));
+                comment_obj.set_property("nodeValue".to_string(), Value::String(data.clone()));
+                comment_obj.set_property("textContent".to_string(), Value::String(data));
+                Ok(Some(Value::Object(comment_obj)))
+            }
+            "createAttribute" => {
+                let name = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let mut attr_obj = PhpObject::new("DOMAttr".to_string());
+                attr_obj.set_property("name".to_string(), Value::String(name.clone()));
+                attr_obj.set_property("nodeName".to_string(), Value::String(name));
+                attr_obj.set_property("nodeType".to_string(), Value::Long(2));
+                attr_obj.set_property("value".to_string(), Value::String(String::new()));
+                Ok(Some(Value::Object(attr_obj)))
+            }
+            "createDocumentFragment" => {
+                let mut frag = PhpObject::new("DOMDocumentFragment".to_string());
+                frag.set_property("nodeType".to_string(), Value::Long(11));
+                frag.set_property("__children".to_string(), Value::Array(PhpArray::new()));
+                Ok(Some(Value::Object(frag)))
+            }
+            "createCDATASection" => {
+                let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let mut cdata = PhpObject::new("DOMCdataSection".to_string());
+                cdata.set_property("nodeType".to_string(), Value::Long(4));
+                cdata.set_property("nodeValue".to_string(), Value::String(data));
+                Ok(Some(Value::Object(cdata)))
+            }
+            "getElementsByTagName" => {
+                let tag = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let doc_id = obj.get_property("__dom_doc_id").map(|v| v.to_long()).unwrap_or(0);
+                let mut list = PhpArray::new();
+                if let Some(doc) = self.dom_documents.get(&doc_id) {
+                    let elements = doc.get_elements_by_tag_name(&tag);
+                    for elem in elements {
+                        let elem_obj = dom_element_to_php_object(elem);
+                        list.push(Value::Object(elem_obj));
+                    }
+                }
+                let mut nl = PhpObject::new("DOMNodeList".to_string());
+                let len = list.len() as i64;
+                nl.set_property("__items".to_string(), Value::Array(list));
+                nl.set_property("length".to_string(), Value::Long(len));
+                Ok(Some(Value::Object(nl)))
+            }
+            "getElementById" => {
+                let id = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let doc_id = obj.get_property("__dom_doc_id").map(|v| v.to_long()).unwrap_or(0);
+                if let Some(doc) = self.dom_documents.get(&doc_id) {
+                    if let Some(elem) = doc.get_element_by_id(&id) {
+                        let elem_obj = dom_element_to_php_object(elem);
+                        return Ok(Some(Value::Object(elem_obj)));
+                    }
+                }
+                Ok(Some(Value::Null))
+            }
+            "importNode" => {
+                // Simplified: just clone the node
+                if let Some(node_val) = args.get(1) {
+                    Ok(Some(node_val.clone()))
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn call_dom_element_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(o)) => o.clone(),
+            _ => return Ok(None),
+        };
+
+        match method {
+            "getAttribute" => {
+                let name = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                if let Some(Value::Array(ref attrs)) = obj.get_property("__attributes") {
+                    if let Some(val) = attrs.get(&Value::String(name)) {
+                        return Ok(Some(val.clone()));
+                    }
+                }
+                Ok(Some(Value::String(String::new())))
+            }
+            "setAttribute" => {
+                let name = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let value = args.get(2).map(|v| v.to_php_string()).unwrap_or_default();
+                let mut attrs = match obj.get_property("__attributes") {
+                    Some(Value::Array(a)) => a,
+                    _ => PhpArray::new(),
+                };
+                attrs.set_string(name, Value::String(value));
+                obj.set_property("__attributes".to_string(), Value::Array(attrs));
+                Ok(Some(Value::Null))
+            }
+            "removeAttribute" => {
+                let name = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                if let Some(Value::Array(ref mut attrs)) = obj.get_property("__attributes") {
+                    let mut new_attrs = PhpArray::new();
+                    for (k, v) in attrs.entries().iter() {
+                        if let ArrayKey::String(ref s) = k {
+                            if *s != name {
+                                new_attrs.set_string(s.clone(), v.clone());
+                            }
+                        }
+                    }
+                    obj.set_property("__attributes".to_string(), Value::Array(new_attrs));
+                }
+                Ok(Some(Value::Bool(true)))
+            }
+            "hasAttribute" => {
+                let name = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                if let Some(Value::Array(ref attrs)) = obj.get_property("__attributes") {
+                    Ok(Some(Value::Bool(attrs.get(&Value::String(name)).is_some())))
+                } else {
+                    Ok(Some(Value::Bool(false)))
+                }
+            }
+            "appendChild" => {
+                let child = args.get(1).cloned().unwrap_or(Value::Null);
+                let mut children = match obj.get_property("__children") {
+                    Some(Value::Array(a)) => a,
+                    _ => PhpArray::new(),
+                };
+                children.push(child.clone());
+                obj.set_property("__children".to_string(), Value::Array(children));
+                Ok(Some(child))
+            }
+            "removeChild" => {
+                // Simplified: just return the child
+                if let Some(child) = args.get(1) {
+                    Ok(Some(child.clone()))
+                } else {
+                    Ok(Some(Value::Null))
+                }
+            }
+            "getElementsByTagName" => {
+                let tag = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                // Collect matching children recursively
+                let mut list = PhpArray::new();
+                self.collect_elements_by_tag(&obj, &tag, &mut list);
+                let mut nl = PhpObject::new("DOMNodeList".to_string());
+                let len = list.len() as i64;
+                nl.set_property("__items".to_string(), Value::Array(list));
+                nl.set_property("length".to_string(), Value::Long(len));
+                Ok(Some(Value::Object(nl)))
+            }
+            _ => self.call_dom_node_method(method, args),
+        }
+    }
+
+    fn collect_elements_by_tag(&self, obj: &PhpObject, tag: &str, result: &mut PhpArray) {
+        if let Some(Value::Array(ref children)) = obj.get_property("__children") {
+            for (_, child) in children.entries().iter() {
+                if let Value::Object(ref child_obj) = child {
+                    let cn = child_obj.class_name();
+                    if cn == "DOMElement" {
+                        if tag == "*" || child_obj.get_property("tagName").map(|v| v.to_php_string()).as_deref() == Some(tag) {
+                            result.push(child.clone());
+                        }
+                    }
+                    self.collect_elements_by_tag(child_obj, tag, result);
+                }
+            }
+        }
+    }
+
+    fn call_dom_node_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(o)) => o.clone(),
+            _ => return Ok(None),
+        };
+
+        match method {
+            "appendChild" => {
+                let child = args.get(1).cloned().unwrap_or(Value::Null);
+                let mut children = match obj.get_property("__children") {
+                    Some(Value::Array(a)) => a,
+                    _ => PhpArray::new(),
+                };
+                children.push(child.clone());
+                obj.set_property("__children".to_string(), Value::Array(children));
+                Ok(Some(child))
+            }
+            "insertBefore" => {
+                let new_child = args.get(1).cloned().unwrap_or(Value::Null);
+                let mut children = match obj.get_property("__children") {
+                    Some(Value::Array(a)) => a,
+                    _ => PhpArray::new(),
+                };
+                // Simplified: just prepend
+                let mut new_arr = PhpArray::new();
+                new_arr.push(new_child.clone());
+                for (_, v) in children.entries().iter() {
+                    new_arr.push(v.clone());
+                }
+                obj.set_property("__children".to_string(), Value::Array(new_arr));
+                Ok(Some(new_child))
+            }
+            "cloneNode" => {
+                let _deep = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
+                // Clone the PHP object
+                Ok(Some(Value::Object(obj.clone())))
+            }
+            "hasChildNodes" => {
+                let has = match obj.get_property("__children") {
+                    Some(Value::Array(ref a)) => !a.entries().is_empty(),
+                    _ => false,
+                };
+                Ok(Some(Value::Bool(has)))
+            }
+            "__toString" | "C14N" => {
+                // Return textContent for string conversion
+                let text = obj.get_property("textContent")
+                    .or_else(|| obj.get_property("nodeValue"))
+                    .unwrap_or(Value::String(String::new()));
+                Ok(Some(text))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn call_dom_node_list_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(o)) => o.clone(),
+            _ => return Ok(None),
+        };
+
+        match method {
+            "item" => {
+                let index = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                if let Some(Value::Array(ref items)) = obj.get_property("__items") {
+                    if let Some(item) = items.get(&Value::Long(index)) {
+                        return Ok(Some(item.clone()));
+                    }
+                }
+                Ok(Some(Value::Null))
+            }
+            "count" => {
+                let len = obj.get_property("length").map(|v| v.to_long()).unwrap_or(0);
+                Ok(Some(Value::Long(len)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn call_dom_xpath_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(o)) => o.clone(),
+            _ => return Ok(None),
+        };
+
+        match method {
+            "query" => {
+                let expr = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                let doc_id = obj.get_property("__dom_doc_id").map(|v| v.to_long()).unwrap_or(0);
+
+                let mut list = PhpArray::new();
+                if let Some(doc) = self.dom_documents.get(&doc_id) {
+                    let results = php_rs_ext_dom::DomXPath::query(&expr, doc);
+                    for node in results {
+                        let node_obj = dom_node_to_php_object(&node);
+                        list.push(Value::Object(node_obj));
+                    }
+                }
+                let mut nl = PhpObject::new("DOMNodeList".to_string());
+                let len = list.len() as i64;
+                nl.set_property("__items".to_string(), Value::Array(list));
+                nl.set_property("length".to_string(), Value::Long(len));
+                Ok(Some(Value::Object(nl)))
+            }
+            "evaluate" => {
+                // Same as query for basic usage
+                self.call_dom_xpath_method("query", args)
+            }
+            "registerNamespace" => Ok(Some(Value::Bool(true))),
+            _ => Ok(None),
+        }
+    }
+
+    fn call_dom_named_node_map_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(o)) => o.clone(),
+            _ => return Ok(None),
+        };
+
+        match method {
+            "getNamedItem" => {
+                let name = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+                if let Some(Value::Array(ref items)) = obj.get_property("__items") {
+                    if let Some(val) = items.get(&Value::String(name)) {
+                        return Ok(Some(val.clone()));
+                    }
+                }
+                Ok(Some(Value::Null))
+            }
+            "item" => {
+                let index = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+                if let Some(Value::Array(ref items)) = obj.get_property("__items") {
+                    if let Some(val) = items.get(&Value::Long(index)) {
+                        return Ok(Some(val.clone()));
+                    }
+                }
+                Ok(Some(Value::Null))
+            }
+            "count" => {
+                let len = obj.get_property("length").map(|v| v.to_long()).unwrap_or(0);
+                Ok(Some(Value::Long(len)))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Convert a DomElement to a PHP DOMElement object.
+fn dom_element_to_php_object(elem: &php_rs_ext_dom::DomElement) -> PhpObject {
+    let mut obj = PhpObject::new("DOMElement".to_string());
+    obj.set_property("nodeName".to_string(), Value::String(elem.tag_name.clone()));
+    obj.set_property("tagName".to_string(), Value::String(elem.tag_name.clone()));
+    obj.set_property("nodeType".to_string(), Value::Long(1));
+    obj.set_property("textContent".to_string(), Value::String(elem.text_content()));
+    obj.set_property("nodeValue".to_string(), Value::Null);
+
+    // Attributes
+    let mut attrs = PhpArray::new();
+    for (name, value) in &elem.attributes {
+        attrs.set_string(name.clone(), Value::String(value.clone()));
+    }
+    obj.set_property("__attributes".to_string(), Value::Array(attrs));
+
+    // Children
+    let mut children_arr = PhpArray::new();
+    for child in &elem.children {
+        let child_obj = dom_node_to_php_object(child);
+        children_arr.push(Value::Object(child_obj));
+    }
+    obj.set_property("__children".to_string(), Value::Array(children_arr));
+
+    // childNodes as DOMNodeList
+    let mut nl = PhpObject::new("DOMNodeList".to_string());
+    let mut items = PhpArray::new();
+    for child in &elem.children {
+        let child_obj = dom_node_to_php_object(child);
+        items.push(Value::Object(child_obj));
+    }
+    let len = items.len() as i64;
+    nl.set_property("__items".to_string(), Value::Array(items));
+    nl.set_property("length".to_string(), Value::Long(len));
+    obj.set_property("childNodes".to_string(), Value::Object(nl));
+
+    // firstChild / lastChild
+    if let Some(first) = elem.children.first() {
+        obj.set_property("firstChild".to_string(), Value::Object(dom_node_to_php_object(first)));
+    }
+    if let Some(last) = elem.children.last() {
+        obj.set_property("lastChild".to_string(), Value::Object(dom_node_to_php_object(last)));
+    }
+
+    // attributes as DOMNamedNodeMap
+    let mut named_map = PhpObject::new("DOMNamedNodeMap".to_string());
+    let mut attr_items = PhpArray::new();
+    for (name, value) in &elem.attributes {
+        let mut attr_obj = PhpObject::new("DOMAttr".to_string());
+        attr_obj.set_property("name".to_string(), Value::String(name.clone()));
+        attr_obj.set_property("nodeName".to_string(), Value::String(name.clone()));
+        attr_obj.set_property("value".to_string(), Value::String(value.clone()));
+        attr_obj.set_property("nodeValue".to_string(), Value::String(value.clone()));
+        attr_obj.set_property("nodeType".to_string(), Value::Long(2));
+        attr_items.set_string(name.clone(), Value::Object(attr_obj));
+    }
+    let attr_len = elem.attributes.len() as i64;
+    named_map.set_property("__items".to_string(), Value::Array(attr_items));
+    named_map.set_property("length".to_string(), Value::Long(attr_len));
+    obj.set_property("attributes".to_string(), Value::Object(named_map));
+
+    obj
+}
+
+/// Convert a DomNode to a PHP object.
+fn dom_node_to_php_object(node: &php_rs_ext_dom::DomNode) -> PhpObject {
+    match node {
+        php_rs_ext_dom::DomNode::Element(elem) => dom_element_to_php_object(elem),
+        php_rs_ext_dom::DomNode::Text(text) => {
+            let mut obj = PhpObject::new("DOMText".to_string());
+            obj.set_property("nodeName".to_string(), Value::String("#text".to_string()));
+            obj.set_property("nodeType".to_string(), Value::Long(3));
+            obj.set_property("nodeValue".to_string(), Value::String(text.data.clone()));
+            obj.set_property("textContent".to_string(), Value::String(text.data.clone()));
+            obj.set_property("wholeText".to_string(), Value::String(text.data.clone()));
+            obj
+        }
+        php_rs_ext_dom::DomNode::Comment(comment) => {
+            let mut obj = PhpObject::new("DOMComment".to_string());
+            obj.set_property("nodeName".to_string(), Value::String("#comment".to_string()));
+            obj.set_property("nodeType".to_string(), Value::Long(8));
+            obj.set_property("nodeValue".to_string(), Value::String(comment.data.clone()));
+            obj.set_property("textContent".to_string(), Value::String(comment.data.clone()));
+            obj
+        }
+        php_rs_ext_dom::DomNode::Attribute(attr) => {
+            let mut obj = PhpObject::new("DOMAttr".to_string());
+            obj.set_property("name".to_string(), Value::String(attr.name.clone()));
+            obj.set_property("nodeName".to_string(), Value::String(attr.name.clone()));
+            obj.set_property("value".to_string(), Value::String(attr.value.clone()));
+            obj.set_property("nodeValue".to_string(), Value::String(attr.value.clone()));
+            obj.set_property("nodeType".to_string(), Value::Long(2));
+            obj
+        }
+        php_rs_ext_dom::DomNode::CDataSection(data) => {
+            let mut obj = PhpObject::new("DOMCdataSection".to_string());
+            obj.set_property("nodeType".to_string(), Value::Long(4));
+            obj.set_property("nodeValue".to_string(), Value::String(data.clone()));
+            obj
+        }
+        php_rs_ext_dom::DomNode::ProcessingInstruction { target, data } => {
+            let mut obj = PhpObject::new("DOMProcessingInstruction".to_string());
+            obj.set_property("nodeType".to_string(), Value::Long(7));
+            obj.set_property("target".to_string(), Value::String(target.clone()));
+            obj.set_property("data".to_string(), Value::String(data.clone()));
+            obj
+        }
+        php_rs_ext_dom::DomNode::Document(_) => {
+            let mut obj = PhpObject::new("DOMDocument".to_string());
+            obj.set_property("nodeType".to_string(), Value::Long(9));
+            obj
         }
     }
 }

@@ -1021,6 +1021,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp".into(),
+            next_uid: 10000,
         };
 
         let current_pid = std::process::id();
@@ -1065,6 +1066,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp".into(),
+            next_uid: 10000,
         };
 
         state.apps.insert("stopped".into(), AppState {

@@ -589,6 +589,12 @@ pub struct Vm {
     pub(crate) headers_sent_line: u32,
     /// Whether to ignore user abort (connection close).
     pub(crate) ignore_user_abort: bool,
+    /// strtok state: (string, position)
+    pub(crate) strtok_state: Option<(String, usize)>,
+    /// APCu in-memory cache
+    pub(crate) apcu_cache: HashMap<String, Value>,
+    /// Streaming hash contexts: resource_id → (algorithm, accumulated_data)
+    pub(crate) hash_contexts: HashMap<i64, (String, Vec<u8>)>,
     /// MySQLi connections: connection_id → mysql::Conn.
     #[cfg(feature = "native-io")]
     pub(crate) mysqli_connections: HashMap<i64, mysql::Conn>,
@@ -874,6 +880,9 @@ impl Vm {
             headers_sent_file: String::new(),
             headers_sent_line: 0,
             ignore_user_abort: false,
+            strtok_state: None,
+            apcu_cache: HashMap::new(),
+            hash_contexts: HashMap::new(),
             #[cfg(feature = "native-io")]
             mysqli_connections: HashMap::new(),
             #[cfg(feature = "native-io")]

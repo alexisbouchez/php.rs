@@ -17,6 +17,13 @@ pub struct PlatformState {
     pub next_port: u16,
     /// Base directory for app deployments (default: ~/.php-rs/apps/).
     pub apps_dir: String,
+    /// Next UID to assign to a new app (starting at 10000).
+    #[serde(default = "default_next_uid")]
+    pub next_uid: u32,
+}
+
+fn default_next_uid() -> u32 {
+    10000
 }
 
 /// Per-application state.
@@ -127,6 +134,7 @@ impl PlatformState {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: dir.to_string_lossy().to_string(),
+            next_uid: 10000,
         }
     }
 
@@ -138,6 +146,7 @@ impl PlatformState {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: apps_dir.to_string_lossy().to_string(),
+            next_uid: 10000,
         }
     }
 
@@ -162,6 +171,16 @@ impl PlatformState {
             .map_err(|e| format!("Cannot rename {}: {}", tmp_path.display(), e))?;
 
         Ok(())
+    }
+
+    /// Allocate the next available UID for a new app (starting at 10000).
+    pub fn allocate_uid(&mut self) -> u32 {
+        let uid = self.next_uid;
+        self.next_uid += 1;
+        if self.next_uid < 10000 {
+            self.next_uid = 10000;
+        }
+        uid
     }
 
     /// Allocate the next available port and increment the counter.
@@ -214,6 +233,7 @@ impl AppState {
 
     /// Build environment variables for spawning the app process.
     /// Decrypts any encrypted values (ENC: prefix) using the platform master key.
+    /// Injects mandatory isolation defaults if not already configured.
     pub fn build_process_env(&self) -> HashMap<String, String> {
         // Decrypt env vars using the secret store.
         let mut env = match crate::secrets::SecretStore::new().decrypt_env(&self.env) {
@@ -231,6 +251,20 @@ impl AppState {
             env.insert("APP_WORKERS".into(), self.workers.to_string());
         }
         env.insert("APP_NAME".into(), self.name.clone());
+
+        // Inject mandatory isolation defaults if not explicitly set.
+        env.entry("APP_RLIMIT_MEMORY".into()).or_insert_with(|| "512M".into());
+        env.entry("APP_RLIMIT_NOFILE".into()).or_insert_with(|| "1024".into());
+        env.entry("APP_RLIMIT_NPROC".into()).or_insert_with(|| "64".into());
+        env.entry("APP_RLIMIT_FSIZE".into()).or_insert_with(|| "100M".into());
+
+        // Enable network isolation by default.
+        env.entry("APP_NET_ISOLATE".into()).or_insert_with(|| "true".into());
+
+        // Per-app temp directory.
+        let tmp_dir = format!("/tmp/phprs-{}", self.name);
+        env.insert("TMPDIR".into(), tmp_dir);
+
         env
     }
 }
@@ -324,6 +358,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp/test-apps".into(),
+            next_uid: 10000,
         };
         assert_eq!(state.allocate_port(), 8001);
         assert_eq!(state.allocate_port(), 8002);

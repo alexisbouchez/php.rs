@@ -7,6 +7,480 @@ use crate::vm::{
 };
 use php_rs_compiler::op::OperandType;
 
+/// Convert raw bytes to a PHP-compatible string, preserving all byte values.
+/// Tries UTF-8 first; falls back to latin-1 (each byte → its code point) to
+/// ensure binary data is not corrupted.
+#[inline]
+pub(crate) fn bytes_to_php_string(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Convert a PHP string (which may contain latin-1 encoded binary data) back to raw bytes.
+/// This is the inverse of bytes_to_php_string: chars ≤ 0xFF are stored as their byte value.
+#[inline]
+fn php_string_to_bytes(s: &str) -> Vec<u8> {
+    // Fast path: if all bytes are ASCII or the string is valid UTF-8 with only
+    // single-byte or latin-1 range chars, collect char values.
+    s.chars().map(|c| c as u8).collect()
+}
+
+/// Apply a PHP filter to a value. Used by both filter_var() and filter_input().
+fn apply_filter(val: Value, filter: i64) -> Value {
+    match filter {
+        257 => {
+            // FILTER_VALIDATE_INT
+            match &val {
+                Value::Long(n) => Value::Long(*n),
+                Value::String(s) => match s.trim().parse::<i64>() {
+                    Ok(n) => Value::Long(n),
+                    Err(_) => Value::Bool(false),
+                },
+                _ => Value::Bool(false),
+            }
+        }
+        259 => {
+            // FILTER_VALIDATE_FLOAT
+            match &val {
+                Value::Double(n) => Value::Double(*n),
+                Value::Long(n) => Value::Double(*n as f64),
+                Value::String(s) => match s.trim().parse::<f64>() {
+                    Ok(n) => Value::Double(n),
+                    Err(_) => Value::Bool(false),
+                },
+                _ => Value::Bool(false),
+            }
+        }
+        274 => {
+            // FILTER_VALIDATE_EMAIL
+            let s = val.to_php_string();
+            let valid =
+                s.contains('@') && s.len() > 3 && !s.starts_with('@') && !s.ends_with('@');
+            if valid { Value::String(s) } else { Value::Bool(false) }
+        }
+        273 => {
+            // FILTER_VALIDATE_URL
+            let s = val.to_php_string();
+            let valid = s.starts_with("http://")
+                || s.starts_with("https://")
+                || s.starts_with("ftp://");
+            if valid { Value::String(s) } else { Value::Bool(false) }
+        }
+        275 => {
+            // FILTER_VALIDATE_IP
+            let s = val.to_php_string();
+            // Check IPv4
+            let parts: Vec<&str> = s.split('.').collect();
+            let ipv4_valid = parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok());
+            // Check IPv6
+            let ipv6_valid = s.contains(':') && s.split(':').count() >= 3
+                && s.split(':').all(|p| p.is_empty() || (p.len() <= 4 && p.chars().all(|c| c.is_ascii_hexdigit())));
+            if ipv4_valid || ipv6_valid { Value::String(s) } else { Value::Bool(false) }
+        }
+        258 => {
+            // FILTER_VALIDATE_BOOLEAN
+            match val.to_php_string().to_lowercase().as_str() {
+                "true" | "on" | "yes" | "1" => Value::Bool(true),
+                "false" | "off" | "no" | "0" | "" => Value::Bool(false),
+                _ => Value::Null,
+            }
+        }
+        513 => {
+            // FILTER_SANITIZE_STRING (deprecated but common)
+            let s = val.to_php_string();
+            let cleaned: String = s.chars().filter(|c| *c != '<' && *c != '>').collect();
+            Value::String(cleaned)
+        }
+        276 => {
+            // FILTER_VALIDATE_DOMAIN
+            let s = val.to_php_string();
+            let valid = !s.is_empty()
+                && s.len() <= 253
+                && s.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+                && !s.starts_with('-')
+                && !s.ends_with('-')
+                && s.contains('.');
+            if valid { Value::String(s) } else { Value::Bool(false) }
+        }
+        279 => {
+            // FILTER_VALIDATE_MAC
+            let s = val.to_php_string();
+            let parts: Vec<&str> = if s.contains(':') {
+                s.split(':').collect()
+            } else if s.contains('-') {
+                s.split('-').collect()
+            } else {
+                vec![]
+            };
+            let valid = parts.len() == 6
+                && parts.iter().all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()));
+            if valid { Value::String(s) } else { Value::Bool(false) }
+        }
+        514 => {
+            // FILTER_SANITIZE_ENCODED
+            let s = val.to_php_string();
+            let encoded: String = s
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || "-._~".contains(c) {
+                        c.to_string()
+                    } else {
+                        format!("%{:02X}", c as u32)
+                    }
+                })
+                .collect();
+            Value::String(encoded)
+        }
+        515 => {
+            // FILTER_SANITIZE_SPECIAL_CHARS
+            let s = val.to_php_string();
+            let cleaned: String = s
+                .chars()
+                .map(|c| match c {
+                    '&' => "&amp;".to_string(),
+                    '"' => "&quot;".to_string(),
+                    '\'' => "&#039;".to_string(),
+                    '<' => "&lt;".to_string(),
+                    '>' => "&gt;".to_string(),
+                    _ => c.to_string(),
+                })
+                .collect();
+            Value::String(cleaned)
+        }
+        517 => {
+            // FILTER_SANITIZE_NUMBER_INT
+            let s = val.to_php_string();
+            let cleaned: String = s.chars().filter(|c| c.is_ascii_digit() || *c == '+' || *c == '-').collect();
+            Value::String(cleaned)
+        }
+        520 => {
+            // FILTER_SANITIZE_NUMBER_FLOAT
+            let s = val.to_php_string();
+            let cleaned: String = s
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '+' || *c == '-' || *c == '.' || *c == 'e' || *c == 'E')
+                .collect();
+            Value::String(cleaned)
+        }
+        522 => {
+            // FILTER_SANITIZE_EMAIL
+            let s = val.to_php_string();
+            let cleaned: String = s
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || "!#$%&'*+/=?^_`{|}~@.[]-.".contains(*c))
+                .collect();
+            Value::String(cleaned)
+        }
+        523 => {
+            // FILTER_SANITIZE_URL
+            let s = val.to_php_string();
+            let cleaned: String = s
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || "$-_.+!*'(),{}|\\^~[]`<>#%\";/?:@&=".contains(*c))
+                .collect();
+            Value::String(cleaned)
+        }
+        524 => {
+            // FILTER_SANITIZE_ADD_SLASHES
+            let s = val.to_php_string();
+            let escaped: String = s
+                .chars()
+                .flat_map(|c| match c {
+                    '\'' => vec!['\\', '\''],
+                    '"' => vec!['\\', '"'],
+                    '\\' => vec!['\\', '\\'],
+                    '\0' => vec!['\\', '0'],
+                    _ => vec![c],
+                })
+                .collect();
+            Value::String(escaped)
+        }
+        _ => val, // FILTER_DEFAULT or unknown
+    }
+}
+
+/// Get a value from a PHP superglobal array.
+fn get_superglobal_value(vm: &Vm, sg_name: &str, key: &str) -> Option<Value> {
+    // Check call stack first (runtime modifications take precedence)
+    for frame in vm.call_stack.iter().rev() {
+        let oa = &vm.op_arrays[frame.op_array_idx];
+        if let Some(idx) = oa.vars.iter().position(|v| v == sg_name) {
+            if idx < frame.cvs.len() {
+                if let Value::Array(ref arr) = frame.cvs[idx] {
+                    for (k, v) in arr.entries() {
+                        let key_str = match k {
+                            ArrayKey::String(s) => s.clone(),
+                            ArrayKey::Int(n) => n.to_string(),
+                        };
+                        if key_str == key {
+                            return Some(v.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to VM's stored superglobals
+    if let Some(sg_val) = vm.superglobals.get(sg_name) {
+        if let Value::Array(ref arr) = sg_val {
+            for (k, v) in arr.entries() {
+                let key_str = match k {
+                    ArrayKey::String(s) => s.clone(),
+                    ArrayKey::Int(n) => n.to_string(),
+                };
+                if key_str == key {
+                    return Some(v.clone());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// XMLWriter state machine for generating XML documents.
+#[derive(Debug, Clone)]
+pub struct XmlWriterState {
+    /// The XML buffer being built
+    buf: String,
+    /// Stack of open element names (for closing tags)
+    element_stack: Vec<String>,
+    /// Whether indentation is enabled
+    indent: bool,
+    /// The indentation string (default: single space)
+    indent_string: String,
+    /// Current nesting depth
+    depth: usize,
+    /// Whether we're inside a start tag (haven't written '>' yet)
+    in_start_tag: bool,
+    /// Per-depth flag: whether the element at that depth has child elements
+    has_child_elements: Vec<bool>,
+}
+
+impl XmlWriterState {
+    fn new() -> Self {
+        Self {
+            buf: String::new(),
+            element_stack: Vec::new(),
+            indent: false,
+            indent_string: " ".to_string(),
+            depth: 0,
+            in_start_tag: false,
+            has_child_elements: Vec::new(),
+        }
+    }
+
+    fn close_start_tag(&mut self) {
+        if self.in_start_tag {
+            self.buf.push('>');
+            self.in_start_tag = false;
+        }
+    }
+
+    fn write_indent(&mut self) {
+        if self.indent {
+            self.buf.push('\n');
+            for _ in 0..self.depth {
+                self.buf.push_str(&self.indent_string);
+            }
+        }
+    }
+
+    fn start_document(&mut self, version: &str, encoding: Option<&str>, standalone: Option<&str>) {
+        self.buf.push_str("<?xml version=\"");
+        self.buf.push_str(if version.is_empty() { "1.0" } else { version });
+        self.buf.push('"');
+        if let Some(enc) = encoding {
+            if !enc.is_empty() {
+                self.buf.push_str(" encoding=\"");
+                self.buf.push_str(enc);
+                self.buf.push('"');
+            }
+        }
+        if let Some(sa) = standalone {
+            if !sa.is_empty() {
+                self.buf.push_str(" standalone=\"");
+                self.buf.push_str(sa);
+                self.buf.push('"');
+            }
+        }
+        self.buf.push_str("?>");
+    }
+
+    fn end_document(&mut self) {
+        self.close_start_tag();
+        // Close any remaining open elements
+        while let Some(name) = self.element_stack.pop() {
+            self.depth = self.depth.saturating_sub(1);
+            self.write_indent();
+            self.buf.push_str("</");
+            self.buf.push_str(&name);
+            self.buf.push('>');
+        }
+    }
+
+    fn start_element(&mut self, name: &str) {
+        self.close_start_tag();
+        // Mark parent as having child elements
+        if let Some(last) = self.has_child_elements.last_mut() {
+            *last = true;
+        }
+        self.write_indent();
+        self.buf.push('<');
+        self.buf.push_str(name);
+        self.in_start_tag = true;
+        self.element_stack.push(name.to_string());
+        self.has_child_elements.push(false); // New element has no children yet
+        self.depth += 1;
+    }
+
+    fn start_element_ns(&mut self, prefix: Option<&str>, name: &str, uri: Option<&str>) {
+        self.close_start_tag();
+        if let Some(last) = self.has_child_elements.last_mut() {
+            *last = true;
+        }
+        self.write_indent();
+        self.buf.push('<');
+        let full_name = if let Some(p) = prefix {
+            if !p.is_empty() {
+                format!("{}:{}", p, name)
+            } else {
+                name.to_string()
+            }
+        } else {
+            name.to_string()
+        };
+        self.buf.push_str(&full_name);
+        self.in_start_tag = true;
+        // Add namespace declaration
+        if let Some(u) = uri {
+            if !u.is_empty() {
+                if let Some(p) = prefix {
+                    if !p.is_empty() {
+                        self.buf.push_str(&format!(" xmlns:{}=\"{}\"", p, xml_escape_attr(u)));
+                    } else {
+                        self.buf.push_str(&format!(" xmlns=\"{}\"", xml_escape_attr(u)));
+                    }
+                } else {
+                    self.buf.push_str(&format!(" xmlns=\"{}\"", xml_escape_attr(u)));
+                }
+            }
+        }
+        self.element_stack.push(full_name);
+        self.has_child_elements.push(false);
+        self.depth += 1;
+    }
+
+    fn end_element(&mut self) {
+        self.depth = self.depth.saturating_sub(1);
+        let had_children = self.has_child_elements.pop().unwrap_or(false);
+        if self.in_start_tag {
+            // Self-closing tag
+            self.buf.push_str("/>");
+            self.in_start_tag = false;
+            self.element_stack.pop();
+        } else {
+            if let Some(name) = self.element_stack.pop() {
+                if had_children {
+                    self.write_indent();
+                }
+                self.buf.push_str("</");
+                self.buf.push_str(&name);
+                self.buf.push('>');
+            }
+        }
+    }
+
+    fn full_end_element(&mut self) {
+        self.close_start_tag();
+        self.depth = self.depth.saturating_sub(1);
+        let had_children = self.has_child_elements.pop().unwrap_or(false);
+        if let Some(name) = self.element_stack.pop() {
+            if had_children {
+                self.write_indent();
+            }
+            self.buf.push_str("</");
+            self.buf.push_str(&name);
+            self.buf.push('>');
+        }
+    }
+
+    fn write_attribute(&mut self, name: &str, value: &str) {
+        if self.in_start_tag {
+            self.buf.push(' ');
+            self.buf.push_str(name);
+            self.buf.push_str("=\"");
+            self.buf.push_str(&xml_escape_attr(value));
+            self.buf.push('"');
+        }
+    }
+
+    fn write_text(&mut self, text: &str) {
+        self.close_start_tag();
+        self.buf.push_str(&xml_escape_text(text));
+        // has_text_only stays true — text doesn't require indented close
+    }
+
+    fn write_cdata(&mut self, text: &str) {
+        self.close_start_tag();
+        self.buf.push_str("<![CDATA[");
+        self.buf.push_str(text);
+        self.buf.push_str("]]>");
+        // has_text_only stays true — CDATA doesn't require indented close
+    }
+
+    fn write_comment(&mut self, text: &str) {
+        self.close_start_tag();
+        self.write_indent();
+        self.buf.push_str("<!-- ");
+        self.buf.push_str(text);
+        self.buf.push_str(" -->");
+    }
+
+    fn write_pi(&mut self, target: &str, content: &str) {
+        self.close_start_tag();
+        self.write_indent();
+        self.buf.push_str("<?");
+        self.buf.push_str(target);
+        if !content.is_empty() {
+            self.buf.push(' ');
+            self.buf.push_str(content);
+        }
+        self.buf.push_str("?>");
+    }
+
+    fn write_raw(&mut self, raw: &str) {
+        self.close_start_tag();
+        self.buf.push_str(raw);
+    }
+
+    fn output_memory(&mut self, flush: bool) -> String {
+        let result = self.buf.clone();
+        if flush {
+            self.buf.clear();
+        }
+        result
+    }
+}
+
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// Dispatch remaining built-in function calls.
 /// Returns `Ok(Some(value))` if handled, `Ok(None)` if not recognized.
 pub(crate) fn dispatch(
@@ -480,216 +954,46 @@ pub(crate) fn dispatch(
         "filter_var" => {
             let val = args.first().cloned().unwrap_or(Value::Null);
             let filter = args.get(1).map(|v| v.to_long()).unwrap_or(516); // FILTER_DEFAULT
-            match filter {
-                257 => {
-                    // FILTER_VALIDATE_INT
-                    match &val {
-                        Value::Long(n) => Ok(Some(Value::Long(*n))),
-                        Value::String(s) => match s.trim().parse::<i64>() {
-                            Ok(n) => Ok(Some(Value::Long(n))),
-                            Err(_) => Ok(Some(Value::Bool(false))),
-                        },
-                        _ => Ok(Some(Value::Bool(false))),
-                    }
-                }
-                259 => {
-                    // FILTER_VALIDATE_FLOAT
-                    match &val {
-                        Value::Double(n) => Ok(Some(Value::Double(*n))),
-                        Value::Long(n) => Ok(Some(Value::Double(*n as f64))),
-                        Value::String(s) => match s.trim().parse::<f64>() {
-                            Ok(n) => Ok(Some(Value::Double(n))),
-                            Err(_) => Ok(Some(Value::Bool(false))),
-                        },
-                        _ => Ok(Some(Value::Bool(false))),
-                    }
-                }
-                274 => {
-                    // FILTER_VALIDATE_EMAIL
-                    let s = val.to_php_string();
-                    let valid =
-                        s.contains('@') && s.len() > 3 && !s.starts_with('@') && !s.ends_with('@');
-                    if valid {
-                        Ok(Some(Value::String(s)))
-                    } else {
-                        Ok(Some(Value::Bool(false)))
-                    }
-                }
-                273 => {
-                    // FILTER_VALIDATE_URL
-                    let s = val.to_php_string();
-                    let valid = s.starts_with("http://")
-                        || s.starts_with("https://")
-                        || s.starts_with("ftp://");
-                    if valid {
-                        Ok(Some(Value::String(s)))
-                    } else {
-                        Ok(Some(Value::Bool(false)))
-                    }
-                }
-                275 => {
-                    // FILTER_VALIDATE_IP
-                    let s = val.to_php_string();
-                    let parts: Vec<&str> = s.split('.').collect();
-                    let valid = parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok());
-                    if valid {
-                        Ok(Some(Value::String(s)))
-                    } else {
-                        Ok(Some(Value::Bool(false)))
-                    }
-                }
-                258 => {
-                    // FILTER_VALIDATE_BOOLEAN
-                    match val.to_php_string().to_lowercase().as_str() {
-                        "true" | "on" | "yes" | "1" => Ok(Some(Value::Bool(true))),
-                        "false" | "off" | "no" | "0" | "" => Ok(Some(Value::Bool(false))),
-                        _ => Ok(Some(Value::Null)),
-                    }
-                }
-                513 => {
-                    // FILTER_SANITIZE_STRING (deprecated but common)
-                    let s = val.to_php_string();
-                    let cleaned: String = s.chars().filter(|c| *c != '<' && *c != '>').collect();
-                    Ok(Some(Value::String(cleaned)))
-                }
-                276 => {
-                    // FILTER_VALIDATE_DOMAIN
-                    let s = val.to_php_string();
-                    let valid = !s.is_empty()
-                        && s.len() <= 253
-                        && s.chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-                        && !s.starts_with('-')
-                        && !s.ends_with('-')
-                        && s.contains('.');
-                    if valid {
-                        Ok(Some(Value::String(s)))
-                    } else {
-                        Ok(Some(Value::Bool(false)))
-                    }
-                }
-                279 => {
-                    // FILTER_VALIDATE_MAC
-                    let s = val.to_php_string();
-                    let parts: Vec<&str> = if s.contains(':') {
-                        s.split(':').collect()
-                    } else if s.contains('-') {
-                        s.split('-').collect()
-                    } else {
-                        vec![]
-                    };
-                    let valid = parts.len() == 6
-                        && parts
-                            .iter()
-                            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_hexdigit()));
-                    if valid {
-                        Ok(Some(Value::String(s)))
-                    } else {
-                        Ok(Some(Value::Bool(false)))
-                    }
-                }
-                514 => {
-                    // FILTER_SANITIZE_ENCODED
-                    let s = val.to_php_string();
-                    let encoded: String = s
-                        .chars()
-                        .map(|c| {
-                            if c.is_ascii_alphanumeric() || "-._~".contains(c) {
-                                c.to_string()
-                            } else {
-                                format!("%{:02X}", c as u32)
-                            }
-                        })
-                        .collect();
-                    Ok(Some(Value::String(encoded)))
-                }
-                515 => {
-                    // FILTER_SANITIZE_SPECIAL_CHARS
-                    let s = val.to_php_string();
-                    let cleaned: String = s
-                        .chars()
-                        .map(|c| match c {
-                            '&' => "&amp;".to_string(),
-                            '"' => "&quot;".to_string(),
-                            '\'' => "&#039;".to_string(),
-                            '<' => "&lt;".to_string(),
-                            '>' => "&gt;".to_string(),
-                            _ => c.to_string(),
-                        })
-                        .collect();
-                    Ok(Some(Value::String(cleaned)))
-                }
-                517 => {
-                    // FILTER_SANITIZE_NUMBER_INT
-                    let s = val.to_php_string();
-                    let cleaned: String = s
-                        .chars()
-                        .filter(|c| c.is_ascii_digit() || *c == '+' || *c == '-')
-                        .collect();
-                    Ok(Some(Value::String(cleaned)))
-                }
-                520 => {
-                    // FILTER_SANITIZE_NUMBER_FLOAT
-                    let s = val.to_php_string();
-                    let cleaned: String = s
-                        .chars()
-                        .filter(|c| {
-                            c.is_ascii_digit()
-                                || *c == '+'
-                                || *c == '-'
-                                || *c == '.'
-                                || *c == 'e'
-                                || *c == 'E'
-                        })
-                        .collect();
-                    Ok(Some(Value::String(cleaned)))
-                }
-                522 => {
-                    // FILTER_SANITIZE_EMAIL
-                    let s = val.to_php_string();
-                    let cleaned: String = s
-                        .chars()
-                        .filter(|c| {
-                            c.is_ascii_alphanumeric() || "!#$%&'*+/=?^_`{|}~@.[]-.".contains(*c)
-                        })
-                        .collect();
-                    Ok(Some(Value::String(cleaned)))
-                }
-                523 => {
-                    // FILTER_SANITIZE_URL
-                    let s = val.to_php_string();
-                    let cleaned: String = s
-                        .chars()
-                        .filter(|c| {
-                            c.is_ascii_alphanumeric()
-                                || "$-_.+!*'(),{}|\\^~[]`<>#%\";/?:@&=".contains(*c)
-                        })
-                        .collect();
-                    Ok(Some(Value::String(cleaned)))
-                }
-                524 => {
-                    // FILTER_SANITIZE_ADD_SLASHES
-                    let s = val.to_php_string();
-                    let escaped: String = s
-                        .chars()
-                        .flat_map(|c| match c {
-                            '\'' => vec!['\\', '\''],
-                            '"' => vec!['\\', '"'],
-                            '\\' => vec!['\\', '\\'],
-                            '\0' => vec!['\\', '0'],
-                            _ => vec![c],
-                        })
-                        .collect();
-                    Ok(Some(Value::String(escaped)))
-                }
-                _ => Ok(Some(val)), // FILTER_DEFAULT or unknown
-            }
+            Ok(Some(apply_filter(val, filter)))
         }
         "filter_input" => {
-            // Stub: return null (no superglobals)
-            Ok(Some(Value::Null))
+            let input_type = args.first().map(|v| v.to_long()).unwrap_or(0);
+            let var_name = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            let filter = args.get(2).map(|v| v.to_long()).unwrap_or(516); // FILTER_DEFAULT
+
+            // Map INPUT_* constant to superglobal name
+            let sg_name = match input_type {
+                1 => "_GET",     // INPUT_GET
+                2 => "_POST",    // INPUT_POST
+                4 => "_COOKIE",  // INPUT_COOKIE
+                16 => "_ENV",    // INPUT_ENV
+                32 => "_SERVER", // INPUT_SERVER
+                99 => "_REQUEST", // INPUT_REQUEST
+                _ => return Ok(Some(Value::Null)),
+            };
+
+            // Look up value from superglobals stored on VM
+            let val = get_superglobal_value(vm, sg_name, &var_name);
+            match val {
+                Some(v) => Ok(Some(apply_filter(v, filter))),
+                None => Ok(Some(Value::Null)),
+            }
         }
-        "filter_has_var" => Ok(Some(Value::Bool(false))),
+        "filter_has_var" => {
+            let input_type = args.first().map(|v| v.to_long()).unwrap_or(0);
+            let var_name = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            let sg_name = match input_type {
+                1 => "_GET",
+                2 => "_POST",
+                4 => "_COOKIE",
+                16 => "_ENV",
+                32 => "_SERVER",
+                99 => "_REQUEST",
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let has = get_superglobal_value(vm, sg_name, &var_name).is_some();
+            Ok(Some(Value::Bool(has)))
+        }
         "filter_list" => {
             let mut arr = PhpArray::new();
             for name in &[
@@ -1468,8 +1772,43 @@ pub(crate) fn dispatch(
 
         // === Finish filter (2 missing) ===
         "filter_input_array" => {
-            // Would need superglobals - return empty array
-            Ok(Some(Value::Array(PhpArray::new())))
+            let input_type = args.first().map(|v| v.to_long()).unwrap_or(0);
+            let sg_name = match input_type {
+                1 => "_GET",
+                2 => "_POST",
+                4 => "_COOKIE",
+                16 => "_ENV",
+                32 => "_SERVER",
+                99 => "_REQUEST",
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            // Get the entire superglobal array
+            let mut result = PhpArray::new();
+            let sg_val = vm.superglobals.get(sg_name).cloned()
+                .or_else(|| {
+                    for frame in &vm.call_stack {
+                        let oa = &vm.op_arrays[frame.op_array_idx];
+                        if let Some(idx) = oa.vars.iter().position(|v| v == sg_name) {
+                            if idx < frame.cvs.len() {
+                                if let Value::Array(_) = &frame.cvs[idx] {
+                                    return Some(frame.cvs[idx].clone());
+                                }
+                            }
+                        }
+                    }
+                    None
+                });
+            if let Some(Value::Array(ref arr)) = sg_val {
+                let filter = args.get(1).map(|v| v.to_long()).unwrap_or(516);
+                for (key, val) in arr.entries() {
+                    let filtered = apply_filter(val.clone(), filter);
+                    match key {
+                        ArrayKey::String(s) => result.set_string(s.clone(), filtered),
+                        ArrayKey::Int(n) => result.set_int(*n, filtered),
+                    }
+                }
+            }
+            Ok(Some(Value::Array(result)))
         }
         "filter_var_array" => {
             // Filter each element - basic pass-through
@@ -2138,49 +2477,320 @@ pub(crate) fn dispatch(
         "libxml_disable_entity_loader" => Ok(Some(Value::Bool(true))),
         "libxml_get_external_entity_loader" => Ok(Some(Value::Null)),
 
-        // === XMLWriter (42 functions) — stubs ===
-        "xmlwriter_end_attribute"
-        | "xmlwriter_end_cdata"
-        | "xmlwriter_end_comment"
-        | "xmlwriter_end_document"
-        | "xmlwriter_end_dtd"
-        | "xmlwriter_end_dtd_attlist"
-        | "xmlwriter_end_dtd_element"
-        | "xmlwriter_end_dtd_entity"
-        | "xmlwriter_end_element"
-        | "xmlwriter_end_pi"
-        | "xmlwriter_flush"
-        | "xmlwriter_full_end_element"
-        | "xmlwriter_open_memory"
-        | "xmlwriter_open_uri"
-        | "xmlwriter_output_memory"
-        | "xmlwriter_set_indent"
-        | "xmlwriter_set_indent_string"
-        | "xmlwriter_start_attribute"
-        | "xmlwriter_start_attribute_ns"
-        | "xmlwriter_start_cdata"
-        | "xmlwriter_start_comment"
-        | "xmlwriter_start_document"
-        | "xmlwriter_start_dtd"
-        | "xmlwriter_start_dtd_attlist"
-        | "xmlwriter_start_dtd_element"
-        | "xmlwriter_start_dtd_entity"
-        | "xmlwriter_start_element"
-        | "xmlwriter_start_element_ns"
-        | "xmlwriter_start_pi"
-        | "xmlwriter_text"
-        | "xmlwriter_write_attribute"
-        | "xmlwriter_write_attribute_ns"
-        | "xmlwriter_write_cdata"
-        | "xmlwriter_write_comment"
-        | "xmlwriter_write_dtd"
-        | "xmlwriter_write_dtd_attlist"
-        | "xmlwriter_write_dtd_element"
-        | "xmlwriter_write_dtd_entity"
-        | "xmlwriter_write_element"
-        | "xmlwriter_write_element_ns"
-        | "xmlwriter_write_pi"
-        | "xmlwriter_write_raw" => Ok(Some(Value::Bool(true))),
+        // === XMLWriter ===
+        "xmlwriter_open_memory" => {
+            let id = vm.next_resource_id;
+            vm.next_resource_id += 1;
+            vm.xml_writers.insert(id, XmlWriterState::new());
+            Ok(Some(Value::Long(id)))
+        }
+        "xmlwriter_open_uri" => {
+            // For now, treat URI-based writers as memory writers
+            let id = vm.next_resource_id;
+            vm.next_resource_id += 1;
+            vm.xml_writers.insert(id, XmlWriterState::new());
+            Ok(Some(Value::Long(id)))
+        }
+        "xmlwriter_start_document" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                let version = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+                let encoding = args.get(2).map(|v| v.to_string());
+                let standalone = args.get(3).map(|v| v.to_string());
+                w.start_document(&version, encoding.as_deref(), standalone.as_deref());
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_end_document" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.end_document();
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_start_element" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let name = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.start_element(&name);
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_start_element_ns" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let prefix = args.get(1).map(|v| v.to_string());
+            let name = args.get(2).map(|v| v.to_string()).unwrap_or_default();
+            let uri = args.get(3).map(|v| v.to_string());
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.start_element_ns(prefix.as_deref(), &name, uri.as_deref());
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_end_element" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.end_element();
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_full_end_element" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.full_end_element();
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_write_element" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let name = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            let content = args.get(2).map(|v| v.to_string());
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.start_element(&name);
+                if let Some(text) = content {
+                    w.write_text(&text);
+                }
+                w.end_element();
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_write_element_ns" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let prefix = args.get(1).map(|v| v.to_string());
+            let name = args.get(2).map(|v| v.to_string()).unwrap_or_default();
+            let uri = args.get(3).map(|v| v.to_string());
+            let content = args.get(4).map(|v| v.to_string());
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.start_element_ns(prefix.as_deref(), &name, uri.as_deref());
+                if let Some(text) = content {
+                    w.write_text(&text);
+                }
+                w.end_element();
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_start_attribute" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            // start_attribute just means the next text() will go into the attribute
+            // For simplicity, we handle this as a no-op since write_attribute is the common path
+            if vm.xml_writers.contains_key(&id) {
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_end_attribute" | "xmlwriter_start_attribute_ns" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if vm.xml_writers.contains_key(&id) {
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_write_attribute" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let name = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            let value = args.get(2).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.write_attribute(&name, &value);
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_write_attribute_ns" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let prefix = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            let name = args.get(2).map(|v| v.to_string()).unwrap_or_default();
+            let _uri = args.get(3).map(|v| v.to_string());
+            let value = args.get(4).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                let attr_name = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{}:{}", prefix, name)
+                };
+                w.write_attribute(&attr_name, &value);
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_text" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let text = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.write_text(&text);
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_write_raw" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let raw = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.write_raw(&raw);
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_start_cdata" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.close_start_tag();
+                w.buf.push_str("<![CDATA[");
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_end_cdata" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.buf.push_str("]]>");
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_write_cdata" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let text = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.write_cdata(&text);
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_start_comment" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.close_start_tag();
+                w.buf.push_str("<!-- ");
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_end_comment" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.buf.push_str(" -->");
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_write_comment" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let text = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.write_comment(&text);
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_start_pi" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let target = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.close_start_tag();
+                w.buf.push_str("<?");
+                w.buf.push_str(&target);
+                w.buf.push(' ');
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_end_pi" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.buf.push_str("?>");
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_write_pi" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let target = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            let content = args.get(2).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.write_pi(&target, &content);
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_set_indent" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let enable = args.get(1).map(|v| v.is_truthy()).unwrap_or(false);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.indent = enable;
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_set_indent_string" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let s = args.get(1).map(|v| v.to_string()).unwrap_or_default();
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                w.indent_string = s;
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_output_memory" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            let flush = args.get(1).map(|v| v.is_truthy()).unwrap_or(true);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                let output = w.output_memory(flush);
+                Ok(Some(Value::String(output)))
+            } else {
+                Ok(Some(Value::String(String::new())))
+            }
+        }
+        "xmlwriter_flush" => {
+            let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
+            if let Some(w) = vm.xml_writers.get_mut(&id) {
+                let output = w.output_memory(true);
+                // For memory-based writers, flush returns the content
+                Ok(Some(Value::String(output)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "xmlwriter_start_dtd" | "xmlwriter_end_dtd"
+        | "xmlwriter_start_dtd_attlist" | "xmlwriter_end_dtd_attlist"
+        | "xmlwriter_start_dtd_element" | "xmlwriter_end_dtd_element"
+        | "xmlwriter_start_dtd_entity" | "xmlwriter_end_dtd_entity"
+        | "xmlwriter_write_dtd" | "xmlwriter_write_dtd_attlist"
+        | "xmlwriter_write_dtd_element" | "xmlwriter_write_dtd_entity" => {
+            // DTD functions: stub for now (rarely used)
+            Ok(Some(Value::Bool(true)))
+        }
 
         // === readline (13 functions) — stubs ===
         "readline" => {
@@ -2208,34 +2818,29 @@ pub(crate) fn dispatch(
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             let level = args.get(1).map(|v| v.to_long() as i32).unwrap_or(-1);
             let compressed = php_rs_ext_zlib::gzcompress(data.as_bytes(), level);
-            Ok(Some(Value::String(
-                String::from_utf8_lossy(&compressed).to_string(),
-            )))
+            Ok(Some(Value::String(bytes_to_php_string(&compressed))))
         }
         "gzuncompress" => {
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            match php_rs_ext_zlib::gzuncompress(data.as_bytes()) {
-                Ok(result) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&result).to_string(),
-                ))),
+            let bytes = php_string_to_bytes(&data);
+            match php_rs_ext_zlib::gzuncompress(&bytes) {
+                Ok(result) => Ok(Some(Value::String(bytes_to_php_string(&result)))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
         }
         "gzdecode" => {
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            match php_rs_ext_zlib::gzdecode(data.as_bytes()) {
-                Ok(result) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&result).to_string(),
-                ))),
+            let bytes = php_string_to_bytes(&data);
+            match php_rs_ext_zlib::gzdecode(&bytes) {
+                Ok(result) => Ok(Some(Value::String(bytes_to_php_string(&result)))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
         }
         "gzinflate" => {
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            match php_rs_ext_zlib::gzinflate(data.as_bytes()) {
-                Ok(result) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&result).to_string(),
-                ))),
+            let bytes = php_string_to_bytes(&data);
+            match php_rs_ext_zlib::gzinflate(&bytes) {
+                Ok(result) => Ok(Some(Value::String(bytes_to_php_string(&result)))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
         }
@@ -2243,32 +2848,342 @@ pub(crate) fn dispatch(
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             let level = args.get(1).map(|v| v.to_long() as i32).unwrap_or(-1);
             let encoded = php_rs_ext_zlib::gzencode(data.as_bytes(), level);
-            Ok(Some(Value::String(
-                String::from_utf8_lossy(&encoded).to_string(),
-            )))
+            Ok(Some(Value::String(bytes_to_php_string(&encoded))))
         }
         "gzdeflate" => {
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             let level = args.get(1).map(|v| v.to_long() as i32).unwrap_or(-1);
             let deflated = php_rs_ext_zlib::gzdeflate(data.as_bytes(), level);
-            Ok(Some(Value::String(
-                String::from_utf8_lossy(&deflated).to_string(),
-            )))
+            Ok(Some(Value::String(bytes_to_php_string(&deflated))))
         }
-        "gzopen" => Ok(Some(Value::Bool(false))),
-        "gzclose" | "gzeof" | "gzrewind" => Ok(Some(Value::Bool(false))),
-        "gzread" | "gzgets" | "gzgetc" | "gzpassthru" | "gzputs" => {
-            Ok(Some(Value::String(String::new())))
+        "gzopen" => {
+            let filename = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+            let mode = args.get(1).cloned().unwrap_or(Value::String("r".to_string())).to_php_string();
+            let is_write = mode.starts_with('w');
+            let level = if mode.len() > 1 {
+                mode.chars().find(|c| c.is_ascii_digit())
+                    .map(|c| c.to_digit(10).unwrap() as i32)
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+
+            if is_write {
+                // Writing mode: create empty buffer, flush on close
+                let gz = crate::vm::GzFileHandle {
+                    data: Vec::new(),
+                    pos: 0,
+                    writable: true,
+                    path: filename,
+                    level,
+                };
+                let id = vm.next_resource_id;
+                vm.next_resource_id += 1;
+                vm.gz_handles.insert(id, gz);
+                Ok(Some(Value::Resource(id, "stream".to_string())))
+            } else {
+                // Reading mode: read and decompress file
+                match std::fs::read(&filename) {
+                    Ok(compressed) => {
+                        let decompressed = php_rs_ext_zlib::gzdecode(&compressed)
+                            .unwrap_or_else(|_| compressed);
+                        let gz = crate::vm::GzFileHandle {
+                            data: decompressed,
+                            pos: 0,
+                            writable: false,
+                            path: filename,
+                            level,
+                        };
+                        let id = vm.next_resource_id;
+                        vm.next_resource_id += 1;
+                        vm.gz_handles.insert(id, gz);
+                        Ok(Some(Value::Resource(id, "stream".to_string())))
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
         }
-        "gzseek" => Ok(Some(Value::Long(-1))),
-        "gztell" => Ok(Some(Value::Long(0))),
-        "gzfile" => Ok(Some(Value::Array(PhpArray::new()))),
-        "gzwrite" => Ok(Some(Value::Long(0))),
-        "deflate_init" => Ok(Some(Value::Bool(false))),
-        "deflate_add" => Ok(Some(Value::Bool(false))),
-        "inflate_init" => Ok(Some(Value::Bool(false))),
-        "inflate_add" | "inflate_get_read_len" | "inflate_get_status" => {
-            Ok(Some(Value::Bool(false)))
+        "gzclose" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            if let Some(gz) = vm.gz_handles.remove(&id) {
+                if gz.writable && !gz.path.is_empty() {
+                    let compressed = php_rs_ext_zlib::gzencode(&gz.data, gz.level);
+                    let _ = std::fs::write(&gz.path, &compressed);
+                }
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "gzeof" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(true))),
+            };
+            if let Some(gz) = vm.gz_handles.get(&id) {
+                Ok(Some(Value::Bool(gz.pos >= gz.data.len())))
+            } else {
+                Ok(Some(Value::Bool(true)))
+            }
+        }
+        "gzrewind" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            if let Some(gz) = vm.gz_handles.get_mut(&id) {
+                gz.pos = 0;
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "gzread" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let length = args.get(1).map(|v| v.to_long() as usize).unwrap_or(4096);
+            if let Some(gz) = vm.gz_handles.get_mut(&id) {
+                let end = (gz.pos + length).min(gz.data.len());
+                let chunk = &gz.data[gz.pos..end];
+                let s = bytes_to_php_string(chunk);
+                gz.pos = end;
+                Ok(Some(Value::String(s)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "gzgets" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let max_len = args.get(1).map(|v| v.to_long() as usize).unwrap_or(1024);
+            if let Some(gz) = vm.gz_handles.get_mut(&id) {
+                if gz.pos >= gz.data.len() {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                let remaining = &gz.data[gz.pos..];
+                let end = remaining.iter().position(|&b| b == b'\n')
+                    .map(|p| (p + 1).min(max_len))
+                    .unwrap_or_else(|| remaining.len().min(max_len));
+                let chunk = &remaining[..end];
+                let s = bytes_to_php_string(chunk);
+                gz.pos += end;
+                Ok(Some(Value::String(s)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "gzgetc" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            if let Some(gz) = vm.gz_handles.get_mut(&id) {
+                if gz.pos >= gz.data.len() {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                let ch = gz.data[gz.pos];
+                gz.pos += 1;
+                Ok(Some(Value::String(String::from(ch as char))))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "gzpassthru" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let result = if let Some(gz) = vm.gz_handles.get_mut(&id) {
+                let remaining = gz.data[gz.pos..].to_vec();
+                let len = remaining.len() as i64;
+                let s = bytes_to_php_string(&remaining);
+                gz.pos = gz.data.len();
+                Some((s, len))
+            } else {
+                None
+            };
+            if let Some((s, len)) = result {
+                vm.write_output(&s);
+                Ok(Some(Value::Long(len)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "gzwrite" | "gzputs" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let data = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+            let max_len = args.get(2).map(|v| v.to_long() as usize);
+            let bytes = data.as_bytes();
+            let to_write = match max_len {
+                Some(n) => &bytes[..n.min(bytes.len())],
+                None => bytes,
+            };
+            if let Some(gz) = vm.gz_handles.get_mut(&id) {
+                gz.data.extend_from_slice(to_write);
+                gz.pos = gz.data.len();
+                Ok(Some(Value::Long(to_write.len() as i64)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "gzseek" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Long(-1))),
+            };
+            let offset = args.get(1).map(|v| v.to_long()).unwrap_or(0);
+            let whence = args.get(2).map(|v| v.to_long()).unwrap_or(0); // SEEK_SET=0
+            if let Some(gz) = vm.gz_handles.get_mut(&id) {
+                let new_pos = match whence {
+                    1 => gz.pos as i64 + offset, // SEEK_CUR
+                    _ => offset,                 // SEEK_SET
+                };
+                if new_pos >= 0 {
+                    gz.pos = new_pos as usize;
+                    Ok(Some(Value::Long(0)))
+                } else {
+                    Ok(Some(Value::Long(-1)))
+                }
+            } else {
+                Ok(Some(Value::Long(-1)))
+            }
+        }
+        "gztell" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            if let Some(gz) = vm.gz_handles.get(&id) {
+                Ok(Some(Value::Long(gz.pos as i64)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "gzfile" => {
+            // Read entire gzip file into array of lines
+            let filename = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+            match std::fs::read(&filename) {
+                Ok(compressed) => {
+                    let decompressed = php_rs_ext_zlib::gzdecode(&compressed)
+                        .unwrap_or_else(|_| compressed);
+                    let text = String::from_utf8_lossy(&decompressed);
+                    let mut arr = PhpArray::new();
+                    for line in text.split('\n') {
+                        // PHP gzfile includes the newline in each line
+                        arr.push(Value::String(format!("{}\n", line)));
+                    }
+                    // Remove trailing empty line artifact
+                    let len = arr.len();
+                    if len > 0 {
+                        if let Some(Value::String(s)) = arr.get(&Value::Long(len as i64 - 1)) {
+                            if s == "\n" {
+                                arr.pop();
+                            }
+                        }
+                    }
+                    Ok(Some(Value::Array(arr)))
+                }
+                Err(_) => Ok(Some(Value::Bool(false))),
+            }
+        }
+        "deflate_init" => {
+            let encoding = args.first().map(|v| v.to_long() as i32).unwrap_or(php_rs_ext_zlib::ZLIB_ENCODING_DEFLATE);
+            let level = if let Some(Value::Array(ref opts)) = args.get(1) {
+                opts.get(&Value::String("level".to_string()))
+                    .map(|v| v.to_long() as i32)
+                    .unwrap_or(-1)
+            } else {
+                -1
+            };
+            let ctx = crate::vm::DeflateContext {
+                buffer: Vec::new(),
+                encoding,
+                level,
+            };
+            let id = vm.next_resource_id;
+            vm.next_resource_id += 1;
+            vm.deflate_contexts.insert(id, ctx);
+            Ok(Some(Value::Resource(id, "deflate".to_string())))
+        }
+        "deflate_add" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let data = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+            let flush = args.get(2).map(|v| v.to_long() as i32).unwrap_or(php_rs_ext_zlib::ZLIB_SYNC_FLUSH);
+            if let Some(ctx) = vm.deflate_contexts.get_mut(&id) {
+                // Compress the data chunk according to encoding
+                let compressed = match ctx.encoding {
+                    php_rs_ext_zlib::ZLIB_ENCODING_RAW => php_rs_ext_zlib::gzdeflate(data.as_bytes(), ctx.level),
+                    php_rs_ext_zlib::ZLIB_ENCODING_GZIP => php_rs_ext_zlib::gzencode(data.as_bytes(), ctx.level),
+                    _ => php_rs_ext_zlib::gzcompress(data.as_bytes(), ctx.level),
+                };
+                // For ZLIB_FINISH, return all compressed data
+                // For SYNC_FLUSH, return compressed chunk
+                let _ = flush; // flush mode is handled by the compression call
+                Ok(Some(Value::String(bytes_to_php_string(&compressed))))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "inflate_init" => {
+            let encoding = args.first().map(|v| v.to_long() as i32).unwrap_or(php_rs_ext_zlib::ZLIB_ENCODING_DEFLATE);
+            let ctx = crate::vm::InflateContext {
+                buffer: Vec::new(),
+                encoding,
+                bytes_read: 0,
+            };
+            let id = vm.next_resource_id;
+            vm.next_resource_id += 1;
+            vm.inflate_contexts.insert(id, ctx);
+            Ok(Some(Value::Resource(id, "inflate".to_string())))
+        }
+        "inflate_add" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let data_str = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+            let data_bytes = php_string_to_bytes(&data_str);
+            if let Some(ctx) = vm.inflate_contexts.get_mut(&id) {
+                ctx.bytes_read += data_bytes.len();
+                let result = match ctx.encoding {
+                    php_rs_ext_zlib::ZLIB_ENCODING_RAW => php_rs_ext_zlib::gzinflate(&data_bytes),
+                    php_rs_ext_zlib::ZLIB_ENCODING_GZIP => php_rs_ext_zlib::gzdecode(&data_bytes),
+                    _ => php_rs_ext_zlib::gzuncompress(&data_bytes),
+                };
+                match result {
+                    Ok(decompressed) => Ok(Some(Value::String(bytes_to_php_string(&decompressed)))),
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "inflate_get_read_len" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            if let Some(ctx) = vm.inflate_contexts.get(&id) {
+                Ok(Some(Value::Long(ctx.bytes_read as i64)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "inflate_get_status" => {
+            Ok(Some(Value::Long(0))) // ZLIB_OK
         }
         "zlib_encode" => {
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -2278,18 +3193,14 @@ pub(crate) fn dispatch(
                 .unwrap_or(php_rs_ext_zlib::ZLIB_ENCODING_DEFLATE);
             let level = args.get(2).map(|v| v.to_long() as i32).unwrap_or(-1);
             match php_rs_ext_zlib::zlib_encode(data.as_bytes(), encoding, level) {
-                Ok(result) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&result).to_string(),
-                ))),
+                Ok(result) => Ok(Some(Value::String(bytes_to_php_string(&result)))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
         }
         "zlib_decode" => {
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             match php_rs_ext_zlib::zlib_decode(data.as_bytes()) {
-                Ok(result) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&result).to_string(),
-                ))),
+                Ok(result) => Ok(Some(Value::String(bytes_to_php_string(&result)))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
         }
@@ -2436,25 +3347,106 @@ pub(crate) fn dispatch(
         | "socket_wsaprotocol_info_release" => Ok(Some(Value::Bool(false))),
 
         // === bz2 extension (10 functions) ===
-        "bzopen" => Ok(Some(Value::Bool(false))),
-        "bzclose" | "bzflush" => Ok(Some(Value::Bool(true))),
-        "bzread" => Ok(Some(Value::String(String::new()))),
-        "bzwrite" => Ok(Some(Value::Long(0))),
+        "bzopen" => {
+            let filename = args.first().cloned().unwrap_or(Value::Null).to_php_string();
+            let mode = args.get(1).cloned().unwrap_or(Value::String("r".to_string())).to_php_string();
+            let is_write = mode.starts_with('w');
+
+            if is_write {
+                let bz = crate::vm::BzFileHandle {
+                    data: Vec::new(),
+                    pos: 0,
+                    writable: true,
+                    path: filename,
+                };
+                let id = vm.next_resource_id;
+                vm.next_resource_id += 1;
+                vm.bz_handles.insert(id, bz);
+                Ok(Some(Value::Resource(id, "stream".to_string())))
+            } else {
+                match std::fs::read(&filename) {
+                    Ok(compressed) => {
+                        let decompressed = php_rs_ext_bz2::bzdecompress(&compressed, false)
+                            .unwrap_or_else(|_| compressed);
+                        let bz = crate::vm::BzFileHandle {
+                            data: decompressed,
+                            pos: 0,
+                            writable: false,
+                            path: filename,
+                        };
+                        let id = vm.next_resource_id;
+                        vm.next_resource_id += 1;
+                        vm.bz_handles.insert(id, bz);
+                        Ok(Some(Value::Resource(id, "stream".to_string())))
+                    }
+                    Err(_) => Ok(Some(Value::Bool(false))),
+                }
+            }
+        }
+        "bzclose" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            if let Some(bz) = vm.bz_handles.remove(&id) {
+                if bz.writable && !bz.path.is_empty() {
+                    let compressed = php_rs_ext_bz2::bzcompress(&bz.data, 4, 0);
+                    let _ = std::fs::write(&bz.path, &compressed);
+                }
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "bzflush" => Ok(Some(Value::Bool(true))),
+        "bzread" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let length = args.get(1).map(|v| v.to_long() as usize).unwrap_or(1024);
+            if let Some(bz) = vm.bz_handles.get_mut(&id) {
+                let end = (bz.pos + length).min(bz.data.len());
+                let chunk = &bz.data[bz.pos..end];
+                let s = bytes_to_php_string(chunk);
+                bz.pos = end;
+                Ok(Some(Value::String(s)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "bzwrite" => {
+            let id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let data = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+            let max_len = args.get(2).map(|v| v.to_long() as usize);
+            let bytes = data.as_bytes();
+            let to_write = match max_len {
+                Some(n) => &bytes[..n.min(bytes.len())],
+                None => bytes,
+            };
+            if let Some(bz) = vm.bz_handles.get_mut(&id) {
+                bz.data.extend_from_slice(to_write);
+                bz.pos = bz.data.len();
+                Ok(Some(Value::Long(to_write.len() as i64)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
         "bzcompress" => {
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             let block_size = args.get(1).map(|v| v.to_long() as u32).unwrap_or(4);
             let work_factor = args.get(2).map(|v| v.to_long() as u32).unwrap_or(0);
             let compressed = php_rs_ext_bz2::bzcompress(data.as_bytes(), block_size, work_factor);
-            Ok(Some(Value::String(
-                String::from_utf8_lossy(&compressed).to_string(),
-            )))
+            Ok(Some(Value::String(bytes_to_php_string(&compressed))))
         }
         "bzdecompress" => {
             let data = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            match php_rs_ext_bz2::bzdecompress(data.as_bytes(), false) {
-                Ok(decompressed) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&decompressed).to_string(),
-                ))),
+            let bytes = php_string_to_bytes(&data);
+            match php_rs_ext_bz2::bzdecompress(&bytes, false) {
+                Ok(decompressed) => Ok(Some(Value::String(bytes_to_php_string(&decompressed)))),
                 Err(_) => Ok(Some(Value::Long(-1))),
             }
         }
@@ -2546,7 +3538,7 @@ pub(crate) fn dispatch(
                 Ok(encrypted) => {
                     if (options & php_rs_ext_openssl::constants::OPENSSL_RAW_DATA) != 0 {
                         Ok(Some(Value::String(
-                            String::from_utf8_lossy(&encrypted).to_string(),
+                            bytes_to_php_string(&encrypted),
                         )))
                     } else {
                         Ok(Some(Value::String(php_rs_ext_openssl::base64_encode(
@@ -2579,9 +3571,7 @@ pub(crate) fn dispatch(
                 options,
                 iv.as_bytes(),
             ) {
-                Ok(decrypted) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&decrypted).to_string(),
-                ))),
+                Ok(decrypted) => Ok(Some(Value::String(bytes_to_php_string(&decrypted)))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
         }
@@ -2615,7 +3605,7 @@ pub(crate) fn dispatch(
                             .filter_map(|s| u8::from_str_radix(s, 16).ok())
                             .collect();
                         Ok(Some(Value::String(
-                            String::from_utf8_lossy(&bytes).to_string(),
+                            bytes_to_php_string(&bytes),
                         )))
                     } else {
                         Ok(Some(Value::String(h)))
@@ -2650,7 +3640,7 @@ pub(crate) fn dispatch(
             if let Some(key) = vm.openssl_keys.get(&key_resource_id).cloned() {
                 match php_rs_ext_openssl::openssl_sign(&data, &key, "sha256") {
                     Ok(signature) => {
-                        let sig_str = String::from_utf8_lossy(&signature).to_string();
+                        let sig_str = bytes_to_php_string(&signature);
                         vm.write_back_arg(1, Value::String(sig_str), ref_args, ref_prop_args);
                         Ok(Some(Value::Bool(true)))
                     }
@@ -2805,7 +3795,7 @@ pub(crate) fn dispatch(
                             // Write back to the &$crypted arg (arg index 1)
                             vm.write_back_arg(
                                 1,
-                                Value::String(String::from_utf8_lossy(&encrypted).to_string()),
+                                Value::String(bytes_to_php_string(&encrypted)),
                                 ref_args,
                                 ref_prop_args,
                             );
@@ -2838,7 +3828,7 @@ pub(crate) fn dispatch(
                 b
             };
             Ok(Some(Value::String(
-                String::from_utf8_lossy(&bytes).to_string(),
+                bytes_to_php_string(&bytes),
             )))
         }
         "openssl_spki_export"
@@ -2876,10 +3866,50 @@ pub(crate) fn dispatch(
             vm.gd_images.insert(id, img);
             Ok(Some(Value::Long(id)))
         }
-        "imagecreatefromstring"
-        | "imagecreatefrompng"
-        | "imagecreatefromjpeg"
-        | "imagecreatefromgif"
+        "imagecreatefromstring" => {
+            let data_str = args.first().map(|v| v.to_string()).unwrap_or_default();
+            let data: Vec<u8> = data_str.chars().map(|c| c as u8).collect();
+            match php_rs_ext_gd::imagecreatefromstring(&data) {
+                Some(img) => {
+                    let id = vm.next_resource_id;
+                    vm.next_resource_id += 1;
+                    vm.gd_images.insert(id, img);
+                    Ok(Some(Value::Long(id)))
+                }
+                None => Ok(Some(Value::Bool(false))),
+            }
+        }
+        "imagecreatefrompng" => {
+            let filename = args.first().map(|v| v.to_string()).unwrap_or_default();
+            match std::fs::read(&filename) {
+                Ok(data) => match php_rs_ext_gd::imagecreatefrompng_data(&data) {
+                    Some(img) => {
+                        let id = vm.next_resource_id;
+                        vm.next_resource_id += 1;
+                        vm.gd_images.insert(id, img);
+                        Ok(Some(Value::Long(id)))
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                },
+                Err(_) => Ok(Some(Value::Bool(false))),
+            }
+        }
+        "imagecreatefromgif" => {
+            let filename = args.first().map(|v| v.to_string()).unwrap_or_default();
+            match std::fs::read(&filename) {
+                Ok(data) => match php_rs_ext_gd::imagecreatefromgif_data(&data) {
+                    Some(img) => {
+                        let id = vm.next_resource_id;
+                        vm.next_resource_id += 1;
+                        vm.gd_images.insert(id, img);
+                        Ok(Some(Value::Long(id)))
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                },
+                Err(_) => Ok(Some(Value::Bool(false))),
+            }
+        }
+        "imagecreatefromjpeg"
         | "imagecreatefromwebp"
         | "imagecreatefromavif"
         | "imagecreatefrombmp"
@@ -2898,13 +3928,38 @@ pub(crate) fn dispatch(
         "imagepng" | "imagejpeg" | "imagegif" => {
             let id = args.first().map(|v| v.to_long()).unwrap_or(-1);
             if let Some(img) = vm.gd_images.get(&id) {
-                let _data = match name {
-                    "imagepng" => php_rs_ext_gd::imagepng(img),
-                    "imagejpeg" => php_rs_ext_gd::imagejpeg(img),
+                let data = match name {
+                    "imagepng" => {
+                        let quality = args.get(2).map(|v| v.to_long() as i32).unwrap_or(-1);
+                        php_rs_ext_gd::imagepng_quality(img, quality)
+                    }
+                    "imagejpeg" => {
+                        let quality = args.get(2).map(|v| v.to_long() as i32).unwrap_or(75);
+                        php_rs_ext_gd::imagejpeg_quality(img, quality)
+                    }
                     "imagegif" => php_rs_ext_gd::imagegif(img),
                     _ => Vec::new(),
                 };
-                Ok(Some(Value::Bool(true)))
+                if data.is_empty() {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                // Second arg: filename or null
+                let filename = args.get(1).and_then(|v| match v {
+                    Value::String(s) if !s.is_empty() => Some(s.clone()),
+                    _ => None,
+                });
+                if let Some(path) = filename {
+                    // Write to file
+                    match std::fs::write(&path, &data) {
+                        Ok(_) => Ok(Some(Value::Bool(true))),
+                        Err(_) => Ok(Some(Value::Bool(false))),
+                    }
+                } else {
+                    // Output to stdout (binary data as latin-1 string)
+                    let output: String = data.iter().map(|&b| b as char).collect();
+                    vm.write_output(&output);
+                    Ok(Some(Value::Bool(true)))
+                }
             } else {
                 Ok(Some(Value::Bool(false)))
             }
@@ -3267,7 +4322,7 @@ pub(crate) fn dispatch(
                 .filter_map(|i| u8::from_str_radix(&hex[i..i.min(hex.len()).max(i + 2)], 16).ok())
                 .collect();
             Ok(Some(Value::String(
-                String::from_utf8_lossy(&bytes).to_string(),
+                bytes_to_php_string(&bytes),
             )))
         }
         "sodium_bin2base64" => {
@@ -3280,7 +4335,7 @@ pub(crate) fn dispatch(
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             match php_rs_ext_standard::strings::php_base64_decode(&s) {
                 Some(bytes) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&bytes).to_string(),
+                    bytes_to_php_string(&bytes),
                 ))),
                 None => Ok(Some(Value::Bool(false))),
             }
@@ -3328,7 +4383,7 @@ pub(crate) fn dispatch(
                 keypair.as_bytes(),
             ) {
                 Ok(ct) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&ct).to_string(),
+                    bytes_to_php_string(&ct),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3344,7 +4399,7 @@ pub(crate) fn dispatch(
                 keypair.as_bytes(),
             ) {
                 Ok(pt) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&pt).to_string(),
+                    bytes_to_php_string(&pt),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3353,7 +4408,7 @@ pub(crate) fn dispatch(
         "sodium_crypto_box_keypair" => {
             let keypair = php_rs_ext_sodium::sodium_crypto_box_keypair();
             Ok(Some(Value::String(
-                String::from_utf8_lossy(&keypair).to_string(),
+                bytes_to_php_string(&keypair),
             )))
         }
         #[cfg(feature = "native-io")]
@@ -3361,7 +4416,7 @@ pub(crate) fn dispatch(
             let keypair = args.first().map(|v| v.to_php_string()).unwrap_or_default();
             match php_rs_ext_sodium::sodium_crypto_box_publickey(keypair.as_bytes()) {
                 Ok(pk) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&pk).to_string(),
+                    bytes_to_php_string(&pk),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3371,7 +4426,7 @@ pub(crate) fn dispatch(
             let keypair = args.first().map(|v| v.to_php_string()).unwrap_or_default();
             match php_rs_ext_sodium::sodium_crypto_box_secretkey(keypair.as_bytes()) {
                 Ok(sk) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&sk).to_string(),
+                    bytes_to_php_string(&sk),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3381,7 +4436,7 @@ pub(crate) fn dispatch(
             let sk = args.first().map(|v| v.to_php_string()).unwrap_or_default();
             match php_rs_ext_sodium::sodium_crypto_box_publickey_from_secretkey(sk.as_bytes()) {
                 Ok(pk) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&pk).to_string(),
+                    bytes_to_php_string(&pk),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3395,7 +4450,7 @@ pub(crate) fn dispatch(
                 pk.as_bytes(),
             ) {
                 Ok(kp) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&kp).to_string(),
+                    bytes_to_php_string(&kp),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3456,7 +4511,7 @@ pub(crate) fn dispatch(
                 memlimit,
             ) {
                 Ok(hash) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&hash).to_string(),
+                    bytes_to_php_string(&hash),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3502,7 +4557,7 @@ pub(crate) fn dispatch(
                 key.as_bytes(),
             ) {
                 Ok(ct) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&ct).to_string(),
+                    bytes_to_php_string(&ct),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3518,7 +4573,7 @@ pub(crate) fn dispatch(
                 key.as_bytes(),
             ) {
                 Ok(pt) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&pt).to_string(),
+                    bytes_to_php_string(&pt),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3527,7 +4582,7 @@ pub(crate) fn dispatch(
         "sodium_crypto_secretbox_keygen" => {
             let key = php_rs_ext_sodium::sodium_crypto_secretbox_keygen();
             Ok(Some(Value::String(
-                String::from_utf8_lossy(&key).to_string(),
+                bytes_to_php_string(&key),
             )))
         }
         #[cfg(not(feature = "native-io"))]
@@ -3546,7 +4601,7 @@ pub(crate) fn dispatch(
             let secret_key = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
             match php_rs_ext_sodium::sodium_crypto_sign(message.as_bytes(), secret_key.as_bytes()) {
                 Ok(signed) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&signed).to_string(),
+                    bytes_to_php_string(&signed),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3560,7 +4615,7 @@ pub(crate) fn dispatch(
                 public_key.as_bytes(),
             ) {
                 Ok(msg) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&msg).to_string(),
+                    bytes_to_php_string(&msg),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3574,7 +4629,7 @@ pub(crate) fn dispatch(
                 secret_key.as_bytes(),
             ) {
                 Ok(sig) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&sig).to_string(),
+                    bytes_to_php_string(&sig),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3597,7 +4652,7 @@ pub(crate) fn dispatch(
         "sodium_crypto_sign_keypair" => {
             let keypair = php_rs_ext_sodium::sodium_crypto_sign_keypair();
             Ok(Some(Value::String(
-                String::from_utf8_lossy(&keypair).to_string(),
+                bytes_to_php_string(&keypair),
             )))
         }
         #[cfg(feature = "native-io")]
@@ -3605,7 +4660,7 @@ pub(crate) fn dispatch(
             let seed = args.first().map(|v| v.to_php_string()).unwrap_or_default();
             match php_rs_ext_sodium::sodium_crypto_sign_seed_keypair(seed.as_bytes()) {
                 Ok(kp) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&kp).to_string(),
+                    bytes_to_php_string(&kp),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3615,7 +4670,7 @@ pub(crate) fn dispatch(
             let keypair = args.first().map(|v| v.to_php_string()).unwrap_or_default();
             match php_rs_ext_sodium::sodium_crypto_sign_publickey(keypair.as_bytes()) {
                 Ok(pk) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&pk).to_string(),
+                    bytes_to_php_string(&pk),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3625,7 +4680,7 @@ pub(crate) fn dispatch(
             let keypair = args.first().map(|v| v.to_php_string()).unwrap_or_default();
             match php_rs_ext_sodium::sodium_crypto_sign_secretkey(keypair.as_bytes()) {
                 Ok(sk) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&sk).to_string(),
+                    bytes_to_php_string(&sk),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3635,7 +4690,7 @@ pub(crate) fn dispatch(
             let sk = args.first().map(|v| v.to_php_string()).unwrap_or_default();
             match php_rs_ext_sodium::sodium_crypto_sign_publickey_from_secretkey(sk.as_bytes()) {
                 Ok(pk) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&pk).to_string(),
+                    bytes_to_php_string(&pk),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -3706,7 +4761,7 @@ pub(crate) fn dispatch(
                 pk.as_bytes(),
             ) {
                 Ok(kp) => Ok(Some(Value::String(
-                    String::from_utf8_lossy(&kp).to_string(),
+                    bytes_to_php_string(&kp),
                 ))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -4218,7 +5273,7 @@ pub(crate) fn dispatch(
             if let Some(sock) = vm.sockets.get(&id) {
                 let data = php_rs_ext_sockets::socket_read(sock, length);
                 Ok(Some(Value::String(
-                    String::from_utf8_lossy(&data).to_string(),
+                    bytes_to_php_string(&data),
                 )))
             } else {
                 Ok(Some(Value::Bool(false)))
@@ -5347,7 +6402,7 @@ pub(crate) fn dispatch(
             if let Some(shm) = vm.sysv_shm.get(&id) {
                 match php_rs_ext_sysvshm::shm_get_var(shm, var_key) {
                     Some(data) => Ok(Some(Value::String(
-                        String::from_utf8_lossy(&data).to_string(),
+                        bytes_to_php_string(&data),
                     ))),
                     None => Ok(Some(Value::Bool(false))),
                 }
@@ -5446,7 +6501,7 @@ pub(crate) fn dispatch(
                     // Write back message (arg index 4 = 5th parameter)
                     vm.write_back_arg(
                         4,
-                        Value::String(String::from_utf8_lossy(&message_out).to_string()),
+                        Value::String(bytes_to_php_string(&message_out)),
                         ref_args,
                         ref_prop_args,
                     );
@@ -5514,7 +6569,7 @@ pub(crate) fn dispatch(
             if let Some(block) = vm.shmop_blocks.get(&id) {
                 match php_rs_ext_shmop::shmop_read(block, start, count) {
                     Ok(data) => Ok(Some(Value::String(
-                        String::from_utf8_lossy(&data).to_string(),
+                        bytes_to_php_string(&data),
                     ))),
                     Err(_) => Ok(Some(Value::Bool(false))),
                 }

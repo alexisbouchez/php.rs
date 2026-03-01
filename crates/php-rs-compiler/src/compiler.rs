@@ -165,7 +165,12 @@ impl Compiler {
     }
 
     /// Create a sub-compiler that inherits the source filename, namespace, and class context from parent.
-    fn sub_compiler(&self, op_array: ZOpArray) -> Self {
+    fn sub_compiler(&self, mut op_array: ZOpArray) -> Self {
+        // Propagate the source filename to the function's op_array
+        // so that stack traces and error messages reference the correct file.
+        if op_array.filename.is_none() {
+            op_array.filename = self.source_filename.clone();
+        }
         Self {
             op_array,
             loop_stack: Vec::new(),

@@ -17,6 +17,7 @@ php-rs-runtime = { path = "../php-rs-runtime" }
 php-rs-composer = { path = "../php-rs-composer" }
 php-rs-ext-pdo = { path = "../php-rs-ext-pdo" }
 php-rs-ext-pdo-pgsql = { path = "../php-rs-ext-pdo-pgsql" }
+php-rs-ext-pdo-mysql = { path = "../php-rs-ext-pdo-mysql" }
 libc = "0.2"
 
 [dev-dependencies]

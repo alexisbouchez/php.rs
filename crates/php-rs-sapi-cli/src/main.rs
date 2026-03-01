@@ -1900,6 +1900,9 @@ fn main() {
     php_rs_ext_pdo::register_pdo_driver("pgsql", || {
         Box::new(php_rs_ext_pdo_pgsql::PdoPgsqlDriver::new())
     });
+    php_rs_ext_pdo::register_pdo_driver("mysql", || {
+        Box::new(php_rs_ext_pdo_mysql::PdoMysqlDriver::new())
+    });
 
     let args: Vec<String> = env::args().collect();
 

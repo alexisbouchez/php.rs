@@ -334,6 +334,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp/test".into(),
+            next_uid: 10000,
         };
         let actions = monitor_workers(&mut state);
         assert!(actions.is_empty());
@@ -345,6 +346,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp/test".into(),
+            next_uid: 10000,
         };
         let mut app = test_app();
         app.worker_configs.push(WorkerConfig {

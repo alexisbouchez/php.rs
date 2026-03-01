@@ -48,6 +48,20 @@ impl Default for NetworkPolicy {
 }
 
 impl NetworkPolicy {
+    /// Create mandatory network isolation defaults.
+    /// Blocks SMTP (port 25) and restricts outbound to HTTP/HTTPS + DNS.
+    pub fn mandatory_defaults(app_port: u16) -> Self {
+        Self {
+            enabled: true,
+            app_port,
+            allowed_outbound_ports: vec![80, 443, 3306, 5432, 6379], // HTTP, HTTPS, MySQL, PG, Redis
+            allowed_outbound_destinations: Vec::new(),
+            allow_dns: true,
+            allow_loopback: true,
+            blocked_loopback_ports: Vec::new(),
+        }
+    }
+
     /// Build from app environment variables.
     pub fn from_env(env: &std::collections::HashMap<String, String>) -> Self {
         let mut policy = Self::default();
@@ -314,6 +328,29 @@ pub struct IsolationConfig {
 }
 
 impl IsolationConfig {
+    /// Create mandatory isolation defaults for PaaS multi-tenant security.
+    /// These are the baseline limits enforced for every app.
+    pub fn mandatory_defaults(app_port: u16, uid: u32) -> Self {
+        Self {
+            uid: Some(uid),
+            gid: Some(uid),
+            memory_limit_bytes: Some(512 * 1024 * 1024), // 512 MB
+            max_fds: Some(1024),
+            max_procs: Some(64),
+            cpu_time_limit: None, // No CPU time limit by default.
+            max_file_size: Some(100 * 1024 * 1024), // 100 MB
+            core_size: Some(0), // Disable core dumps.
+            disk_quota: None,
+            network: NetworkPolicy::mandatory_defaults(app_port),
+            #[cfg(target_os = "linux")]
+            cgroup_path: Some(format!("/sys/fs/cgroup/phprs/app-{}", uid)),
+            #[cfg(target_os = "linux")]
+            cgroup_memory_max: Some(512 * 1024 * 1024),
+            #[cfg(target_os = "linux")]
+            cgroup_cpu_max: Some("50000 100000".into()), // 50% of 1 core.
+        }
+    }
+
     /// Build from an app's environment variables.
     /// Reads APP_UID, APP_GID, APP_RLIMIT_*, APP_NET_* env vars from the app's config.
     pub fn from_env(env: &std::collections::HashMap<String, String>) -> Self {
@@ -974,6 +1011,42 @@ mod tests {
         assert!(over);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_mandatory_defaults() {
+        let config = IsolationConfig::mandatory_defaults(8080, 10001);
+        assert_eq!(config.uid, Some(10001));
+        assert_eq!(config.gid, Some(10001));
+        assert_eq!(config.memory_limit_bytes, Some(512 * 1024 * 1024));
+        assert_eq!(config.max_fds, Some(1024));
+        assert_eq!(config.max_procs, Some(64));
+        assert_eq!(config.max_file_size, Some(100 * 1024 * 1024));
+        assert_eq!(config.core_size, Some(0));
+        assert!(config.network.enabled);
+        assert_eq!(config.network.app_port, 8080);
+        assert!(config.has_settings());
+
+        // SMTP (port 25) should NOT be in allowed outbound ports.
+        assert!(!config.network.allowed_outbound_ports.contains(&25));
+        // Database ports should be allowed.
+        assert!(config.network.allowed_outbound_ports.contains(&3306));
+        assert!(config.network.allowed_outbound_ports.contains(&5432));
+        assert!(config.network.allowed_outbound_ports.contains(&6379));
+    }
+
+    #[test]
+    fn test_network_policy_mandatory_defaults() {
+        let policy = NetworkPolicy::mandatory_defaults(8080);
+        assert!(policy.enabled);
+        assert_eq!(policy.app_port, 8080);
+        assert!(policy.allow_dns);
+        assert!(policy.allow_loopback);
+        // HTTP/HTTPS allowed.
+        assert!(policy.allowed_outbound_ports.contains(&80));
+        assert!(policy.allowed_outbound_ports.contains(&443));
+        // SMTP blocked (not in allowed list).
+        assert!(!policy.allowed_outbound_ports.contains(&25));
     }
 
     #[test]

@@ -7,5 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+mysql = "25.0"
+php-rs-ext-pdo = { path = "../php-rs-ext-pdo" }
 
 [dev-dependencies]

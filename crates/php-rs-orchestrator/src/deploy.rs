@@ -259,6 +259,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: std::env::temp_dir().join("phprs-test-cleanup").to_string_lossy().to_string(),
+            next_uid: 10000,
         };
         state.apps.insert("myapp".into(), AppState {
             name: "myapp".into(),

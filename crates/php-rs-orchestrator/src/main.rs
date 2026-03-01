@@ -3157,6 +3157,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: dir.join("apps").to_string_lossy().to_string(),
+            next_uid: 10000,
         };
 
         let port = state.allocate_port();
@@ -3199,6 +3200,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: dir.join("apps").to_string_lossy().to_string(),
+            next_uid: 10000,
         };
 
         let port = state.allocate_port();
@@ -3233,6 +3235,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp".into(),
+            next_uid: 10000,
         };
 
         state.apps.insert("configapp".into(), AppState {
@@ -3273,6 +3276,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp".into(),
+            next_uid: 10000,
         };
 
         assert!(state.get_app("nonexistent").is_none());
@@ -3284,6 +3288,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp/test-apps".into(),
+            next_uid: 10000,
         };
 
         for i in 0..5 {
@@ -3453,6 +3458,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 9001,
             apps_dir: "/tmp".into(),
+            next_uid: 10000,
         };
         platform.apps.insert("myapp".into(), AppState {
             name: "myapp".into(),

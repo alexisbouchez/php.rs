@@ -20,5 +20,7 @@ rustls-pemfile = "2"
 rcgen = "0.13"
 ring = "0.17"
 base64 = "0.22"
+bcrypt = "0.16"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]

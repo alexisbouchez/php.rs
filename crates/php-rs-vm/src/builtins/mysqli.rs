@@ -4,6 +4,35 @@ use crate::vm::{Vm, VmResult};
 use php_rs_compiler::op::OperandType;
 
 // ===========================================================================
+// MySQLi prepared statement state
+// ===========================================================================
+
+/// Tracks a prepared statement's SQL, bound parameters, and execution results.
+#[derive(Debug, Clone)]
+pub struct MysqliStmt {
+    /// The prepared SQL with ? placeholders.
+    pub sql: String,
+    /// Connection ID this statement belongs to.
+    pub conn_id: i64,
+    /// Bound parameter values (positional, 0-based).
+    pub params: Vec<Value>,
+    /// Bound parameter types (from bind_param type string).
+    pub param_types: String,
+    /// Number of affected rows after execute.
+    pub affected_rows: u64,
+    /// Last insert ID after execute.
+    pub insert_id: u64,
+    /// Error message (empty if no error).
+    pub error: String,
+    /// Error number (0 if no error).
+    pub errno: u16,
+    /// SQLSTATE string.
+    pub sqlstate: String,
+    /// Number of parameters (? placeholders).
+    pub param_count: usize,
+}
+
+// ===========================================================================
 // PDO helper functions (shared with vm.rs PDO handling)
 // ===========================================================================
 
@@ -155,39 +184,39 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     r.insert("mysqli_store_result", php_mysqli_bool_false_stub);
     r.insert("mysqli_use_result", php_mysqli_bool_false_stub);
 
-    // prepared statements (stubs)
-    r.insert("mysqli_prepare", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_init", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_prepare", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_bind_param", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_bind_result", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_execute", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_fetch", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_close", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_reset", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_free_result", php_mysqli_bool_false_stub);
+    // prepared statements
+    r.insert("mysqli_prepare", php_mysqli_prepare);
+    r.insert("mysqli_stmt_init", php_mysqli_stmt_init);
+    r.insert("mysqli_stmt_prepare", php_mysqli_stmt_prepare);
+    r.insert("mysqli_stmt_bind_param", php_mysqli_stmt_bind_param);
+    r.insert("mysqli_stmt_bind_result", php_mysqli_bool_true_stub); // no-op (results via get_result)
+    r.insert("mysqli_stmt_execute", php_mysqli_stmt_execute);
+    r.insert("mysqli_stmt_fetch", php_mysqli_bool_false_stub); // use get_result + fetch_assoc instead
+    r.insert("mysqli_stmt_close", php_mysqli_stmt_close);
+    r.insert("mysqli_stmt_reset", php_mysqli_stmt_reset);
+    r.insert("mysqli_stmt_free_result", php_mysqli_stmt_free_result);
     r.insert("mysqli_stmt_send_long_data", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_store_result", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_get_result", php_mysqli_bool_false_stub);
+    r.insert("mysqli_stmt_store_result", php_mysqli_bool_true_stub); // results always buffered
+    r.insert("mysqli_stmt_get_result", php_mysqli_stmt_get_result);
     r.insert("mysqli_stmt_data_seek", php_mysqli_bool_false_stub);
     r.insert("mysqli_stmt_more_results", php_mysqli_bool_false_stub);
     r.insert("mysqli_stmt_next_result", php_mysqli_bool_false_stub);
     r.insert("mysqli_stmt_result_metadata", php_mysqli_bool_false_stub);
     r.insert("mysqli_stmt_attr_get", php_mysqli_bool_false_stub);
     r.insert("mysqli_stmt_attr_set", php_mysqli_bool_false_stub);
-    r.insert("mysqli_stmt_error_list", php_mysqli_bool_false_stub);
+    r.insert("mysqli_stmt_error_list", php_mysqli_empty_array_stub);
 
-    // stmt numeric stubs
-    r.insert("mysqli_stmt_affected_rows", php_mysqli_long_zero_stub);
-    r.insert("mysqli_stmt_insert_id", php_mysqli_long_zero_stub);
-    r.insert("mysqli_stmt_num_rows", php_mysqli_long_zero_stub);
-    r.insert("mysqli_stmt_param_count", php_mysqli_long_zero_stub);
+    // stmt metadata
+    r.insert("mysqli_stmt_affected_rows", php_mysqli_stmt_affected_rows);
+    r.insert("mysqli_stmt_insert_id", php_mysqli_stmt_insert_id);
+    r.insert("mysqli_stmt_num_rows", php_mysqli_stmt_num_rows);
+    r.insert("mysqli_stmt_param_count", php_mysqli_stmt_param_count);
     r.insert("mysqli_stmt_field_count", php_mysqli_long_zero_stub);
-    r.insert("mysqli_stmt_errno", php_mysqli_long_zero_stub);
+    r.insert("mysqli_stmt_errno", php_mysqli_stmt_errno);
 
-    // stmt string stubs
-    r.insert("mysqli_stmt_error", php_mysqli_string_empty_stub);
-    r.insert("mysqli_stmt_sqlstate", php_mysqli_string_empty_stub);
+    // stmt error info
+    r.insert("mysqli_stmt_error", php_mysqli_stmt_error);
+    r.insert("mysqli_stmt_sqlstate", php_mysqli_stmt_sqlstate);
 
     // metadata / info
     r.insert("mysqli_affected_rows", php_mysqli_affected_rows);
@@ -1100,6 +1129,570 @@ fn php_mysqli_real_escape_string(
             .replace('"', "\\\"")
             .replace('\0', "\\0"),
     ))
+}
+
+// ===========================================================================
+// mysqli_prepare
+// ===========================================================================
+
+fn php_mysqli_prepare(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    // mysqli_prepare($conn, $query) -> mysqli_stmt|false
+    let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Bool(false)),
+    };
+    let sql = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+
+    // Verify connection exists.
+    if !vm.mysqli_connections.contains_key(&conn_id) {
+        return Ok(Value::Bool(false));
+    }
+
+    // Count ? placeholders (outside strings).
+    let param_count = count_placeholders(&sql);
+
+    let stmt_id = vm.next_resource_id;
+    vm.next_resource_id += 1;
+    vm.mysqli_stmts.insert(stmt_id, MysqliStmt {
+        sql,
+        conn_id,
+        params: Vec::new(),
+        param_types: String::new(),
+        affected_rows: 0,
+        insert_id: 0,
+        error: String::new(),
+        errno: 0,
+        sqlstate: "00000".to_string(),
+        param_count,
+    });
+
+    Ok(Value::Resource(stmt_id, "mysqli_stmt".to_string()))
+}
+
+// ===========================================================================
+// mysqli_stmt_init
+// ===========================================================================
+
+fn php_mysqli_stmt_init(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    // mysqli_stmt_init($conn) -> mysqli_stmt
+    let conn_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Bool(false)),
+    };
+
+    let stmt_id = vm.next_resource_id;
+    vm.next_resource_id += 1;
+    vm.mysqli_stmts.insert(stmt_id, MysqliStmt {
+        sql: String::new(),
+        conn_id,
+        params: Vec::new(),
+        param_types: String::new(),
+        affected_rows: 0,
+        insert_id: 0,
+        error: String::new(),
+        errno: 0,
+        sqlstate: "00000".to_string(),
+        param_count: 0,
+    });
+
+    Ok(Value::Resource(stmt_id, "mysqli_stmt".to_string()))
+}
+
+// ===========================================================================
+// mysqli_stmt_prepare
+// ===========================================================================
+
+fn php_mysqli_stmt_prepare(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    // mysqli_stmt_prepare($stmt, $query) -> bool
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Bool(false)),
+    };
+    let sql = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+
+    if let Some(stmt) = vm.mysqli_stmts.get_mut(&stmt_id) {
+        stmt.param_count = count_placeholders(&sql);
+        stmt.sql = sql;
+        stmt.params.clear();
+        stmt.param_types.clear();
+        Ok(Value::Bool(true))
+    } else {
+        Ok(Value::Bool(false))
+    }
+}
+
+// ===========================================================================
+// mysqli_stmt_bind_param
+// ===========================================================================
+
+fn php_mysqli_stmt_bind_param(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    // mysqli_stmt_bind_param($stmt, $types, ...$values) -> bool
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Bool(false)),
+    };
+    let types = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
+
+    let stmt = match vm.mysqli_stmts.get_mut(&stmt_id) {
+        Some(s) => s,
+        None => return Ok(Value::Bool(false)),
+    };
+
+    stmt.param_types = types.clone();
+    stmt.params.clear();
+
+    // Collect bound values starting from arg index 2.
+    for i in 2..args.len() {
+        stmt.params.push(args[i].clone());
+    }
+
+    Ok(Value::Bool(true))
+}
+
+// ===========================================================================
+// mysqli_stmt_execute
+// ===========================================================================
+
+fn php_mysqli_stmt_execute(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    use mysql::prelude::Queryable;
+
+    // mysqli_stmt_execute($stmt) -> bool
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Bool(false)),
+    };
+
+    // Get stmt data (clone to release borrow).
+    let stmt_data = match vm.mysqli_stmts.get(&stmt_id) {
+        Some(s) => s.clone(),
+        None => return Ok(Value::Bool(false)),
+    };
+
+    let conn = match vm.mysqli_connections.get_mut(&stmt_data.conn_id) {
+        Some(c) => c,
+        None => {
+            if let Some(stmt) = vm.mysqli_stmts.get_mut(&stmt_id) {
+                stmt.error = "Connection not found".to_string();
+                stmt.errno = 2006;
+                stmt.sqlstate = "HY000".to_string();
+            }
+            return Ok(Value::Bool(false));
+        }
+    };
+
+    // Convert bound params to mysql::Value.
+    let mysql_params: Vec<mysql::Value> = stmt_data
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let type_char = stmt_data.param_types.chars().nth(i).unwrap_or('s');
+            value_to_mysql_param(v, type_char)
+        })
+        .collect();
+
+    // Execute using prepared statement.
+    let result = if mysql_params.is_empty() {
+        conn.query::<mysql::Row, &str>(&stmt_data.sql)
+    } else {
+        match conn.prep(&stmt_data.sql) {
+            Ok(prep_stmt) => conn.exec::<mysql::Row, _, _>(&prep_stmt, &mysql_params),
+            Err(e) => Err(e),
+        }
+    };
+
+    match result {
+        Ok(rows) => {
+            let affected = conn.affected_rows();
+            let insert_id = conn.last_insert_id();
+
+            // Store result rows if any.
+            if !rows.is_empty() {
+                let field_names: Vec<String> = rows[0]
+                    .columns_ref()
+                    .iter()
+                    .map(|c| c.name_str().to_string())
+                    .collect();
+
+                let result_id = vm.next_resource_id;
+                vm.next_resource_id += 1;
+                vm.mysqli_results.insert(result_id, (rows, 0, field_names));
+
+                // Associate result with statement for get_result.
+                if let Some(stmt) = vm.mysqli_stmts.get_mut(&stmt_id) {
+                    stmt.affected_rows = affected;
+                    stmt.insert_id = insert_id;
+                    stmt.error.clear();
+                    stmt.errno = 0;
+                    stmt.sqlstate = "00000".to_string();
+                }
+
+                // Store result_id on the stmt resource so get_result can find it.
+                // We use the conn_meta trick: store in a separate map keyed by stmt_id.
+                vm.mysqli_conn_meta.entry(stmt_id).or_insert((0, 0, String::new(), 0));
+                if let Some(meta) = vm.mysqli_conn_meta.get_mut(&stmt_id) {
+                    // Repurpose insert_id field to hold result_id.
+                    meta.0 = result_id as u64;
+                }
+            } else {
+                if let Some(stmt) = vm.mysqli_stmts.get_mut(&stmt_id) {
+                    stmt.affected_rows = affected;
+                    stmt.insert_id = insert_id;
+                    stmt.error.clear();
+                    stmt.errno = 0;
+                    stmt.sqlstate = "00000".to_string();
+                }
+            }
+
+            // Update connection metadata too.
+            if let Some(meta) = vm.mysqli_conn_meta.get_mut(&stmt_data.conn_id) {
+                meta.0 = insert_id;
+                meta.1 = affected;
+                meta.2.clear();
+                meta.3 = 0;
+            }
+
+            Ok(Value::Bool(true))
+        }
+        Err(e) => {
+            let err_msg = format!("{}", e);
+            let errno = match &e {
+                mysql::Error::MySqlError(me) => me.code as u16,
+                _ => 1,
+            };
+            let sqlstate = match &e {
+                mysql::Error::MySqlError(me) => me.state.clone(),
+                _ => "HY000".to_string(),
+            };
+
+            if let Some(stmt) = vm.mysqli_stmts.get_mut(&stmt_id) {
+                stmt.error = err_msg.clone();
+                stmt.errno = errno;
+                stmt.sqlstate = sqlstate;
+            }
+            if let Some(meta) = vm.mysqli_conn_meta.get_mut(&stmt_data.conn_id) {
+                meta.2 = err_msg;
+                meta.3 = errno;
+            }
+            Ok(Value::Bool(false))
+        }
+    }
+}
+
+// ===========================================================================
+// mysqli_stmt_get_result
+// ===========================================================================
+
+fn php_mysqli_stmt_get_result(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    // mysqli_stmt_get_result($stmt) -> mysqli_result|false
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Bool(false)),
+    };
+
+    // Look up the result_id stored during execute.
+    if let Some(meta) = vm.mysqli_conn_meta.get(&stmt_id) {
+        let result_id = meta.0 as i64;
+        if vm.mysqli_results.contains_key(&result_id) {
+            return Ok(Value::Resource(result_id, "mysqli_result".to_string()));
+        }
+    }
+
+    Ok(Value::Bool(false))
+}
+
+// ===========================================================================
+// mysqli_stmt_close
+// ===========================================================================
+
+fn php_mysqli_stmt_close(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Bool(false)),
+    };
+
+    vm.mysqli_stmts.remove(&stmt_id);
+    Ok(Value::Bool(true))
+}
+
+// ===========================================================================
+// mysqli_stmt_reset
+// ===========================================================================
+
+fn php_mysqli_stmt_reset(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Bool(false)),
+    };
+
+    if let Some(stmt) = vm.mysqli_stmts.get_mut(&stmt_id) {
+        stmt.params.clear();
+        stmt.param_types.clear();
+        stmt.affected_rows = 0;
+        stmt.insert_id = 0;
+        stmt.error.clear();
+        stmt.errno = 0;
+        stmt.sqlstate = "00000".to_string();
+        Ok(Value::Bool(true))
+    } else {
+        Ok(Value::Bool(false))
+    }
+}
+
+// ===========================================================================
+// mysqli_stmt_free_result
+// ===========================================================================
+
+fn php_mysqli_stmt_free_result(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Null),
+    };
+
+    // Remove associated result.
+    if let Some(meta) = vm.mysqli_conn_meta.get(&stmt_id) {
+        let result_id = meta.0 as i64;
+        vm.mysqli_results.remove(&result_id);
+    }
+    Ok(Value::Null)
+}
+
+// ===========================================================================
+// mysqli_stmt_affected_rows
+// ===========================================================================
+
+fn php_mysqli_stmt_affected_rows(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Long(-1)),
+    };
+
+    if let Some(stmt) = vm.mysqli_stmts.get(&stmt_id) {
+        Ok(Value::Long(stmt.affected_rows as i64))
+    } else {
+        Ok(Value::Long(-1))
+    }
+}
+
+// ===========================================================================
+// mysqli_stmt_insert_id
+// ===========================================================================
+
+fn php_mysqli_stmt_insert_id(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Long(0)),
+    };
+
+    if let Some(stmt) = vm.mysqli_stmts.get(&stmt_id) {
+        Ok(Value::Long(stmt.insert_id as i64))
+    } else {
+        Ok(Value::Long(0))
+    }
+}
+
+// ===========================================================================
+// mysqli_stmt_num_rows
+// ===========================================================================
+
+fn php_mysqli_stmt_num_rows(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Long(0)),
+    };
+
+    // Get result from associated meta.
+    if let Some(meta) = vm.mysqli_conn_meta.get(&stmt_id) {
+        let result_id = meta.0 as i64;
+        if let Some((rows, _, _)) = vm.mysqli_results.get(&result_id) {
+            return Ok(Value::Long(rows.len() as i64));
+        }
+    }
+    Ok(Value::Long(0))
+}
+
+// ===========================================================================
+// mysqli_stmt_param_count
+// ===========================================================================
+
+fn php_mysqli_stmt_param_count(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Long(0)),
+    };
+
+    if let Some(stmt) = vm.mysqli_stmts.get(&stmt_id) {
+        Ok(Value::Long(stmt.param_count as i64))
+    } else {
+        Ok(Value::Long(0))
+    }
+}
+
+// ===========================================================================
+// mysqli_stmt_errno
+// ===========================================================================
+
+fn php_mysqli_stmt_errno(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::Long(0)),
+    };
+
+    if let Some(stmt) = vm.mysqli_stmts.get(&stmt_id) {
+        Ok(Value::Long(stmt.errno as i64))
+    } else {
+        Ok(Value::Long(0))
+    }
+}
+
+// ===========================================================================
+// mysqli_stmt_error
+// ===========================================================================
+
+fn php_mysqli_stmt_error(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::String(String::new())),
+    };
+
+    if let Some(stmt) = vm.mysqli_stmts.get(&stmt_id) {
+        Ok(Value::String(stmt.error.clone()))
+    } else {
+        Ok(Value::String(String::new()))
+    }
+}
+
+// ===========================================================================
+// mysqli_stmt_sqlstate
+// ===========================================================================
+
+fn php_mysqli_stmt_sqlstate(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let stmt_id = match args.first().cloned().unwrap_or(Value::Null) {
+        Value::Resource(id, _) => id,
+        _ => return Ok(Value::String("00000".to_string())),
+    };
+
+    if let Some(stmt) = vm.mysqli_stmts.get(&stmt_id) {
+        Ok(Value::String(stmt.sqlstate.clone()))
+    } else {
+        Ok(Value::String("00000".to_string()))
+    }
+}
+
+// ===========================================================================
+// Helper: convert PHP Value to mysql::Value based on type char
+// ===========================================================================
+
+fn value_to_mysql_param(value: &Value, type_char: char) -> mysql::Value {
+    match value {
+        Value::Null => mysql::Value::NULL,
+        _ => match type_char {
+            'i' => mysql::Value::Int(value.to_long()),
+            'd' => mysql::Value::Double(value.to_double()),
+            'b' => mysql::Value::Bytes(value.to_php_string().into_bytes()),
+            _ => mysql::Value::Bytes(value.to_php_string().into_bytes()), // 's' and default
+        },
+    }
+}
+
+/// Count ? placeholders in SQL (outside of string literals).
+fn count_placeholders(sql: &str) -> usize {
+    let mut count = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut prev = '\0';
+
+    for ch in sql.chars() {
+        match ch {
+            '\'' if !in_double_quote && prev != '\\' => in_single_quote = !in_single_quote,
+            '"' if !in_single_quote && prev != '\\' => in_double_quote = !in_double_quote,
+            '?' if !in_single_quote && !in_double_quote => count += 1,
+            _ => {}
+        }
+        prev = ch;
+    }
+
+    count
 }
 
 // ===========================================================================

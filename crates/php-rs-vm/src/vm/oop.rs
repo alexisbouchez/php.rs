@@ -1541,6 +1541,50 @@ impl Vm {
             return Ok(());
         }
 
+        // DOMDocument constructor
+        if class_name == "DOMDocument" {
+            let obj = PhpObject::new("DOMDocument".to_string());
+            obj.set_object_id(self.next_object_id);
+            self.next_object_id += 1;
+            let obj_val = Value::Object(obj);
+            self.write_result(op, oa_idx, obj_val.clone())?;
+
+            let frame = self.call_stack.last_mut().unwrap();
+            frame.call_stack_pending.push(PendingCall {
+                name: "DOMDocument::__construct".to_string(),
+                args: vec![obj_val],
+                arg_names: Vec::new(),
+                this_source: Some((op.result_type, op.result.val)),
+                static_class: None,
+                forwarded_this: None,
+                ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
+            });
+            return Ok(());
+        }
+
+        // DOMXPath constructor
+        if class_name == "DOMXPath" {
+            let obj = PhpObject::new("DOMXPath".to_string());
+            obj.set_object_id(self.next_object_id);
+            self.next_object_id += 1;
+            let obj_val = Value::Object(obj);
+            self.write_result(op, oa_idx, obj_val.clone())?;
+
+            let frame = self.call_stack.last_mut().unwrap();
+            frame.call_stack_pending.push(PendingCall {
+                name: "DOMXPath::__construct".to_string(),
+                args: vec![obj_val],
+                arg_names: Vec::new(),
+                this_source: Some((op.result_type, op.result.val)),
+                static_class: None,
+                forwarded_this: None,
+                ref_args: Vec::new(),
+                ref_prop_args: Vec::new(),
+            });
+            return Ok(());
+        }
+
         // Try autoloading if the class isn't found
         if !self.classes.contains_key(&class_name) {
             self.try_autoload_class(&class_name);
@@ -2218,7 +2262,16 @@ impl Vm {
                         break;
                     }
                 }
-                // No __toString found — fallback
+                // No user-defined __toString — try built-in __toString (e.g. Exception)
+                let full_name = format!("{}::__toString", class_name);
+                if let Some(result) = Self::try_exception_method(&full_name, &[val.clone()]) {
+                    return Ok(result.to_php_string());
+                }
+                // Try SPL/builtin method dispatch
+                if let Some(result) = self.call_builtin_method(&full_name, &[val.clone()])? {
+                    return Ok(result.to_php_string());
+                }
+                // Final fallback
                 Ok(val.to_php_string())
             }
             Value::Reference(rc) => {

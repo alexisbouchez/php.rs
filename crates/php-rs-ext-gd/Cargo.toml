@@ -7,5 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+png = "0.17"
+gif = "0.13"
 
 [dev-dependencies]

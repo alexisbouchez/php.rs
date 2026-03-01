@@ -577,6 +577,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp/test".into(),
+            next_uid: 10000,
         };
         let result = set_instance_count(&mut state, "nonexistent", 2);
         assert!(result.is_err());
@@ -589,6 +590,7 @@ mod tests {
             apps: HashMap::new(),
             next_port: 8001,
             apps_dir: "/tmp/test".into(),
+            next_uid: 10000,
         };
         state.apps.insert("myapp".into(), test_app("myapp"));
         let result = set_instance_count(&mut state, "myapp", 2);

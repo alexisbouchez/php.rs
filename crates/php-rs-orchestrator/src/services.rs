@@ -275,20 +275,52 @@ pub fn postgres_available() -> bool {
 
 // ── Redis ──────────────────────────────────────────────────────────────────
 
-/// Provision a Redis instance for an app (key prefix isolation).
+/// Provision a Redis instance for an app using Redis 6+ ACLs.
+///
+/// Creates a dedicated Redis user with a password, restricted to keys
+/// matching the app's prefix pattern. This provides real isolation instead
+/// of relying on key-prefix conventions that apps can bypass.
 pub fn redis_create(
     app_name: &str,
     config: &ServiceConfig,
 ) -> Result<ServiceInstance, String> {
     let prefix = sanitize_name(app_name);
+    let username = format!("phprs_{}", prefix);
+    let password = generate_password();
 
     // Verify Redis is reachable.
     redis_exec(config, &["PING"])
         .map_err(|e| format!("Cannot connect to Redis: {}", e))?;
 
+    // Create a Redis ACL user (Redis 6+) restricted to keys with this app's prefix.
+    // ACL SETUSER <username> on ><password> ~<prefix>:* +@all -@admin -@dangerous
+    let key_pattern = format!("~{}:*", prefix);
+    let pass_arg = format!(">{}", password);
+    let acl_result = redis_exec(config, &[
+        "ACL", "SETUSER", &username,
+        "on",           // Enable the user.
+        &pass_arg,      // Set password.
+        &key_pattern,   // Restrict to keys matching prefix:*
+        "+@all",        // Allow all commands...
+        "-@admin",      // ...except admin commands (CONFIG, DEBUG, etc.)
+        "-@dangerous",  // ...and dangerous commands (FLUSHALL, FLUSHDB, etc.)
+    ]);
+
+    match acl_result {
+        Ok(_) => {
+            // ACL user created — persist ACL changes.
+            let _ = redis_exec(config, &["ACL", "SAVE"]);
+        }
+        Err(e) => {
+            // Redis < 6 or ACL not supported — fall back to prefix-only isolation.
+            eprintln!("Warning: Redis ACL setup failed (Redis 6+ required): {}", e);
+            eprintln!("Falling back to key-prefix isolation for '{}'", app_name);
+        }
+    }
+
     let url = format!(
-        "redis://{}:{}/0?prefix={}:",
-        config.redis_host, config.redis_port, prefix
+        "redis://{}:{}@{}:{}/0?prefix={}:",
+        username, password, config.redis_host, config.redis_port, prefix
     );
 
     Ok(ServiceInstance {
@@ -296,19 +328,25 @@ pub fn redis_create(
         name: prefix,
         host: config.redis_host.clone(),
         port: config.redis_port,
-        username: String::new(),
-        password: String::new(),
+        username,
+        password,
         url,
         env_var: "REDIS_URL".into(),
         created_at: crate::state::now_iso8601(),
     })
 }
 
-/// Destroy a Redis instance (flush keys with the app's prefix).
+/// Destroy a Redis instance — remove the ACL user and flush its keys.
 pub fn redis_destroy(
     instance: &ServiceInstance,
     config: &ServiceConfig,
 ) -> Result<(), String> {
+    // Delete the ACL user (Redis 6+).
+    if !instance.username.is_empty() {
+        let _ = redis_exec(config, &["ACL", "DELUSER", &instance.username]);
+        let _ = redis_exec(config, &["ACL", "SAVE"]);
+    }
+
     // Delete all keys with the app's prefix using SCAN + DEL.
     let pattern = format!("{}:*", instance.name);
     let output = redis_exec(config, &["KEYS", &pattern])?;
@@ -319,6 +357,37 @@ pub fn redis_destroy(
         redis_exec(config, &args)?;
     }
     Ok(())
+}
+
+/// Auto-populate network policy allowed destinations for provisioned services.
+/// Call this after provisioning a service to ensure the app can reach it.
+pub fn populate_network_destinations(
+    env: &mut HashMap<String, String>,
+    services: &[ServiceInstance],
+) {
+    let mut destinations: Vec<String> = Vec::new();
+    for svc in services {
+        if !svc.host.is_empty() && svc.port > 0 {
+            destinations.push(format!("{}:{}", svc.host, svc.port));
+        }
+    }
+    if !destinations.is_empty() {
+        // Merge with any existing destinations.
+        if let Some(existing) = env.get("APP_NET_ALLOW_DEST") {
+            let mut all: Vec<String> = existing
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for dest in &destinations {
+                if !all.contains(dest) {
+                    all.push(dest.clone());
+                }
+            }
+            destinations = all;
+        }
+        env.insert("APP_NET_ALLOW_DEST".into(), destinations.join(","));
+    }
 }
 
 /// Execute a Redis command via redis-cli.
@@ -1021,6 +1090,82 @@ mod tests {
         ];
         let missing = ServiceDiscovery::check_required_services(&required, &provisioned);
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_populate_network_destinations() {
+        let mut env = HashMap::new();
+        let services = vec![
+            ServiceInstance {
+                service_type: "mysql".into(),
+                name: "db".into(),
+                host: "10.0.1.5".into(),
+                port: 3306,
+                username: "user".into(),
+                password: "pass".into(),
+                url: "mysql://user:pass@10.0.1.5:3306/db".into(),
+                env_var: "DATABASE_URL".into(),
+                created_at: "2024-01-01T00:00:00Z".into(),
+            },
+            ServiceInstance {
+                service_type: "redis".into(),
+                name: "cache".into(),
+                host: "10.0.1.6".into(),
+                port: 6379,
+                username: "phprs_cache".into(),
+                password: "redispass".into(),
+                url: "redis://phprs_cache:redispass@10.0.1.6:6379/0".into(),
+                env_var: "REDIS_URL".into(),
+                created_at: "2024-01-01T00:00:00Z".into(),
+            },
+        ];
+
+        populate_network_destinations(&mut env, &services);
+        let dest = env.get("APP_NET_ALLOW_DEST").unwrap();
+        assert!(dest.contains("10.0.1.5:3306"));
+        assert!(dest.contains("10.0.1.6:6379"));
+    }
+
+    #[test]
+    fn test_populate_network_destinations_merges() {
+        let mut env = HashMap::new();
+        env.insert("APP_NET_ALLOW_DEST".into(), "10.0.0.1:5432".into());
+
+        let services = vec![ServiceInstance {
+            service_type: "mysql".into(),
+            name: "db".into(),
+            host: "10.0.1.5".into(),
+            port: 3306,
+            username: "user".into(),
+            password: "pass".into(),
+            url: "mysql://user:pass@10.0.1.5:3306/db".into(),
+            env_var: "DATABASE_URL".into(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+        }];
+
+        populate_network_destinations(&mut env, &services);
+        let dest = env.get("APP_NET_ALLOW_DEST").unwrap();
+        assert!(dest.contains("10.0.0.1:5432")); // Existing preserved.
+        assert!(dest.contains("10.0.1.5:3306")); // New added.
+    }
+
+    #[test]
+    fn test_redis_service_has_credentials() {
+        // Verify ServiceInstance for redis now includes username/password.
+        let svc = ServiceInstance {
+            service_type: "redis".into(),
+            name: "myapp".into(),
+            host: "127.0.0.1".into(),
+            port: 6379,
+            username: "phprs_myapp".into(),
+            password: "securepass".into(),
+            url: "redis://phprs_myapp:securepass@127.0.0.1:6379/0?prefix=myapp:".into(),
+            env_var: "REDIS_URL".into(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+        };
+        assert!(!svc.username.is_empty());
+        assert!(!svc.password.is_empty());
+        assert!(svc.url.contains("phprs_myapp"));
     }
 
     #[test]

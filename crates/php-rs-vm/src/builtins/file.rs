@@ -5,6 +5,77 @@ use crate::vm::{Vm, VmResult};
 use php_rs_compiler::op::OperandType;
 use std::net::ToSocketAddrs;
 
+/// Parse a CSV line following RFC 4180 rules with PHP-compatible quoting.
+/// Handles: quoted fields, escaped quotes (doubled or backslash-escaped),
+/// embedded separators/newlines.
+fn parse_csv_line(line: &str, sep: char, enc: char, esc: Option<char>) -> PhpArray {
+    let mut arr = PhpArray::new();
+    let chars: Vec<char> = line.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    loop {
+        if i >= len {
+            break;
+        }
+
+        if chars[i] == enc {
+            // Quoted field
+            i += 1; // skip opening enclosure
+            let mut field = String::new();
+            while i < len {
+                // Doubled enclosure always means escaped enclosure (RFC 4180)
+                if chars[i] == enc && i + 1 < len && chars[i + 1] == enc {
+                    field.push(enc);
+                    i += 2;
+                    continue;
+                }
+                // Escape char (when different from enclosure) escapes the next char
+                if let Some(esc_c) = esc {
+                    if esc_c != enc && chars[i] == esc_c && i + 1 < len {
+                        field.push(chars[i + 1]);
+                        i += 2;
+                        continue;
+                    }
+                }
+                if chars[i] == enc {
+                    // End of quoted field
+                    i += 1;
+                    break;
+                }
+                field.push(chars[i]);
+                i += 1;
+            }
+            arr.push(Value::String(field));
+            // Skip separator after quoted field
+            if i < len && chars[i] == sep {
+                i += 1;
+                // Trailing separator means empty final field
+                if i >= len {
+                    arr.push(Value::String(String::new()));
+                }
+            }
+        } else {
+            // Unquoted field
+            let mut field = String::new();
+            while i < len && chars[i] != sep {
+                field.push(chars[i]);
+                i += 1;
+            }
+            arr.push(Value::String(field));
+            if i < len && chars[i] == sep {
+                i += 1;
+                // If separator is at end of line, there's one more empty field
+                if i >= len {
+                    arr.push(Value::String(String::new()));
+                }
+            }
+        }
+    }
+
+    arr
+}
+
 /// Match a filename against a glob pattern supporting *, ?, and [...] character classes.
 /// PHP's glob uses [...] for character classes: [abc] matches a, b, or c.
 /// [[] matches a literal '['. [!abc] or [^abc] matches anything except a, b, c.
@@ -255,7 +326,80 @@ pub(crate) fn dispatch(
             let f = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             vm.check_open_basedir(&f)?;
             let d = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
-            match vm.vm_write_file(&f, d.as_bytes()) {
+            let flags = args
+                .get(2)
+                .map(|v| v.to_long())
+                .unwrap_or(0);
+            let append = (flags & 8) != 0; // FILE_APPEND = 8
+            let lock_ex = (flags & 2) != 0; // LOCK_EX = 2
+
+            let result = if append {
+                // Append mode
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&f);
+                    match file {
+                        Ok(ref mut file) => {
+                            #[cfg(unix)]
+                            if lock_ex {
+                                use std::os::unix::io::AsRawFd;
+                                unsafe {
+                                    libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+                                }
+                            }
+                            file.write_all(d.as_bytes())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let _ = lock_ex;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "No filesystem",
+                    ))
+                }
+            } else if lock_ex {
+                // Write with lock
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    use std::io::Write;
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(true)
+                        .open(&f);
+                    match file {
+                        Ok(ref mut file) => {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::io::AsRawFd;
+                                unsafe {
+                                    libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+                                }
+                            }
+                            file.write_all(d.as_bytes())
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "No filesystem",
+                    ))
+                }
+            } else {
+                vm.vm_write_file(&f, d.as_bytes())
+            };
+
+            match result {
                 Ok(()) => Ok(Some(Value::Long(d.len() as i64))),
                 Err(_) => Ok(Some(Value::Bool(false))),
             }
@@ -277,12 +421,20 @@ pub(crate) fn dispatch(
         }
         "dirname" => {
             let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            Ok(Some(Value::String(
-                std::path::Path::new(&p)
+            let levels = args.get(1).map(|v| v.to_long()).unwrap_or(1).max(1) as usize;
+            let mut path = std::path::PathBuf::from(&p);
+            for _ in 0..levels {
+                path = path
                     .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| ".".to_string()),
-            )))
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+            }
+            let result = path.to_string_lossy().to_string();
+            Ok(Some(Value::String(if result.is_empty() {
+                ".".to_string()
+            } else {
+                result
+            })))
         }
         "basename" => {
             let p = args.first().cloned().unwrap_or(Value::Null).to_php_string();
@@ -890,15 +1042,22 @@ pub(crate) fn dispatch(
                 .get(2)
                 .map(|v| v.to_php_string())
                 .unwrap_or_else(|| ",".into());
+            let enclosure = args
+                .get(3)
+                .map(|v| v.to_php_string())
+                .unwrap_or_else(|| "\"".into());
+            let escape_char = args
+                .get(4)
+                .map(|v| v.to_php_string())
+                .unwrap_or_else(|| "\\".into());
             let sep = separator.chars().next().unwrap_or(',');
+            let enc = enclosure.chars().next().unwrap_or('"');
+            let esc = escape_char.chars().next();
             if let Some(handle) = vm.file_handles.get_mut(&id) {
                 match handle.gets() {
                     Ok(Some(line)) => {
-                        let mut arr = PhpArray::new();
                         let line = line.trim_end_matches('\n').trim_end_matches('\r');
-                        for field in line.split(sep) {
-                            arr.push(Value::String(field.trim_matches('"').to_string()));
-                        }
+                        let arr = parse_csv_line(line, sep, enc, esc);
                         Ok(Some(Value::Array(arr)))
                     }
                     _ => Ok(Some(Value::Bool(false))),

@@ -6492,12 +6492,140 @@ fn php_odbc_connection_string_quote(
 }
 
 fn register_apcu(r: &mut BuiltinRegistry) {
-    r.insert("apcu_fetch", stub_false);
-    r.insert("apcu_store", stub_true);
-    r.insert("apcu_add", stub_true);
-    r.insert("apcu_delete", stub_true);
-    r.insert("apcu_exists", stub_false);
-    r.insert("apcu_clear_cache", stub_true);
+    r.insert("apcu_fetch", php_apcu_fetch);
+    r.insert("apcu_store", php_apcu_store);
+    r.insert("apcu_add", php_apcu_add);
+    r.insert("apcu_delete", php_apcu_delete);
+    r.insert("apcu_exists", php_apcu_exists);
+    r.insert("apcu_clear_cache", php_apcu_clear_cache);
+    r.insert("apcu_cache_info", php_apcu_cache_info);
+    r.insert("apcu_enabled", stub_true);
+    r.insert("apcu_inc", php_apcu_inc);
+    r.insert("apcu_dec", php_apcu_dec);
+}
+
+fn php_apcu_fetch(
+    vm: &mut Vm,
+    args: &[Value],
+    ref_args: &[(usize, OperandType, u32)],
+    ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let key = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let cached = vm.apcu_cache.get(&key).cloned();
+    match cached {
+        Some(val) => {
+            // Set $success to true if ref arg provided
+            vm.write_back_arg(1, Value::Bool(true), ref_args, ref_prop_args);
+            Ok(val)
+        }
+        None => {
+            vm.write_back_arg(1, Value::Bool(false), ref_args, ref_prop_args);
+            Ok(Value::Bool(false))
+        }
+    }
+}
+
+fn php_apcu_store(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let key = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let val = args.get(1).cloned().unwrap_or(Value::Null);
+    vm.apcu_cache.insert(key, val);
+    Ok(Value::Bool(true))
+}
+
+fn php_apcu_add(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let key = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    if vm.apcu_cache.contains_key(&key) {
+        return Ok(Value::Bool(false)); // already exists
+    }
+    let val = args.get(1).cloned().unwrap_or(Value::Null);
+    vm.apcu_cache.insert(key, val);
+    Ok(Value::Bool(true))
+}
+
+fn php_apcu_delete(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let key = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    Ok(Value::Bool(vm.apcu_cache.remove(&key).is_some()))
+}
+
+fn php_apcu_exists(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let key = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    Ok(Value::Bool(vm.apcu_cache.contains_key(&key)))
+}
+
+fn php_apcu_clear_cache(
+    vm: &mut Vm,
+    _args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    vm.apcu_cache.clear();
+    Ok(Value::Bool(true))
+}
+
+fn php_apcu_cache_info(
+    vm: &mut Vm,
+    _args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let mut info = PhpArray::new();
+    info.set_string("num_slots".into(), Value::Long(4099));
+    info.set_string("ttl".into(), Value::Long(0));
+    info.set_string("num_hits".into(), Value::Long(0));
+    info.set_string("num_misses".into(), Value::Long(0));
+    info.set_string("num_entries".into(), Value::Long(vm.apcu_cache.len() as i64));
+    info.set_string("memory_size".into(), Value::Long(0));
+    Ok(Value::Array(info))
+}
+
+fn php_apcu_inc(
+    vm: &mut Vm,
+    args: &[Value],
+    ref_args: &[(usize, OperandType, u32)],
+    ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let key = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let step = args.get(1).map(|v| v.to_long()).unwrap_or(1);
+    let current = vm.apcu_cache.get(&key).map(|v| v.to_long()).unwrap_or(0);
+    let new_val = current + step;
+    vm.apcu_cache.insert(key, Value::Long(new_val));
+    vm.write_back_arg(2, Value::Bool(true), ref_args, ref_prop_args);
+    Ok(Value::Long(new_val))
+}
+
+fn php_apcu_dec(
+    vm: &mut Vm,
+    args: &[Value],
+    ref_args: &[(usize, OperandType, u32)],
+    ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let key = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    let step = args.get(1).map(|v| v.to_long()).unwrap_or(1);
+    let current = vm.apcu_cache.get(&key).map(|v| v.to_long()).unwrap_or(0);
+    let new_val = current - step;
+    vm.apcu_cache.insert(key, Value::Long(new_val));
+    vm.write_back_arg(2, Value::Bool(true), ref_args, ref_prop_args);
+    Ok(Value::Long(new_val))
 }
 
 // ═══════════════════════════════════════════════════════════════════

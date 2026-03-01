@@ -374,8 +374,16 @@ pub(crate) fn dispatch(
             let padding: String = pad_str.chars().cycle().take(diff).collect();
 
             let result = match pad_type {
-                2 => format!("{}{}", padding, input), // STR_PAD_LEFT
-                _ => format!("{}{}", input, padding), // STR_PAD_RIGHT (default)
+                0 => format!("{}{}", padding, input), // STR_PAD_LEFT
+                2 => {
+                    // STR_PAD_BOTH
+                    let left = diff / 2;
+                    let right = diff - left;
+                    let lpad: String = pad_str.chars().cycle().take(left).collect();
+                    let rpad: String = pad_str.chars().cycle().take(right).collect();
+                    format!("{}{}{}", lpad, input, rpad)
+                }
+                _ => format!("{}{}", input, padding), // STR_PAD_RIGHT (default, 1)
             };
             Ok(Some(Value::String(result)))
         }
@@ -744,15 +752,39 @@ pub(crate) fn dispatch(
             }
         }
         "strtok" => {
-            // Simplified: just split on first char of delimiter and return first token
-            let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
-            let delim = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
-            if delim.is_empty() {
-                return Ok(Some(Value::String(s)));
-            }
-            match s.find(|c: char| delim.contains(c)) {
-                Some(pos) => Ok(Some(Value::String(s[..pos].to_string()))),
-                None => Ok(Some(Value::String(s))),
+            // PHP strtok is stateful: strtok($string, $delim) initializes, strtok($delim) continues
+            let delim = if args.len() >= 2 {
+                // strtok($string, $token) — initialize with new string
+                let s = args[0].to_php_string();
+                let d = args[1].to_php_string();
+                vm.strtok_state = Some((s, 0));
+                d
+            } else {
+                // strtok($token) — continue with stored string
+                args.first().map(|v| v.to_php_string()).unwrap_or_default()
+            };
+
+            if let Some((ref stored_str, ref mut pos)) = vm.strtok_state {
+                let bytes = stored_str.as_bytes();
+                let len = bytes.len();
+                let mut start = *pos;
+                // Skip leading delimiters
+                while start < len && delim.contains(bytes[start] as char) {
+                    start += 1;
+                }
+                if start >= len {
+                    return Ok(Some(Value::Bool(false)));
+                }
+                // Find next delimiter
+                let mut end = start;
+                while end < len && !delim.contains(bytes[end] as char) {
+                    end += 1;
+                }
+                let token = stored_str[start..end].to_string();
+                *pos = end;
+                Ok(Some(Value::String(token)))
+            } else {
+                Ok(Some(Value::Bool(false)))
             }
         }
         "str_getcsv" => {
@@ -1880,16 +1912,85 @@ pub(crate) fn dispatch(
                 Ok(Some(Value::Bool(false)))
             }
         }
-        "hash_init" | "hash_copy" => {
-            // Context-based hashing - return a resource placeholder
-            Ok(Some(Value::Long(0)))
+        "hash_init" => {
+            let algo = args.first().map(|v| v.to_php_string().to_lowercase()).unwrap_or_default();
+            let id = vm.next_resource_id;
+            vm.next_resource_id += 1;
+            vm.hash_contexts.insert(id, (algo, Vec::new()));
+            Ok(Some(Value::Resource(id, "Hash Context".into())))
         }
-        "hash_update" | "hash_update_file" | "hash_update_stream" => Ok(Some(Value::Bool(true))),
+        "hash_copy" => {
+            let ctx_id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                Some(v) => v.to_long(),
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            if let Some((algo, data)) = vm.hash_contexts.get(&ctx_id) {
+                let id = vm.next_resource_id;
+                vm.next_resource_id += 1;
+                vm.hash_contexts.insert(id, (algo.clone(), data.clone()));
+                Ok(Some(Value::Resource(id, "Hash Context".into())))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "hash_update" => {
+            let ctx_id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                Some(v) => v.to_long(),
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let data = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+            if let Some((_, ref mut buf)) = vm.hash_contexts.get_mut(&ctx_id) {
+                buf.extend_from_slice(data.as_bytes());
+                Ok(Some(Value::Bool(true)))
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
+        }
+        "hash_update_file" | "hash_update_stream" => {
+            let ctx_id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                Some(v) => v.to_long(),
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let filename = args.get(1).map(|v| v.to_php_string()).unwrap_or_default();
+            if let Ok(data) = vm.vm_read_file(&filename) {
+                if let Some((_, ref mut buf)) = vm.hash_contexts.get_mut(&ctx_id) {
+                    buf.extend_from_slice(&data);
+                    return Ok(Some(Value::Bool(true)));
+                }
+            }
+            Ok(Some(Value::Bool(false)))
+        }
         "hash_final" => {
-            // Without real context tracking, return empty hash
-            Ok(Some(Value::String(
-                "d41d8cd98f00b204e9800998ecf8427e".to_string(),
-            )))
+            let ctx_id = match args.first() {
+                Some(Value::Resource(id, _)) => *id,
+                Some(v) => v.to_long(),
+                _ => return Ok(Some(Value::Bool(false))),
+            };
+            let raw = args.get(1).map(|v| v.to_bool()).unwrap_or(false);
+            if let Some((algo, data)) = vm.hash_contexts.remove(&ctx_id) {
+                let input = String::from_utf8_lossy(&data);
+                match php_rs_ext_hash::php_hash(&algo, &input) {
+                    Some(hex_result) => {
+                        if raw {
+                            let bytes: Vec<u8> = (0..hex_result.len())
+                                .step_by(2)
+                                .filter_map(|i| u8::from_str_radix(&hex_result[i..i + 2], 16).ok())
+                                .collect();
+                            Ok(Some(Value::String(
+                                crate::builtins::remaining::bytes_to_php_string(&bytes),
+                            )))
+                        } else {
+                            Ok(Some(Value::String(hex_result)))
+                        }
+                    }
+                    None => Ok(Some(Value::Bool(false))),
+                }
+            } else {
+                Ok(Some(Value::Bool(false)))
+            }
         }
         "hash_pbkdf2" => {
             let algo = args

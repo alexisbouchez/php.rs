@@ -645,22 +645,32 @@ fn php_array_column(
     if let Value::Array(ref a) = input {
         let mut result = PhpArray::new();
         for (_, row) in a.entries() {
-            if let Value::Array(ref row_arr) = row {
-                let val = if column_key.is_null() {
-                    row.clone()
-                } else {
-                    row_arr.get(&column_key).cloned().unwrap_or(Value::Null)
-                };
-                match &index_key {
-                    Some(ik) if !ik.is_null() => {
-                        if let Some(idx) = row_arr.get(ik) {
-                            result.set(idx, val);
-                        } else {
-                            result.push(val);
-                        }
+            // Helper to get a value by key from either arrays or objects
+            let get_val = |row: &Value, key: &Value| -> Option<Value> {
+                match row {
+                    Value::Array(ref arr) => arr.get(key).cloned(),
+                    Value::Object(ref obj) => {
+                        let prop_name = key.to_php_string();
+                        obj.get_property(&prop_name)
                     }
-                    _ => result.push(val),
+                    _ => None,
                 }
+            };
+
+            let val = if column_key.is_null() {
+                row.clone()
+            } else {
+                get_val(row, &column_key).unwrap_or(Value::Null)
+            };
+            match &index_key {
+                Some(ik) if !ik.is_null() => {
+                    if let Some(idx) = get_val(row, ik) {
+                        result.set(&idx, val);
+                    } else {
+                        result.push(val);
+                    }
+                }
+                _ => result.push(val),
             }
         }
         Ok(Value::Array(result))
@@ -1049,13 +1059,27 @@ fn php_array_map(
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
     let callback = args.first().cloned().unwrap_or(Value::Null);
-    let arr = args.get(1).cloned().unwrap_or(Value::Null);
-    if let Value::Array(ref a) = arr {
+
+    // Collect all array arguments (args[1], args[2], ...)
+    let arrays: Vec<&PhpArray> = args[1..]
+        .iter()
+        .filter_map(|v| match v {
+            Value::Array(ref a) => Some(a),
+            _ => None,
+        })
+        .collect();
+
+    if arrays.is_empty() {
+        return Ok(Value::Array(PhpArray::new()));
+    }
+
+    // Single array case (most common)
+    if arrays.len() == 1 {
+        let a = arrays[0];
         let entries: Vec<_> = a.entries().iter().cloned().collect();
         let mut result = PhpArray::new();
         if callback == Value::Null {
-            // null callback = identity
-            return Ok(arr.clone());
+            return Ok(args.get(1).cloned().unwrap_or(Value::Null));
         }
         let cb_name = Vm::extract_closure_name(&callback);
         for (key, val) in &entries {
@@ -1065,10 +1089,43 @@ fn php_array_map(
                 ArrayKey::String(s) => result.set_string(s.clone(), mapped),
             }
         }
-        Ok(Value::Array(result))
-    } else {
-        Ok(Value::Array(PhpArray::new()))
+        return Ok(Value::Array(result));
     }
+
+    // Multiple arrays case: iterate by index, pass one element from each array
+    let max_len = arrays.iter().map(|a| a.len()).max().unwrap_or(0);
+    let mut result = PhpArray::new();
+
+    if callback == Value::Null {
+        // null callback with multiple arrays = array of arrays
+        for i in 0..max_len {
+            let mut sub = PhpArray::new();
+            for a in &arrays {
+                let val = a
+                    .get(&Value::Long(i as i64))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                sub.push(val);
+            }
+            result.push(Value::Array(sub));
+        }
+    } else {
+        let cb_name = Vm::extract_closure_name(&callback);
+        for i in 0..max_len {
+            let cb_args: Vec<Value> = arrays
+                .iter()
+                .map(|a| {
+                    a.get(&Value::Long(i as i64))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            let mapped = vm.invoke_user_callback(&cb_name, cb_args)?;
+            result.push(mapped);
+        }
+    }
+
+    Ok(Value::Array(result))
 }
 
 // ---------------------------------------------------------------------------

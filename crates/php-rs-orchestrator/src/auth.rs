@@ -5,6 +5,12 @@
 //! - Session cookie — for the web dashboard
 //!
 //! User data and tokens stored in a JSON file at ~/.php-rs/users.json.
+//!
+//! Security features:
+//! - bcrypt password hashing (cost=12)
+//! - Cryptographically secure token generation via ring::rand::SystemRandom
+//! - Legacy SHA-256 hash support with automatic upgrade on login
+//! - IP-based rate limiting on login (token bucket, 10 attempts/minute)
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,12 +18,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// bcrypt cost factor (12 = ~250ms per hash on modern hardware).
+const BCRYPT_COST: u32 = 12;
+
 /// A registered user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub id: u64,
     pub username: String,
-    /// Bcrypt-hashed password.
+    /// Bcrypt-hashed password (or legacy "sha256:salt:hash" format).
     pub password_hash: String,
     pub email: String,
     /// API tokens for this user.
@@ -147,7 +156,8 @@ impl UserStore {
     }
 
     /// Authenticate with username + password. Returns user ID on success.
-    pub fn login(&self, username: &str, password: &str) -> Result<u64, String> {
+    /// Automatically upgrades legacy SHA-256 hashes to bcrypt.
+    pub fn login(&mut self, username: &str, password: &str) -> Result<u64, String> {
         let user = self
             .users
             .iter()
@@ -155,7 +165,18 @@ impl UserStore {
             .ok_or_else(|| "Invalid username or password".to_string())?;
 
         if verify_password(password, &user.password_hash)? {
-            Ok(user.id)
+            let user_id = user.id;
+
+            // Auto-upgrade legacy SHA-256 hashes to bcrypt on successful login.
+            if user.password_hash.starts_with("sha256:") {
+                if let Ok(new_hash) = hash_password(password) {
+                    if let Some(u) = self.users.iter_mut().find(|u| u.id == user_id) {
+                        u.password_hash = new_hash;
+                    }
+                }
+            }
+
+            Ok(user_id)
         } else {
             Err("Invalid username or password".into())
         }
@@ -293,16 +314,29 @@ impl UserStore {
     }
 }
 
-/// Hash a password using SHA-256 + salt (simple, no bcrypt dependency).
-/// Format: "sha256:{salt}:{hash}"
+// ── Password Hashing ────────────────────────────────────────────────────────
+
+/// Hash a password using bcrypt with cost factor 12.
 fn hash_password(password: &str) -> Result<String, String> {
-    let salt = generate_salt();
-    let hash = sha256_hex(&format!("{}{}", salt, password));
-    Ok(format!("sha256:{}:{}", salt, hash))
+    bcrypt::hash(password, BCRYPT_COST)
+        .map_err(|e| format!("bcrypt hash failed: {}", e))
 }
 
 /// Verify a password against a stored hash.
+/// Supports both bcrypt and legacy "sha256:salt:hash" format.
 fn verify_password(password: &str, stored: &str) -> Result<bool, String> {
+    if stored.starts_with("sha256:") {
+        // Legacy SHA-256 format: "sha256:{salt}:{hash}"
+        verify_password_sha256_legacy(password, stored)
+    } else {
+        // bcrypt format (starts with "$2b$" or "$2a$" or "$2y$")
+        bcrypt::verify(password, stored)
+            .map_err(|e| format!("bcrypt verify failed: {}", e))
+    }
+}
+
+/// Verify a legacy SHA-256 password hash.
+fn verify_password_sha256_legacy(password: &str, stored: &str) -> Result<bool, String> {
     let parts: Vec<&str> = stored.splitn(3, ':').collect();
     if parts.len() != 3 || parts[0] != "sha256" {
         return Err("Invalid hash format".into());
@@ -313,43 +347,106 @@ fn verify_password(password: &str, stored: &str) -> Result<bool, String> {
     Ok(computed == expected_hash)
 }
 
-/// Generate a random hex token (32 bytes = 64 hex chars).
+// ── Token Generation ────────────────────────────────────────────────────────
+
+/// Generate a cryptographically secure random hex token (32 bytes = 64 hex chars).
+/// Uses ring::rand::SystemRandom for secure random bytes.
 fn generate_token() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    epoch_nanos().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    let h1 = hasher.finish();
-
-    let mut hasher2 = DefaultHasher::new();
-    (h1 ^ 0xdeadbeef).hash(&mut hasher2);
-    epoch_nanos().hash(&mut hasher2);
-    let h2 = hasher2.finish();
-
-    format!("{:016x}{:016x}", h1, h2)
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    ring::rand::SecureRandom::fill(&rng, &mut bytes)
+        .expect("SystemRandom fill failed");
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Generate a random salt (16 hex chars).
-fn generate_salt() -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+// ── Rate Limiting ───────────────────────────────────────────────────────────
 
-    let mut hasher = DefaultHasher::new();
-    epoch_nanos().hash(&mut hasher);
-    std::process::id().hash(&mut hasher);
-    std::thread::current().id().hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+/// Token-bucket rate limiter for login attempts.
+/// Allows `max_attempts` per `window_secs` per IP address.
+pub struct RateLimiter {
+    /// Map of IP address → list of attempt timestamps (epoch seconds).
+    attempts: std::sync::Mutex<HashMap<String, Vec<u64>>>,
+    /// Maximum attempts allowed per window.
+    max_attempts: u64,
+    /// Window size in seconds.
+    window_secs: u64,
 }
 
-/// Simple SHA-256 (manual implementation for no extra dependencies).
+impl RateLimiter {
+    /// Create a new rate limiter.
+    pub fn new(max_attempts: u64, window_secs: u64) -> Self {
+        Self {
+            attempts: std::sync::Mutex::new(HashMap::new()),
+            max_attempts,
+            window_secs,
+        }
+    }
+
+    /// Create a default login rate limiter (10 attempts per 60 seconds).
+    pub fn login_default() -> Self {
+        Self::new(10, 60)
+    }
+
+    /// Check if an IP is rate limited. Returns Ok(()) if allowed,
+    /// Err(seconds_until_retry) if rate limited.
+    pub fn check(&self, ip: &str) -> Result<(), u64> {
+        let now = epoch_secs();
+        let mut attempts = self.attempts.lock().unwrap();
+        let entry = attempts.entry(ip.to_string()).or_default();
+
+        // Remove expired attempts outside the window.
+        let cutoff = now.saturating_sub(self.window_secs);
+        entry.retain(|&t| t > cutoff);
+
+        if entry.len() as u64 >= self.max_attempts {
+            // Rate limited — calculate seconds until the oldest attempt expires.
+            let oldest = entry.first().copied().unwrap_or(now);
+            let retry_after = (oldest + self.window_secs).saturating_sub(now);
+            Err(retry_after)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Record a login attempt for an IP.
+    pub fn record_attempt(&self, ip: &str) {
+        let now = epoch_secs();
+        let mut attempts = self.attempts.lock().unwrap();
+        let entry = attempts.entry(ip.to_string()).or_default();
+
+        // Clean up old entries while we're here.
+        let cutoff = now.saturating_sub(self.window_secs);
+        entry.retain(|&t| t > cutoff);
+
+        entry.push(now);
+    }
+
+    /// Reset rate limit for an IP (e.g. after successful login).
+    pub fn reset(&self, ip: &str) {
+        let mut attempts = self.attempts.lock().unwrap();
+        attempts.remove(ip);
+    }
+
+    /// Clean up stale entries (call periodically).
+    pub fn cleanup(&self) {
+        let now = epoch_secs();
+        let cutoff = now.saturating_sub(self.window_secs);
+        let mut attempts = self.attempts.lock().unwrap();
+        attempts.retain(|_, timestamps| {
+            timestamps.retain(|&t| t > cutoff);
+            !timestamps.is_empty()
+        });
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// SHA-256 hash for legacy password verification (using ring).
 fn sha256_hex(input: &str) -> String {
     sha256_bytes(input.as_bytes())
 }
 
 fn sha256_bytes(data: &[u8]) -> String {
-    // Use ring for SHA-256 since we already depend on it.
     use ring::digest;
     let d = digest::digest(&digest::SHA256, data);
     d.as_ref()
@@ -363,13 +460,6 @@ fn epoch_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn epoch_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
 }
 
 fn users_file_path() -> PathBuf {
@@ -418,6 +508,74 @@ mod tests {
         assert!(store.login("nouser", "password123").is_err());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_bcrypt_hash_format() {
+        let hash = hash_password("testpass").unwrap();
+        // bcrypt hashes start with "$2b$"
+        assert!(hash.starts_with("$2b$"), "Hash should be bcrypt format, got: {}", hash);
+        assert!(verify_password("testpass", &hash).unwrap());
+        assert!(!verify_password("wrongpass", &hash).unwrap());
+    }
+
+    #[test]
+    fn test_legacy_sha256_verification() {
+        // Manually create a legacy SHA-256 hash.
+        let salt = "abcdef0123456789";
+        let password = "legacypass";
+        let hash = sha256_hex(&format!("{}{}", salt, password));
+        let stored = format!("sha256:{}:{}", salt, hash);
+
+        // Should still verify correctly.
+        assert!(verify_password(password, &stored).unwrap());
+        assert!(!verify_password("wrongpass", &stored).unwrap());
+    }
+
+    #[test]
+    fn test_legacy_hash_auto_upgrade() {
+        let path = test_store_path();
+        let mut store = UserStore::load_from(&path);
+
+        // Register a user (will use bcrypt).
+        store.register("upgradeuser", "mypass", "up@test.com").unwrap();
+
+        // Manually set a legacy SHA-256 hash to simulate migration.
+        let salt = "deadbeef01234567";
+        let hash = sha256_hex(&format!("{}{}", salt, "mypass"));
+        store.users[0].password_hash = format!("sha256:{}:{}", salt, hash);
+        assert!(store.users[0].password_hash.starts_with("sha256:"));
+
+        // Login should succeed and upgrade the hash.
+        let uid = store.login("upgradeuser", "mypass").unwrap();
+        assert_eq!(uid, 1);
+
+        // Hash should now be bcrypt.
+        assert!(store.users[0].password_hash.starts_with("$2b$"),
+            "Hash should be upgraded to bcrypt, got: {}", store.users[0].password_hash);
+
+        // Login should still work with the new bcrypt hash.
+        let uid2 = store.login("upgradeuser", "mypass").unwrap();
+        assert_eq!(uid2, 1);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn test_secure_token_generation() {
+        let t1 = generate_token();
+        let t2 = generate_token();
+
+        // Should be 64 hex chars (32 bytes).
+        assert_eq!(t1.len(), 64);
+        assert_eq!(t2.len(), 64);
+
+        // Should be valid hex.
+        assert!(t1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(t2.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Should be different (cryptographically random).
+        assert_ne!(t1, t2);
     }
 
     #[test]
@@ -492,7 +650,7 @@ mod tests {
         store.register("user1", "pass1", "user@test.com").unwrap();
         store.save_to(&path).unwrap();
 
-        let loaded = UserStore::load_from(&path);
+        let mut loaded = UserStore::load_from(&path);
         assert_eq!(loaded.users.len(), 1);
         assert_eq!(loaded.users[0].username, "user1");
         assert_eq!(loaded.next_id, 2);
@@ -567,7 +725,7 @@ mod tests {
     #[test]
     fn test_password_hash_verify() {
         let hash = hash_password("testpassword").unwrap();
-        assert!(hash.starts_with("sha256:"));
+        assert!(hash.starts_with("$2b$"));
         assert!(verify_password("testpassword", &hash).unwrap());
         assert!(!verify_password("wrongpassword", &hash).unwrap());
     }
@@ -587,5 +745,83 @@ mod tests {
         assert!(store.get_user_by_name("nouser").is_none());
 
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    // ── Rate Limiter Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_rate_limiter_allows_under_limit() {
+        let limiter = RateLimiter::new(3, 60);
+        let ip = "192.168.1.1";
+
+        // First 3 attempts should be allowed.
+        for _ in 0..3 {
+            assert!(limiter.check(ip).is_ok());
+            limiter.record_attempt(ip);
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_blocks_over_limit() {
+        let limiter = RateLimiter::new(3, 60);
+        let ip = "192.168.1.2";
+
+        // Record 3 attempts.
+        for _ in 0..3 {
+            limiter.record_attempt(ip);
+        }
+
+        // 4th check should be rate limited.
+        assert!(limiter.check(ip).is_err());
+    }
+
+    #[test]
+    fn test_rate_limiter_different_ips_independent() {
+        let limiter = RateLimiter::new(2, 60);
+
+        // Fill up IP 1.
+        limiter.record_attempt("10.0.0.1");
+        limiter.record_attempt("10.0.0.1");
+        assert!(limiter.check("10.0.0.1").is_err());
+
+        // IP 2 should still be allowed.
+        assert!(limiter.check("10.0.0.2").is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_reset() {
+        let limiter = RateLimiter::new(2, 60);
+        let ip = "10.0.0.3";
+
+        limiter.record_attempt(ip);
+        limiter.record_attempt(ip);
+        assert!(limiter.check(ip).is_err());
+
+        // Reset should clear the limit.
+        limiter.reset(ip);
+        assert!(limiter.check(ip).is_ok());
+    }
+
+    #[test]
+    fn test_rate_limiter_cleanup() {
+        let limiter = RateLimiter::new(10, 60);
+        limiter.record_attempt("stale-ip");
+        limiter.cleanup();
+        // Should not panic, stale entries will be cleaned on next window expiry.
+    }
+
+    #[test]
+    fn test_rate_limiter_login_default() {
+        let limiter = RateLimiter::login_default();
+        let ip = "1.2.3.4";
+
+        // Should allow 10 attempts.
+        for _ in 0..10 {
+            assert!(limiter.check(ip).is_ok());
+            limiter.record_attempt(ip);
+        }
+
+        // 11th should be blocked.
+        assert!(limiter.check(ip).is_err());
     }
 }
