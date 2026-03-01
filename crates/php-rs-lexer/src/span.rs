@@ -17,6 +17,7 @@
 /// assert_eq!(span.extract("<?php echo 42;"), "echo");
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Span {
     /// Byte offset from the start of the source (inclusive)
     pub start: usize,

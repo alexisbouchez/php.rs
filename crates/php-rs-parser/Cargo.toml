@@ -6,7 +6,11 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+serde = ["dep:serde", "php-rs-lexer/serde"]
+
 [dependencies]
 php-rs-lexer = { path = "../php-rs-lexer" }
+serde = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]

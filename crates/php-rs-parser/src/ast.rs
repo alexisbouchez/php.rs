@@ -17,6 +17,7 @@ use php_rs_lexer::Span;
 /// Contains the ordered list of top-level statements parsed from the source.
 /// This is the entry point for AST traversal and compilation.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Program {
     /// The top-level statements in source order.
     pub statements: Vec<Statement>,
@@ -30,6 +31,7 @@ pub struct Program {
 ///
 /// Every variant includes a [`Span`] field for source location.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Statement {
     /// Expression statement: `expr;`
     Expression { expr: Expression, span: Span },
@@ -216,6 +218,7 @@ pub enum Statement {
 ///
 /// Every variant includes a [`Span`] field for source location.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Expression {
     /// Integer literal
     IntLiteral { value: i64, span: Span },
@@ -447,6 +450,7 @@ pub enum Expression {
 
 /// Binary operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum BinaryOperator {
     // Arithmetic
     Add, // +
@@ -497,6 +501,7 @@ pub enum BinaryOperator {
 
 /// Unary operators
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UnaryOperator {
     Plus,          // +
     Minus,         // -
@@ -508,6 +513,7 @@ pub enum UnaryOperator {
 
 /// Cast types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CastType {
     Int,
     Float,
@@ -520,6 +526,7 @@ pub enum CastType {
 
 /// Magic constant kinds
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum MagicConstantKind {
     Line,      // __LINE__
     File,      // __FILE__
@@ -534,6 +541,7 @@ pub enum MagicConstantKind {
 
 /// Function/method argument
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Argument {
     pub name: Option<String>, // Named argument
     pub value: Expression,
@@ -543,6 +551,7 @@ pub struct Argument {
 
 /// Array element in array literal
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ArrayElement {
     pub key: Option<Expression>,
     pub value: Expression,
@@ -552,6 +561,7 @@ pub struct ArrayElement {
 
 /// Parameter in function/method declaration
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Parameter {
     pub name: String,
     pub param_type: Option<Type>,
@@ -566,6 +576,7 @@ pub struct Parameter {
 
 /// Type annotation
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Type {
     /// Named type (class name or built-in)
     Named { name: Name, span: Span },
@@ -584,6 +595,7 @@ pub enum Type {
 
 /// Qualified name (may include namespace)
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Name {
     pub parts: Vec<String>,
     pub fully_qualified: bool, // Leading backslash
@@ -592,6 +604,7 @@ pub struct Name {
 
 /// Switch case
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SwitchCase {
     pub condition: Option<Expression>, // None for default case
     pub statements: Vec<Statement>,
@@ -599,6 +612,7 @@ pub struct SwitchCase {
 
 /// Match arm (PHP 8.0+)
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MatchArm {
     pub conditions: Vec<Expression>, // Empty for default case
     pub body: Expression,
@@ -606,6 +620,7 @@ pub struct MatchArm {
 
 /// Use declaration
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct UseDeclaration {
     pub name: Name,
     pub alias: Option<String>,
@@ -613,6 +628,7 @@ pub struct UseDeclaration {
 
 /// Use kind
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UseKind {
     Normal,
     Function,
@@ -621,6 +637,7 @@ pub enum UseKind {
 
 /// Catch clause
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CatchClause {
     pub types: Vec<Name>,
     pub var: Option<String>,
@@ -629,6 +646,7 @@ pub struct CatchClause {
 
 /// Static variable declaration
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StaticVar {
     pub name: String,
     pub default: Option<Expression>,
@@ -636,6 +654,7 @@ pub struct StaticVar {
 
 /// Class member
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ClassMember {
     /// Property declaration
     Property {
@@ -676,6 +695,7 @@ pub enum ClassMember {
 
 /// Property hook (PHP 8.4+)
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PropertyHook {
     pub kind: PropertyHookKind,
     pub params: Vec<Parameter>,
@@ -686,6 +706,7 @@ pub struct PropertyHook {
 
 /// Property hook kind
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PropertyHookKind {
     Get,
     Set,
@@ -693,6 +714,7 @@ pub enum PropertyHookKind {
 
 /// Property hook body
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PropertyHookBody {
     Expression(Expression),
     Block(Vec<Statement>),
@@ -700,6 +722,7 @@ pub enum PropertyHookBody {
 
 /// Trait adaptation (alias/precedence)
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TraitAdaptation {
     Precedence {
         trait_name: Option<Name>,
@@ -716,6 +739,7 @@ pub enum TraitAdaptation {
 
 /// Modifier (visibility, static, abstract, etc.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Modifier {
     Public,
     Protected,
@@ -734,6 +758,7 @@ pub enum Modifier {
 
 /// Enum member
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum EnumMember {
     /// Enum case: `case Name [= value];`
     Case {
@@ -748,6 +773,7 @@ pub enum EnumMember {
 
 /// Closure use variable
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClosureUse {
     pub name: String,
     pub by_ref: bool,
@@ -755,6 +781,7 @@ pub struct ClosureUse {
 
 /// Attribute (#[...])
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Attribute {
     pub name: Name,
     pub args: Vec<Argument>,

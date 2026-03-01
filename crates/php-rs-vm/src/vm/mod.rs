@@ -1939,6 +1939,135 @@ impl Vm {
         self.raw_input_body = Some(body);
     }
 
+    /// Force-set an INI directive, bypassing permission checks.
+    /// Used by SAPIs to apply `-d` flags or pre-execution configuration.
+    pub fn ini_force_set(&mut self, name: &str, value: &str) {
+        self.ini.force_set(name, value);
+    }
+
+    /// Apply a VmConfig to this VM, updating execution limits and security settings.
+    pub fn apply_config(&mut self, config: VmConfig) {
+        self.config = config;
+    }
+
+    /// Get the response headers set by `header()` calls during execution.
+    pub fn take_response_headers(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.response_headers)
+    }
+
+    /// Get the response status code set by `http_response_code()` or `header()`.
+    pub fn take_response_code(&mut self) -> Option<u16> {
+        self.response_code.take()
+    }
+
+    /// Execute an opcode array while preserving functions, classes, and constants
+    /// from previous invocations. Only per-request transient state is cleared.
+    ///
+    /// This enables REPL-like behavior where each `eval()` call can reference
+    /// functions/classes defined in earlier calls.
+    pub fn execute_incremental(
+        &mut self,
+        op_array: &ZOpArray,
+        superglobals: Option<&HashMap<String, Value>>,
+    ) -> VmResult<String> {
+        // Save persistent state
+        let saved_functions = std::mem::take(&mut self.functions);
+        let mut saved_op_arrays = std::mem::take(&mut self.op_arrays);
+
+        // Clear only transient per-request state
+        self.output.clear();
+        self.ob_stack.clear();
+        self.session_id.clear();
+        self.session_started = false;
+        self.shutdown_functions.clear();
+        self.generators.clear();
+        self.fibers.clear();
+        self.closure_bindings.clear();
+        self.closure_scopes.clear();
+        self.current_exception = None;
+        self.current_fiber_id = None;
+        self.next_object_id = 1;
+        self.next_closure_id = 0;
+        self.last_return_value = Value::Null;
+        self.opcode_counter = 0;
+        self.response_headers.clear();
+        self.response_code = None;
+
+        // Reset request-scoped allocators
+        self.arena.reset();
+        self.string_pool.reset();
+
+        // Restore persistent op_arrays, append the new main script
+        let new_main_idx = saved_op_arrays.len();
+        saved_op_arrays.push(op_array.clone());
+        self.op_arrays = saved_op_arrays;
+        self.functions = saved_functions;
+
+        // Start execution timer
+        if self.config.max_execution_time > 0 {
+            self.execution_start_millis = Some(now_millis());
+        } else {
+            self.execution_start_millis = None;
+        }
+
+        // Pre-register nested function definitions from the new main script
+        self.register_dynamic_func_defs(new_main_idx);
+
+        if op_array.halt_compiler_offset > 0 {
+            self.constants.insert(
+                "__COMPILER_HALT_OFFSET__".to_string(),
+                Value::Long(op_array.halt_compiler_offset as i64),
+            );
+        }
+
+        if let Some(sg) = superglobals {
+            for (name, value) in sg {
+                self.superglobals.insert(name.clone(), value.clone());
+            }
+        }
+
+        let mut frame = Frame::new(op_array);
+        frame.op_array_idx = new_main_idx;
+        self.populate_superglobals(&mut frame, op_array);
+        self.call_stack.push(frame);
+
+        let dispatch_result = self.dispatch_loop();
+        self.run_shutdown_functions();
+
+        match dispatch_result {
+            Err(VmError::Exit(code)) => {
+                while let Some(buf) = self.ob_stack.pop() {
+                    self.write_output(&buf);
+                }
+                return Err(VmError::Exit(code));
+            }
+            Err(VmError::Thrown(ref exception_val)) => {
+                if let Some(handler_name) = self.exception_handler.clone() {
+                    let _ = self.invoke_user_callback(&handler_name, vec![exception_val.clone()]);
+                } else {
+                    return Err(VmError::Thrown(exception_val.clone()));
+                }
+            }
+            Err(e) => return Err(e),
+            Ok(()) => {}
+        }
+
+        if self.session_started && !self.session_id.is_empty() {
+            let data = self.get_session_cv().unwrap_or_default();
+            let serialized = session_serialize(&data);
+            let path = self.session_file_path(&self.session_id.clone());
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = std::fs::write(&path, serialized);
+            self.session_started = false;
+        }
+
+        while let Some(buf) = self.ob_stack.pop() {
+            self.write_output(&buf);
+        }
+
+        Ok(self.output.clone())
+    }
+
     /// When set, all file operations will use the VFS instead of the real filesystem.
     pub fn set_vfs(
         &mut self,

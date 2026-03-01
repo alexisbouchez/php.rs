@@ -28,6 +28,11 @@
             color: #89b4fa;
         }
         header h1 span { color: #f38ba8; }
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
         .version {
             font-size: 12px;
             color: #6c7086;
@@ -111,11 +116,22 @@
         }
         .btn-run:hover { background: #94e2d5; }
         .btn-run:disabled { opacity: 0.5; cursor: not-allowed; }
-        .btn-clear {
+        .btn-secondary {
             background: #45475a;
             color: #cdd6f4;
         }
-        .btn-clear:hover { background: #585b70; }
+        .btn-secondary:hover { background: #585b70; }
+        select {
+            padding: 6px 8px;
+            background: #313244;
+            border: 1px solid #45475a;
+            border-radius: 4px;
+            color: #cdd6f4;
+            font-size: 12px;
+            outline: none;
+            cursor: pointer;
+        }
+        select:focus { border-color: #89b4fa; }
         .status {
             font-size: 12px;
             color: #6c7086;
@@ -178,17 +194,43 @@
             word-break: break-all;
         }
         .output-content.error-output { color: #f38ba8; }
+        .error-line-info {
+            padding: 4px 16px;
+            background: rgba(243, 139, 168, 0.1);
+            border-left: 3px solid #f38ba8;
+            font-size: 12px;
+            color: #f38ba8;
+            font-family: 'JetBrains Mono', monospace;
+        }
         .timing {
             font-size: 11px;
             color: #6c7086;
             margin-left: auto;
         }
+        .share-toast {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            background: #a6e3a1;
+            color: #1e1e2e;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            opacity: 0;
+            transition: opacity 0.3s;
+            pointer-events: none;
+            z-index: 100;
+        }
+        .share-toast.visible { opacity: 1; }
     </style>
 </head>
 <body>
     <header>
         <h1>php<span>.rs</span> Playground</h1>
-        <span class="version" id="php-version">Loading...</span>
+        <div class="header-right">
+            <span class="version" id="php-version">Loading...</span>
+        </div>
     </header>
     <div class="main">
         <div class="sidebar">
@@ -201,25 +243,56 @@
         <div class="editor-panel">
             <div class="toolbar">
                 <button class="btn btn-run" id="run-btn" disabled>Run (Ctrl+Enter)</button>
-                <button class="btn btn-clear" id="clear-btn">Clear Output</button>
+                <button class="btn btn-secondary" id="clear-btn">Clear</button>
+                <button class="btn btn-secondary" id="share-btn">Share</button>
+                <select id="examples">
+                    <option value="">Examples...</option>
+                    <option value="hello">Hello World</option>
+                    <option value="fibonacci">Fibonacci</option>
+                    <option value="classes">Classes &amp; OOP</option>
+                    <option value="generators">Generators</option>
+                    <option value="closures">Closures</option>
+                    <option value="match">Match Expression</option>
+                    <option value="fibers">Fibers</option>
+                    <option value="enums">Enums</option>
+                </select>
                 <span class="status" id="status">Initializing...</span>
             </div>
             <div class="editor-area">
                 <div class="code-container">
-                    <textarea id="editor" spellcheck="false">&lt;?php
+                    <textarea id="editor" spellcheck="false"></textarea>
+                </div>
+                <div class="output-panel">
+                    <div class="output-header">
+                        <span class="output-tab active" data-tab="output">Output</span>
+                        <span class="output-tab" data-tab="tokens">Tokens</span>
+                        <span class="output-tab" data-tab="ast">AST</span>
+                        <span class="timing" id="timing"></span>
+                    </div>
+                    <div class="output-content" id="output"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div class="share-toast" id="share-toast">Link copied to clipboard!</div>
 
-echo "Hello from php.rs!\n";
+    <script type="module">
+        import init, { PhpWasm } from '../../pkg/php_rs_sapi_wasm.js';
+
+        const EXAMPLES = {
+            hello: `<?php
+echo "Hello from php.rs!\\n";
 
 $name = "World";
-echo "Hello, $name!\n";
+echo "Hello, $name!\\n";
 
 // Arrays
 $numbers = [1, 2, 3, 4, 5];
-echo "Count: " . count($numbers) . "\n";
-echo "Sum: " . array_sum($numbers) . "\n";
+echo "Count: " . count($numbers) . "\\n";
+echo "Sum: " . array_sum($numbers) . "\\n";
 
 // String functions
-echo strtoupper("php running in your browser") . "\n";
+echo strtoupper("php running in your browser") . "\\n";
 
 // Classes
 class Greeter {
@@ -235,24 +308,214 @@ class Greeter {
 }
 
 $greeter = new Greeter("Welcome");
-echo $greeter->greet("Developer") . "\n";
-</textarea>
-                </div>
-                <div class="output-panel">
-                    <div class="output-header">
-                        <span class="output-tab active" data-tab="output">Output</span>
-                        <span class="output-tab" data-tab="tokens">Tokens</span>
-                        <span class="output-tab" data-tab="ast">AST</span>
-                        <span class="timing" id="timing"></span>
-                    </div>
-                    <div class="output-content" id="output"></div>
-                </div>
-            </div>
-        </div>
-    </div>
+echo $greeter->greet("Developer") . "\\n";
+`,
+            fibonacci: `<?php
+function fibonacci(int $n): array {
+    $fib = [0, 1];
+    for ($i = 2; $i < $n; $i++) {
+        $fib[$i] = $fib[$i - 1] + $fib[$i - 2];
+    }
+    return $fib;
+}
 
-    <script type="module">
-        import init, { PhpWasm } from '../../pkg/php_rs_sapi_wasm.js';
+$sequence = fibonacci(20);
+echo "First 20 Fibonacci numbers:\\n";
+echo implode(', ', $sequence) . "\\n";
+
+// Recursive version
+function fib_recursive(int $n): int {
+    if ($n <= 1) return $n;
+    return fib_recursive($n - 1) + fib_recursive($n - 2);
+}
+
+echo "\\nfib(10) = " . fib_recursive(10) . "\\n";
+echo "fib(15) = " . fib_recursive(15) . "\\n";
+`,
+            classes: `<?php
+interface Shape {
+    public function area(): float;
+    public function describe(): string;
+}
+
+class Circle implements Shape {
+    public function __construct(
+        private float $radius
+    ) {}
+
+    public function area(): float {
+        return M_PI * $this->radius ** 2;
+    }
+
+    public function describe(): string {
+        return "Circle(r={$this->radius})";
+    }
+}
+
+class Rectangle implements Shape {
+    public function __construct(
+        private float $width,
+        private float $height
+    ) {}
+
+    public function area(): float {
+        return $this->width * $this->height;
+    }
+
+    public function describe(): string {
+        return "Rectangle({$this->width}x{$this->height})";
+    }
+}
+
+$shapes = [
+    new Circle(5),
+    new Rectangle(4, 6),
+    new Circle(3),
+    new Rectangle(10, 2),
+];
+
+foreach ($shapes as $shape) {
+    printf("%-25s area = %.2f\\n", $shape->describe(), $shape->area());
+}
+
+$total = array_sum(array_map(fn(Shape $s) => $s->area(), $shapes));
+printf("\\nTotal area: %.2f\\n", $total);
+`,
+            generators: `<?php
+function range_gen(int $start, int $end, int $step = 1): Generator {
+    for ($i = $start; $i <= $end; $i += $step) {
+        yield $i;
+    }
+}
+
+echo "Even numbers 0-20:\\n";
+foreach (range_gen(0, 20, 2) as $n) {
+    echo "$n ";
+}
+echo "\\n\\n";
+
+// Infinite Fibonacci generator
+function fibonacci(): Generator {
+    [$a, $b] = [0, 1];
+    while (true) {
+        yield $a;
+        [$a, $b] = [$b, $a + $b];
+    }
+}
+
+echo "First 15 Fibonacci numbers:\\n";
+$count = 0;
+foreach (fibonacci() as $fib) {
+    echo "$fib ";
+    if (++$count >= 15) break;
+}
+echo "\\n";
+`,
+            closures: `<?php
+// Basic closure
+$greet = function(string $name): string {
+    return "Hello, $name!";
+};
+echo $greet("World") . "\\n";
+
+// Closure with use
+$prefix = "PHP";
+$format = function(string $msg) use ($prefix): string {
+    return "[$prefix] $msg";
+};
+echo $format("Running in WASM") . "\\n";
+
+// Arrow functions
+$numbers = [1, 2, 3, 4, 5];
+$doubled = array_map(fn($n) => $n * 2, $numbers);
+echo "Doubled: " . implode(', ', $doubled) . "\\n";
+
+$evens = array_filter($numbers, fn($n) => $n % 2 === 0);
+echo "Evens: " . implode(', ', $evens) . "\\n";
+
+// Higher-order functions
+function compose(callable ...$fns): Closure {
+    return function($x) use ($fns) {
+        foreach (array_reverse($fns) as $fn) {
+            $x = $fn($x);
+        }
+        return $x;
+    };
+}
+
+$transform = compose(
+    fn($s) => strtoupper($s),
+    fn($s) => trim($s),
+    fn($s) => str_replace('world', 'PHP', $s)
+);
+
+echo $transform("  hello world  ") . "\\n";
+`,
+            match: `<?php
+function http_status(int $code): string {
+    return match(true) {
+        $code >= 500 => 'Server Error',
+        $code >= 400 => 'Client Error',
+        $code >= 300 => 'Redirect',
+        $code >= 200 => 'Success',
+        $code >= 100 => 'Informational',
+        default => 'Unknown',
+    };
+}
+
+$codes = [200, 301, 404, 500, 201, 403, 503];
+foreach ($codes as $code) {
+    echo "$code => " . http_status($code) . "\\n";
+}
+
+// Match with enum-like pattern
+$day = 'Monday';
+$type = match($day) {
+    'Saturday', 'Sunday' => 'Weekend',
+    default => 'Weekday',
+};
+echo "\\n$day is a $type\\n";
+`,
+            fibers: `<?php
+$fiber = new Fiber(function(): void {
+    $value = Fiber::suspend('first');
+    echo "Got: $value\\n";
+
+    $value = Fiber::suspend('second');
+    echo "Got: $value\\n";
+});
+
+$result = $fiber->start();
+echo "Fiber yielded: $result\\n";
+
+$result = $fiber->resume('hello');
+echo "Fiber yielded: $result\\n";
+
+$fiber->resume('world');
+echo "Fiber finished\\n";
+`,
+            enums: `<?php
+enum Suit: string {
+    case Hearts = 'H';
+    case Diamonds = 'D';
+    case Clubs = 'C';
+    case Spades = 'S';
+
+    public function color(): string {
+        return match($this) {
+            self::Hearts, self::Diamonds => 'Red',
+            self::Clubs, self::Spades => 'Black',
+        };
+    }
+}
+
+foreach (Suit::cases() as $suit) {
+    echo "{$suit->name} ({$suit->value}) => {$suit->color()}\\n";
+}
+
+echo "\\nFrom value: " . Suit::from('H')->name . "\\n";
+`,
+        };
 
         let php = null;
         let activeTab = 'output';
@@ -261,11 +524,25 @@ echo $greeter->greet("Developer") . "\n";
         const output = document.getElementById('output');
         const runBtn = document.getElementById('run-btn');
         const clearBtn = document.getElementById('clear-btn');
+        const shareBtn = document.getElementById('share-btn');
+        const examplesSelect = document.getElementById('examples');
         const status = document.getElementById('status');
         const timing = document.getElementById('timing');
         const fileList = document.getElementById('file-list');
         const newFileInput = document.getElementById('new-file');
         const versionEl = document.getElementById('php-version');
+        const shareToast = document.getElementById('share-toast');
+
+        // Load code from URL hash
+        function loadFromHash() {
+            const hash = window.location.hash;
+            if (hash.startsWith('#code=')) {
+                try {
+                    return atob(hash.substring(6));
+                } catch (e) {}
+            }
+            return null;
+        }
 
         async function initialize() {
             try {
@@ -275,6 +552,11 @@ echo $greeter->greet("Developer") . "\n";
                 runBtn.disabled = false;
                 status.textContent = 'Ready';
                 status.className = 'status ready';
+
+                // Load from URL hash or default example
+                const hashCode = loadFromHash();
+                editor.value = hashCode || EXAMPLES.hello;
+
                 updateFileList();
             } catch (e) {
                 status.textContent = 'Failed to load';
@@ -284,8 +566,39 @@ echo $greeter->greet("Developer") . "\n";
             }
         }
 
+        function clearErrorHighlight() {
+            const existing = document.querySelector('.error-line-info');
+            if (existing) existing.remove();
+        }
+
+        function showErrorLine(message) {
+            clearErrorHighlight();
+            // Try to extract line number from error message
+            const lineMatch = message.match(/line\s+(\d+)/i) ||
+                              message.match(/on line (\d+)/i) ||
+                              message.match(/Line (\d+)/);
+            if (lineMatch) {
+                const lineNum = parseInt(lineMatch[1], 10);
+                const info = document.createElement('div');
+                info.className = 'error-line-info';
+                info.textContent = `Error on line ${lineNum}`;
+                const codeContainer = document.querySelector('.code-container');
+                codeContainer.parentNode.insertBefore(info, codeContainer.nextSibling);
+
+                // Scroll editor to the error line
+                const lines = editor.value.split('\n');
+                let charPos = 0;
+                for (let i = 0; i < Math.min(lineNum - 1, lines.length); i++) {
+                    charPos += lines[i].length + 1;
+                }
+                editor.setSelectionRange(charPos, charPos + (lines[lineNum - 1]?.length || 0));
+                editor.focus();
+            }
+        }
+
         function run() {
             if (!php) return;
+            clearErrorHighlight();
             const code = editor.value;
             const start = performance.now();
 
@@ -296,6 +609,10 @@ echo $greeter->greet("Developer") . "\n";
                     result = JSON.stringify(JSON.parse(result), null, 2);
                 } else if (activeTab === 'ast') {
                     result = php.parse(code);
+                    // Pretty-print JSON AST
+                    try {
+                        result = JSON.stringify(JSON.parse(result), null, 2);
+                    } catch (e) {}
                 } else {
                     result = php.eval(code);
                 }
@@ -307,12 +624,27 @@ echo $greeter->greet("Developer") . "\n";
             } catch (e) {
                 const elapsed = (performance.now() - start).toFixed(1);
                 timing.textContent = `${elapsed}ms`;
-                output.textContent = `Error: ${e}`;
+                const errMsg = `${e}`;
+                output.textContent = `Error: ${errMsg}`;
                 output.className = 'output-content error-output';
+                showErrorLine(errMsg);
             }
 
             php.reset();
             updateFileList();
+        }
+
+        function share() {
+            const code = editor.value;
+            const encoded = btoa(code);
+            const url = `${window.location.origin}${window.location.pathname}#code=${encoded}`;
+            navigator.clipboard.writeText(url).then(() => {
+                shareToast.classList.add('visible');
+                setTimeout(() => shareToast.classList.remove('visible'), 2000);
+            }).catch(() => {
+                // Fallback: update URL
+                window.location.hash = `code=${encoded}`;
+            });
         }
 
         function updateFileList() {
@@ -335,9 +667,7 @@ echo $greeter->greet("Developer") . "\n";
                     });
                     fileList.appendChild(item);
                 }
-            } catch (e) {
-                // No files yet
-            }
+            } catch (e) {}
         }
 
         // Event listeners
@@ -347,13 +677,21 @@ echo $greeter->greet("Developer") . "\n";
             output.className = 'output-content';
             timing.textContent = '';
         });
+        shareBtn.addEventListener('click', share);
+
+        examplesSelect.addEventListener('change', () => {
+            const key = examplesSelect.value;
+            if (key && EXAMPLES[key]) {
+                editor.value = EXAMPLES[key];
+                examplesSelect.value = '';
+            }
+        });
 
         editor.addEventListener('keydown', (e) => {
             if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
                 e.preventDefault();
                 run();
             }
-            // Tab key inserts spaces
             if (e.key === 'Tab') {
                 e.preventDefault();
                 const start = editor.selectionStart;
@@ -376,13 +714,18 @@ echo $greeter->greet("Developer") . "\n";
             }
         });
 
-        // Output tabs
         document.querySelectorAll('.output-tab').forEach(tab => {
             tab.addEventListener('click', () => {
                 document.querySelectorAll('.output-tab').forEach(t => t.classList.remove('active'));
                 tab.classList.add('active');
                 activeTab = tab.dataset.tab;
             });
+        });
+
+        // Handle hash changes (back/forward navigation)
+        window.addEventListener('hashchange', () => {
+            const code = loadFromHash();
+            if (code) editor.value = code;
         });
 
         initialize();

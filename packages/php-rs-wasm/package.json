@@ -1,0 +1,46 @@
+{
+  "name": "php-rs-wasm",
+  "version": "0.1.0",
+  "description": "Run PHP in the browser and edge runtimes via WebAssembly — powered by php.rs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/php/php-rs",
+    "directory": "packages/php-rs-wasm"
+  },
+  "type": "module",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js",
+      "types": "./dist/esm/index.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "wasm/"
+  ],
+  "scripts": {
+    "build:wasm": "bash scripts/build.sh",
+    "build:ts": "tsc -p tsconfig.json && tsc -p tsconfig.cjs.json",
+    "build": "npm run build:wasm && npm run build:ts",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "typescript": "^5.4",
+    "vitest": "^1.6"
+  },
+  "keywords": [
+    "php",
+    "wasm",
+    "webassembly",
+    "interpreter",
+    "edge",
+    "cloudflare-workers",
+    "deno"
+  ]
+}

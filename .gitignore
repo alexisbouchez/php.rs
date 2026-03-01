@@ -2,3 +2,5 @@ php-src/
 target/
 tests/laravel-app/
 pkg/
+node_modules/
+data/

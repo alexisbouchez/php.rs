@@ -57,6 +57,29 @@ jobs:
         env:
           MIRIFLAGS: "-Zmiri-disable-isolation"
 
+  wasm:
+    name: WASM Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Build WASM (browser target)
+        run: wasm-pack build crates/php-rs-sapi-wasm --target web --release
+      - name: Check WASM binary size
+        run: |
+          WASM_SIZE=$(wc -c < pkg/php_rs_sapi_wasm_bg.wasm | tr -d ' ')
+          echo "WASM binary size: $(( WASM_SIZE / 1024 ))KB"
+          if [ "$WASM_SIZE" -gt 3145728 ]; then
+            echo "::warning::WASM binary exceeds 3MB target ($WASM_SIZE bytes)"
+          fi
+      - name: Run WASM SAPI native tests
+        run: cargo test -p php-rs-sapi-wasm
+
   sanitizer:
     name: Address Sanitizer
     runs-on: ubuntu-latest

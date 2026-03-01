@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use php_rs_runtime::superglobals::Superglobals;
 use php_rs_vm::{PhpArray, Value};
 
 // ── Configuration ───────────────────────────────────────────────────────────
@@ -482,11 +483,26 @@ fn execute_php_request(
 fn build_superglobals(req: &HttpRequest, config: &ServerConfig) -> HashMap<String, Value> {
     let server_vars = build_server_vars(req, config);
     let get_vars = parse_query_string(&req.query_string);
+    let mut multipart_files: Option<HashMap<String, String>> = None;
     let post_vars = if req.method == "POST" {
         if let Some(ct) = req.headers.get("content-type") {
             if ct.starts_with("application/x-www-form-urlencoded") {
                 let body_str = String::from_utf8_lossy(&req.body);
                 parse_query_string(&body_str)
+            } else if ct.starts_with("multipart/form-data") {
+                if let Some(boundary) = Superglobals::extract_boundary(ct) {
+                    let mut sg = Superglobals::new();
+                    let _ = sg.parse_multipart(
+                        &req.body,
+                        &boundary,
+                        2 * 1024 * 1024,  // 2 MB max file size
+                        8 * 1024 * 1024,  // 8 MB max post size
+                    );
+                    multipart_files = Some(sg.files);
+                    sg.post
+                } else {
+                    HashMap::new()
+                }
             } else {
                 HashMap::new()
             }
@@ -557,9 +573,55 @@ fn build_superglobals(req: &HttpRequest, config: &ServerConfig) -> HashMap<Strin
         "_REQUEST".into(),
         Value::Array(PhpArray::from_string_map(&request_vars)),
     );
-    superglobals.insert("_FILES".into(), Value::Array(PhpArray::new()));
+    // Build $_FILES from multipart data (flat keys like "image[name]" → nested arrays)
+    let files_array = if let Some(flat_files) = multipart_files {
+        flat_files_to_php_array(&flat_files)
+    } else {
+        PhpArray::new()
+    };
+    superglobals.insert("_FILES".into(), Value::Array(files_array));
 
     superglobals
+}
+
+/// Convert flat $_FILES keys (e.g. "image[name]", "image[type]") into nested PhpArrays.
+///
+/// PHP expects `$_FILES['image']` to be an array with keys: name, type, tmp_name, error, size.
+/// The Superglobals parser stores them as flat keys like `image[name]`, `image[type]`, etc.
+fn flat_files_to_php_array(flat: &HashMap<String, String>) -> PhpArray {
+    let mut files = PhpArray::new();
+
+    // Group by field name
+    let mut grouped: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for (key, value) in flat {
+        // Parse "fieldname[subkey]" format
+        if let Some(bracket) = key.find('[') {
+            if key.ends_with(']') {
+                let field = &key[..bracket];
+                let subkey = &key[bracket + 1..key.len() - 1];
+                grouped
+                    .entry(field.to_string())
+                    .or_default()
+                    .insert(subkey.to_string(), value.clone());
+            }
+        }
+    }
+
+    for (field_name, subkeys) in grouped {
+        let mut entry = PhpArray::new();
+        for (subkey, value) in subkeys {
+            let v = match subkey.as_str() {
+                "error" | "size" => {
+                    Value::Long(value.parse::<i64>().unwrap_or(0))
+                }
+                _ => Value::String(value),
+            };
+            entry.set_string(subkey, v);
+        }
+        files.set_string(field_name, Value::Array(entry));
+    }
+
+    files
 }
 
 // ── URL Parsing ─────────────────────────────────────────────────────────────

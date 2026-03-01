@@ -1,0 +1,8 @@
+name = "php-rs-worker"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[build]
+command = "npm run build:wasm"
+
+# WASM modules are automatically detected by wrangler
