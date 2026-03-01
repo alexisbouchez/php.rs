@@ -396,7 +396,22 @@ impl Value {
             (Value::Double(a), Value::Double(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Resource(a, _), Value::Resource(b, _)) => a == b,
-            (Value::Object(a), Value::Object(b)) => a.is_same_instance(b),
+            (Value::Object(a), Value::Object(b)) => {
+                // For enum objects, compare by class name + case name (value equality)
+                if a.class_name() == b.class_name() {
+                    if let (Some(name_a), Some(name_b)) =
+                        (a.get_property("name"), b.get_property("name"))
+                    {
+                        if let (Some(val_a), Some(val_b)) =
+                            (a.get_property("value"), b.get_property("value"))
+                        {
+                            // Both have name + value → likely enum instances
+                            return name_a.strict_eq(&name_b) && val_a.strict_eq(&val_b);
+                        }
+                    }
+                }
+                a.is_same_instance(b)
+            }
             (Value::Array(a), Value::Array(b)) => {
                 // PHP strict equality for arrays: same keys, same values (===), same order
                 if a.len() != b.len() {

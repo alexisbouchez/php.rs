@@ -14640,4 +14640,68 @@ echo implode(",", $arr);
 "#);
         assert_eq!(output, "a,b,c\n1,2,3");
     }
+
+    #[test]
+    fn test_backed_enum_value_name() {
+        let output = run_php(r#"<?php
+enum Color: string {
+    case Red = "red";
+    case Green = "green";
+}
+$c = Color::Green;
+echo $c->value . "\n";
+echo $c->name;
+"#);
+        assert_eq!(output, "green\nGreen");
+    }
+
+    #[test]
+    fn test_enum_method() {
+        let output = run_php(r#"<?php
+enum Color: string {
+    case Red = "red";
+    case Green = "green";
+
+    public function label(): string {
+        return "Color: " . $this->name;
+    }
+}
+echo Color::Red->label();
+"#);
+        assert_eq!(output, "Color: Red");
+    }
+
+    #[test]
+    fn test_enum_match_this() {
+        let output = run_php(r#"<?php
+enum Status: int {
+    case Active = 1;
+    case Inactive = 0;
+
+    public function label(): string {
+        return match($this) {
+            Status::Active => "Active",
+            Status::Inactive => "Inactive",
+        };
+    }
+}
+echo Status::Active->label();
+"#);
+        assert_eq!(output, "Active");
+    }
+
+    #[test]
+    fn test_enum_strict_equality() {
+        let output = run_php(r#"<?php
+enum Suit {
+    case Hearts;
+    case Diamonds;
+}
+$a = Suit::Hearts;
+$b = Suit::Hearts;
+echo ($a === $b ? "equal" : "not equal") . "\n";
+echo ($a === Suit::Diamonds ? "equal" : "not equal");
+"#);
+        assert_eq!(output, "equal\nnot equal");
+    }
 }

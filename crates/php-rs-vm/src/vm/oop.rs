@@ -2124,6 +2124,13 @@ impl Vm {
         loop {
             if let Some(class_def) = self.classes.get(&current) {
                 if let Some(val) = class_def.class_constants.get(const_name) {
+                    // For enum classes, wrap the constant in an enum object
+                    if class_def.is_enum && const_name != "class" {
+                        let mut obj = PhpObject::new(class_name.to_string());
+                        obj.set_property("name".to_string(), Value::String(const_name.to_string()));
+                        obj.set_property("value".to_string(), val.clone());
+                        return Some(Value::Object(obj));
+                    }
                     return Some(val.clone());
                 }
                 if let Some(ref parent) = class_def.parent {
