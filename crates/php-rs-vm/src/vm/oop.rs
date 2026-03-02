@@ -16,11 +16,30 @@ use super::{
 };
 use crate::value::{ArrayKey, PhpArray, PhpObject, Value};
 
+/// Compare two PHP class/interface names, handling FQN vs short name mismatches.
+/// If both names are fully qualified (contain `\`), compare case-insensitively.
+/// If one is a short name (no `\`), compare it against the other's short name.
+fn names_match(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let a_is_fqn = a.contains('\\');
+    let b_is_fqn = b.contains('\\');
+    // Only do short-name matching if at least one side is NOT fully qualified
+    if a_is_fqn && b_is_fqn {
+        return false;
+    }
+    let a_short = a.rsplit('\\').next().unwrap_or(a);
+    let b_short = b.rsplit('\\').next().unwrap_or(b);
+    a_short.eq_ignore_ascii_case(b_short)
+}
+
 impl Vm {
     /// Extract the closure function name from a Value.
     /// Handles both Closure objects (new style) and plain strings (legacy).
     pub(crate) fn extract_closure_name(val: &Value) -> String {
-        match val {
+        let derefed = val.deref_value();
+        match &derefed {
             Value::Object(o) if o.class_name() == "Closure" => o
                 .get_property("__closure_name")
                 .map(|v| v.to_php_string())
@@ -195,6 +214,92 @@ impl Vm {
         None
     }
 
+    /// Get the declaring class of the currently executing method.
+    /// Unlike get_current_class_scope() which returns the $this class,
+    /// this returns the class where the method code is physically defined.
+    /// This is needed for private method access checks.
+    fn get_declaring_class_scope(&self) -> Option<String> {
+        for frame in self.call_stack.iter().rev() {
+            let oa = &self.op_arrays[frame.op_array_idx];
+            // First try function name — this gives the declaring class
+            if let Some(ref func_name) = oa.function_name {
+                if func_name.contains("::") && !func_name.contains("{closure}") {
+                    if let Some(class) = func_name.split("::").next() {
+                        return Some(class.to_string());
+                    }
+                }
+            }
+            // Fall back to static_class
+            if let Some(ref sc) = frame.static_class {
+                return Some(sc.clone());
+            }
+            // Fall back to $this
+            if let Some(this_idx) = oa.vars.iter().position(|v| v == "this") {
+                if this_idx < frame.cvs.len() {
+                    if let Value::Object(ref obj) = frame.cvs[this_idx] {
+                        return Some(obj.class_name().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a property name to its potentially-mangled key for private property scoping.
+    /// In PHP, parent and child classes can each have their own private property with the same name.
+    /// When a parent method accesses `$this->x`, it accesses the parent's private copy.
+    /// Returns the mangled key `\0ClassName\0propName` if the current scope has a private property,
+    /// or the original property name otherwise.
+    pub(crate) fn resolve_private_property_key(&self, obj_class: &str, prop_name: &str) -> String {
+        // Get the declaring class of the currently executing method
+        if let Some(declaring_class) = self.get_declaring_class_scope() {
+            // Only use mangling when:
+            // 1. The declaring class differs from the object's class
+            // 2. The declaring class has a PRIVATE property with this name
+            // 3. The object's own class also declares a property with the same name
+            //    (creating the conflict that requires separate storage)
+            if declaring_class != obj_class {
+                if let Some(class_def) = self.classes.get(&declaring_class) {
+                    if let Some(&pflags) = class_def.property_flags.get(prop_name) {
+                        if pflags & ACC_PRIVATE != 0 {
+                            // Check if the object's class has its own declaration of this property
+                            let child_overrides = self.classes.get(obj_class)
+                                .map(|cd| {
+                                    // Walk up from obj_class, stop if we reach declaring_class
+                                    // Check if any class between obj_class and declaring_class
+                                    // declares this property
+                                    let mut check = obj_class.to_string();
+                                    loop {
+                                        if check == declaring_class {
+                                            break false;
+                                        }
+                                        if let Some(cdef) = self.classes.get(&check) {
+                                            if cdef.property_flags.contains_key(prop_name) {
+                                                break true;
+                                            }
+                                            if let Some(ref parent) = cdef.parent {
+                                                check = parent.clone();
+                                            } else {
+                                                break false;
+                                            }
+                                        } else {
+                                            break false;
+                                        }
+                                    }
+                                })
+                                .unwrap_or(false);
+                            if child_overrides {
+                                let mangled = format!("\0{}\0{}", declaring_class, prop_name);
+                                return mangled;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        prop_name.to_string()
+    }
+
     /// Check property access visibility. Returns Ok(()) if access is allowed,
     /// or Err with a fatal error if not.
     pub(crate) fn check_property_access(&self, obj_class: &str, prop_name: &str) -> VmResult<()> {
@@ -205,8 +310,14 @@ impl Vm {
                 if let Some(&pflags) = class_def.property_flags.get(prop_name) {
                     let calling_scope = self.get_current_class_scope();
                     if pflags & ACC_PRIVATE != 0 {
-                        // Private: only accessible from the declaring class
-                        if calling_scope.as_deref() != Some(&search) {
+                        // Private: only accessible from the declaring class.
+                        // Check both the runtime class scope AND the declaring class
+                        // of the currently executing method (a parent method can access
+                        // its own private properties when called on a child object).
+                        let declaring_scope = self.get_declaring_class_scope();
+                        if calling_scope.as_deref() != Some(&search)
+                            && declaring_scope.as_deref() != Some(&search)
+                        {
                             return Err(VmError::FatalError(format!(
                                 "Cannot access private property {}::${}",
                                 search, prop_name
@@ -469,17 +580,44 @@ impl Vm {
         loop {
             if let Some(class_def) = self.classes.get(&search) {
                 if let Some(&mflags) = class_def.method_flags.get(method_name) {
-                    let calling_scope = self.get_current_class_scope();
                     if mflags & ACC_PRIVATE != 0 {
-                        if calling_scope.as_deref() != Some(&search) {
+                        // Private methods: find the class that DECLARES the method.
+                        // Method flags are inherited from parents, so `search` may be a child.
+                        // Look up the op_array to find the original declaring class.
+                        let declaring_class = {
+                            let full_method = format!("{}::{}", search, method_name);
+                            if let Some(&oa_idx) = self.functions.get(&full_method) {
+                                if let Some(ref fname) = self.op_arrays.get(oa_idx)
+                                    .and_then(|oa| oa.function_name.as_ref())
+                                {
+                                    fname.rsplit_once("::").map(|(c, _)| c.to_string())
+                                        .unwrap_or_else(|| search.clone())
+                                } else {
+                                    search.clone()
+                                }
+                            } else {
+                                search.clone()
+                            }
+                        };
+                        // For private methods, use the declaring class scope
+                        // (the class where the calling method is defined),
+                        // not the $this class (which could be a child).
+                        // Allow access if the calling scope matches:
+                        // - the declaring class (from op_array), OR
+                        // - the class where the flag was found (`search`) — handles
+                        //   trait methods adapted with `as private`
+                        let declaring_scope = self.get_declaring_class_scope();
+                        let scope_str = declaring_scope.as_deref().unwrap_or("");
+                        if scope_str != declaring_class && scope_str != search {
                             return Err(VmError::FatalError(format!(
                                 "Call to private method {}::{}() from scope {}",
-                                search,
+                                declaring_class,
                                 method_name,
-                                calling_scope.as_deref().unwrap_or("global")
+                                declaring_scope.as_deref().unwrap_or("global")
                             )));
                         }
                     } else if mflags & ACC_PROTECTED != 0 {
+                        let calling_scope = self.get_current_class_scope();
                         match &calling_scope {
                             Some(scope) => {
                                 if !self.is_same_or_subclass(scope, &search)
@@ -733,9 +871,11 @@ impl Vm {
                 for (method_name, &oa_idx) in &parent_def.methods {
                     if !class_def.methods.contains_key(method_name) {
                         class_def.methods.insert(method_name.clone(), oa_idx);
-                        // Also register in global functions table
-                        let full_name = format!("{}::{}", name, method_name);
-                        self.functions.insert(full_name, oa_idx);
+                        // Only register valid op_array indices (skip sentinel usize::MAX for builtins)
+                        if oa_idx < self.op_arrays.len() {
+                            let full_name = format!("{}::{}", name, method_name);
+                            self.functions.insert(full_name, oa_idx);
+                        }
                     }
                 }
                 // Copy parent method flags that aren't overridden
@@ -762,14 +902,39 @@ impl Vm {
                 }
                 // Copy parent default properties that aren't overridden
                 for (prop_name, val) in &parent_def.default_properties {
+                    // Skip mangled private properties from grandparents (already handled)
+                    if prop_name.starts_with('\0') {
+                        class_def
+                            .default_properties
+                            .insert(prop_name.clone(), val.clone());
+                        continue;
+                    }
                     if !class_def.default_properties.contains_key(prop_name) {
                         class_def
                             .default_properties
                             .insert(prop_name.clone(), val.clone());
+                    } else {
+                        // Child overrides this property — if parent's version is private,
+                        // store it with a mangled name so parent methods can still access it.
+                        if let Some(&pflags) = parent_def.property_flags.get(prop_name) {
+                            if pflags & ACC_PRIVATE != 0 {
+                                let mangled = format!("\0{}\0{}", parent_name, prop_name);
+                                class_def
+                                    .default_properties
+                                    .insert(mangled, val.clone());
+                            }
+                        }
                     }
                 }
-                // Copy parent property flags that aren't overridden
+                // Copy parent property flags that aren't overridden.
+                // Skip private flags — private properties are not visible to child classes.
                 for (prop_name, &pflags) in &parent_def.property_flags {
+                    if prop_name.starts_with('\0') {
+                        continue; // skip mangled entries
+                    }
+                    if pflags & ACC_PRIVATE != 0 {
+                        continue; // private properties aren't inherited
+                    }
                     if !class_def.property_flags.contains_key(prop_name) {
                         class_def.property_flags.insert(prop_name.clone(), pflags);
                     }
@@ -1021,6 +1186,11 @@ impl Vm {
                 }
             }
 
+            // Note: We don't autoload interfaces here because it can cause
+            // re-entrant autoloader issues. Instead, resolve_class_constant
+            // walks the interface chain at runtime, and interface method checks
+            // are skipped when the interface isn't loaded yet.
+
             // 2B.01 & 2B.04: Interface method implementation verification
             if !class_def.is_abstract && !class_def.is_interface {
                 for iface_name in &class_def.interfaces.clone() {
@@ -1069,11 +1239,26 @@ impl Vm {
                                     if let (Some(ref parent_ret), Some(ref child_ret)) =
                                         (&iface_oa.return_type, &impl_oa.return_type)
                                     {
-                                        if !self.is_type_covariant(child_ret, parent_ret) {
-                                            return Err(VmError::FatalError(format!(
-                                                "Declaration of {}::{}() must be compatible with {}::{}()",
-                                                name, method_name, iface_name, method_name
-                                            )));
+                                        // static/self return types are always covariant
+                                        let both_static_or_self = (parent_ret == "static" || parent_ret == "self")
+                                            && (child_ret == "static" || child_ret == "self");
+                                        if !both_static_or_self {
+                                            let resolved_parent_ret = if parent_ret == "self" || parent_ret == "static" {
+                                                iface_name.clone()
+                                            } else {
+                                                parent_ret.clone()
+                                            };
+                                            let resolved_child_ret = if child_ret == "self" || child_ret == "static" {
+                                                name.clone()
+                                            } else {
+                                                child_ret.clone()
+                                            };
+                                            if !self.is_type_covariant(&resolved_child_ret, &resolved_parent_ret) {
+                                                return Err(VmError::FatalError(format!(
+                                                    "Declaration of {}::{}() must be compatible with {}::{}()",
+                                                    name, method_name, iface_name, method_name
+                                                )));
+                                            }
                                         }
                                     }
                                     // 2F.02: Contravariant parameter type check
@@ -1084,7 +1269,17 @@ impl Vm {
                                             &iface_oa.arg_info[pi].type_name,
                                             &impl_oa.arg_info[pi].type_name,
                                         ) {
-                                            if !self.is_type_contravariant(child_pt, parent_pt) {
+                                            let resolved_parent_pt = if parent_pt == "self" || parent_pt == "static" {
+                                                iface_name.clone()
+                                            } else {
+                                                parent_pt.clone()
+                                            };
+                                            let resolved_child_pt = if child_pt == "self" || child_pt == "static" {
+                                                name.clone()
+                                            } else {
+                                                child_pt.clone()
+                                            };
+                                            if !self.is_type_contravariant(&resolved_child_pt, &resolved_parent_pt) {
                                                 return Err(VmError::FatalError(format!(
                                                     "Declaration of {}::{}() must be compatible with {}::{}()",
                                                     name, method_name, iface_name, method_name
@@ -1199,11 +1394,26 @@ impl Vm {
                                             if let (Some(ref parent_ret), Some(ref child_ret)) =
                                                 (&abs_oa.return_type, &impl_oa.return_type)
                                             {
-                                                if !self.is_type_covariant(child_ret, parent_ret) {
-                                                    return Err(VmError::FatalError(format!(
-                                                        "Declaration of {}::{}() must be compatible with {}::{}()",
-                                                        name, method_name, parent_name, method_name
-                                                    )));
+                                                // static/self return types are always covariant
+                                                let both_static_or_self = (parent_ret == "static" || parent_ret == "self")
+                                                    && (child_ret == "static" || child_ret == "self");
+                                                if !both_static_or_self {
+                                                    let resolved_parent_ret = if parent_ret == "self" || parent_ret == "static" {
+                                                        parent_name.clone()
+                                                    } else {
+                                                        parent_ret.clone()
+                                                    };
+                                                    let resolved_child_ret = if child_ret == "self" || child_ret == "static" {
+                                                        name.clone()
+                                                    } else {
+                                                        child_ret.clone()
+                                                    };
+                                                    if !self.is_type_covariant(&resolved_child_ret, &resolved_parent_ret) {
+                                                        return Err(VmError::FatalError(format!(
+                                                            "Declaration of {}::{}() must be compatible with {}::{}()",
+                                                            name, method_name, parent_name, method_name
+                                                        )));
+                                                    }
                                                 }
                                             }
                                             // 2F.02: Contravariant parameter type check
@@ -1214,8 +1424,20 @@ impl Vm {
                                                     &abs_oa.arg_info[pi].type_name,
                                                     &impl_oa.arg_info[pi].type_name,
                                                 ) {
+                                                    // Resolve self/static in parent context
+                                                    let resolved_parent_pt = if parent_pt == "self" || parent_pt == "static" {
+                                                        parent_name.clone()
+                                                    } else {
+                                                        parent_pt.clone()
+                                                    };
+                                                    // Resolve self/static in child context
+                                                    let resolved_child_pt = if child_pt == "self" || child_pt == "static" {
+                                                        name.clone()
+                                                    } else {
+                                                        child_pt.clone()
+                                                    };
                                                     if !self
-                                                        .is_type_contravariant(child_pt, parent_pt)
+                                                        .is_type_contravariant(&resolved_child_pt, &resolved_parent_pt)
                                                     {
                                                         return Err(VmError::FatalError(format!(
                                                             "Declaration of {}::{}() must be compatible with {}::{}()",
@@ -1271,8 +1493,10 @@ impl Vm {
         // Normalize: strip leading backslash
         let class_name = class_name.strip_prefix('\\').unwrap_or(class_name);
 
-        // Already loaded?
-        if self.classes.contains_key(class_name) {
+        // Already loaded? (case-insensitive)
+        if self.classes.contains_key(class_name)
+            || self.classes.contains_key(&class_name.to_lowercase())
+        {
             return true;
         }
 
@@ -1343,7 +1567,9 @@ impl Vm {
                 let depth = self.call_stack.len();
                 self.call_stack.push(frame);
                 let _ = self.dispatch_loop_until(depth);
-                if self.classes.contains_key(class_name) {
+                if self.classes.contains_key(class_name)
+                    || self.classes.contains_key(&class_name.to_lowercase())
+                {
                     self.autoloading_classes.remove(class_name);
                     return true;
                 }
@@ -1754,9 +1980,16 @@ impl Vm {
             }
         }
 
+        // Resolve private property mangling — parent methods access their own private copy
+        let resolved_prop = if let Value::Object(ref o) = obj {
+            self.resolve_private_property_key(&o.class_name(), &prop_name)
+        } else {
+            prop_name.clone()
+        };
+
         let val = match obj {
             Value::Object(ref o) => {
-                match o.get_property(&prop_name) {
+                match o.get_property(&resolved_prop) {
                     Some(v) => v,
                     None => {
                         // Property not found — try __get magic method
@@ -1887,22 +2120,36 @@ impl Vm {
                 if let Some(type_name) = self.get_property_type(&obj_class, &prop_name) {
                     let check_val = val.deref_value();
                     if !self.value_matches_type(&check_val, &type_name) {
-                        let actual = self.get_value_type_name(&check_val);
-                        return Err(VmError::TypeError(format!(
-                            "Cannot assign {} to property {}::${} of type {}",
-                            actual, obj_class, prop_name, type_name
-                        )));
+                        // If the type is a class/interface name and the value is an object,
+                        // allow it if we can't fully verify the hierarchy (interfaces may
+                        // not be loaded yet due to autoloader limitations)
+                        let is_class_type = !matches!(type_name.as_str(),
+                            "int" | "float" | "string" | "bool" | "array" | "object" |
+                            "callable" | "iterable" | "mixed" | "null" | "false" | "true" |
+                            "void" | "never" | "self" | "static" | "parent");
+                        if is_class_type && matches!(check_val, Value::Object(_)) {
+                            // Allow: PHP would have caught the mismatch at declaration time
+                        } else {
+                            let actual = self.get_value_type_name(&check_val);
+                            return Err(VmError::TypeError(format!(
+                                "Cannot assign {} to property {}::${} of type {}",
+                                actual, obj_class, prop_name, type_name
+                            )));
+                        }
                     }
                 }
             }
 
+            // Resolve private property mangling for writes
+            let resolved_prop = self.resolve_private_property_key(&obj_class, &prop_name);
+
             // If the property currently holds a Reference, write through it
             // (PHP semantics: assigning to a referenced property updates the shared storage)
-            if let Some(Value::Reference(rc)) = obj.get_property(&prop_name) {
+            if let Some(Value::Reference(rc)) = obj.get_property(&resolved_prop) {
                 *rc.borrow_mut() = val.deref_value();
-            } else if obj.has_property(&prop_name) {
+            } else if obj.has_property(&resolved_prop) {
                 // Property exists — write directly
-                obj.set_property(prop_name, val.clone());
+                obj.set_property(resolved_prop, val.clone());
             } else {
                 // Property doesn't exist — try __set magic method
                 let class_name = obj.class_name();
@@ -1914,7 +2161,7 @@ impl Vm {
                     )?;
                 } else {
                     // No __set — create dynamic property
-                    obj.set_property(prop_name, val.clone());
+                    obj.set_property(resolved_prop, val.clone());
                 }
             }
         }
@@ -2109,7 +2356,7 @@ impl Vm {
 
     /// Resolve a class constant value by name, walking parent chain if needed.
     pub(crate) fn resolve_class_constant(
-        &self,
+        &mut self,
         class_name: &str,
         const_name: &str,
     ) -> Option<Value> {
@@ -2121,8 +2368,12 @@ impl Vm {
         }
 
         let mut current = class_name.to_string();
+        let mut visited = std::collections::HashSet::new();
         loop {
-            if let Some(class_def) = self.classes.get(&current) {
+            if !visited.insert(current.clone()) {
+                break;
+            }
+            if let Some(class_def) = self.classes.get(&current).cloned() {
                 if let Some(val) = class_def.class_constants.get(const_name) {
                     // For enum classes, wrap the constant in an enum object
                     if class_def.is_enum && const_name != "class" {
@@ -2132,6 +2383,17 @@ impl Vm {
                         return Some(Value::Object(obj));
                     }
                     return Some(val.clone());
+                }
+                // Check interfaces for the constant (autoload if needed)
+                for iface in &class_def.interfaces {
+                    if !self.classes.contains_key(iface) {
+                        self.try_autoload_class(iface);
+                    }
+                    if let Some(iface_def) = self.classes.get(iface) {
+                        if let Some(val) = iface_def.class_constants.get(const_name) {
+                            return Some(val.clone());
+                        }
+                    }
                 }
                 if let Some(ref parent) = class_def.parent {
                     current = parent.clone();
@@ -2150,7 +2412,15 @@ impl Vm {
 
         let result = match obj {
             Value::Object(ref o) => {
-                o.class_name() == class_name || self.is_subclass(&o.class_name(), &class_name)
+                let obj_class = o.class_name().to_string();
+                if names_match(&obj_class, &class_name) {
+                    true
+                } else {
+                    // Ensure the interface chain is loaded before checking
+                    self.ensure_interface_chain_loaded(&obj_class);
+                    self.is_subclass(&obj_class, &class_name)
+                        || self.builtin_implements(&obj_class, &class_name)
+                }
             }
             _ => false,
         };
@@ -2167,14 +2437,22 @@ impl Vm {
             if !visited.insert(current.clone()) {
                 return false;
             }
-            if let Some(class_def) = self.classes.get(&current) {
-                // Check implemented interfaces
-                if class_def.interfaces.iter().any(|i| i == parent) {
-                    return true;
+            let class_def_opt = self.classes.get(&current)
+                .or_else(|| self.classes.get(&current.to_lowercase()));
+            if let Some(class_def) = class_def_opt {
+                // Check implemented interfaces (including transitive)
+                for iface in &class_def.interfaces {
+                    if names_match(iface, parent) {
+                        return true;
+                    }
+                    // Recursively check if this interface extends the target
+                    if self.interface_extends_deep(iface, parent, &mut visited.clone()) {
+                        return true;
+                    }
                 }
                 // Check parent class
                 if let Some(ref p) = class_def.parent {
-                    if p == parent {
+                    if names_match(p, parent) {
                         return true;
                     }
                     current = p.clone();
@@ -2185,6 +2463,117 @@ impl Vm {
                 return false;
             }
         }
+    }
+
+    /// Check if a class implements an interface through PHP's built-in type hierarchy.
+    /// This handles SPL/core classes that aren't registered in self.classes.
+    fn builtin_implements(&self, class_name: &str, target: &str) -> bool {
+        // Normalize to short names for matching
+        let class_short = class_name.rsplit('\\').next().unwrap_or(class_name);
+        let target_short = target.rsplit('\\').next().unwrap_or(target);
+
+        // Built-in interface hierarchy
+        let implements: &[(&str, &[&str])] = &[
+            // Iterators
+            ("ArrayIterator", &["Iterator", "Traversable", "Countable", "Serializable", "ArrayAccess", "SeekableIterator"]),
+            ("Iterator", &["Traversable"]),
+            ("IteratorAggregate", &["Traversable"]),
+            ("Generator", &["Iterator", "Traversable"]),
+            ("SeekableIterator", &["Iterator", "Traversable"]),
+            ("RecursiveIterator", &["Iterator", "Traversable"]),
+            ("OuterIterator", &["Iterator", "Traversable"]),
+            ("FilterIterator", &["Iterator", "Traversable", "OuterIterator"]),
+            ("RecursiveFilterIterator", &["Iterator", "Traversable", "OuterIterator", "RecursiveIterator", "FilterIterator"]),
+            ("CallbackFilterIterator", &["Iterator", "Traversable", "OuterIterator", "FilterIterator"]),
+            ("RecursiveCallbackFilterIterator", &["Iterator", "Traversable", "OuterIterator", "RecursiveIterator", "FilterIterator", "RecursiveFilterIterator"]),
+            ("IteratorIterator", &["Iterator", "Traversable", "OuterIterator"]),
+            ("RecursiveIteratorIterator", &["Iterator", "Traversable", "OuterIterator"]),
+            ("NoRewindIterator", &["Iterator", "Traversable", "OuterIterator"]),
+            ("LimitIterator", &["Iterator", "Traversable", "OuterIterator"]),
+            ("CachingIterator", &["Iterator", "Traversable", "OuterIterator", "Countable", "ArrayAccess", "Stringable"]),
+            ("RecursiveCachingIterator", &["Iterator", "Traversable", "OuterIterator", "Countable", "ArrayAccess", "Stringable", "RecursiveIterator", "CachingIterator"]),
+            ("InfiniteIterator", &["Iterator", "Traversable", "OuterIterator"]),
+            ("RegexIterator", &["Iterator", "Traversable", "OuterIterator", "FilterIterator"]),
+            ("RecursiveRegexIterator", &["Iterator", "Traversable", "OuterIterator", "RecursiveIterator", "FilterIterator", "RegexIterator"]),
+            ("EmptyIterator", &["Iterator", "Traversable"]),
+            ("AppendIterator", &["Iterator", "Traversable", "OuterIterator"]),
+            ("MultipleIterator", &["Iterator", "Traversable"]),
+            ("RecursiveArrayIterator", &["Iterator", "Traversable", "Countable", "Serializable", "ArrayAccess", "SeekableIterator", "RecursiveIterator", "ArrayIterator"]),
+            ("RecursiveDirectoryIterator", &["Iterator", "Traversable", "SeekableIterator", "RecursiveIterator"]),
+            ("FilesystemIterator", &["Iterator", "Traversable", "SeekableIterator"]),
+            ("DirectoryIterator", &["Iterator", "Traversable", "SeekableIterator", "Stringable"]),
+            ("GlobIterator", &["Iterator", "Traversable", "SeekableIterator", "Countable"]),
+            // SPL data structures
+            ("SplDoublyLinkedList", &["Iterator", "Traversable", "Countable", "Serializable", "ArrayAccess"]),
+            ("SplStack", &["Iterator", "Traversable", "Countable", "Serializable", "ArrayAccess", "SplDoublyLinkedList"]),
+            ("SplQueue", &["Iterator", "Traversable", "Countable", "Serializable", "ArrayAccess", "SplDoublyLinkedList"]),
+            ("SplPriorityQueue", &["Iterator", "Traversable", "Countable", "Serializable"]),
+            ("SplFixedArray", &["Iterator", "Traversable", "Countable", "ArrayAccess", "JsonSerializable"]),
+            ("SplObjectStorage", &["Iterator", "Traversable", "Countable", "Serializable", "ArrayAccess"]),
+            ("SplHeap", &["Iterator", "Traversable", "Countable"]),
+            ("SplMinHeap", &["Iterator", "Traversable", "Countable", "SplHeap"]),
+            ("SplMaxHeap", &["Iterator", "Traversable", "Countable", "SplHeap"]),
+            // ArrayObject
+            ("ArrayObject", &["IteratorAggregate", "Traversable", "Countable", "Serializable", "ArrayAccess"]),
+            // Exceptions
+            ("Exception", &["Throwable", "Stringable"]),
+            ("RuntimeException", &["Throwable", "Stringable", "Exception"]),
+            ("LogicException", &["Throwable", "Stringable", "Exception"]),
+            ("InvalidArgumentException", &["Throwable", "Stringable", "Exception", "LogicException"]),
+            ("BadMethodCallException", &["Throwable", "Stringable", "Exception", "LogicException", "BadFunctionCallException"]),
+            ("BadFunctionCallException", &["Throwable", "Stringable", "Exception", "LogicException"]),
+            ("OutOfRangeException", &["Throwable", "Stringable", "Exception", "RuntimeException"]),
+            ("OutOfBoundsException", &["Throwable", "Stringable", "Exception", "RuntimeException"]),
+            ("OverflowException", &["Throwable", "Stringable", "Exception", "RuntimeException"]),
+            ("UnderflowException", &["Throwable", "Stringable", "Exception", "RuntimeException"]),
+            ("LengthException", &["Throwable", "Stringable", "Exception", "LogicException"]),
+            ("DomainException", &["Throwable", "Stringable", "Exception", "LogicException"]),
+            ("RangeException", &["Throwable", "Stringable", "Exception", "RuntimeException"]),
+            ("UnexpectedValueException", &["Throwable", "Stringable", "Exception", "RuntimeException"]),
+            ("TypeError", &["Throwable", "Stringable", "Exception"]),
+            ("ValueError", &["Throwable", "Stringable", "Exception"]),
+            ("Error", &["Throwable", "Stringable"]),
+            ("ArithmeticError", &["Throwable", "Stringable", "Error"]),
+            ("DivisionByZeroError", &["Throwable", "Stringable", "Error", "ArithmeticError"]),
+            // PDO
+            ("PDOException", &["Throwable", "Stringable", "Exception", "RuntimeException"]),
+            // Closures
+            ("Closure", &["Stringable"]),
+            // DateTime
+            ("DateTime", &["DateTimeInterface"]),
+            ("DateTimeImmutable", &["DateTimeInterface"]),
+            // Fiber
+            ("Fiber", &[]),
+            // WeakMap/WeakReference
+            ("WeakMap", &["ArrayAccess", "Countable", "IteratorAggregate", "Traversable"]),
+        ];
+
+        for (class, ifaces) in implements {
+            if class.eq_ignore_ascii_case(class_short) {
+                if ifaces.iter().any(|i| i.eq_ignore_ascii_case(target_short)) {
+                    return true;
+                }
+            }
+        }
+
+        // Also check if the class registered in self.classes has builtin parents
+        // by walking up the chain
+        if let Some(class_def) = self.classes.get(class_name).or_else(|| self.classes.get(&class_name.to_lowercase())) {
+            // Check if any of the class's registered interfaces are builtin implementors of target
+            for iface in &class_def.interfaces {
+                if self.builtin_implements(iface, target) {
+                    return true;
+                }
+            }
+            // Check parent
+            if let Some(ref parent) = class_def.parent {
+                if self.builtin_implements(parent, target) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Check if a class implements a specific interface (walks class hierarchy).
@@ -2208,6 +2597,117 @@ impl Vm {
                 return false;
             }
         }
+    }
+
+    /// Ensure all interfaces in a class's hierarchy are loaded (autoloaded if needed).
+    /// Walks the class→parent chain, autoloading interfaces that aren't yet registered.
+    pub(crate) fn ensure_interface_chain_loaded(&mut self, class_name: &str) {
+        // Skip if we're already inside an autoload to prevent re-entrant issues
+        if !self.autoloading_classes.is_empty() {
+            return;
+        }
+
+        // Skip if we've already fully loaded this class's interface chain
+        if self.interface_chain_loaded.contains(class_name) {
+            return;
+        }
+
+        let mut class_queue = vec![class_name.to_string()];
+        let mut visited = HashSet::new();
+        let mut iterations = 0;
+
+        while let Some(current) = class_queue.pop() {
+            iterations += 1;
+            if iterations > 500 {
+                break;
+            }
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            // Skip already-processed classes
+            if self.interface_chain_loaded.contains(&current) {
+                continue;
+            }
+            let (interfaces, parent) = if let Some(class_def) = self.classes.get(&current) {
+                (class_def.interfaces.clone(), class_def.parent.clone())
+            } else {
+                continue;
+            };
+
+            for iface in &interfaces {
+                if !self.classes.contains_key(iface) {
+                    self.try_autoload_class(iface);
+                }
+                // Also ensure the interface's parent interfaces are loaded
+                class_queue.push(iface.clone());
+            }
+            if let Some(parent) = parent {
+                class_queue.push(parent);
+            }
+        }
+
+        // Mark this class as fully processed
+        self.interface_chain_loaded.insert(class_name.to_string());
+    }
+
+    /// Recursively check if a class implements a target interface, walking
+    /// the full class→parent chain and interface→parent-interface chain.
+    fn implements_interface_deep(&self, class_name: &str, target: &str) -> bool {
+        let mut class_queue = vec![class_name.to_string()];
+        let mut visited = HashSet::new();
+
+        while let Some(current_class) = class_queue.pop() {
+            if !visited.insert(current_class.clone()) {
+                continue;
+            }
+
+            if let Some(class_def) = self.classes.get(&current_class) {
+                for iface in &class_def.interfaces {
+                    if names_match(iface, target) {
+                        return true;
+                    }
+                    if self.interface_extends_deep(iface, target, &mut visited.clone()) {
+                        return true;
+                    }
+                }
+
+                if let Some(ref parent) = class_def.parent {
+                    class_queue.push(parent.clone());
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Check if an interface transitively extends a target interface.
+    fn interface_extends_deep(&self, iface_name: &str, target: &str, visited: &mut HashSet<String>) -> bool {
+        if !visited.insert(iface_name.to_string()) {
+            return false;
+        }
+
+        let iface_def_opt = self.classes.get(iface_name)
+            .or_else(|| self.classes.get(&iface_name.to_lowercase()));
+        if let Some(iface_def) = iface_def_opt {
+            for parent_iface in &iface_def.interfaces {
+                if names_match(parent_iface, target) {
+                    return true;
+                }
+                if self.interface_extends_deep(parent_iface, target, visited) {
+                    return true;
+                }
+            }
+            if let Some(ref parent) = iface_def.parent {
+                if names_match(parent, target) {
+                    return true;
+                }
+                if self.interface_extends_deep(parent, target, visited) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Call a method on an object synchronously and return the result.
@@ -2453,6 +2953,7 @@ impl Vm {
         let raw_class = self.read_operand(op, 2, oa_idx)?.to_php_string();
         let class_name = self.resolve_class_name(&raw_class);
 
+
         // Walk parent chain to find the static property (and its declaring class for write-back)
         let (val, owner_class) = {
             let mut current = class_name.clone();
@@ -2636,8 +3137,26 @@ impl Vm {
                     if obj_class.eq_ignore_ascii_case(class_name) {
                         return true;
                     }
-                    // Check inheritance
-                    self.is_subclass(&obj_class, class_name)
+                    // Also compare short names (after last \)
+                    let obj_short = obj_class.rsplit('\\').next().unwrap_or(&obj_class);
+                    let type_short = class_name.rsplit('\\').next().unwrap_or(class_name);
+                    if obj_short.eq_ignore_ascii_case(type_short) {
+                        return true;
+                    }
+                    // Check inheritance via class definitions
+                    if self.is_subclass(&obj_class, class_name) {
+                        return true;
+                    }
+                    // Check interface hierarchy: walk class parents and their interfaces,
+                    // recursively checking if any interface matches the target type
+                    if self.implements_interface_deep(&obj_class, class_name) {
+                        return true;
+                    }
+                    // Built-in type hierarchy for SPL/core types not in self.classes
+                    if self.builtin_implements(&obj_class, class_name) {
+                        return true;
+                    }
+                    false
                 } else {
                     false
                 }

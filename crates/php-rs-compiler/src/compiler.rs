@@ -364,11 +364,28 @@ impl Compiler {
                     if rt == "never" {
                         self.op_array.emit(ZOp::new(ZOpcode::VerifyNeverType, line));
                     } else {
-                        // Emit for all types including void (void expects null return)
+                        // When VerifyReturnType needs to coerce the value (e.g., string→int),
+                        // it writes back to op1. If op1 is a Const, we can't write back.
+                        // Copy to a temp first so the coerced value can be written back.
+                        let (vrt_operand, vrt_op_type) = if ret_op_type == OperandType::Const {
+                            let tmp = self.op_array.alloc_temp();
+                            self.op_array.emit(
+                                ZOp::new(ZOpcode::QmAssign, line)
+                                    .with_op1(ret_operand, ret_op_type)
+                                    .with_result(Operand::tmp_var(tmp), OperandType::TmpVar),
+                            );
+                            (Operand::tmp_var(tmp), OperandType::TmpVar)
+                        } else {
+                            (ret_operand, ret_op_type)
+                        };
                         self.op_array.emit(
                             ZOp::new(ZOpcode::VerifyReturnType, line)
-                                .with_op1(ret_operand, ret_op_type),
+                                .with_op1(vrt_operand, vrt_op_type),
                         );
+                        // Return uses the same operand that VerifyReturnType may have coerced
+                        self.op_array
+                            .emit(ZOp::new(ZOpcode::Return, line).with_op1(vrt_operand, vrt_op_type));
+                        return;
                     }
                 }
 
@@ -2105,6 +2122,13 @@ impl Compiler {
         rhs: &Expression,
         line: u32,
     ) -> ExprResult {
+        // Handle ??= specially — it has short-circuit semantics that don't fit
+        // the regular compound-assignment (AssignDimOp/AssignObjOp) path,
+        // especially for complex LHS like $this->prop[$key].
+        if op == BinaryOperator::CoalesceAssign {
+            return self.compile_coalesce_assign(lhs, rhs, line);
+        }
+
         // Handle compound assignment operators
         if let Some(assign_op) = compound_assign_op(op) {
             return self.compile_compound_assign(assign_op, lhs, rhs, line);
@@ -2681,6 +2705,48 @@ impl Compiler {
         self.op_array.opcodes[coalesce_idx as usize].op2 = Operand::jmp_target(target);
 
         ExprResult::tmp(tmp)
+    }
+
+    /// Compile `$lhs ??= $rhs`.
+    ///
+    /// Strategy: read LHS, check with Coalesce (jump if non-null),
+    /// compile full assignment `$lhs = $rhs` (which handles property write-back),
+    /// QmAssign result.
+    fn compile_coalesce_assign(
+        &mut self,
+        lhs: &Expression,
+        rhs: &Expression,
+        line: u32,
+    ) -> ExprResult {
+        // Step 1: Read the current value of LHS
+        let lhs_read = self.compile_expr(lhs);
+        let result_tmp = self.op_array.alloc_temp();
+
+        // Step 2: Coalesce — if non-null, jump to end with the existing value
+        let coalesce_idx = self.op_array.emit(
+            ZOp::new(ZOpcode::Coalesce, line)
+                .with_op1(lhs_read.operand, lhs_read.op_type)
+                .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+        );
+
+        // Step 3: Use the existing compile_assign which handles all LHS patterns
+        // including property-array write-back ($this->prop[$key] = $val).
+        // This re-compiles the RHS expression, which is fine because it only runs
+        // on the null path (the Coalesce jump skips it when LHS is non-null).
+        let assign_result = self.compile_assign(lhs, rhs, line);
+
+        // Step 4: QmAssign — copy assignment result to result_tmp for the null path
+        self.op_array.emit(
+            ZOp::new(ZOpcode::QmAssign, line)
+                .with_op1(assign_result.operand, assign_result.op_type)
+                .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
+        );
+
+        // Patch the Coalesce jump target to after the assignment
+        let end_target = self.op_array.next_opline();
+        self.op_array.opcodes[coalesce_idx as usize].op2 = Operand::jmp_target(end_target);
+
+        ExprResult::tmp(result_tmp)
     }
 
     fn compile_isset(&mut self, vars: &[Expression], line: u32) -> ExprResult {
@@ -3724,6 +3790,63 @@ impl Compiler {
     // =========================================================================
 
     /// Serialize a Type AST node to a string representation for runtime checking.
+    /// Convert a type to string, qualifying class names using use imports and namespace.
+    fn qualified_type_to_string(&self, t: &php_rs_parser::Type) -> String {
+        match t {
+            php_rs_parser::Type::Named { name, .. } => {
+                let full = name.parts.join("\\");
+                let raw = if name.fully_qualified {
+                    full.strip_prefix('\\').unwrap_or(&full).to_string()
+                } else {
+                    full
+                };
+                // Don't qualify built-in type names
+                match raw.as_str() {
+                    "int" | "float" | "string" | "bool" | "array" | "object" | "callable"
+                    | "iterable" | "mixed" | "null" | "false" | "true" | "void" | "never"
+                    | "self" | "static" | "parent" => raw,
+                    _ => {
+                        if name.fully_qualified {
+                            // Already fully qualified — don't re-qualify with namespace
+                            raw
+                        } else {
+                            self.qualify_name(&raw)
+                        }
+                    }
+                }
+            }
+            php_rs_parser::Type::Nullable { inner, .. } => {
+                format!("?{}", self.qualified_type_to_string(inner))
+            }
+            php_rs_parser::Type::Union { types, .. } => types
+                .iter()
+                .map(|t| self.qualified_type_to_string(t))
+                .collect::<Vec<_>>()
+                .join("|"),
+            php_rs_parser::Type::Intersection { types, .. } => types
+                .iter()
+                .map(|t| self.qualified_type_to_string(t))
+                .collect::<Vec<_>>()
+                .join("&"),
+            php_rs_parser::Type::Dnf { groups, .. } => groups
+                .iter()
+                .map(|g| {
+                    let inner = g
+                        .iter()
+                        .map(|t| self.qualified_type_to_string(t))
+                        .collect::<Vec<_>>()
+                        .join("&");
+                    if g.len() > 1 {
+                        format!("({})", inner)
+                    } else {
+                        inner
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|"),
+        }
+    }
+
     fn type_to_string(t: &php_rs_parser::Type) -> String {
         match t {
             php_rs_parser::Type::Named { name, .. } => {
@@ -3790,7 +3913,7 @@ impl Compiler {
 
         // Store the return type
         if let Some(rt) = return_type {
-            func_oa.return_type = Some(Self::type_to_string(rt));
+            func_oa.return_type = Some(self.qualified_type_to_string(rt));
         }
 
         // Compile body in sub-compiler
@@ -3923,20 +4046,9 @@ impl Compiler {
                 .as_ref()
                 .and_then(|expr| Self::expr_to_literal(expr));
             // Extract full type hint string (preserves ?nullable, unions, etc.)
+            // Use qualified_type_to_string to properly handle FQN types (e.g. \Iterator)
             let type_name = param.param_type.as_ref().map(|t| {
-                let type_str = Self::type_to_string(t);
-                // Qualify non-builtin class names with namespace
-                let base = Self::extract_type_name(t).unwrap_or_default();
-                match base.as_str() {
-                    "int" | "float" | "string" | "bool" | "array" | "callable" | "iterable"
-                    | "object" | "mixed" | "void" | "never" | "null" | "false" | "true"
-                    | "self" | "static" | "parent" => type_str,
-                    _ => {
-                        // For class types in the type string, qualify with namespace
-                        let qualified = self.qualify_name(&base);
-                        type_str.replace(&base, &qualified)
-                    }
-                }
+                self.qualified_type_to_string(t)
             });
             // Encode parameter attributes
             let param_attrs: Vec<(String, Vec<(Option<String>, String)>)> = param
@@ -4122,38 +4234,24 @@ impl Compiler {
                         .with_extended_value(args.len() as u32),
                 );
             }
-            Expression::PropertyAccess {
-                object, property, ..
-            } => {
-                // Method call: $obj->method()
-                let obj = self.compile_expr(object);
-                let method = self.compile_expr(property);
+            Expression::PropertyAccess { .. } => {
+                // Parenthesized property access: ($obj->prop)()
+                // Read the property value, then call it dynamically
+                let func = self.compile_expr(name);
                 self.op_array.emit(
-                    ZOp::new(ZOpcode::InitMethodCall, line)
-                        .with_op1(obj.operand, obj.op_type)
-                        .with_op2(method.operand, method.op_type)
+                    ZOp::new(ZOpcode::InitDynamicCall, line)
+                        .with_op1(func.operand, func.op_type)
                         .with_extended_value(args.len() as u32),
                 );
             }
-            Expression::NullsafePropertyAccess {
-                object, property, ..
-            } => {
-                // Nullsafe method call: $obj?->method()
-                let obj = self.compile_expr(object);
-                let result_tmp = self.op_array.alloc_temp();
-                let jmp_null_idx = self.op_array.emit(
-                    ZOp::new(ZOpcode::JmpNull, line)
-                        .with_op1(obj.operand, obj.op_type)
-                        .with_result(Operand::tmp_var(result_tmp), OperandType::TmpVar),
-                );
-                let method = self.compile_expr(property);
+            Expression::NullsafePropertyAccess { .. } => {
+                // Parenthesized nullsafe property access: ($obj?->prop)()
+                let func = self.compile_expr(name);
                 self.op_array.emit(
-                    ZOp::new(ZOpcode::InitMethodCall, line)
-                        .with_op1(obj.operand, obj.op_type)
-                        .with_op2(method.operand, method.op_type)
+                    ZOp::new(ZOpcode::InitDynamicCall, line)
+                        .with_op1(func.operand, func.op_type)
                         .with_extended_value(args.len() as u32),
                 );
-                nullsafe_jmp = Some((jmp_null_idx, result_tmp));
             }
             Expression::StaticPropertyAccess {
                 class, property, ..
@@ -4644,7 +4742,7 @@ impl Compiler {
                     let is_static = prop_mods.contains(&Modifier::Static);
                     let default_lit = default.as_ref().and_then(|e| Self::try_expr_to_literal(e));
                     let prop_flags: u32 = prop_mods.iter().map(modifier_flag).sum();
-                    let type_name = prop_type.as_ref().map(|t| Self::type_to_string(t));
+                    let type_name = prop_type.as_ref().map(|t| self.qualified_type_to_string(t));
 
                     // Compile property hooks into separate op arrays
                     let mut get_hook_name = None;
@@ -4777,7 +4875,7 @@ impl Compiler {
 
                     // Store the return type
                     if let Some(ref rt) = method_return_type {
-                        method_oa.return_type = Some(Self::type_to_string(rt));
+                        method_oa.return_type = Some(self.qualified_type_to_string(rt));
                     }
 
                     // Add $this as implicit first CV for non-static methods
@@ -4803,7 +4901,7 @@ impl Compiler {
                                 let promo_flags: u32 =
                                     param.modifiers.iter().map(modifier_flag).sum();
                                 let promo_type =
-                                    param.param_type.as_ref().map(|t| Self::type_to_string(t));
+                                    param.param_type.as_ref().map(|t| self.qualified_type_to_string(t));
                                 // Also register as a class property
                                 metadata.properties.push(ClassPropertyInfo {
                                     name: param_name_stripped.to_string(),
@@ -4885,7 +4983,7 @@ impl Compiler {
                     method_oa.line_start = line;
                     self.setup_params(&mut method_oa, params);
                     if let Some(ref rt) = method_return_type {
-                        method_oa.return_type = Some(Self::type_to_string(rt));
+                        method_oa.return_type = Some(self.qualified_type_to_string(rt));
                     }
                     // Emit a single Return so the op_array is valid
                     let null = method_oa.add_literal(Literal::Null);
@@ -5047,7 +5145,7 @@ impl Compiler {
                     method_oa.line_start = line;
                     self.setup_params(&mut method_oa, params);
                     if let Some(ref rt) = method_return_type {
-                        method_oa.return_type = Some(Self::type_to_string(rt));
+                        method_oa.return_type = Some(self.qualified_type_to_string(rt));
                     }
                     let null = method_oa.add_literal(Literal::Null);
                     method_oa.emit(
@@ -5142,7 +5240,7 @@ impl Compiler {
                         default: default_lit,
                         is_static,
                         flags: trait_prop_flags,
-                        type_name: prop_type.as_ref().map(|t| Self::type_to_string(t)),
+                        type_name: prop_type.as_ref().map(|t| self.qualified_type_to_string(t)),
                         get_hook: None,
                         set_hook: None,
                     });

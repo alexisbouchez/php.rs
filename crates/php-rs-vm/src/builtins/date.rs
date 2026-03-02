@@ -36,6 +36,8 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     r.insert("timezone_name_get", php_timezone_name_get);
     r.insert("timezone_offset_get", php_timezone_offset_get);
     r.insert("strftime", php_strftime);
+    r.insert("date_default_timezone_set", php_date_default_timezone_set);
+    r.insert("date_default_timezone_get", php_date_default_timezone_get);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -882,4 +884,26 @@ pub(crate) fn php_timezone_offset_get(
         }
         _ => Ok(Value::Long(0)),
     }
+}
+
+fn php_date_default_timezone_set(
+    vm: &mut Vm,
+    args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let tz = args.first().map(|v| v.to_php_string()).unwrap_or_default();
+    vm.ini.force_set("date.timezone", &tz);
+    Ok(Value::Bool(true))
+}
+
+fn php_date_default_timezone_get(
+    vm: &mut Vm,
+    _args: &[Value],
+    _ref_args: &[(usize, OperandType, u32)],
+    _ref_prop_args: &[(usize, Value, String)],
+) -> VmResult<Value> {
+    let tz = vm.ini.get("date.timezone");
+    let tz = if tz.is_empty() { "UTC" } else { tz };
+    Ok(Value::String(tz.to_string().into()))
 }

@@ -578,6 +578,8 @@ pub struct Vm {
     pub(crate) autoload_callbacks: Vec<(String, Option<Value>)>,
     /// Guard to prevent recursive autoloading of the same class.
     pub(crate) autoloading_classes: HashSet<String>,
+    /// Cache of classes whose interface chains have been fully loaded.
+    pub(crate) interface_chain_loaded: HashSet<String>,
     /// HTTP response headers set by header() calls.
     pub(crate) response_headers: Vec<String>,
     /// HTTP response code set by http_response_code().
@@ -874,6 +876,7 @@ impl Vm {
             opcode_counter: 0,
             autoload_callbacks: Vec::new(),
             autoloading_classes: HashSet::new(),
+            interface_chain_loaded: HashSet::new(),
             response_headers: Vec::new(),
             response_code: None,
             headers_sent: false,
@@ -1752,7 +1755,6 @@ impl Vm {
             if self.opcode_counter & 0x3FF == 0 {
                 self.check_execution_limits()?;
             }
-
             let frame = self.call_stack.last().unwrap();
             let op_array_idx = frame.op_array_idx;
             let ip = frame.ip;
@@ -1805,6 +1807,8 @@ impl Vm {
                         self.find_catch_block(op_array_idx, ip, exception_val)
                     {
                         self.current_exception = Some(exception_val.clone());
+                        // Clear pending calls — any Init* that preceded the throw are now stale
+                        self.call_stack.last_mut().unwrap().call_stack_pending.clear();
                         Ok(DispatchSignal::Jump(catch_target))
                     } else {
                         // Unwind call stack looking for a catch block in parent frames
@@ -1822,7 +1826,10 @@ impl Vm {
                                     self.find_catch_block(caller_oa_idx, caller_ip, exception_val)
                                 {
                                     self.current_exception = Some(exception_val.clone());
-                                    self.call_stack.last_mut().unwrap().ip = catch_target;
+                                    let catcher = self.call_stack.last_mut().unwrap();
+                                    catcher.ip = catch_target;
+                                    // Clear stale pending calls from before the exception
+                                    catcher.call_stack_pending.clear();
                                     found_catch = true;
                                     break;
                                 }
@@ -2183,7 +2190,17 @@ impl Vm {
                     ref_val
                 };
 
-                self.write_cv(op, oa_idx, ref_val.clone())?;
+                // For AssignRef, always replace the CV directly (don't write through
+                // an existing reference). This ensures $a = &$a[$key] re-seats the
+                // binding instead of modifying the old referent.
+                if op.op1_type == OperandType::Cv {
+                    let idx = op.op1.val as usize;
+                    let frame = self.call_stack.last_mut().unwrap();
+                    if idx >= frame.cvs.len() {
+                        frame.cvs.resize(idx + 1, Value::Null);
+                    }
+                    frame.cvs[idx] = ref_val.clone();
+                }
                 if op.result_type != OperandType::Unused {
                     self.write_result(op, oa_idx, ref_val)?;
                 }
@@ -2823,7 +2840,9 @@ impl Vm {
                 // Auto-deref Reference for array access
                 let arr = arr_raw.deref_value();
                 let val = if let Value::Array(ref a) = arr {
-                    a.get(&key).cloned().unwrap_or(Value::Null)
+                    // Dereference element values — references inside arrays should be
+                    // transparent when reading (FetchDimR is a read-only fetch).
+                    a.get(&key).cloned().unwrap_or(Value::Null).deref_value()
                 } else if let Value::String(ref s) = arr {
                     // String character access (supports negative indices)
                     let idx = key.to_long();
@@ -2955,7 +2974,7 @@ impl Vm {
                 let key = self.read_operand(op, 2, oa_idx)?;
                 let arr = arr_raw.deref_value();
                 let val = if let Value::Array(ref a) = arr {
-                    a.get(&key).cloned().unwrap_or(Value::Null)
+                    a.get(&key).cloned().unwrap_or(Value::Null).deref_value()
                 } else {
                     Value::Null
                 };
@@ -3000,7 +3019,8 @@ impl Vm {
                     Value::Object(ref obj) => {
                         // isset($obj->prop) — check if property exists and is not null
                         let prop_name = key.to_php_string();
-                        obj.get_property(&prop_name).unwrap_or(Value::Null)
+                        let resolved = self.resolve_private_property_key(&obj.class_name(), &prop_name);
+                        obj.get_property(&resolved).unwrap_or(Value::Null)
                     }
                     Value::String(ref s) => {
                         // isset($str[$idx]) — check if index is within bounds (negative OK)
@@ -3789,7 +3809,8 @@ impl Vm {
                 Ok(DispatchSignal::Next)
             }
             ZOpcode::InitDynamicCall => {
-                let name_val = self.read_operand(op, 1, oa_idx)?;
+                let name_val_raw = self.read_operand(op, 1, oa_idx)?;
+                let name_val = name_val_raw.deref_value();
                 // Handle array callables: [$obj, "method"] or ["ClassName", "method"]
                 if let Value::Array(ref arr) = name_val {
                     let entries = arr.entries();
@@ -3993,6 +4014,7 @@ impl Vm {
             | ZOpcode::SendVarNoRef
             | ZOpcode::SendVarNoRefEx
             | ZOpcode::SendFuncArg => {
+                let opcode = op.opcode;
                 let val = self.read_operand(op, 1, oa_idx)?;
                 // Check for named argument: op2_type == Const means there's a name literal
                 let arg_name = if op.op2_type == OperandType::Const {
@@ -4021,6 +4043,14 @@ impl Vm {
                                 .push((pending.args.len(), obj_val, prop_name));
                         }
                     }
+                    // For pass-by-value sends, dereference any Reference wrapper so
+                    // the callee gets its own copy and cannot mutate the original.
+                    // SendRef keeps the reference for pass-by-reference semantics.
+                    let val = if opcode == ZOpcode::SendRef {
+                        val
+                    } else {
+                        val.deref_value()
+                    };
                     pending.args.push(val);
                     pending.arg_names.push(arg_name);
                 }
@@ -4422,8 +4452,8 @@ impl Vm {
             }
             ZOpcode::ArrayKeyExists => {
                 // op1 = key, op2 = array
-                let key = self.read_operand(op, 1, oa_idx)?;
-                let arr = self.read_operand(op, 2, oa_idx)?;
+                let key = self.read_operand(op, 1, oa_idx)?.deref_value();
+                let arr = self.read_operand(op, 2, oa_idx)?.deref_value();
                 let exists = if let Value::Array(ref a) = arr {
                     a.get(&key).is_some()
                 } else {
@@ -4502,15 +4532,7 @@ impl Vm {
                 let val = self.constants.get(name).cloned().unwrap_or_else(|| {
                     // Try short name (after last \) for namespaced constants
                     let short = name.rsplit('\\').next().unwrap_or(name);
-                    self.constants.get(short).cloned().unwrap_or_else(|| {
-                        if name.contains("DIRECTORY") || name.contains("SEPARATOR") {
-                            eprintln!(
-                                "DEBUG FetchConstant: raw={} name={} short={} NOT FOUND",
-                                raw_name, name, short
-                            );
-                        }
-                        Value::Null
-                    })
+                    self.constants.get(short).cloned().unwrap_or(Value::Null)
                 });
                 self.write_result(op, oa_idx, val)?;
                 Ok(DispatchSignal::Next)
@@ -4818,40 +4840,6 @@ impl Vm {
             // =====================================================================
             ZOpcode::Throw => {
                 let val = self.read_operand(op, 1, oa_idx)?;
-                {
-                    let class = if let Value::Object(ref o) = val {
-                        o.class_name()
-                    } else {
-                        "non-object".to_string()
-                    };
-                    let msg = if let Value::Object(ref o) = val {
-                        o.get_property("message")
-                            .map(|v| v.to_php_string())
-                            .unwrap_or_default()
-                    } else {
-                        format!("{:?}", val)
-                    };
-                    let stack: Vec<String> = self
-                        .call_stack
-                        .iter()
-                        .rev()
-                        .map(|f| {
-                            let name = self
-                                .op_arrays
-                                .get(f.op_array_idx)
-                                .and_then(|oa| oa.function_name.as_deref())
-                                .unwrap_or("<main>");
-                            format!("{}@ip{}", name, f.ip)
-                        })
-                        .collect();
-                    eprintln!(
-                        "[THROW] {} at {} line {}: {}",
-                        class,
-                        stack.join(" -> "),
-                        op.lineno,
-                        msg
-                    );
-                }
                 Err(VmError::Thrown(val))
             }
             ZOpcode::Catch => {
@@ -5011,12 +4999,70 @@ impl Vm {
                 let val = self.read_operand(op, 1, oa_idx)?.deref_value();
                 let frame = self.call_stack.last().unwrap();
                 let func_oa = &self.op_arrays[frame.op_array_idx];
-                if let Some(ref rt) = func_oa.return_type {
+                let rt_opt = func_oa.return_type.clone();
+                let func_name_owned = func_oa.function_name.clone().unwrap_or_else(|| "{main}".to_string());
+                drop(frame); // release borrow
+
+                if let Some(ref rt) = rt_opt {
+                    let nullable = rt.starts_with('?');
+                    let rt_inner = rt.strip_prefix('?').unwrap_or(rt);
+                    // If nullable and value is null, skip coercion — null is valid
+                    if nullable && matches!(val, Value::Null) {
+                        return Ok(DispatchSignal::Next);
+                    }
+                    // PHP auto-coerces values for scalar return types in weak mode
+                    let coerced = match rt_inner {
+                        "string" => {
+                            if let Value::Object(_) = val {
+                                Some(Value::String(self.value_to_string(&val)?))
+                            } else if !matches!(val, Value::String(_)) {
+                                Some(Value::String(val.to_php_string()))
+                            } else {
+                                None
+                            }
+                        }
+                        "bool" => {
+                            if !matches!(val, Value::Bool(_)) {
+                                Some(Value::Bool(val.to_bool()))
+                            } else {
+                                None
+                            }
+                        }
+                        "int" => {
+                            if !matches!(val, Value::Long(_)) {
+                                Some(Value::Long(val.to_long()))
+                            } else {
+                                None
+                            }
+                        }
+                        "float" => {
+                            if !matches!(val, Value::Double(_)) {
+                                Some(Value::Double(val.to_double()))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(coerced_val) = coerced {
+                        // Write the coerced value back to op1
+                        if op.op1_type == OperandType::Cv || op.op1_type == OperandType::Var || op.op1_type == OperandType::TmpVar {
+                            let idx = op.op1.val as usize;
+                            let frame = self.call_stack.last_mut().unwrap();
+                            if op.op1_type == OperandType::Cv {
+                                if idx < frame.cvs.len() {
+                                    frame.cvs[idx] = coerced_val;
+                                }
+                            } else if idx < frame.temps.len() {
+                                frame.temps[idx] = coerced_val;
+                            }
+                        }
+                        return Ok(DispatchSignal::Next);
+                    }
                     if !self.value_matches_type(&val, rt) {
-                        let func_name = func_oa.function_name.as_deref().unwrap_or("{main}");
                         let actual_type = self.get_value_type_name(&val);
                         return Err(VmError::TypeError(format!(
-                            "{func_name}(): Return value must be of type {rt}, {actual_type} returned"
+                            "{func_name_owned}(): Return value must be of type {rt}, {actual_type} returned"
                         )));
                     }
                 }
@@ -5539,6 +5585,11 @@ impl Vm {
                 name
             )));
         }
+
+        // Dereference any Reference-wrapped arguments so builtins see plain values.
+        // Write-back is handled separately via ref_args/ref_prop_args.
+        let derefed: Vec<Value> = args.iter().map(|v| v.deref_value()).collect();
+        let args = &derefed;
 
         // Consult the builtins registry first.
         if let Some(handler) = self.builtins.get(name).copied() {

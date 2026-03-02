@@ -549,6 +549,8 @@ pub(crate) fn build_default_classes() -> HashMap<String, ClassDef> {
         ]),
     );
     cls.insert("SplObjectStorage".into(), make_class("SplObjectStorage", None, vec![]));
+    cls.insert("WeakMap".into(), make_class("WeakMap", None, vec![]));
+    cls.insert("WeakReference".into(), make_class("WeakReference", None, vec![]));
 
     // Built-in interfaces
     let make_interface = |name: &str| -> ClassDef {

@@ -152,19 +152,18 @@ impl Vm {
         caller_oa_idx: usize,
     ) -> VmResult<DispatchSignal> {
         let caller_frame = self.call_stack.last_mut().unwrap();
-        let pending = caller_frame
-            .call_stack_pending
-            .pop()
-            .unwrap_or(PendingCall {
-                name: String::new(),
-                args: Vec::new(),
-                arg_names: Vec::new(),
-                this_source: None,
-                static_class: None,
-                forwarded_this: None,
-                ref_args: Vec::new(),
-                ref_prop_args: Vec::new(),
-            });
+        let pending = if let Some(p) = caller_frame.call_stack_pending.pop() {
+            p
+        } else {
+            // No pending call — an Init* opcode was likely skipped.
+            // This can happen when exception unwinding clears pending calls
+            // or when conditional branches skip Init* opcodes. Return Null.
+            if op.result_type != OperandType::Unused {
+                self.write_result(op, caller_oa_idx, Value::Null)?;
+            }
+            // DON'T set last_return_value to Null — keep the previous value
+            return Ok(DispatchSignal::Next);
+        };
         let func_name = if pending.name.starts_with('\\') && !pending.name.contains("::") {
             pending.name[1..].to_string()
         } else {
@@ -728,8 +727,30 @@ impl Vm {
             let class_part = &func_name[..func_name.len() - 13]; // strip "::__construct"
             let base_class = class_part.rsplit('\\').next().unwrap_or(class_part);
 
+            // Resolve the effective base class for constructor dispatch:
+            // walk the parent chain to find if this class inherits from a known built-in
+            let effective_base = {
+                let mut eb = base_class.to_string();
+                let mut current = class_part.to_string();
+                loop {
+                    if let Some(class_def) = self.classes.get(&current) {
+                        if let Some(ref parent) = class_def.parent {
+                            let parent_short = parent.rsplit('\\').next().unwrap_or(parent);
+                            eb = parent_short.to_string();
+                            current = parent.clone();
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                eb
+            };
+
             // DateTime/DateTimeImmutable constructors — parse and store timestamp
-            if base_class == "DateTime" || base_class == "DateTimeImmutable" {
+            if base_class == "DateTime" || base_class == "DateTimeImmutable"
+                || effective_base == "DateTime" || effective_base == "DateTimeImmutable" {
                 if let Some(Value::Object(ref obj)) = args.first() {
                     let time_str = args.get(1).and_then(|v| {
                         if matches!(v, Value::Null) {
@@ -774,7 +795,8 @@ impl Vm {
             }
 
             // DateTimeZone constructor — resolve timezone name and offset
-            if base_class == "DateTimeZone" || base_class == "CarbonTimeZone" {
+            if base_class == "DateTimeZone" || base_class == "CarbonTimeZone"
+                || effective_base == "DateTimeZone" || effective_base == "CarbonTimeZone" {
                 if let Some(Value::Object(ref obj)) = args.first() {
                     let tz_name = args
                         .get(1)
@@ -1173,8 +1195,30 @@ impl Vm {
         // Handle Closure::bind() and Closure::fromCallable()
         if func_name == "Closure::bind" || func_name == "Closure::bindTo" {
             // Closure::bind($closure, $newThis, $newScope = "static")
-            // For the Composer use case, just return the original closure
             let closure_val = args.first().cloned().unwrap_or(Value::Null);
+            let new_this = args.get(1).cloned().unwrap_or(Value::Null);
+            let new_scope = args.get(2).map(|v| v.to_php_string());
+            // Store the bound scope for the closure so visibility checks work
+            let closure_name = Self::extract_closure_name(&closure_val);
+            if !closure_name.is_empty() {
+                let scope = new_scope.clone().or_else(|| {
+                    if let Value::Object(ref o) = new_this {
+                        Some(o.class_name())
+                    } else {
+                        None
+                    }
+                });
+                if let Some(scope) = scope {
+                    self.closure_scopes.insert(closure_name.clone(), scope);
+                }
+                // Store $this binding if provided
+                if !matches!(new_this, Value::Null) {
+                    let bindings = self.closure_bindings.entry(closure_name).or_insert_with(Vec::new);
+                    // Remove existing "this" binding if any
+                    bindings.retain(|(k, _)| k != "this");
+                    bindings.push(("this".to_string(), new_this));
+                }
+            }
             if op.result_type != OperandType::Unused {
                 self.write_result(op, caller_oa_idx, closure_val)?;
             }
@@ -1359,6 +1403,12 @@ impl Vm {
             }
             return Ok(DispatchSignal::Next);
         }
+        if let Some(refl_result) = self.try_reflection_attribute_call(&func_name, &args)? {
+            if op.result_type != OperandType::Unused {
+                self.write_result(op, caller_oa_idx, refl_result)?;
+            }
+            return Ok(DispatchSignal::Next);
+        }
 
         // Look up user-defined function (with parent chain fallback for methods)
         let func_oa_idx = self.functions.get(&func_name).copied().or_else(|| {
@@ -1376,6 +1426,10 @@ impl Vm {
             }
         });
         if let Some(oa_idx) = func_oa_idx {
+            // Guard against sentinel values (e.g. usize::MAX for builtin constructors)
+            if oa_idx >= self.op_arrays.len() {
+                return Err(VmError::UndefinedFunction(func_name));
+            }
             // Check if this is a generator function
             if self.op_arrays[oa_idx].is_generator {
                 return self.create_generator_object(op, caller_oa_idx, oa_idx, &args);
@@ -1403,7 +1457,8 @@ impl Vm {
             }
             self.call_stack.last_mut().unwrap().ip += 1;
 
-            let func_oa = &self.op_arrays[oa_idx];
+            let func_oa_clone = self.op_arrays[oa_idx].clone();
+            let func_oa = &func_oa_clone;
             let mut new_frame = Frame::new(func_oa);
             new_frame.op_array_idx = oa_idx;
             self.populate_superglobals(&mut new_frame, func_oa);
@@ -1464,6 +1519,10 @@ impl Vm {
                     if let Some(ref type_name) = func_oa.arg_info[i].type_name {
                         let val = &new_frame.args[i];
                         let derefed = val.deref_value();
+                        // Ensure interface chains are loaded for object type checks
+                        if let Value::Object(ref obj) = derefed {
+                            self.ensure_interface_chain_loaded(&obj.class_name());
+                        }
                         if !self.value_matches_type(&derefed, type_name) {
                             // In strict mode, do NOT attempt coercion — reject immediately
                             let caller_is_strict = self.op_arrays[caller_oa_idx].strict_types;
@@ -1491,9 +1550,10 @@ impl Vm {
                         }
                     }
                     new_frame.cvs[i] = new_frame.args[i].clone();
-                } else if let Some(ref default) = func_oa.arg_info[i].default {
+                } else if let Some(default) = func_oa.arg_info[i].default.clone() {
                     // Apply default value from arg_info
-                    new_frame.cvs[i] = match default {
+                    // Clone to release borrow on func_oa before potential autoloading
+                    new_frame.cvs[i] = match &default {
                         Literal::Null => Value::Null,
                         Literal::Bool(b) => Value::Bool(*b),
                         Literal::Long(n) => Value::Long(*n),
@@ -1743,6 +1803,16 @@ impl Vm {
             }
         }
 
-        Err(VmError::UndefinedFunction(func_name))
+        // Provide caller context for debugging
+        let caller_info = self
+            .call_stack
+            .last()
+            .and_then(|f| self.op_arrays.get(f.op_array_idx))
+            .and_then(|oa| oa.function_name.as_deref())
+            .unwrap_or("<main>");
+        Err(VmError::UndefinedFunction(format!(
+            "{} (called from {})",
+            func_name, caller_info
+        )))
     }
 }

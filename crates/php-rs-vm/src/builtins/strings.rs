@@ -158,7 +158,14 @@ pub(crate) fn dispatch(
         "substr" => {
             let s = args.first().cloned().unwrap_or(Value::Null).to_php_string();
             let start = args.get(1).cloned().unwrap_or(Value::Long(0)).to_long();
-            let len = args.get(2).map(|v| v.to_long());
+            // PHP: substr($s, $start, null) means "to end of string" (same as omitting $length)
+            let len = args.get(2).and_then(|v| {
+                if matches!(v, Value::Null) {
+                    None
+                } else {
+                    Some(v.to_long())
+                }
+            });
 
             // PHP strings are binary — substr operates on byte offsets.
             // Since we use Latin-1 encoding (each PHP byte = one Rust char),
@@ -1641,7 +1648,14 @@ pub(crate) fn dispatch(
         "mb_substr" => {
             let s = args.first().map(|v| v.to_php_string()).unwrap_or_default();
             let start = args.get(1).map(|v| v.to_long()).unwrap_or(0);
-            let len = args.get(2).map(|v| v.to_long());
+            // PHP: mb_substr($s, $start, null) means "to end of string" (same as omitting $length)
+            let len = args.get(2).and_then(|v| {
+                if matches!(v, Value::Null) {
+                    None
+                } else {
+                    Some(v.to_long())
+                }
+            });
             let chars: Vec<char> = s.chars().collect();
             let total = chars.len() as i64;
             let start = if start < 0 {

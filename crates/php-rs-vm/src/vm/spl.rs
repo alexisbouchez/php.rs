@@ -1280,7 +1280,106 @@ impl Vm {
             }
         }
 
+        // WeakMap methods (ArrayAccess + Countable + IteratorAggregate)
+        if base_class == "WeakMap" {
+            if let Some(result) = self.call_weakmap_method(method, args)? {
+                return Ok(Some(result));
+            }
+        }
+
         Ok(None)
+    }
+
+    fn call_weakmap_method(
+        &mut self,
+        method: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let obj = match args.first() {
+            Some(Value::Object(ref o)) => o.clone(),
+            _ => return Ok(None),
+        };
+
+        match method {
+            "__construct" => Ok(Some(Value::Null)),
+            "offsetSet" => {
+                let key = args.get(1).cloned().unwrap_or(Value::Null);
+                let value = args.get(2).cloned().unwrap_or(Value::Null);
+                let key_id = match &key {
+                    Value::Object(o) => o.object_id().to_string(),
+                    _ => return Err(VmError::TypeError(
+                        "WeakMap key must be an object".to_string(),
+                    )),
+                };
+                let mut entries = match obj.get_property("__weakmap_entries") {
+                    Some(Value::Array(a)) => a,
+                    _ => PhpArray::new(),
+                };
+                entries.set(&Value::String(key_id), value);
+                obj.set_property("__weakmap_entries".to_string(), Value::Array(entries));
+                Ok(Some(Value::Null))
+            }
+            "offsetGet" => {
+                let key = args.get(1).cloned().unwrap_or(Value::Null);
+                let key_id = match &key {
+                    Value::Object(o) => o.object_id().to_string(),
+                    _ => return Err(VmError::TypeError(
+                        "WeakMap key must be an object".to_string(),
+                    )),
+                };
+                let result = match obj.get_property("__weakmap_entries") {
+                    Some(Value::Array(ref a)) => {
+                        a.get(&Value::String(key_id)).cloned().unwrap_or(Value::Null)
+                    }
+                    _ => Value::Null,
+                };
+                Ok(Some(result))
+            }
+            "offsetExists" => {
+                let key = args.get(1).cloned().unwrap_or(Value::Null);
+                let key_id = match &key {
+                    Value::Object(o) => o.object_id().to_string(),
+                    _ => return Ok(Some(Value::Bool(false))),
+                };
+                let exists = match obj.get_property("__weakmap_entries") {
+                    Some(Value::Array(ref a)) => a.get(&Value::String(key_id)).is_some(),
+                    _ => false,
+                };
+                Ok(Some(Value::Bool(exists)))
+            }
+            "offsetUnset" => {
+                let key = args.get(1).cloned().unwrap_or(Value::Null);
+                let key_id = match &key {
+                    Value::Object(o) => o.object_id().to_string(),
+                    _ => return Ok(Some(Value::Null)),
+                };
+                let mut entries = match obj.get_property("__weakmap_entries") {
+                    Some(Value::Array(a)) => a,
+                    _ => PhpArray::new(),
+                };
+                entries.unset(&Value::String(key_id));
+                obj.set_property("__weakmap_entries".to_string(), Value::Array(entries));
+                Ok(Some(Value::Null))
+            }
+            "count" => {
+                let count = match obj.get_property("__weakmap_entries") {
+                    Some(Value::Array(ref a)) => a.len() as i64,
+                    _ => 0,
+                };
+                Ok(Some(Value::Long(count)))
+            }
+            "getIterator" => {
+                let entries = match obj.get_property("__weakmap_entries") {
+                    Some(Value::Array(a)) => a,
+                    _ => PhpArray::new(),
+                };
+                let iter_obj = PhpObject::new("ArrayIterator".to_string());
+                iter_obj.set_property("__data".to_string(), Value::Array(entries));
+                iter_obj.set_property("__position".to_string(), Value::Long(0));
+                Ok(Some(Value::Object(iter_obj)))
+            }
+            _ => Ok(None),
+        }
     }
 
     // ── DateTime / DateTimeImmutable method dispatch ─────────────────────────

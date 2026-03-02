@@ -252,7 +252,7 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
 
     // -- Class / Object introspection --
     r.insert("class_exists", php_class_exists);
-    r.insert("method_exists", php_method_exists);
+    // method_exists is registered by type_check module (canonical implementation with parent chain walk)
     r.insert("property_exists", php_property_exists);
     r.insert("get_parent_class", php_get_parent_class);
     r.insert("is_a", php_is_a);
@@ -262,7 +262,7 @@ pub(crate) fn register(r: &mut BuiltinRegistry) {
     r.insert("get_class_vars", php_get_class_vars);
     r.insert("get_object_vars", php_get_object_vars);
     r.insert("interface_exists", php_interface_exists);
-    r.insert("class_alias", php_class_alias);
+    // class_alias is registered by type_check module (canonical implementation)
     r.insert("extension_loaded", php_extension_loaded);
     r.insert("enum_exists", php_enum_exists);
     r.insert("get_declared_classes", php_get_declared_classes);
@@ -2220,25 +2220,8 @@ fn php_is_subclass_of(
     _ref_args: &[(usize, OperandType, u32)],
     _ref_prop_args: &[(usize, Value, String)],
 ) -> VmResult<Value> {
-    let obj = args.first().cloned().unwrap_or(Value::Null);
-    let target = args.get(1).cloned().unwrap_or(Value::Null).to_php_string();
-    let cn = match &obj {
-        Value::Object(o) => o.class_name(),
-        Value::String(s) => s.clone(),
-        _ => return Ok(Value::Bool(false)),
-    };
-    if cn.eq_ignore_ascii_case(&target) {
-        return Ok(Value::Bool(false));
-    }
-    let mut cur = cn;
-    loop {
-        match vm.classes.get(&cur).and_then(|c| c.parent.clone()) {
-            Some(p) if p.eq_ignore_ascii_case(&target) => return Ok(Value::Bool(true)),
-            Some(p) => cur = p,
-            None => break,
-        }
-    }
-    Ok(Value::Bool(false))
+    // Delegate to the canonical implementation in type_check
+    crate::builtins::type_check::php_is_subclass_of(vm, args, _ref_args, _ref_prop_args)
 }
 
 fn php_get_called_class(

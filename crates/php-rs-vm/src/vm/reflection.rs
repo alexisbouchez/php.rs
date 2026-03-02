@@ -11,7 +11,7 @@ use crate::value::{ArrayKey, PhpArray, PhpObject, Value};
 impl Vm {
     /// Try handling a ReflectionFunction method call.
     pub(crate) fn try_reflection_function_method(
-        &self,
+        &mut self,
         func_name: &str,
         args: &[Value],
     ) -> VmResult<Option<Value>> {
@@ -54,7 +54,7 @@ impl Vm {
                 let oa_idx = self.functions.get(&func_n).copied();
                 let mut params = PhpArray::new();
                 if let Some(idx) = oa_idx {
-                    let arg_info = &self.op_arrays[idx].arg_info;
+                    let arg_info = self.op_arrays[idx].arg_info.clone();
                     for (i, info) in arg_info.iter().enumerate() {
                         let param_obj = PhpObject::new("ReflectionParameter".to_string());
                         param_obj
@@ -600,6 +600,84 @@ impl Vm {
                     .unwrap_or(false);
                 Ok(Some(Value::Bool(v)))
             }
+            _ => Ok(None),
+        }
+    }
+
+    /// Handle ReflectionAttribute::* calls.
+    pub(crate) fn try_reflection_attribute_call(
+        &mut self,
+        func_name: &str,
+        args: &[Value],
+    ) -> VmResult<Option<Value>> {
+        let method_name = if let Some(m) = func_name.strip_prefix("ReflectionAttribute::") {
+            m
+        } else {
+            return Ok(None);
+        };
+
+        let obj = match args.first() {
+            Some(Value::Object(o)) if o.class_name() == "ReflectionAttribute" => o.clone(),
+            _ => return Ok(None),
+        };
+
+        match method_name {
+            "getName" => {
+                let name = obj
+                    .get_property("name")
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
+                Ok(Some(Value::String(name)))
+            }
+            "getArguments" => {
+                let arguments = obj
+                    .get_property("arguments")
+                    .unwrap_or(Value::Array(PhpArray::new()));
+                Ok(Some(arguments))
+            }
+            "newInstance" => {
+                // Get the attribute class name and arguments
+                let attr_class = obj
+                    .get_property("name")
+                    .map(|v| v.to_php_string())
+                    .unwrap_or_default();
+                let arguments = match obj.get_property("arguments") {
+                    Some(Value::Array(arr)) => arr,
+                    _ => PhpArray::new(),
+                };
+
+                // Autoload the attribute class if needed
+                let attr_lc = attr_class.to_lowercase();
+                if !self.classes.contains_key(&attr_lc) {
+                    self.try_autoload_class(&attr_class);
+                }
+
+                // Create instance of the attribute class with the stored arguments
+                let instance = PhpObject::new(attr_class.clone());
+                instance.set_object_id(self.next_object_id);
+                self.next_object_id += 1;
+
+                // Set named properties from arguments
+                // For #[AsCommand(name: 'value')], arguments has named keys
+                let entries: Vec<_> = arguments.entries().to_vec();
+                for (key, val) in &entries {
+                    match key {
+                        crate::value::ArrayKey::String(name) => {
+                            instance.set_property(name.clone(), val.clone());
+                        }
+                        crate::value::ArrayKey::Int(_) => {
+                            // Positional arg — for AsCommand, first positional is "name"
+                            if attr_class.ends_with("AsCommand") {
+                                instance.set_property("name".to_string(), val.clone());
+                            }
+                        }
+                    }
+                }
+
+                Ok(Some(Value::Object(instance)))
+            }
+            "getTarget" => Ok(Some(Value::Long(0))),
+            "isRepeated" => Ok(Some(Value::Bool(false))),
             _ => Ok(None),
         }
     }

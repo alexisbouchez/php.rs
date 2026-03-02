@@ -2862,6 +2862,9 @@ impl<'a> Parser<'a> {
                 | Token::LogicalAnd
                 | Token::LogicalOr
                 | Token::LogicalXor
+                | Token::Public
+                | Token::Protected
+                | Token::Private
         )
     }
 
@@ -4509,22 +4512,158 @@ impl<'a> Parser<'a> {
             Token::ObjectOperator => {
                 self.advance();
                 let property = self.parse_member_name()?;
-                Ok(Expression::PropertyAccess {
-                    object: Box::new(left),
-                    property,
-                    span,
-                })
+                // If followed by `(`, this is a method call: $obj->method(args)
+                // Parse it directly as MethodCall to distinguish from ($obj->prop)()
+                if self.current_token == Token::LParen {
+                    self.advance();
+                    // First-class callable syntax: $obj->method(...)
+                    if self.current_token == Token::Ellipsis && *self.peek() == Token::RParen {
+                        self.advance(); // consume ...
+                        self.expect(Token::RParen)?;
+                        let method_name = match *property {
+                            Expression::StringLiteral { value, .. } => value,
+                            _ => "unknown".to_string(),
+                        };
+                        let callable = Expression::ArrayLiteral {
+                            elements: vec![
+                                ArrayElement {
+                                    key: None,
+                                    value: left,
+                                    unpack: false,
+                                    by_ref: false,
+                                },
+                                ArrayElement {
+                                    key: None,
+                                    value: Expression::StringLiteral {
+                                        value: method_name,
+                                        span,
+                                    },
+                                    unpack: false,
+                                    by_ref: false,
+                                },
+                            ],
+                            span,
+                        };
+                        return Ok(Expression::FunctionCall {
+                            name: Box::new(Expression::StringLiteral {
+                                value: "Closure::fromCallable".to_string(),
+                                span,
+                            }),
+                            args: vec![Argument {
+                                name: None,
+                                value: callable,
+                                unpack: false,
+                                by_ref: false,
+                            }],
+                            span,
+                        });
+                    }
+                    let mut args = Vec::new();
+                    if self.current_token != Token::RParen {
+                        loop {
+                            args.push(self.parse_argument()?);
+                            if self.current_token == Token::Comma {
+                                self.advance();
+                                if self.current_token == Token::RParen {
+                                    break;
+                                }
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    Ok(Expression::MethodCall {
+                        object: Box::new(left),
+                        method: property,
+                        args,
+                        span,
+                    })
+                } else {
+                    Ok(Expression::PropertyAccess {
+                        object: Box::new(left),
+                        property,
+                        span,
+                    })
+                }
             }
 
-            // Nullsafe property access: $obj?->prop
+            // Nullsafe property access: $obj?->prop or $obj?->method()
             Token::NullsafeObjectOperator => {
                 self.advance();
                 let property = self.parse_member_name()?;
-                Ok(Expression::NullsafePropertyAccess {
-                    object: Box::new(left),
-                    property,
-                    span,
-                })
+                if self.current_token == Token::LParen {
+                    self.advance();
+                    // First-class callable syntax: $obj?->method(...)
+                    if self.current_token == Token::Ellipsis && *self.peek() == Token::RParen {
+                        self.advance();
+                        self.expect(Token::RParen)?;
+                        let method_name = match *property {
+                            Expression::StringLiteral { value, .. } => value,
+                            _ => "unknown".to_string(),
+                        };
+                        let callable = Expression::ArrayLiteral {
+                            elements: vec![
+                                ArrayElement {
+                                    key: None,
+                                    value: left,
+                                    unpack: false,
+                                    by_ref: false,
+                                },
+                                ArrayElement {
+                                    key: None,
+                                    value: Expression::StringLiteral {
+                                        value: method_name,
+                                        span,
+                                    },
+                                    unpack: false,
+                                    by_ref: false,
+                                },
+                            ],
+                            span,
+                        };
+                        return Ok(Expression::FunctionCall {
+                            name: Box::new(Expression::StringLiteral {
+                                value: "Closure::fromCallable".to_string(),
+                                span,
+                            }),
+                            args: vec![Argument {
+                                name: None,
+                                value: callable,
+                                unpack: false,
+                                by_ref: false,
+                            }],
+                            span,
+                        });
+                    }
+                    let mut args = Vec::new();
+                    if self.current_token != Token::RParen {
+                        loop {
+                            args.push(self.parse_argument()?);
+                            if self.current_token == Token::Comma {
+                                self.advance();
+                                if self.current_token == Token::RParen {
+                                    break;
+                                }
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    self.expect(Token::RParen)?;
+                    Ok(Expression::NullsafeMethodCall {
+                        object: Box::new(left),
+                        method: property,
+                        args,
+                        span,
+                    })
+                } else {
+                    Ok(Expression::NullsafePropertyAccess {
+                        object: Box::new(left),
+                        property,
+                        span,
+                    })
+                }
             }
 
             // Static access: Class::member, Class::$prop, Class::method()
@@ -4791,6 +4930,7 @@ impl<'a> Parser<'a> {
                     span,
                 })
             }
+
 
             _ => Ok(left),
         }

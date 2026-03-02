@@ -1,7 +1,7 @@
 //! Type checking and introspection built-in functions.
 
 use crate::value::{ArrayKey, PhpArray, PhpObject, Value};
-use crate::vm::{Vm, VmResult};
+use crate::vm::{ClassDef, Vm, VmResult};
 use php_rs_compiler::op::OperandType;
 
 pub(crate) fn register(r: &mut super::BuiltinRegistry) {
@@ -577,10 +577,19 @@ pub(crate) fn php_class_exists(
         .first()
         .map(|v| deref(v).to_php_string())
         .unwrap_or_default();
+    let autoload = args.get(1).map(|v| v.to_bool()).unwrap_or(true);
     let lc = name.to_lowercase();
-    Ok(Value::Bool(
-        vm.classes.contains_key(&lc) || vm.classes.contains_key(&name),
-    ))
+    if vm.classes.contains_key(&lc) || vm.classes.contains_key(&name) {
+        return Ok(Value::Bool(true));
+    }
+    // Try autoloading if enabled
+    if autoload {
+        vm.try_autoload_class(&name);
+        if vm.classes.contains_key(&lc) || vm.classes.contains_key(&name) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
 }
 
 pub(crate) fn php_method_exists(
@@ -604,13 +613,41 @@ pub(crate) fn php_method_exists(
     let method = deref(&args[1]).to_php_string().to_lowercase();
     let lc = class_name.to_lowercase();
 
-    if let Some(def) = vm.classes.get(&lc).or_else(|| vm.classes.get(&class_name)) {
-        let found = def.methods.contains_key(&method)
-            || def.methods.keys().any(|k| k.to_ascii_lowercase() == method);
-        Ok(Value::Bool(found))
-    } else {
-        Ok(Value::Bool(false))
+    // Walk class hierarchy to find the method
+    let mut search = Some(class_name.clone());
+    while let Some(ref current) = search {
+        let current_lc = current.to_lowercase();
+        if let Some(def) = vm.classes.get(&current_lc).or_else(|| vm.classes.get(current)) {
+            let found = def.methods.contains_key(&method)
+                || def.methods.keys().any(|k| k.to_ascii_lowercase() == method);
+            if found {
+                return Ok(Value::Bool(true));
+            }
+            search = def.parent.clone();
+        } else {
+            // Try autoloading
+            if vm.classes.get(&current_lc).is_none() && vm.classes.get(current).is_none() {
+                vm.try_autoload_class(current);
+                if let Some(def) = vm.classes.get(&current_lc).or_else(|| vm.classes.get(current)) {
+                    let found = def.methods.contains_key(&method)
+                        || def.methods.keys().any(|k| k.to_ascii_lowercase() == method);
+                    if found {
+                        return Ok(Value::Bool(true));
+                    }
+                    search = def.parent.clone();
+                    continue;
+                }
+            }
+            break;
+        }
     }
+    // Also check if the function is registered as Class::method
+    let full_name = format!("{}::{}", class_name, method);
+    let full_name_lc = full_name.to_lowercase();
+    if vm.functions.contains_key(&full_name) || vm.functions.contains_key(&full_name_lc) {
+        return Ok(Value::Bool(true));
+    }
+    Ok(Value::Bool(false))
 }
 
 pub(crate) fn php_property_exists(
@@ -752,25 +789,60 @@ pub(crate) fn php_is_subclass_of(
     let target = deref(&args[1]).to_php_string();
     let target_lc = target.to_lowercase();
 
+    // Helper: lookup class in classes map (try original case, then lowercase)
+    fn get_class_def(vm: &Vm, name: &str) -> Option<ClassDef> {
+        vm.classes
+            .get(name)
+            .or_else(|| vm.classes.get(&name.to_lowercase()))
+            .cloned()
+    }
+
+    // Autoload the class if not yet loaded
+    if get_class_def(vm, &class_name).is_none() {
+        vm.try_autoload_class(&class_name);
+    }
+    // Also autoload the target if not loaded
+    if get_class_def(vm, &target).is_none() {
+        vm.try_autoload_class(&target);
+    }
+
     // Unlike is_a, do NOT match self
-    let mut current = class_name.to_lowercase();
+    let mut current = class_name.clone();
     loop {
-        let def = vm.classes.get(&current).cloned();
+        let def = get_class_def(vm, &current);
         match def {
             Some(def) => {
                 // Check interfaces
                 for iface in &def.interfaces {
-                    if iface.to_lowercase() == target_lc {
+                    if iface.eq_ignore_ascii_case(&target) {
                         return Ok(Value::Bool(true));
+                    }
+                    // Also walk interface parents
+                    let mut iface_current = iface.clone();
+                    loop {
+                        let iface_def = get_class_def(vm, &iface_current);
+                        match iface_def {
+                            Some(idef) => {
+                                for parent_iface in &idef.interfaces {
+                                    if parent_iface.eq_ignore_ascii_case(&target) {
+                                        return Ok(Value::Bool(true));
+                                    }
+                                }
+                                match &idef.parent {
+                                    Some(p) => iface_current = p.clone(),
+                                    None => break,
+                                }
+                            }
+                            None => break,
+                        }
                     }
                 }
                 match &def.parent {
                     Some(parent) => {
-                        let parent_lc = parent.to_lowercase();
-                        if parent_lc == target_lc {
+                        if parent.eq_ignore_ascii_case(&target) {
                             return Ok(Value::Bool(true));
                         }
-                        current = parent_lc;
+                        current = parent.clone();
                     }
                     None => break,
                 }
@@ -852,8 +924,13 @@ pub(crate) fn php_class_alias(
         .cloned();
     match def {
         Some(class_def) => {
+            // Store with original case (like all other class registrations)
+            vm.classes.insert(alias.clone(), class_def.clone());
+            // Also store lowercase for case-insensitive lookups
             let alias_lc = alias.to_lowercase();
-            vm.classes.insert(alias_lc, class_def);
+            if alias_lc != alias {
+                vm.classes.insert(alias_lc, class_def);
+            }
             Ok(Value::Bool(true))
         }
         None => Ok(Value::Bool(false)),

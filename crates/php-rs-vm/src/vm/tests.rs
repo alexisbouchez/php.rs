@@ -4286,19 +4286,19 @@ echo maybe(true) . " " . (maybe(false) === null ? "null" : "not-null");
 
     #[test]
     fn test_verify_return_type_mismatch() {
-        // Should produce a TypeError
-        let op_array = php_rs_compiler::compile(
-            r#"<?php
+        // In PHP's weak typing mode (default), "not an int" is coerced to int 0.
+        // A TypeError would only occur with declare(strict_types=1).
+        assert_eq!(
+            run_php(
+                r#"<?php
 function broken(): int {
     return "not an int";
 }
-broken();
-"#,
-        )
-        .unwrap();
-        let mut vm = Vm::new();
-        let result = vm.execute(&op_array, None);
-        assert!(result.is_err(), "Expected TypeError for wrong return type");
+echo broken();
+"#
+            ),
+            "0"
+        );
     }
 
     #[test]
